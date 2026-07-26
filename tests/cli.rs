@@ -202,8 +202,24 @@ fn match_rejects_malformed_streams_with_exit_3() {
 
 // ---- zrush config ----
 
+/// Isolated XDG_CONFIG_HOME, removed on drop so runs don't litter TMPDIR.
+struct TempXdg(PathBuf);
+
+impl Drop for TempXdg {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+impl std::ops::Deref for TempXdg {
+    type Target = PathBuf;
+    fn deref(&self) -> &PathBuf {
+        &self.0
+    }
+}
+
 /// Create an isolated XDG_CONFIG_HOME; write config.toml when given.
-fn xdg_dir(test: &str, config: Option<&str>) -> PathBuf {
+fn xdg_dir(test: &str, config: Option<&str>) -> TempXdg {
     let dir = std::env::temp_dir().join(format!("zrush-it-{}-{test}", std::process::id()));
     let sub = dir.join("zrush");
     std::fs::create_dir_all(&sub).expect("mkdir");
@@ -213,7 +229,7 @@ fn xdg_dir(test: &str, config: Option<&str>) -> PathBuf {
             let _ = std::fs::remove_file(sub.join("config.toml"));
         }
     }
-    dir
+    TempXdg(dir)
 }
 
 fn run_config(xdg: &PathBuf) -> (i32, String) {

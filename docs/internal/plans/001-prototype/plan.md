@@ -120,7 +120,8 @@ zrush の最終ゴールは、リアルタイム候補一覧・履歴メニュ�
   - CI(Linux + macOS)は M2 から、実機での統合確認・ドッグフーディングは M5 で行う。
   - バイナリは各環境で `cargo build` する(クロスコンパイル・バイナリ配布はフェーズ 1 のスコープ外)。
 - **移植性ガードレール** — mac 固有依存を作らない
-  - zsh スクリプトから呼ぶ外部コマンドは POSIX 範囲のみ(現状 `sleep` / `stty` を想定)。
+  - zsh スクリプトから呼ぶ外部コマンドは POSIX 範囲のみ(現状 `mkfifo` / `rm`。
+    デバウンスは `zselect`、搬出 pipe は fifo の匿名化で実現しており `sleep` / `stty` は不要になった)。
   - config パスは `$XDG_CONFIG_HOME` → `~/.config` の解決を自前実装(OS のプラットフォーム慣習パスに寄せない)。
   - Rust は特定 OS 固有の API を禁止する(mac / Linux の両方で使えない依存を作らない)。
     両対応の unix 共通 API(例: `std::os::unix::ffi::OsStrExt` による argv の生バイト受理)は許容する。
@@ -360,7 +361,7 @@ zpty 内部シェル(現在シェルの fork)で compsys を走らせ、**広げ
 - 設定エラー時のフォールバック表示(仕様は config-schema.md に従う)。
 - zsh-autocomplete を無効化し zrush に切り替えて日常利用開始。
   気になった挙動をこのディレクトリの `notes-dogfooding.md` に記録し、チューニング。
-  チェックリストには通常操作に加えて、端末リサイズ・複数行バッファ(継続行)・tmux 内・accept-line 後の残骸・シェル多重起動・zsh-syntax-highlighting / zsh-abbr との共存(Enter での略語展開を含む)を含める。
+  チェックリストには通常操作に加えて、端末リサイズ・複数行バッファ(継続行)・tmux 内・accept-line 後の残骸・シェル多重起動・zsh-syntax-highlighting / zsh-abbr との共存(Enter での略語展開を含む)・全角文字を含む候補の表示崩れ($COLUMNS 切り詰めが文字数ベースのため)・zsh 5.8 実機での入力圧見送り(`KEYS_QUEUED_COUNT` は 5.9 追加。5.8 では劣化動作)を含める。
   あいまいマッチの順位の体感も確認する(ティア序列は prefix > substring > 誤字許容 > あいまい。
   例: `dcs` では dash(1 置換)が docs(部分列)より上位になる。気になるようなら序列を再検討する)。
 - Linux 実機検証: 実際に使う Linux 環境(SSH 先サーバ / WSL / コンテナ)に導入し、検証用スクリプトで受け入れ条件 2〜7 を確認したうえでドッグフーディングに含める。
