@@ -25,6 +25,10 @@ docs/
 - ドキュメントは常に「最新の姿」だけを書く。経緯・履歴・レビュー記録の類は残さない(履歴は git が持つ)。
 - 現在進行中の計画: `docs/internal/plans/001-prototype/`
 
+## コミットメッセージ
+
+[Conventional Commits](https://www.conventionalcommits.org/) に従い、英語で簡潔に書く(例: `docs: add prototype plan`, `feat(match): add typo-tolerant matching`, `fix(zle): clear listing on accept-line`)。
+
 ## 実装の原則(要約)
 
 詳細は各 plan / spec を参照。
