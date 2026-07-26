@@ -19,7 +19,7 @@
 //!   beyond the aligned prefix, so "gti" matches both "git" and
 //!   "git-lfs").
 //!
-//! Tier ordering (prefix > substring > fuzzy > edit) is decided here,
+//! Tier ordering (prefix > substring > edit > fuzzy) is decided here,
 //! not by nucleo's raw score: nucleo can rank a scattered fuzzy match
 //! above a plain substring match (measured: "doc" scored dot-config 82 >
 //! my-docs 80 > mydocs 56). Intra-tier scores are an implementation
@@ -72,8 +72,8 @@ impl Mode {
 pub enum Tier {
     Prefix,
     Substring,
-    Fuzzy,
     Edit,
+    Fuzzy,
 }
 
 /// Match result for one candidate.
@@ -189,6 +189,22 @@ impl QueryMatcher {
             return None;
         }
 
+        // Edit tier: bounded prefix edit distance. Checked before fuzzy
+        // because it is the higher tier: a <=1-edit prefix match is
+        // high-precision/low-volume evidence, while the fuzzy tier can
+        // admit thousands of scattered subsequences. Skipped for 1-byte
+        // queries: a single-char query within one edit would match every
+        // candidate (substitution or trailing deletion), which is pure
+        // noise; substring/fuzzy already cover the sensible matches.
+        if q.len() >= 2
+            && let Some(em) = prefix_edit_within_one(q, cand)
+        {
+            return Some(MatchScore {
+                tier: Tier::Edit,
+                score: edit_score(em),
+            });
+        }
+
         // Fuzzy tier: nucleo strict-subsequence match.
         let cand_lossy = String::from_utf8_lossy(cand);
         let hay = Utf32Str::new(&cand_lossy, hay_char_buf);
@@ -199,19 +215,33 @@ impl QueryMatcher {
                 score: u32::from(s),
             });
         }
-
-        // Edit tier: bounded prefix edit distance. Skipped for 1-byte
-        // queries: a single-char query within one edit would match every
-        // candidate (substitution or trailing deletion), which is pure
-        // noise; substring/fuzzy already cover the sensible matches.
-        if q.len() >= 2 && prefix_edit_within_one(q, cand) {
-            return Some(MatchScore {
-                tier: Tier::Edit,
-                score: 0,
-            });
-        }
         None
     }
+}
+
+/// How the single edit reads. Declaration order = intra-tier preference
+/// (better first) used as the tie-break after suffix length:
+/// transposition carries the strongest signal (both correct characters
+/// were typed), then substitution, insertion (the user missed one
+/// candidate character), deletion (the query has one extra character).
+/// Exact only arises on distance-0 direct calls (`score()` routes those
+/// to the prefix tier first).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum EditKind {
+    Exact,
+    Transposition,
+    Substitution,
+    Insertion,
+    Deletion,
+}
+
+/// Best reading of a <=1-edit prefix match.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EditMatch {
+    kind: EditKind,
+    /// Candidate bytes after the aligned (corrected-query) prefix.
+    /// 0 = the whole candidate is the corrected query.
+    suffix_len: usize,
 }
 
 /// Does some prefix of `cand` lie within one edit (optimal string
@@ -220,41 +250,77 @@ impl QueryMatcher {
 ///
 /// Only a prefix of the candidate is aligned; the remaining candidate
 /// suffix is free, so a typo of a word's beginning still matches longer
-/// candidates ("gti" -> "git-lfs").
-fn prefix_edit_within_one(q: &[u8], cand: &[u8]) -> bool {
+/// candidates ("gti" -> "git-lfs"). When several readings exist for the
+/// same candidate (e.g. "gti" vs "gitb…" reads as transposition or
+/// deletion), the lexicographically best (suffix_len, kind) is returned.
+/// The aligned length is determined by the kind alone (substitution/
+/// transposition consume |q| bytes, insertion |q|+1, deletion |q|-1),
+/// so anchoring every reading at the first mismatch is exhaustive.
+fn prefix_edit_within_one(q: &[u8], cand: &[u8]) -> Option<EditMatch> {
     let m = q.len();
+    let total = cand.len();
     // Any aligned prefix within one edit consumes at most m+1 bytes.
-    let b = &cand[..cand.len().min(m + 1)];
+    let b = &cand[..total.min(m + 1)];
     let n = b.len();
     if n + 1 < m {
-        return false; // would need more than one deletion
+        return None; // would need more than one deletion
     }
     let k = q.iter().zip(b).take_while(|(a, c)| a == c).count();
     if k == m {
-        return true; // distance 0 against the prefix b[..m]
+        return Some(EditMatch {
+            kind: EditKind::Exact,
+            suffix_len: total - m,
+        });
     }
     // Exactly one edit at the first mismatch position k; the remainder
     // of q must then match the remainder of b exactly (b may extend
-    // beyond — prefix semantics).
-    // deletion: q[k] is an extra typed character.
-    if b[k..].starts_with(&q[k + 1..]) {
-        return true;
-    }
-    if k < n {
-        // substitution at k.
-        if b[k + 1..].starts_with(&q[k + 1..]) {
-            return true;
+    // beyond — prefix semantics). Collect every valid reading and keep
+    // the best (validity guarantees total >= consumed).
+    let mut best: Option<EditMatch> = None;
+    let mut consider = |kind: EditKind, consumed: usize| {
+        let em = EditMatch {
+            kind,
+            suffix_len: total - consumed,
+        };
+        if best.is_none_or(|cur| (em.suffix_len, em.kind) < (cur.suffix_len, cur.kind)) {
+            best = Some(em);
         }
+    };
+    if k < n {
         // insertion: b[k] is a character the user failed to type.
         if b[k + 1..].starts_with(&q[k..]) {
-            return true;
+            consider(EditKind::Insertion, m + 1);
         }
         // adjacent transposition at k/k+1.
-        if k + 1 < m && k + 1 < n && q[k] == b[k + 1] && q[k + 1] == b[k] {
-            return b[k + 2..].starts_with(&q[k + 2..]);
+        if k + 1 < m
+            && k + 1 < n
+            && q[k] == b[k + 1]
+            && q[k + 1] == b[k]
+            && b[k + 2..].starts_with(&q[k + 2..])
+        {
+            consider(EditKind::Transposition, m);
+        }
+        // substitution at k.
+        if b[k + 1..].starts_with(&q[k + 1..]) {
+            consider(EditKind::Substitution, m);
         }
     }
-    false
+    // deletion: q[k] is an extra typed character.
+    if b[k..].starts_with(&q[k + 1..]) {
+        consider(EditKind::Deletion, m - 1);
+    }
+    best
+}
+
+/// Pack an EditMatch into the intra-tier score (higher = better):
+/// shorter unmatched suffix first, then the EditKind preference.
+fn edit_score(em: EditMatch) -> u32 {
+    const SUFFIX_MAX: u32 = 0x0FFF_FFFF; // 28 bits
+    let suffix = u32::try_from(em.suffix_len)
+        .unwrap_or(SUFFIX_MAX)
+        .min(SUFFIX_MAX);
+    let kind_rank = em.kind as u32; // Exact=0 .. Deletion=4, lower = better
+    ((SUFFIX_MAX - suffix) << 4) | (0xF - kind_rank)
 }
 
 /// Byte-wise longest common prefix over the matched candidates'
@@ -289,7 +355,9 @@ mod tests {
     fn required_typo_cases() {
         assert_eq!(tier("gti", "git", Mode::Typo), Some(Tier::Edit));
         assert_eq!(tier("gti", "git-lfs", Mode::Typo), Some(Tier::Edit));
-        assert_eq!(tier("dcs", "docs", Mode::Typo), Some(Tier::Fuzzy));
+        // one missed char now reads as the edit tier (insertion), which
+        // outranks scattered fuzzy matches under the edit > fuzzy order
+        assert_eq!(tier("dcs", "docs", Mode::Typo), Some(Tier::Edit));
         assert_eq!(tier("inte", "internal", Mode::Typo), Some(Tier::Prefix));
         assert_eq!(tier("verbso", "verbose", Mode::Typo), Some(Tier::Edit));
         assert_eq!(tier("gir", "git", Mode::Typo), Some(Tier::Edit));
@@ -319,7 +387,11 @@ mod tests {
     fn tier_assignment_prefers_stricter_tiers() {
         assert_eq!(tier("doc", "docs", Mode::Typo), Some(Tier::Prefix));
         assert_eq!(tier("doc", "mydocs", Mode::Typo), Some(Tier::Substring));
-        assert_eq!(tier("doc", "dot-config", Mode::Typo), Some(Tier::Fuzzy));
+        // "doc" vs "dot-config" reads as a substitution (do[c/t]) — edit
+        // tier, which now sits above fuzzy
+        assert_eq!(tier("doc", "dot-config", Mode::Typo), Some(Tier::Edit));
+        // a subsequence not reachable by one edit stays in the fuzzy tier
+        assert_eq!(tier("dcf", "dot-config", Mode::Typo), Some(Tier::Fuzzy));
     }
 
     #[test]
@@ -380,8 +452,9 @@ mod tests {
             Some(Tier::Prefix)
         );
         // fuzzy tier goes through lossy conversion without dropping
+        // ("cfx" is a subsequence of caf\xe9x but not within one edit)
         assert_eq!(
-            score(b"cf", b"caf\xe9x", Mode::Typo, true).map(|m| m.tier),
+            score(b"cfx", b"caf\xe9x", Mode::Typo, true).map(|m| m.tier),
             Some(Tier::Fuzzy)
         );
         // edit tier is byte-based
@@ -393,16 +466,74 @@ mod tests {
 
     #[test]
     fn prefix_edit_examples() {
-        assert!(prefix_edit_within_one(b"gti", b"git")); // transposition
-        assert!(prefix_edit_within_one(b"gti", b"git-lfs")); // + free suffix
-        assert!(prefix_edit_within_one(b"verbso", b"verbose")); // transposition
-        assert!(prefix_edit_within_one(b"gir", b"git")); // substitution
-        assert!(prefix_edit_within_one(b"installl", b"install")); // deletion
-        assert!(prefix_edit_within_one(b"instal", b"install")); // insertion
-        assert!(prefix_edit_within_one(b"gt", b"grep")); // trailing deletion
-        assert!(!prefix_edit_within_one(b"gti", b"grep"));
-        assert!(!prefix_edit_within_one(b"abc", b"a"));
-        assert!(!prefix_edit_within_one(b"ab", b""));
+        let em = |q: &[u8], c: &[u8]| prefix_edit_within_one(q, c);
+        let hit = |kind, suffix_len| Some(EditMatch { kind, suffix_len });
+        assert_eq!(em(b"gti", b"git"), hit(EditKind::Transposition, 0));
+        assert_eq!(em(b"gti", b"git-lfs"), hit(EditKind::Transposition, 4));
+        assert_eq!(em(b"verbso", b"verbose"), hit(EditKind::Transposition, 1));
+        assert_eq!(em(b"gir", b"git"), hit(EditKind::Substitution, 0));
+        assert_eq!(em(b"installl", b"install"), hit(EditKind::Deletion, 0));
+        assert_eq!(em(b"dcs", b"docs"), hit(EditKind::Insertion, 0));
+        // "instal" is a plain prefix of "install" (score() never reaches
+        // the edit tier for it, but the direct call reports Exact)
+        assert_eq!(em(b"instal", b"install"), hit(EditKind::Exact, 1));
+        // "gt" vs "grep": substitution g[t/r]+"ep" (suffix 2) beats the
+        // trailing-deletion reading "g"+"rep" (suffix 3)
+        assert_eq!(em(b"gt", b"grep"), hit(EditKind::Substitution, 2));
+        // multiple readings: "gti" vs "gitb" is a transposition (suffix
+        // 1) and also a deletion (suffix 2) — best reading wins
+        assert_eq!(em(b"gti", b"gitb"), hit(EditKind::Transposition, 1));
+        assert_eq!(em(b"gti", b"grep"), None);
+        assert_eq!(em(b"abc", b"a"), None);
+        assert_eq!(em(b"ab", b""), None);
+    }
+
+    #[test]
+    fn edit_scores_rank_by_suffix_then_kind() {
+        let s = |q: &[u8], c: &[u8]| score(q, c, Mode::Typo, true).unwrap();
+        // all Edit tier for query "gti"
+        let git = s(b"gti", b"git"); // transposition, suffix 0
+        let gtsort = s(b"gti", b"gtsort"); // substitution,  suffix 3
+        let glibtool = s(b"gti", b"glibtool"); // substitution,  suffix 5
+        let gif2webp = s(b"gti", b"gif2webp"); // deletion,      suffix 6
+        for m in [git, gtsort, glibtool, gif2webp] {
+            assert_eq!(m.tier, Tier::Edit);
+        }
+        assert!(git.score > gtsort.score);
+        assert!(gtsort.score > glibtool.score);
+        assert!(glibtool.score > gif2webp.score);
+        // equal suffix: kind breaks the tie (insertion beats deletion)
+        let docs = s(b"dcs", b"docs"); // insertion, suffix 0
+        let dash = s(b"dcs", b"dash"); // substitution, suffix 1
+        assert_eq!(docs.tier, Tier::Edit);
+        assert_eq!(dash.tier, Tier::Edit);
+        assert!(docs.score > dash.score);
+        // kind preference at equal suffix: transposition > substitution
+        let transp = edit_score(EditMatch {
+            kind: EditKind::Transposition,
+            suffix_len: 2,
+        });
+        let subst = edit_score(EditMatch {
+            kind: EditKind::Substitution,
+            suffix_len: 2,
+        });
+        let insert = edit_score(EditMatch {
+            kind: EditKind::Insertion,
+            suffix_len: 2,
+        });
+        let delete = edit_score(EditMatch {
+            kind: EditKind::Deletion,
+            suffix_len: 2,
+        });
+        assert!(transp > subst);
+        assert!(subst > insert);
+        assert!(insert > delete);
+        // suffix dominates kind
+        let far_transp = edit_score(EditMatch {
+            kind: EditKind::Transposition,
+            suffix_len: 3,
+        });
+        assert!(delete > far_transp);
     }
 
     /// Cross-check the O(|q|) case analysis against a straightforward
@@ -462,7 +593,7 @@ mod tests {
             }
             for c in &cands {
                 assert_eq!(
-                    prefix_edit_within_one(q, c),
+                    prefix_edit_within_one(q, c).is_some(),
                     dp_reference(q, c),
                     "q={:?} cand={:?}",
                     String::from_utf8_lossy(q),
