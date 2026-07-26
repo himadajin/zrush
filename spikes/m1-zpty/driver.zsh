@@ -21,6 +21,8 @@ typeset -F SECONDS
 typeset -g SPIKE=${0:A:h}
 typeset -g PLAYGROUND=${1:?usage: driver.zsh <playground-dir>}
 [[ -d $PLAYGROUND ]] || { print -u2 "FATAL: playground not found: $PLAYGROUND"; exit 1 }
+# 部分パス補完(/u/lo → /usr/local)検証用の固定ツリー(冪等に作成)
+mkdir -p $PLAYGROUND/pp/usr/local/bin $PLAYGROUND/pp/usr/local/lib $PLAYGROUND/pp/usr/share/doc
 
 typeset -gi PASS=0 FAIL=0
 out() { print -r -u2 -- "$@" }
@@ -33,6 +35,7 @@ typeset -g WORK=$(mktemp -d ${TMPDIR:-/tmp}/zrush-driver.XXXXXX)
 export ZRUSH_SPIKE_DIR=$SPIKE
 export ZRUSH_TEST_TMP=$WORK
 export ZDOTDIR=$WORK/zdot
+export HOME=$PLAYGROUND   # ~ 保持検証用(~/do → ~/docs)。実ホームには触れない
 mkdir -p $ZDOTDIR
 print 'source $ZRUSH_SPIKE_DIR/rc/minimal.zshrc' > $ZDOTDIR/.zshrc
 export TERM=vt100
@@ -77,11 +80,12 @@ expect() {  # $1=glob $2=timeout(s)
   return 1
 }
 
-# EXPECT_BUF から ZRUSH-ITEM 行(${(qqqq)} エンコード)を抽出。
-# ITEMS     = 捕獲された compadd 語そのもの(compsys の挿入用クォートを含み得る)
+# EXPECT_BUF から ZRUSH-ITEM 行(${(qqqq)} エンコードされた v1 レコード)を抽出。
+# ITEMS     = デコード済みレコード(<tag>\1<value> を \2 結合したもの)
+# WORDS     = レコードの w フィールド(compadd 語。挿入用クォートを含み得る)
 # RAW_ITEMS = さらに ${(Q)} でクォートを剥がした「実ファイル名」
 parse_items() {
-  typeset -ga ITEMS=() RAW_ITEMS=()
+  typeset -ga ITEMS=() WORDS=() RAW_ITEMS=()
   typeset -g RESULT_LINE=
   local line enc decoded
   for line in ${(f)${EXPECT_BUF//$'\r'/}}; do
@@ -90,10 +94,41 @@ parse_items() {
       decoded=
       eval "decoded=$enc" 2>/dev/null    # (qqqq) エンコードを戻す(自前出力なので安全)
       ITEMS+=( "$decoded" )
-      RAW_ITEMS+=( "${(Q)decoded}" )
+      rec_get "$decoded" w
+      WORDS+=( "$REPLY" )
+      RAW_ITEMS+=( "${(Q)REPLY}" )
     fi
     [[ $line == *ZRUSH-RESULT\ * ]] && RESULT_LINE=${line##*ZRUSH-RESULT }
   done
+}
+
+rec_get() {  # $1=レコード $2=タグ → REPLY=値(なければ非 0)
+  typeset -g REPLY=
+  local f
+  for f in "${(@ps:\2:)1}"; do
+    if [[ ${f%%$'\1'*} == $2 ]]; then
+      REPLY=${f#*$'\1'}
+      return 0
+    fi
+  done
+  return 1
+}
+
+# レコードから挿入文字列(語領域の完全形)を再構成する。
+# モデル(compadd doc の合成順): <IPREFIX><ipre(-i)><apre(-P)><hpre(-p)><word><hsuf(-s)><asuf(-S)><isuf(-I)>
+# さらに -f(ファイル候補)でディレクトリの場合は compadd の挙動に合わせ '/' を付与
+# (判定には捕獲した realdir(rd)を使う。driver は host と同じ cwd で動く前提)。
+reconstruct() {  # $1=レコード → REPLY
+  local rec=$1 t
+  local -A g=()
+  for t in ip i P p w s S I f rd; do
+    rec_get "$rec" $t && g[$t]=$REPLY
+  done
+  local composed=${g[ip]}${g[i]}${g[P]}${g[p]}${g[w]}${g[s]}${g[S]}${g[I]}
+  if [[ ${g[f]} == 1 && $composed != */ ]] && [[ -d ${g[rd]}${(Q)g[w]} ]]; then
+    composed+=/
+  fi
+  typeset -g REPLY=$composed
 }
 
 has_item() {  # $1=実ファイル名(クォートなし)。RAW_ITEMS に一致があるか
@@ -115,6 +150,59 @@ run_capture() {  # $1=buffer text  $2=label  $3=trigger key (省略時 ^X^Z)
 }
 
 clear_line() { send_keys $'\C-u' }   # kill-whole-line
+
+# 素の compsys に第 1 候補を実挿入させ、結果 BUFFER を取得(^X^R → zrush-real-insert)
+real_insert() {  # $1=buffer text → REAL_BUF
+  typeset -g REAL_BUF=
+  send_keys $1
+  send_keys $'\C-x\C-r'
+  local st=1 line
+  if expect '*ZRUSH-REAL-END*' 15; then
+    for line in ${(f)${EXPECT_BUF//$'\r'/}}; do
+      [[ $line == *ZRUSH-REAL-END* ]] && continue
+      [[ $line == *ZRUSH-REAL\ * ]] && eval "REAL_BUF=${line##*ZRUSH-REAL }" 2>/dev/null
+    done
+    st=0
+  fi
+  clear_line
+  expect '*HP>*' 3 >/dev/null
+  return $st
+}
+
+# 捕獲レコードからの再構成と実挿入を突き合わせる。
+# mode=match: 一致を要求(不一致は FAIL)
+# mode=observe: 一致/不一致を記録するだけ(FAIL にしない。崩れ方の記録が目的)
+compare_case() {  # $1=label $2=buffer $3=語領域より前の部分 $4=mode
+  local label=$1 buffer=$2 pre=$3 mode=${4:-match}
+  if ! run_capture $buffer "$label(capture)"; then
+    return 1
+  fi
+  local -a caprecs=( "${(@)ITEMS}" )
+  clear_line
+  expect '*HP>*' 3 >/dev/null
+  if (( $#caprecs == 0 )); then
+    ng "$label: 候補が捕獲できない"
+    return 1
+  fi
+  if ! real_insert $buffer; then
+    ng "$label: 実挿入(^X^R)の結果が取れない"
+    return 1
+  fi
+  reconstruct "${caprecs[1]}"
+  local recon="$pre$REPLY"
+  if [[ $REAL_BUF == $recon ]]; then
+    ok "$label: 再構成 == 実挿入 ${(qqqq)recon}"
+  elif [[ $REAL_BUF == "$recon " ]]; then
+    ok "$label: 再構成+auto-space == 実挿入 ${(qqqq)REAL_BUF}"
+  else
+    if [[ $mode == observe ]]; then
+      out "OBSV: $label: 不一致(想定内・記録) recon=${(qqqq)recon} real=${(qqqq)REAL_BUF} rec1=${(qqqq)caprecs[1]}"
+    else
+      ng "$label: 不一致 recon=${(qqqq)recon} real=${(qqqq)REAL_BUF} rec1=${(qqqq)caprecs[1]}"
+    fi
+  fi
+  return 0
+}
 
 {
   # ---------------- ホスト起動 ----------------
@@ -171,6 +259,111 @@ clear_line() { send_keys $'\C-u' }   # kill-whole-line
     else
       ng "[deferred] 候補が取れない。items=${(j:, :)${(qqqq)ITEMS[@]}} ($RESULT_LINE)"
     fi
+  fi
+  clear_line
+  expect '*HP>*' 3 >/dev/null
+
+  # ================ M1-3: compadd フックの網羅性 ================
+  out "==== M1-3: メタデータ捕獲・-O/-A 除外・挿入再構成 ===="
+
+  # --- (1) -O/-A 除外: _describe 経由(内部で -O/-A/-D を多用)---
+  if run_capture 'tstdesc ' "[m1-3] describe"; then
+    if (( $#RAW_ITEMS == 3 )) && has_item add && has_item remove && has_item update; then
+      ok "[m1-3] -O/-A 除外: _describe で候補がちょうど {add,remove,update} の 3 件(マッチテスト呼び出しの混入なし)"
+    else
+      ng "[m1-3] -O/-A 除外: 候補集合が想定外: ${(j:, :)${(qqqq)RAW_ITEMS[@]}}"
+    fi
+    # --- (4) 表示文字列と挿入文字列の区別 ---
+    local _r _w _d ok_d=1
+    for _r in "${(@)ITEMS}"; do
+      rec_get "$_r" w; _w=$REPLY
+      rec_get "$_r" d || { ok_d=0; break }
+      _d=$REPLY
+      [[ -n $_d && $_d != $_w ]] || { ok_d=0; break }
+    done
+    if (( ok_d )); then
+      rec_get "${ITEMS[1]}" d
+      ok "[m1-3] 表示/挿入の区別: 全候補で -d 表示文字列を別途捕獲(例: w=add d=${(qqqq)REPLY})"
+    else
+      ng "[m1-3] 表示/挿入の区別: -d が取れない候補あり: ${(qqqq)ITEMS[1]}"
+    fi
+  fi
+  clear_line
+  expect '*HP>*' 3 >/dev/null
+
+  # --- (2)+(3) 合成 -P/-S/-p/-s/-i/-I: メタデータ捕獲と合成順序の検証 ---
+  if run_capture 'tstps ' "[m1-3] ps(capture)"; then
+    local _rec1=${ITEMS[1]:-}
+    local want ok_meta=1 missing=
+    for want in P:PRE: p:hidp: S::SUF s::hids i:ign: I::igns; do
+      rec_get "$_rec1" ${want%%:*} && [[ $REPLY == ${want#*:} ]] || { ok_meta=0; missing+=" ${want%%:*}" }
+    done
+    if (( ok_meta )); then
+      ok "[m1-3] メタデータ捕獲: -P/-p/-S/-s/-i/-I の全値を捕獲(rec=${(qqqq)_rec1})"
+    else
+      ng "[m1-3] メタデータ捕獲: 欠落タグ:$missing rec=${(qqqq)_rec1}"
+    fi
+  fi
+  clear_line
+  expect '*HP>*' 3 >/dev/null
+  compare_case "[m1-3] 合成順序(-P/-S/-p/-s/-i/-I)" 'tstps ' 'tstps ' match
+
+  # --- (3) 実在ケースでの再構成一致 ---
+  compare_case "[m1-3] 変数補完(\$ZRUSHUNIQ → IPREFIX)" 'echo $ZRUSHUNIQ' 'echo ' match
+  compare_case "[m1-3] オプション補完(--verb → --verbose)" 'tstargs --verb' 'tstargs ' match
+  compare_case "[m1-3] オプション補完(--fi → --file=)" 'tstargs --fi' 'tstargs ' match
+  compare_case "[m1-3] describe 系(tstdesc ad → add)" 'tstdesc ad' 'tstdesc ' match
+  compare_case "[m1-3] ファイル補完・dir(docs/inte → internal/)" 'ls docs/inte' 'ls ' match
+  compare_case "[m1-3] ファイル補完・file(Cargo.t → Cargo.toml)" 'ls Cargo.t' 'ls ' match
+
+  # --- (3) 崩れるはずのケース(観察・記録)---
+  compare_case "[m1-3] compadd -U(語全体書き換え)" 'tstu xyz' 'tstu ' observe
+  compare_case "[m1-3] _multi_parts(段階補完)" 'tstmulti /usr/lo' 'tstmulti ' observe
+  compare_case "[m1-3] _multi_parts(複数セグメント略記 /u/lo)" 'tstmulti /u/lo' 'tstmulti ' observe
+  compare_case "[m1-3] 部分パス補完(pp/u/lo → pp/usr/local)" 'ls pp/u/lo' 'ls ' observe
+
+  # --- (3') ~ 保持: 捕獲データ上で ~ が展開されないか(plan の ~ 非展開保証に直結)---
+  if run_capture 'ls ~/do' "[m1-3] tilde(capture)"; then
+    local _trec=${ITEMS[1]:-}
+    local _tp= _tip=
+    rec_get "$_trec" p  && _tp=$REPLY
+    rec_get "$_trec" ip && _tip=$REPLY
+    if [[ $_tip$_tp == '~/'* ]]; then
+      ok "[m1-3] ~ 保持: 捕獲プレフィックスが未展開のまま (ip=${(qqqq)_tip} p=${(qqqq)_tp})"
+    else
+      ng "[m1-3] ~ 保持: プレフィックスが展開されている ip=${(qqqq)_tip} p=${(qqqq)_tp} rec=${(qqqq)_trec}"
+    fi
+  fi
+  clear_line
+  expect '*HP>*' 3 >/dev/null
+  compare_case "[m1-3] ~ 再構成(~/do → ~/docs/)" 'ls ~/do' 'ls ' match
+
+  # --- (2') _arguments の説明文と -S= の捕獲(合否外の情報も含めて確認)---
+  if run_capture 'tstargs --' "[m1-3] args(capture)"; then
+    local _found_file=0 _file_rec=
+    for _r in "${(@)ITEMS}"; do
+      rec_get "$_r" w
+      [[ $REPLY == --file ]] && { _found_file=1; _file_rec=$_r }
+    done
+    if (( _found_file )); then
+      local _sfx= _dsc=
+      rec_get "$_file_rec" S && _sfx=$REPLY
+      rec_get "$_file_rec" s && _sfx=${_sfx:-$REPLY}
+      rec_get "$_file_rec" d && _dsc=$REPLY
+      if [[ $_sfx == '=' && -n $_dsc ]]; then
+        ok "[m1-3] --file= 型: suffix '=' と説明文を捕獲(d=${(qqqq)_dsc})"
+      else
+        ng "[m1-3] --file= 型: suffix/説明が取れない rec=${(qqqq)_file_rec}"
+      fi
+    else
+      ng "[m1-3] --file 候補が捕獲できない: ${(j:, :)${(qqqq)RAW_ITEMS[@]}}"
+    fi
+    # あれば良い: -X/-J/-V の取得可否を記録(合否に含めない)
+    local _x= _j= _v=
+    rec_get "${ITEMS[1]}" X && _x=$REPLY
+    rec_get "${ITEMS[1]}" J && _j=$REPLY
+    rec_get "${ITEMS[1]}" V && _v=$REPLY
+    out "OBSV: [m1-3] グループ情報(合否外): X=${(qqqq)_x} J=${(qqqq)_j} V=${(qqqq)_v} (rec=${(qqqq)ITEMS[1]})"
   fi
   clear_line
   expect '*HP>*' 3 >/dev/null

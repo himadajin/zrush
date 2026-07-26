@@ -6,5 +6,7 @@
 PS1='HP> '
 autoload -Uz compinit
 compinit -u -d ${ZRUSH_TEST_TMP:-${TMPDIR:-/tmp}}/zcompdump-zrush-spike
-source $ZRUSH_SPIKE_DIR/02-capture-v0.zsh
+# 既定は v1(メタデータ捕獲)。ZRUSH_CAPTURE=02-capture-v0.zsh で v0 に切替可能。
+source $ZRUSH_SPIKE_DIR/${ZRUSH_CAPTURE:-03-capture-v1.zsh}
+source $ZRUSH_SPIKE_DIR/rc/test-completers.zsh
 print MARK-RC-DONE
