@@ -4,7 +4,7 @@
 
 現行の marlonrichert/zsh-autocomplete には、頻繁な破壊的変更・細部動作の不安定さ・設定不能な挙動(`~` の勝手な展開、Tab での過剰な補完挿入、あいまい入力が補完されない、キーバインド設定不可)への不満がある。これを置き換える自分専用ツール zrush を作る。
 
-元アイディアのドキュメントは [`idea/`](idea/)([design.md](idea/design.md) / [config.md](idea/config.md))にスナップショットとして取り込んである(2026-07-26 時点の verbatim コピー)。以降の参照はすべてこのコピーを指す。
+元アイディアのドキュメントは [`idea/`](idea/)([design.md](idea/design.md) / [config.md](idea/config.md))にある。
 
 このプランのゴールは、元アイディア([idea/design.md](idea/design.md))のフェーズ 1 に相当する **日常投入可能な最小形** を完成させること:
 
