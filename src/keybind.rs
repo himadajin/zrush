@@ -45,7 +45,13 @@ pub fn normalize(notation: &str) -> Option<String> {
     if let Some(rest) = notation.strip_prefix("alt-") {
         let [b] = rest.as_bytes() else { return None };
         if is_plain_char(*b) {
-            return Some(format!("seq:^[{}", *b as char));
+            // ^ and \ would be misread by bindkey after the ^[ prefix,
+            // same escaping rule as the bare single-char forms.
+            return Some(match b {
+                b'^' => "seq:^[\\^".into(),
+                b'\\' => "seq:^[\\\\".into(),
+                _ => format!("seq:^[{}", *b as char),
+            });
         }
         return None;
     }
@@ -53,7 +59,13 @@ pub fn normalize(notation: &str) -> Option<String> {
         return None;
     };
     if is_plain_char(*b) {
-        return Some(format!("seq:{}", *b as char));
+        // `^` and `\` would be misread by bindkey as the start of a
+        // caret/backslash escape; emit them escaped (config-schema.md).
+        return Some(match *b {
+            b'^' => "seq:\\^".into(),
+            b'\\' => "seq:\\\\".into(),
+            _ => format!("seq:{}", *b as char),
+        });
     }
     None
 }
@@ -132,6 +144,12 @@ mod tests {
         assert_eq!(normalize("9").as_deref(), Some("seq:9"));
         assert_eq!(normalize("/").as_deref(), Some("seq:/"));
         assert_eq!(normalize("'").as_deref(), Some("seq:'"));
+        // bindkey-metacharacters are escaped; neighbors stay literal
+        assert_eq!(normalize("^").as_deref(), Some("seq:\\^"));
+        assert_eq!(normalize("\\").as_deref(), Some("seq:\\\\"));
+        assert_eq!(normalize("~").as_deref(), Some("seq:~"));
+        assert_eq!(normalize("[").as_deref(), Some("seq:["));
+        assert_eq!(normalize("-").as_deref(), Some("seq:-"));
         // ctrl
         assert_eq!(normalize("ctrl-a").as_deref(), Some("seq:^A"));
         assert_eq!(normalize("ctrl-z").as_deref(), Some("seq:^Z"));
@@ -140,6 +158,8 @@ mod tests {
         // alt
         assert_eq!(normalize("alt-x").as_deref(), Some("seq:^[x"));
         assert_eq!(normalize("alt-.").as_deref(), Some("seq:^[."));
+        assert_eq!(normalize("alt-^").as_deref(), Some("seq:^[\\^"));
+        assert_eq!(normalize("alt-\\").as_deref(), Some("seq:^[\\\\"));
         // named
         assert_eq!(normalize("enter").as_deref(), Some("seq:^M"));
         assert_eq!(normalize("tab").as_deref(), Some("seq:^I"));
