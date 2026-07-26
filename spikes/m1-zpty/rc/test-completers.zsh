@@ -38,3 +38,40 @@ compdef _tst_multi tstmulti
 
 # 6) 変数補完ケース用の一意な変数($ZRUSHUNIQ<TAB> が単一候補になる)
 typeset -g ZRUSHUNIQVAR=1
+
+# ---- M1-5: キャンセル・後始末検証用 ----
+
+# 7) 遅い補完(3 秒)。fork の実 pid を $ZRUSH_SLOW_LOG に記録してから眠る。
+_tst_slow() {
+  print -r -- "SLOWPID=$sysparams[pid]" >>| ${ZRUSH_SLOW_LOG:-/dev/null}
+  _zlog "tst_slow: pid logged to ${ZRUSH_SLOW_LOG:-(unset)}"
+  command sleep 3
+  compadd -- slow-one slow-two
+}
+compdef _tst_slow tstslow
+
+# 8) ハング級の補完(15 秒)。fork の TMOUT=10 が補完実行中に効くかの観察と、
+#    ハング中 fork のキャンセル検証用。
+_tst_hang() {
+  print -r -- "HANGPID=$sysparams[pid]" >>| ${ZRUSH_SLOW_LOG:-/dev/null}
+  command sleep 15
+  compadd -- hang-done
+}
+compdef _tst_hang tsthang
+
+# 9) 部分ペイロードで異常死する補完(NUL 終端なしで fork が exit)。
+#    親側の unterminated-payload 経路の検証用。
+_tst_die() {
+  compadd -- die-one                                      # 正常レコード 1 件
+  print -rn -u ${_zrush_wfd:-1} -- "PARTIAL-NO-NUL" 2>/dev/null   # NUL なしの断片
+  builtin exit 7
+}
+compdef _tst_die tstdie
+
+# 10) fork 内から zrush のリクエスト関数を呼ぶ補完(再帰防止ガードの検証)。
+#     ZRUSH_INTERNAL ガードが効けば即 return し、補完は正常に続くはず。
+_tst_recur() {
+  _zrush_request 2>/dev/null
+  compadd -- recur-done
+}
+compdef _tst_recur tstrecur

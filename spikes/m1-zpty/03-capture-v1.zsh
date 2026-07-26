@@ -21,12 +21,12 @@ zmodload zsh/parameter || return 1
 zmodload zsh/datetime
 
 typeset -g  ZRUSH_VARIANT=${ZRUSH_VARIANT:-direct}
-typeset -g  _zrush_query= _zrush_fuzzy= _zrush_buf= _zrush_pty=
+typeset -g  _zrush_query= _zrush_fuzzy= _zrush_buf= _zrush_pty= _zrush_worker_pid=
 typeset -gi _zrush_rfd=-1 _zrush_wfd=-1 _zrush_gen=0 _zrush_nreads=0
 typeset -gF _zrush_t0=0
 
 # デバッグログ($ZRUSH_LOG が設定されていればファイル追記。fork 内でも使える)
-_zlog() { [[ -n $ZRUSH_LOG ]] && print -r -- "[$$] $1" >>| $ZRUSH_LOG; return 0 }
+_zlog() { [[ -n $ZRUSH_LOG ]] && print -r -- "[$$ ${EPOCHREALTIME:-0}] $1" >>| $ZRUSH_LOG; return 0 }
 
 # ------------------------------------------------------------------ compadd フック
 # fork 内でのみ functions[compadd] に差し込まれる(FTB -ftb-compadd の拡張版)。
@@ -136,6 +136,9 @@ _zrush_worker() {  # $1 = direct | vared
   TMOUT=10
   (( _zrush_rfd >= 0 )) && exec {_zrush_rfd}<&-
 
+  # 先頭レコードで自分の実 pid を親へ申告する(キャンセル時の pgroup kill 用)
+  print -rn -u $_zrush_wfd -- "pid"$'\1'"$sysparams[pid]"$'\0' 2>/dev/null
+
   if [[ $1 == vared ]]; then
     builtin bindkey $'\C-@' _zrush-capture-n
     builtin bindkey $'\r' undefined-key
@@ -154,6 +157,7 @@ _zrush_worker() {  # $1 = direct | vared
 # ------------------------------------------------------------------ ホスト側
 _zrush_cleanup() {
   if (( _zrush_rfd >= 0 )); then
+    _zlog "cleanup: unhooking fd $_zrush_rfd"
     zle -F $_zrush_rfd 2>/dev/null
     exec {_zrush_rfd}<&-
     _zrush_rfd=-1
@@ -163,17 +167,41 @@ _zrush_cleanup() {
     _zrush_wfd=-1
   fi
   if [[ -n $_zrush_pty ]]; then
+    # 中断の設計メモ(実測に基づく):
+    # - zpty -d の HUP は「外部コマンド待ち中の fork」には遅延される(zsh は
+    #   フォアグラウンド子待ち中、トラップ処理を延期する。sleep 3 中の fork は
+    #   sleep 終了時刻まで死なないことを実測)。
+    # - zpty -t は(非 -b の)master を読みにいくため、子が無出力だと子の終了まで
+    #   ブロックする(2.5 秒ブロックを実測)。使用禁止。
+    # → worker が pipe の先頭レコードで自己申告した実 pid のプロセスグループへ
+    #   SIGINT を送る(fork は setsid 済みのセッションリーダなので pgid=pid。
+    #   外部コマンドも同じ pgrp にいるため wait がすぐ解け、zsh 側も ^C 相当で
+    #   即座に中断→ entry の always → exit する。TERM は対話継承 zsh に無視され
+    #   得るので使わない)。pid 未着(fork 直後の cancel)のときは zpty -d の
+    #   HUP のみ(外部コマンド終了時点で死ぬ)+ pipe クローズ後の EPIPE が保険。
+    if [[ $_zrush_worker_pid == <-> ]] && (( _zrush_worker_pid > 1 )); then
+      _zlog "cleanup: SIGINT to worker pgid $_zrush_worker_pid"
+      kill -INT -$_zrush_worker_pid 2>/dev/null || kill -INT $_zrush_worker_pid 2>/dev/null
+    fi
+    _zlog "cleanup: zpty -d $_zrush_pty"
     zpty -d $_zrush_pty 2>/dev/null
+    _zlog "cleanup: zpty -d done"
     _zrush_pty=
   fi
+  _zrush_worker_pid=
   _zrush_buf=
 }
 
-zshexit() { _zrush_cleanup }
+zshexit() { _zlog "zshexit: begin"; _zrush_cleanup; _zlog "zshexit: end" }
 
 _zrush_request() {
   emulate -L zsh
+  # ウィジェット内で外部コマンド(mkfifo/rm)を起動するため、ジョブ制御と
+  # SIGCHLD 通知を切る(FTB が _main_complete を no_monitor no_notify で包むのと
+  # 同系の防御。ジョブ制御下の子プロセス待ちがまれに永久待ちになる事故を防ぐ)
+  setopt localoptions no_monitor no_notify
   [[ -n $ZRUSH_INTERNAL ]] && return 0
+  _zlog "request: begin WIDGET=$WIDGET LASTWIDGET=$LASTWIDGET KEYS=${(qqqq)KEYS}"
   _zrush_cleanup
   # ZRUSH_WIDEN=1 なら広げ規則(04-widen.zsh)を適用して収集クエリを作る
   if [[ -n $ZRUSH_WIDEN ]] && (( $+functions[zrush_widen] )); then
@@ -191,12 +219,17 @@ _zrush_request() {
 
   local fifo=${TMPDIR:-/tmp}/zrush-cap-$$-$RANDOM.fifo
   mkfifo $fifo || return 1
+  _zlog "request: fifo made"
   local rw
   exec {rw}<>$fifo
+  _zlog "request: rw open"
   exec {_zrush_rfd}<$fifo
   exec {_zrush_wfd}>$fifo
+  _zlog "request: pipe opens done"
   exec {rw}>&-
+  _zlog "request: rw closed"
   rm -f $fifo
+  _zlog "request: fifo unlinked"
 
   _zrush_pty=zrush-w$(( ++_zrush_gen ))
   _zlog "request: pipe rfd=$_zrush_rfd wfd=$_zrush_wfd"
@@ -224,6 +257,15 @@ _zrush_on_data() {
   if (( st == 0 )); then
     _zrush_buf+=$chunk
     (( ++_zrush_nreads ))
+    # 先頭の pid 申告レコードを消費して記録する
+    if [[ -z $_zrush_worker_pid && $_zrush_buf == *$'\0'* ]]; then
+      local first=${_zrush_buf%%$'\0'*}
+      if [[ $first == pid$'\1'<-> ]]; then
+        _zrush_worker_pid=${first#pid$'\1'}
+        _zrush_buf=${_zrush_buf#*$'\0'}
+        _zlog "on-data: worker pid=$_zrush_worker_pid"
+      fi
+    fi
     return 0
   fi
   zle -F $fd 2>/dev/null

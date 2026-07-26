@@ -151,6 +151,21 @@ run_capture() {  # $1=buffer text  $2=label  $3=trigger key (省略時 ^X^Z)
 
 clear_line() { send_keys $'\C-u' }   # kill-whole-line
 
+# pty を読みながら待つ。
+# 重要: ドライバが pty を読まないままホスト側に出力が滞留すると、ホストは
+# accept-line 後や外部コマンド起動時の tcsetattr(TCSADRAIN) で永久ブロックする
+# (sample で実証: loop→hend→settyinfo→tcsetattr→ioctl)。
+# 実端末は常に読むので実運用では起きないが、ドライバの待ちループは必ずこれを使う。
+drain_pty() {  # $1=待ち秒数
+  local -F dl=$(( SECONDS + ${1:-0.2} ))
+  local chunk
+  while (( SECONDS < dl )); do
+    if zselect -t 10 -r $HOSTFD 2>/dev/null; then
+      zpty -r host chunk 2>/dev/null && TRANSCRIPT+=$chunk
+    fi
+  done
+}
+
 # 広げ収集(ZRUSH_WIDEN=1 前提)から目的候補を選び、その再構成を
 # 「as-typed の実挿入」と突き合わせる(選択→置換の統合確認)。
 compare_widened() {  # $1=label $2=as-typed buffer $3=語領域より前 $4=目的候補(dequoted)
@@ -502,6 +517,214 @@ widen_test() {  # $1=buffer $2=期待広げ後 $3=期待クエリ
   send_line "typeset -g ZRUSH_WIDEN="
   expect '*HP>*' 5 >/dev/null
 
+  # ================ M1-5: キャンセルと後始末 ================
+  out "==== M1-5: キャンセルと後始末 ===="
+  send_line "export ZRUSH_SLOW_LOG=$WORK/slow.log"
+  expect '*HP>*' 5 >/dev/null
+
+  # slow.log の最終行から pid を取り出す(数値でなければ空を返す)
+  read_slow_pid() {  # → REPLY(pid or 空)
+    typeset -g REPLY=
+    [[ -s $WORK/slow.log ]] || return 1
+    # 注意: ${(f)...}[-1] は 1 行のとき「スカラの最終 1 文字」を返す罠がある。
+    # 必ず配列に受けてから [-1] を取る(driver13 で pid=0/1 事故の原因)。
+    local -a lines=( ${(f)"$(<$WORK/slow.log)"} )
+    local pid=${${lines[-1]}#*PID=}
+    [[ $pid == <-> && $pid != 0 ]] && REPLY=$pid
+    [[ -n $REPLY ]]
+  }
+  # pid の消滅を最大 $2 秒待つ(pty を読みながら)。REPLY_ELAPSED に所要秒。
+  wait_dead() {  # $1=pid $2=timeout(s)
+    local -F t0=$SECONDS
+    local -i n=$(( $2 * 5 ))
+    while (( n-- > 0 )); do
+      kill -0 $1 2>/dev/null || { typeset -gF REPLY_ELAPSED=$(( SECONDS - t0 )); return 0 }
+      drain_pty 0.2
+    done
+    typeset -gF REPLY_ELAPSED=$(( SECONDS - t0 ))
+    return 1
+  }
+
+  # --- (3a) 遅い補完(sleep 3)中もホストが入力を受け付ける ---
+  : >| $WORK/slow.log
+  send_keys 'tstslow '
+  send_keys $'\C-x\C-z'
+  clear_line
+  send_line 'print MARK-ALIVE-SLOW'
+  if expect '*MARK-ALIVE-SLOW*' 2; then
+    ok "[m1-5] 遅い補完(sleep 3)の収集中もホストは入力を受け付ける"
+  else
+    ng "[m1-5] 遅い補完中にホストが応答しない"
+  fi
+  # コマンド実行直後は zle 再初期化で typeahead が捨てられるため、プロンプト到達を待つ
+  expect '*HP>*' 3 >/dev/null
+
+  # 旧 fork の pid はホスト自身が pipe 先頭レコードで受領している(_zrush_worker_pid)。
+  # slow.log 経由は「キー到着がバーストした場合に補完関数まで進む前にキャンセルされる」
+  # レースで空になり得るため使わない。
+  local slowpid= _i=0
+  while (( _i++ < 10 )); do
+    send_line 'print WPID-${_zrush_worker_pid:-none}-END'
+    if expect '*WPID-<->-END*' 2; then
+      slowpid=${${EXPECT_BUF##*WPID-}%%-END*}
+      expect '*HP>*' 3 >/dev/null
+      break
+    fi
+    expect '*HP>*' 3 >/dev/null
+  done
+  [[ $slowpid == <-> ]] || { ng "[m1-5] ホストから worker pid が取れない"; slowpid= }
+
+  # --- (1)(2)(3b) 収集中(sleep 残り約 2 秒)に新リクエスト → 旧 zpty 破棄・新結果のみ ---
+  send_keys 'ls docs/'
+  send_keys $'\C-x\C-z'
+  if expect '*ZRUSH-END*' 10; then
+    parse_items
+    if has_item internal && ! has_item slow-one && ! has_item slow-two; then
+      ok "[m1-5] 収集中の新リクエストで旧収集がキャンセルされ、新結果のみ届く ($RESULT_LINE)"
+    else
+      ng "[m1-5] 結果が混ざった: ${(j:, :)${(qqqq)RAW_ITEMS[@]}}"
+    fi
+  else
+    ng "[m1-5] 新リクエストの結果が来ない"
+  fi
+  clear_line
+  expect '*HP>*' 3 >/dev/null
+
+  # --- (1') 旧 fork の死亡確認(pgroup SIGINT による即時中断)---
+  if [[ -n $slowpid ]]; then
+    if wait_dead $slowpid 4; then
+      if (( REPLY_ELAPSED < 2.0 )); then
+        ok "[m1-5] 旧 fork (pid=$slowpid) がキャンセル後 ${REPLY_ELAPSED}s で消滅(sleep の自然終了を待たない即時中断)"
+      else
+        ok "[m1-5] 旧 fork (pid=$slowpid) は消滅したが ${REPLY_ELAPSED}s かかった(自然死の可能性・要注意)"
+      fi
+    else
+      ng "[m1-5] 旧 fork (pid=$slowpid) が残留している"
+      kill -9 $slowpid 2>/dev/null
+    fi
+  fi
+
+  # --- (2') stale 結果の静観: 旧 sleep 完了時刻を過ぎても何も届かない ---
+  expect '*ZRUSH-NEVER*' 4 >/dev/null   # 4 秒読み続ける(意図的に不一致)
+  if [[ $EXPECT_BUF != *ZRUSH-RESULT* && $EXPECT_BUF != *slow-one* ]]; then
+    ok "[m1-5] stale 結果は届かない(4 秒静観で ZRUSH 出力なし)。親も無事"
+  else
+    ng "[m1-5] stale 出力を検出: ${(qqqq)EXPECT_BUF}"
+  fi
+
+  # --- (3c) 遅い補完を放置 → 完走して結果が届く ---
+  send_keys 'tstslow '
+  send_keys $'\C-x\C-z'
+  if expect '*ZRUSH-END*' 8; then
+    parse_items
+    if has_item slow-one && has_item slow-two; then
+      ok "[m1-5] 放置した遅い補完は完走して結果が届く ($RESULT_LINE)"
+    else
+      ng "[m1-5] 遅い補完の結果が不正: ${(j:, :)${(qqqq)RAW_ITEMS[@]}}"
+    fi
+  else
+    ng "[m1-5] 遅い補完が 8 秒で完走しない"
+  fi
+  clear_line
+  expect '*HP>*' 3 >/dev/null
+
+  # --- 連打(rapid-fire): 3 連続リクエストで最後の結果のみ ---
+  send_keys 'tstslow a'
+  send_keys $'\C-x\C-z'
+  clear_line
+  send_keys 'tstslow b'
+  send_keys $'\C-x\C-z'
+  clear_line
+  send_keys 'ls docs/'
+  send_keys $'\C-x\C-z'
+  if expect '*ZRUSH-END*' 10; then
+    parse_items
+    if has_item internal && ! has_item slow-one; then
+      ok "[m1-5] 連打 3 リクエストで最後の結果のみ届く ($RESULT_LINE)"
+    else
+      ng "[m1-5] 連打結果が不正: ${(j:, :)${(qqqq)RAW_ITEMS[@]}}"
+    fi
+  else
+    ng "[m1-5] 連打後の結果が来ない"
+  fi
+  clear_line
+  expect '*HP>*' 3 >/dev/null
+  expect '*ZRUSH-NEVER*' 4 >/dev/null   # 静観
+  if [[ $EXPECT_BUF != *ZRUSH-RESULT* ]]; then
+    ok "[m1-5] 連打後の静観 4 秒でキャンセル済みリクエストの結果は届かない"
+  else
+    ng "[m1-5] キャンセル済みの結果が漏れた: ${(qqqq)EXPECT_BUF}"
+  fi
+
+  # --- (追加確認) 非 NUL 終端の部分ペイロードで fork が異常死した場合 ---
+  send_keys 'tstdie '
+  send_keys $'\C-x\C-z'
+  if expect '*ZRUSH-END*' 10; then
+    if [[ $EXPECT_BUF == *unterminated-payload* ]]; then
+      ok "[m1-5] 異常死 fork の部分ペイロードは ZRUSH-ERROR unterminated-payload として報告され、ホストは無事"
+    else
+      ng "[m1-5] unterminated 経路を通らなかった: ${(qqqq)EXPECT_BUF}"
+    fi
+  else
+    ng "[m1-5] 異常死ケースで ZRUSH-END が来ない"
+  fi
+  clear_line
+  send_line 'print MARK-ALIVE-DIE'
+  expect '*MARK-ALIVE-DIE*' 3 >/dev/null && ok "[m1-5] 異常死ケース後もホスト応答あり"
+  expect '*HP>*' 3 >/dev/null   # typeahead flush 対策(プロンプト同期)
+
+  # --- (5) 再帰防止ガード: fork 内から _zrush_request を呼んでも二重 fork しない ---
+  send_keys 'tstrecur '
+  send_keys $'\C-x\C-z'
+  if expect '*ZRUSH-END*' 10; then
+    parse_items
+    if (( $#RAW_ITEMS == 1 )) && has_item recur-done; then
+      ok "[m1-5] 再帰防止: fork 内の _zrush_request は ZRUSH_INTERNAL ガードで無害化され、候補 recur-done のみ届く"
+    else
+      ng "[m1-5] 再帰ケースの結果が不正: ${(j:, :)${(qqqq)RAW_ITEMS[@]}}"
+    fi
+  else
+    ng "[m1-5] 再帰ケースがハング(ガード不全の疑い)"
+  fi
+  clear_line
+  expect '*HP>*' 3 >/dev/null
+
+  # --- TMOUT 観察: ハング級補完(sleep 15)は TMOUT=10 で自殺するか ---
+  : >| $WORK/slow.log
+  send_keys 'tsthang '
+  send_keys $'\C-x\C-z'
+  if expect '*ZRUSH-END*' 12; then
+    parse_items
+    out "OBSV: [m1-5] TMOUT=10 は補完実行中にも発火: 終端到達 ($RESULT_LINE)"
+    clear_line
+    expect '*HP>*' 3 >/dev/null
+  else
+    out "OBSV: [m1-5] TMOUT=10 は補完実行中には発火しない(12s 時点で未完)→ 新リクエストでのキャンセルを検証"
+    local hangpid=
+    read_slow_pid && hangpid=$REPLY
+    clear_line
+    send_keys 'ls docs/'
+    send_keys $'\C-x\C-z'
+    if expect '*ZRUSH-END*' 10; then
+      parse_items
+      has_item internal && ok "[m1-5] ハング中 fork も新リクエストで即キャンセルされ新結果が届く ($RESULT_LINE)"
+    else
+      ng "[m1-5] ハング fork のキャンセルに失敗"
+    fi
+    if [[ -n $hangpid ]]; then
+      if wait_dead $hangpid 4; then
+        ok "[m1-5] ハング fork (pid=$hangpid) も消滅"
+      else
+        ng "[m1-5] ハング fork (pid=$hangpid) が残留"
+        kill -9 $hangpid 2>/dev/null
+      fi
+    else
+      ng "[m1-5] hang fork の pid が取れない: slow.log=${(qqqq)"$(cat $WORK/slow.log 2>/dev/null)"}"
+    fi
+    clear_line
+    expect '*HP>*' 3 >/dev/null
+  fi
+
   # ================ vared 方式: 既知の制約の確認 ================
   # fork 元(widget 文脈)で zle が活性のため、fork 内の vared は
   # "ZLE cannot be used recursively" で開始できない(ホストログで確認済み)。
@@ -533,6 +756,47 @@ widen_test() {  # $1=buffer $2=期待広げ後 $3=期待クエリ
     ng "収集開始直後にホストが応答しない"
   fi
   expect '*ZRUSH-END*' 10 >/dev/null   # 残骸を回収
+
+  # ================ M1-5(4): zshexit での掃除(ホスト終了・最終テスト)================
+  out "==== M1-5: zshexit 掃除(ホスト終了)===="
+  expect '*HP>*' 3 >/dev/null   # 直前の残骸回収後、プロンプト同期してからキーを送る
+  # 遅い収集を発行した直後にホストを exit させる
+  : >| $WORK/slow.log
+  send_keys 'tstslow '
+  send_keys $'\C-x\C-z'
+  local exitpid= _j=0
+  while (( _j++ < 15 )); do
+    read_slow_pid && { exitpid=$REPLY; break }
+    drain_pty 0.1
+  done
+  clear_line
+  send_line 'exit'
+  local -i hostdead=0; _j=0
+  while (( _j++ < 25 )); do
+    zpty -t host 2>/dev/null || { hostdead=1; break }
+    drain_pty 0.2
+  done
+  if (( hostdead )); then
+    ok "[m1-5] ホストが exit で終了"
+  else
+    ng "[m1-5] ホストが exit しない"
+  fi
+  if [[ -n $exitpid ]]; then
+    if wait_dead $exitpid 4; then
+      ok "[m1-5] zshexit の掃除で収集中 fork (pid=$exitpid) も消滅"
+    else
+      ng "[m1-5] ホスト終了後も fork (pid=$exitpid) が残留"
+      kill -9 $exitpid 2>/dev/null
+    fi
+  else
+    ng "[m1-5] exit テストの fork pid が取れない: slow.log=${(qqqq)"$(cat $WORK/slow.log 2>/dev/null)"}"
+  fi
+  local -a leftover=( ${TMPDIR:-/tmp}/zrush-cap-*(N) )
+  if (( $#leftover == 0 )); then
+    ok "[m1-5] 一時 fifo の残骸なし(作成直後 unlink 済み)"
+  else
+    ng "[m1-5] fifo 残骸: ${(j:, :)leftover}"
+  fi
 
   out "SUMMARY: PASS=$PASS FAIL=$FAIL"
 } always {
