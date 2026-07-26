@@ -70,7 +70,7 @@ fn match_ranks_tiers_and_reports_common_prefix() {
     let stdin = candidates(&[b"mydocs", b"docs", b"dot-config", b"doc", b"xxx"]);
     let (code, out) = run_match(&typo_args("doc", "10"), &stdin);
     assert_eq!(code, 0);
-    // prefix-exact(4) > prefix(2) > substring(1) > fuzzy(3); "xxx" excluded.
+    // prefix-exact(4) > prefix(2) > substring(1) > edit(3: doc~dot); "xxx" excluded.
     // LCP of {mydocs, docs, dot-config, doc} is empty.
     assert_eq!(fields(&out), [&b""[..], b"4", b"2", b"1", b"3"]);
 }
@@ -82,6 +82,17 @@ fn match_typo_transposition_gti() {
     assert_eq!(code, 0);
     // git and git-lfs match via the edit tier, grep does not.
     assert_eq!(fields(&out), [&b"git"[..], b"1", b"3"]);
+}
+
+#[test]
+fn match_edit_tier_ranks_close_corrections_first() {
+    // All four are edit-tier matches for "gti"; git (transposition,
+    // no unmatched suffix) must beat looser corrections regardless of
+    // stdin order.
+    let stdin = candidates(&[b"gtsort", b"gif2webp", b"git", b"glibtool"]);
+    let (code, out) = run_match(&typo_args("gti", "10"), &stdin);
+    assert_eq!(code, 0);
+    assert_eq!(fields(&out), [&b"g"[..], b"3", b"1", b"4", b"2"]);
 }
 
 #[test]

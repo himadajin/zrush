@@ -1,8 +1,8 @@
 //! Ranking of matched candidates.
 //!
 //! Semantics (cli-protocol.md): sort by match quality descending —
-//! stricter tier ranks higher (prefix > substring > order-preserving
-//! fuzzy > typo tolerance). Ties keep stdin order (= compsys output
+//! stricter tier ranks higher (prefix > substring > typo tolerance >
+//! order-preserving fuzzy). Ties keep stdin order (= compsys output
 //! order). Intra-tier ordering is an implementation detail
 //! (matching.rs assigns the scores).
 
@@ -42,7 +42,7 @@ mod tests {
             (4, ms(Tier::Substring, u32::MAX)),
             (5, ms(Tier::Fuzzy, 90)),
         ];
-        assert_eq!(rank(&scored, 10), vec![3, 1, 4, 5, 2, 0]);
+        assert_eq!(rank(&scored, 10), vec![3, 1, 4, 0, 5, 2]);
     }
 
     #[test]
