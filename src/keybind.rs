@@ -79,6 +79,11 @@ fn is_plain_char(b: u8) -> bool {
 /// Resolve the four actions' keybinds from user notations.
 ///
 /// - Invalid notation: that action falls back to its default (+ warning).
+/// - The Tab key (`tab` / `ctrl-i`, normalized seq:^I) cannot be
+///   assigned to an action (config-schema.md): zsh always binds ^I to
+///   the fixed `[insert].tab` behavior hook, so accepting it would
+///   silently swallow the assignment. Validation error: default +
+///   warning.
 /// - Same key on multiple actions (compared AFTER normalization, so
 ///   enter = ctrl-m = ^M collide): every action in the group reverts to
 ///   its default (+ one warning per group). Repeats until no collision
@@ -90,6 +95,10 @@ pub fn resolve(user: &[Option<String>; 4], warnings: &mut Vec<String>) -> [Strin
     for (i, notation) in user.iter().enumerate() {
         let Some(notation) = notation else { continue };
         match normalize(notation) {
+            Some(spec) if spec == "seq:^I" => warnings.push(format!(
+                "config: [keybind] {}: key \"{}\" is reserved for [insert].tab behavior; using default \"{}\"",
+                ACTIONS[i], notation, DEFAULT_NOTATIONS[i]
+            )),
             Some(spec) => specs[i] = spec,
             None => warnings.push(format!(
                 "config: [keybind] {}: unknown key notation \"{}\"; using default \"{}\"",
@@ -239,6 +248,41 @@ mod tests {
         assert!(w[0].contains("dismiss"), "{}", w[0]);
         assert!(w[0].contains("unknown key notation \"meta-g\""), "{}", w[0]);
         assert!(w[0].contains("using default \"ctrl-g\""), "{}", w[0]);
+    }
+
+    #[test]
+    fn resolve_rejects_tab_key_assignment() {
+        for notation in ["tab", "ctrl-i"] {
+            let mut w = Vec::new();
+            let specs = resolve(&[None, None, Some(notation.into()), None], &mut w);
+            assert_eq!(specs, default_specs(), "notation {notation:?}");
+            assert_eq!(w.len(), 1, "notation {notation:?}");
+            assert!(w[0].contains("confirm"), "{}", w[0]);
+            assert!(
+                w[0].contains(&format!(
+                    "key \"{notation}\" is reserved for [insert].tab behavior"
+                )),
+                "{}",
+                w[0]
+            );
+            assert!(w[0].contains("using default \"enter\""), "{}", w[0]);
+        }
+    }
+
+    #[test]
+    fn resolve_tab_rejection_composes_with_duplicate_resolution() {
+        // confirm = "tab" is rejected -> falls back to enter (seq:^M);
+        // dismiss = "ctrl-m" then collides with that default -> the
+        // duplicate loop reverts both, two warnings total.
+        let mut w = Vec::new();
+        let specs = resolve(
+            &[None, None, Some("tab".into()), Some("ctrl-m".into())],
+            &mut w,
+        );
+        assert_eq!(specs, default_specs());
+        assert_eq!(w.len(), 2);
+        assert!(w[0].contains("reserved for [insert].tab"), "{}", w[0]);
+        assert!(w[1].contains("same key after normalization"), "{}", w[1]);
     }
 
     #[test]

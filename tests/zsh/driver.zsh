@@ -32,6 +32,9 @@ ng()  { out "FAIL: $1"; (( ++FAIL )) }
 
 typeset -g WORK=$(mktemp -d ${TMPDIR:-/tmp}/zrush-test.XXXXXX)
 export TERM=vt100
+export HOME=$PLAYGROUND    # ~ 保持テスト用(実ホームに触れない)
+# 部分パス略記(接頭辞不一致置換)テスト用の固定ツリー
+mkdir -p $PLAYGROUND/pp/usr/local/bin $PLAYGROUND/pp/usr/share/doc
 export ZRUSH_REPO=$REPO
 export ZRUSH_TEST_TMP=$WORK
 export ZDOTDIR=$WORK/zdot
@@ -232,6 +235,212 @@ log_count() {  # $1=固定文字列 → REPLY: ZRUSH_LOG 内の出現回数
     ng "(g') 不正 config 後に一覧が出ない"
   fi
   clear_line
+
+  # ================================================================ M4: 選択・確定・挿入
+  local DOWN=$'\e[B' UP=$'\e[A' ENTER=$'\r' TAB=$'\t' CTRLG=$'\C-g'
+  press() { send_keys $1; drain 0.3 }
+  wait_log() {  # $1=固定文字列 $2=基準値 $3=timeout(s) → 増えたら 0
+    local -F dl=$(( SECONDS + ${3:-5} ))
+    while (( SECONDS < dl )); do
+      drain 0.15
+      log_count $1
+      (( REPLY > $2 )) && return 0
+    done
+    return 1
+  }
+  assert_buffer() {  # $1=期待するバッファ内容 $2=ラベル(^Xb ダンプで正確比較)
+    local want=${(qqqq)1}
+    send_keys $'\C-xb'
+    local -F dl=$(( SECONDS + 5 ))
+    local last=
+    local -a tl
+    while (( SECONDS < dl )); do
+      drain 0.15
+      tl=( ${(f)"$(grep -F 'TESTBUF=' $ZRUSH_LOG 2>/dev/null)"} )
+      (( $#tl )) && last=${tl[-1]#*TESTBUF=}
+      [[ $last == "$want" ]] && { ok "$2"; return 0 }
+    done
+    ng "$2: buffer=${last:-?} want=$want"
+    return 1
+  }
+
+  # config を既定に戻す(M3 テストが不正 config を残している)
+  command sleep 1.1
+  rm -f $XDG_CONFIG_HOME/zrush/config.toml
+  send_line ': m4-reset'
+  sync_prompt
+
+  # ---------------- (m4-1) 選択開始・マーカー・移動・先頭 ↑ で解除 ----------------
+  send_keys 'ls docs/'
+  expect '*user*' 10 >/dev/null
+  log_count 'select: start';           local -i c_start=$REPLY
+  log_count 'select: pos=2';           local -i c_pos2=$REPLY
+  log_count 'select: released-at-top'; local -i c_rel=$REPLY
+  send_keys $DOWN            # press() は drain で描画を先に消費するため使わない
+  if expect '*> internal*' 5; then
+    ok "(m4-1a) ↓ で選択開始・マーカー表示"
+  else
+    ng "(m4-1a) マーカーが出ない"
+  fi
+  press $DOWN
+  wait_log 'select: pos=2' $c_pos2 3 && ok "(m4-1b) ↓ で次候補へ移動" || ng "(m4-1b) 候補移動しない"
+  press $UP
+  press $UP
+  wait_log 'select: released-at-top' $c_rel 3 && ok "(m4-1c) 先頭候補で ↑ → 選択解除" || ng "(m4-1c) 先頭 ↑ で解除されない"
+  clear_line
+  drain 0.3
+
+  # ---------------- (m4-2) 非選択時: Enter=実行・↑=履歴(前任者チェーン) ----------------
+  # ^M を明示送信する(send_line の zpty -w は ^J を付加するため zrush の
+  # Enter ディスパッチ → 前任者フォールバックを経由しない。監査指摘)
+  send_keys 'print HISTMARK-ALPHA'
+  send_keys $'\r'
+  if expect '*HISTMARK-ALPHA*' 5; then
+    ok "(m4-2a) 非選択時の Enter は前任者(accept-line)経由でコマンド実行"
+  else
+    ng "(m4-2a) Enter でコマンドが実行されない"
+  fi
+  sync_prompt
+  send_keys $UP
+  if expect '*print HISTMARK-ALPHA*' 5; then
+    ok "(m4-2b) 非選択時の ↑ は前任者経由で履歴移動"
+  else
+    ng "(m4-2b) ↑ で履歴が出ない"
+  fi
+  drain 0.3
+
+  # ---------------- (m4-3) 履歴移動中の ↓ は履歴戻り ----------------
+  log_count 'next: hist-branch'; local -i c_hist=$REPLY
+  press $DOWN
+  wait_log 'next: hist-branch' $c_hist 3 && ok "(m4-3) 履歴移動中の ↓ は履歴戻り(優先順位②)" || ng "(m4-3) hist-branch を通らない"
+  clear_line
+  drain 0.3
+
+  # ---------------- (m4-4/5a/6a) 確定=挿入のみ・末尾置換・dir は space なし ----------------
+  send_keys 'ls docs/inte'
+  expect '*internal*' 10 >/dev/null
+  press $DOWN
+  press $ENTER
+  assert_buffer 'ls docs/internal/' "(m4-4) 確定は挿入のみ(実行されず編集継続)+末尾置換で 'ls docs/internal/'+dir はスペースなし"
+  clear_line
+  drain 0.3
+
+  # ---------------- (m4-6b) trailing-space: 通常ファイル候補に付く ----------------
+  send_keys 'ls Cargo.t'
+  expect '*Cargo.toml*' 10 >/dev/null
+  press $DOWN
+  press $ENTER
+  assert_buffer 'ls Cargo.toml ' "(m4-6) trailing-space: ファイル候補の確定で末尾スペースが付く"
+  clear_line
+  drain 0.3
+
+  # ---------------- (m4-5b) ~ 保持 ----------------
+  send_keys 'ls ~/do'
+  expect '*docs*' 10 >/dev/null
+  press $DOWN
+  press $ENTER
+  assert_buffer 'ls ~/docs/' "(m4-5b) ~ 候補の確定でも ~ が展開されない('ls ~/docs/' のまま)"
+  clear_line
+  drain 0.3
+
+  # ---------------- (m4-5c) 接頭辞不一致 → 語全体置換(pp/u/lo) ----------------
+  log_count 'whole-word-replace'; local -i c_ww=$REPLY
+  send_keys 'ls pp/u/lo'
+  expect '*local*' 10 >/dev/null
+  press $DOWN
+  press $ENTER
+  assert_buffer 'ls pp/usr/local/' "(m4-5c) 部分パス略記の確定は語全体置換で 'ls pp/usr/local/'"
+  wait_log 'whole-word-replace' $c_ww 2 && ok "(m4-5c') 語全体置換の分岐を通った" || ng "(m4-5c') whole-word-replace 分岐が記録されない"
+  clear_line
+  drain 0.3
+
+  # ---------------- (m4-11) dismiss: 一覧を閉じてバッファ不変 ----------------
+  send_keys 'ls docs/'
+  expect '*user*' 10 >/dev/null
+  log_count 'dismiss: closing list'; local -i c_dis=$REPLY
+  press $CTRLG
+  wait_log 'dismiss: closing list' $c_dis 3 && ok "(m4-11a) dismiss で一覧が閉じる" || ng "(m4-11a) dismiss が効かない"
+  assert_buffer 'ls docs/' "(m4-11b) dismiss 後もバッファは不変"
+  clear_line
+  drain 0.3
+
+  # ---------------- (m4-7) Tab menu モード: 一覧中 Tab で選択開始 ----------------
+  send_keys 'ls docs/'
+  expect '*user*' 10 >/dev/null
+  log_count 'select: start'; local -i c_tstart=$REPLY
+  press $TAB
+  wait_log 'select: start' $c_tstart 3 && ok "(m4-7) Tab(menu)で選択開始" || ng "(m4-7) Tab で選択が始まらない"
+  press $CTRLG
+  clear_line
+  drain 0.3
+
+  # ---------------- (m4-8) Tab common-prefix ----------------
+  command sleep 1.1
+  print -r -- $'[insert]\ntab = "common-prefix"' > $XDG_CONFIG_HOME/zrush/config.toml
+  send_line ': cfg-cp'
+  sync_prompt
+  send_keys 'ls docs/inte'
+  expect '*internal*' 10 >/dev/null
+  press $TAB
+  assert_buffer 'ls docs/internal' "(m4-8a) Tab(common-prefix): クエリが真の接頭辞のとき共通部を挿入"
+  clear_line
+  drain 0.3
+  log_count 'finalize: match ok'; local -i c_mok=$REPLY
+  send_keys 'gti'
+  wait_log 'finalize: match ok' $c_mok 10 || ng "(m4-8b 前提) gti の match が来ない"
+  log_count 'condition not met'; local -i c_ncp=$REPLY
+  press $TAB
+  wait_log 'condition not met' $c_ncp 3 && ok "(m4-8b) Tab(common-prefix): typo クエリでは何もしない" || ng "(m4-8b) 条件外で挿入された疑い"
+  assert_buffer 'gti' "(m4-8b') バッファ不変を確認"
+  clear_line
+  drain 0.3
+
+  # ---------------- (m4-9) Tab insert: 先頭候補即挿入 ----------------
+  command sleep 1.1
+  print -r -- $'[insert]\ntab = "insert"' > $XDG_CONFIG_HOME/zrush/config.toml
+  send_line ': cfg-ins'
+  sync_prompt
+  send_keys 'ls docs/inte'
+  expect '*internal*' 10 >/dev/null
+  press $TAB
+  assert_buffer 'ls docs/internal/' "(m4-9) Tab(insert)で先頭候補を即挿入"
+  clear_line
+  drain 0.3
+
+  # ---------------- (m4-10) 候補未着時 Tab → 到着後に適用 ----------------
+  log_count 'tab: pending'; local -i c_pend=$REPLY
+  send_keys 'ls docs/inte'$'\t'    # デバウンス中に Tab(同一バースト送信)
+  if expect '*ls docs/internal/*' 10; then
+    ok "(m4-10a) 未着時 Tab: 収集前倒し→到着時に insert 適用"
+  else
+    ng "(m4-10a) 未着時 Tab が適用されない"
+  fi
+  wait_log 'tab: pending' $c_pend 2 && ok "(m4-10b) pending 経路を通った" || ng "(m4-10b) pending 経路が記録されない"
+  clear_line
+  drain 0.3
+
+  # ---------------- (m4-12) キーバインド変更・奇数配列 ----------------
+  command sleep 1.1
+  print -r -- $'[insert]\ntab = "menu"\n[keybind]\ndismiss = "ctrl-t"' > $XDG_CONFIG_HOME/zrush/config.toml
+  send_line ': cfg-key'
+  sync_prompt
+  send_keys 'ls docs/'
+  expect '*user*' 10 >/dev/null
+  log_count 'dismiss: closing list'; local -i c_dis2=$REPLY
+  press $'\C-t'
+  wait_log 'dismiss: closing list' $c_dis2 3 && ok "(m4-12a) config で変更した dismiss キー(^T)が機能" || ng "(m4-12a) ^T dismiss が効かない"
+  log_count 'keybinds: restored'
+  (( REPLY > 0 )) && ok "(m4-12b) 外れた旧キー(^G)は前任者へ復元される" || ng "(m4-12b) 旧キーの復元記録がない"
+  clear_line
+  drain 0.3
+  # 奇数長 KEYBINDS: 配列全体を無視して既定+警告(ホスト内ユニット)
+  send_line 'ZRUSH_CFG_KEYBINDS=(a b c); _zrush_apply_keybinds'
+  if expect '*odd length*' 5; then
+    ok "(m4-12c) KEYBINDS 奇数長は無視して既定+警告"
+  else
+    ng "(m4-12c) 奇数長の警告が出ない"
+  fi
+  sync_prompt
 
   out "SUMMARY: PASS=$PASS FAIL=$FAIL"
 } always {

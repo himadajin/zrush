@@ -360,7 +360,7 @@ mod tests {
             [keybind]
             select-next = "ctrl-n"
             select-prev = "ctrl-p"
-            confirm = "tab"
+            confirm = "space"
             dismiss = "escape"
             "#,
         );
@@ -373,7 +373,7 @@ mod tests {
         assert!(!c.smart_case);
         assert_eq!(c.tab, TabBehavior::Insert);
         assert!(!c.trailing_space);
-        assert_eq!(c.keybinds, ["seq:^N", "seq:^P", "seq:^I", "seq:^["]);
+        assert_eq!(c.keybinds, ["seq:^N", "seq:^P", "seq: ", "seq:^["]);
     }
 
     #[test]
