@@ -1,6 +1,6 @@
 # AGENTS.md
 
-zrush — zsh-autocomplete を置き換える自分専用の zsh 補完ツール。
+zrush — zsh-autocomplete を置き換える zsh 補完ツール。作者の日常利用を第一に、ドッグフーディング駆動で開発する。
 Rust + zsh スクリプトで実装する。
 
 ## ドキュメントが Single Source of Truth
