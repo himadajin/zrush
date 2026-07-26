@@ -37,7 +37,13 @@
   - `zle -M` では実現できないため。
   - POSTDISPLAY + region_highlight へ描画層を差し替えるときに設定ごと導入する(idea/config.md からの意図的な差分)。
 - **候補一覧の操作** — 簡易選択まで含める
-  - 上下キーで候補を選び Enter/Tab で確定。
+  - キーの特別扱いは「一覧表示中」ではなく「**選択中**」に限る。
+    min-input 0 では一覧がほぼ常時表示されるため、表示中を条件にすると Enter での実行や ↑ での履歴移動が奪われてしまう。
+  - 非選択時は zsh 既定のまま(↑=履歴、Enter=実行)。
+    ↓ で選択に入り、選択中のみ ↑↓=候補移動、Enter/Tab=確定、却下キーで閉じる。
+    先頭候補での ↑ は選択解除して通常状態に戻る(履歴への導線を残す)。
+  - 確定は挿入のみで、コマンドは実行しない(実行はもう一度 Enter)。
+    「勝手に何かをしない」原則の帰結としてコードに固定し、設定項目にしない。
   - 本格的な Tab メニュー選択・履歴メニューはフェーズ 2。
 - **あいまいマッチ実装** — 既存クレート活用
   - fuzzy 部分は実績あるクレート(候補: `nucleo-matcher`)、誤字許容は必要に応じて自前ロジックで補完。
@@ -59,6 +65,16 @@
   - config パスは `$XDG_CONFIG_HOME` → `~/.config` の解決を自前実装(OS のプラットフォーム慣習パスに寄せない)。
   - Rust はプラットフォーム固有 API 禁止。
   - zsh 5.8 に存在しない機能を使わない。
+- **導入形態** — clone → `cargo build --release` → `.zshrc` で source
+  - zrush.zsh は自身の位置(`${0:A:h}`)から `../target/release/zrush` を解決する。
+    `$ZRUSH_BIN` が設定されていればそちらを優先。
+    `cargo install` や PATH 配置を前提にしない(rebuild が即反映され、ドッグフーディング向き)。
+  - compsys が初期化済み(compinit 実行済み)であることを動作前提とし、source は compinit より後に置く。
+    zrush 自身は compinit を実行しない(「勝手に何かをしない」)。
+    未初期化を検知したら警告表示のみ行う。
+- **zsh スクリプトとバイナリの版不整合** — プロトコル版番号で警告
+  - cli-protocol.md にプロトコル版番号を含め、zrush.zsh が期待する版と `zrush config` が出力する版が不一致なら警告を 1 回表示する(動作は継続)。
+  - 複数環境で使うため、git pull 後の rebuild し忘れが原因不明のデバッグに化けるのを安価に防ぐ。
 
 元アイディアからの引き継ぎ決定([idea/design.md](idea/design.md) / [idea/config.md](idea/config.md) 由来):
 
@@ -109,9 +125,57 @@ zle 統合の設計上の要点:
   シェル終了時にも `zshexit` で破棄する。
 - **収集完了の検知・描画は `zle -F -w`** で行う(ハンドラをウィジェットとして実行させ、`BUFFER` 参照と `zle -M` 描画を可能にする)。
   `zrush match` の呼び出しはこのハンドラ内(収集完了後)に置き、キー入力パスには置かない。
-- **選択キーは状態依存ディスパッチ**にする: up/down/Enter/Tab は「一覧表示中」のみ zrush のアクションとして扱い、非表示時は既定のウィジェット(`.up-line-or-history` 等)へフォールバックするディスパッチウィジェットを bindkey する。
+- **選択キーは状態依存ディスパッチ**にする: up/down/Enter/Tab は「選択中」のみ zrush のアクションとして扱い、非選択時は既定のウィジェット(`.up-line-or-history` / `.accept-line` 等)へフォールバックするディスパッチウィジェットを bindkey する。
+  選択への入り口は ↓(および Tab 挙動が menu のときの Tab)。
 - 内部シェルには zrush 自身のフックが fork で継承されるため、**環境変数ガード(例: `ZRUSH_INTERNAL=1`)で再帰を防止**する。
 - zsh↔Rust の入出力仕様は `docs/internal/contracts/cli-protocol.md` として M2 で確定させる(候補は NUL 区切りで stdin、クエリ・文脈は引数、出力はランク済み候補列、を想定。ファイル名は改行を含み得るため NUL 区切りは必須)。
+
+## 導入方法(想定)
+
+各環境(mac / SSH 先サーバ / WSL / コンテナ)で:
+
+```sh
+git clone <repo> ~/repos/zrush
+cd ~/repos/zrush && cargo build --release
+```
+
+```sh
+# .zshrc(zsh-autocomplete の source 行は削除する)
+autoload -Uz compinit && compinit
+source ~/repos/zrush/zsh/zrush.zsh
+```
+
+`~/.config/zrush/config.toml` は任意(不在なら全既定値で動作)。
+更新は git pull → 再ビルド。
+
+## config.toml の絵姿(例)
+
+スキーマの確定は M2(config-schema.md)で行う。
+以下は設定面の全体像を共有するための例示:
+
+```toml
+[display]
+max-lines = 10   # 一覧の最大行数
+delay-ms  = 50   # 表示までの遅延
+min-input = 0    # 表示を開始する最小入力文字数
+
+[matching]
+mode       = "typo"   # "prefix" | "substring" | "typo"(後のものほど広く拾う)
+smart-case = true
+
+[insert]
+tab            = "menu"   # Tab の挙動: "common-prefix" | "menu" | "insert"
+trailing-space = true     # 確定時の末尾スペース付与
+
+[keybind]
+select-next = "down"      # 選択開始 / 次候補
+select-prev = "up"        # 前候補(先頭では選択解除)
+confirm     = "enter"     # 確定(挿入のみ)
+dismiss     = "ctrl-g"    # 却下(一覧を閉じる)
+```
+
+フェーズ 1 でキーバインドに割り当て可能なアクションは select-next / select-prev / confirm / dismiss の 4 つ。
+Tab は `[insert]` の挙動設定に従う(`menu` のときは選択開始キーを兼ねる)ため、独立のアクションにはしない。
 
 ## リポジトリ構成(このプラン完了時)
 
@@ -173,7 +237,7 @@ zpty 内部シェル(現在シェルの fork)で compsys を走らせ、編集�
   デフォルトキーバインド一覧もここで確定する(却下キーの既定は Escape でなく `ctrl-g` を第一候補とする — Escape 単独は矢印キー等の `\e` プレフィックスと曖昧で KEYTIMEOUT 待ちが発生するため。最終決定はここで行う)。
 - ここまでを純粋ロジックとして単体テストを整備。
 - CI を整備: GitHub Actions で Linux (ubuntu) + macOS の `cargo build` / `cargo test` を回す。
-- 成果: `docs/internal/contracts/cli-protocol.md`(zsh↔Rust プロトコル)と `docs/internal/contracts/config-schema.md`(config.toml のテーブル・キー・型・既定値の一覧。設定エラーの表示先・タイミングを含む)を作成。
+- 成果: `docs/internal/contracts/cli-protocol.md`(zsh↔Rust プロトコル。版不整合検知用のプロトコル版番号を含む)と `docs/internal/contracts/config-schema.md`(config.toml のテーブル・キー・型・既定値の一覧。設定エラーの表示先・タイミングを含む)を作成。
   以後この 2 つを真実とし、コードを追従させる。
 
 ### M3: 統合 — リアルタイム候補一覧
@@ -187,8 +251,12 @@ zpty 内部シェル(現在シェルの fork)で compsys を走らせ、編集�
 
 ### M4: 選択・確定・挿入
 
-- 状態依存ディスパッチウィジェットを実装し、一覧表示中のみ上下キーで候補選択、Enter/Tab で確定、却下キーで閉じる(キーはすべて config のキーバインド定義から適用)。
+- 状態依存ディスパッチウィジェットを実装する(キーはすべて config のキーバインド定義から適用):
+  ↓ で選択開始、選択中のみ ↑↓=候補移動、Enter/Tab=確定、却下キーで閉じる。
+  先頭候補での ↑ は選択解除。
+  非選択時は既定ウィジェットへフォールバックし、↑=履歴・Enter=実行を奪わないことを確認する。
   選択中候補はマーカーで表示する。
+- 確定は挿入のみでコマンドを実行しないことを確認する(実行は次の Enter)。
 - Tab の挙動を config で制御(共通接頭辞のみ挿入 / メニューへ入るだけ / 即挿入)。
 - 確定時の末尾スペース付与の有無を config で制御。
 - `~/` 配下の候補を確定しても `~` が展開形に置き換わらないことを確認(compadd の接頭辞経由の再構成で壊さない)。
@@ -213,6 +281,7 @@ zpty 内部シェル(現在シェルの fork)で compsys を走らせ、編集�
 3. `~` を含む入力が、入力中も候補確定時も勝手に展開されない。
 4. あいまいな入力でも目的の候補に到達できる(例: `gti`→`git` のような転置タイプミス、`dcs`→`docs` のような部分文字一致で候補が出る)。
 5. 候補一覧から上下キーで候補を選び、確定・却下できる。
+   非選択時は一覧が表示されていても ↑=履歴移動・Enter=コマンド実行が通常どおり機能する。
 6. フェーズ 1 の全設定項目(max-lines / delay-ms / min-input / マッチ強度 / smart-case / Tab 挙動 / 末尾スペース / 全キーバインド)が `config.toml` で変更でき、次のプロンプトから自動反映される。
 7. 不正な設定値でも起動が止まらず、既定値フォールバックが分かるエラー表示になる。
 8. Rust 側のマッチング・ランキング・設定パース・キー変換に単体テストが存在し、通っている(CI で Linux + macOS の両方が通る)。
