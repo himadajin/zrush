@@ -35,10 +35,19 @@ typeset -g  _zrush_pending_buffer=
 typeset -g  _zrush_last_buffer=
 typeset -gi _zrush_last_cursor=-1
 
-# 受信結果(M4 でも使う: レコード原本と挿入形を保持する)
-typeset -ga _zrush_recs=() _zrush_words=() _zrush_match=() _zrush_disp=()
+# 受信結果(選択・確定でも使う: レコード原本と挿入形を保持する)
+typeset -ga _zrush_recs=() _zrush_krecs=() _zrush_words=() _zrush_match=() _zrush_disp=()
+typeset -ga _zrush_ranked=() _zrush_shown=()
 typeset -g  _zrush_common_prefix=
 typeset -gi _zrush_listing=0
+
+# 選択・Tab 状態
+typeset -gi _zrush_selected=0      # 0=非選択、>0=表示行位置(1 始まり)
+typeset -gi _zrush_tab_pending=0   # 候補未着時に Tab が押された
+
+# キーバインド(ディスパッチウィジェット → 前任者/アクション)
+typeset -gA _zrush_dsp_prev=() _zrush_dsp_action=() _zrush_bound=()
+typeset -gi _zrush_dsp_n=0
 
 # ---------------------------------------------------------------- ユーティリティ
 _zlog() { [[ -n $ZRUSH_LOG ]] && print -r -- "[$$ ${EPOCHREALTIME:-0}] $1" >>| $ZRUSH_LOG; return 0 }
@@ -124,8 +133,12 @@ _zrush_precmd() {
   _zrush_config_mtime
   if [[ $REPLY != $_zrush_cfg_mtime ]]; then
     _zlog "precmd: config mtime changed ($_zrush_cfg_mtime -> $REPLY); reloading"
-    _zrush_load_config reload || _zlog "precmd: config reload failed; keeping previous values"
-    # 失敗時は前回の設定値を維持して継続(cli-protocol.md)
+    if _zrush_load_config reload; then
+      _zrush_apply_keybinds    # 再適用(自分自身を前任者として捕まえない設計)
+    else
+      _zlog "precmd: config reload failed; keeping previous values"
+      # 失敗時は前回の設定値を維持して継続(cli-protocol.md)
+    fi
   fi
   return 0
 }
@@ -284,10 +297,12 @@ _zrush_disarm_timer() {
 }
 
 _zrush_clear_display() {  # zle ウィジェット文脈からのみ呼ぶこと
+  _zrush_selected=0
   (( _zrush_listing )) || return 0
   zle -M ""
   _zrush_listing=0
-  _zrush_recs=() _zrush_words=() _zrush_match=() _zrush_disp=()
+  _zrush_recs=() _zrush_krecs=() _zrush_words=() _zrush_match=() _zrush_disp=()
+  _zrush_ranked=() _zrush_shown=()
   _zrush_common_prefix=
 }
 
@@ -395,8 +410,9 @@ _zrush_finalize() {
     words=( "${(@)${(@)_zrush_recs#w$'\1'}%%$'\2'*}" )
     mts=( "${(@Q)words}" )
     if [[ -z ${(M)words:#(*$'\1'*|)} && -z ${(M)mts:#*$'\0'*} ]]; then
-      # 高速経路: 不正レコード・NUL 入り候補なし
+      # 高速経路: 不正レコード・NUL 入り候補なし(除外ゼロ = recs と 1:1 対応)
       n=$#words
+      _zrush_krecs=( "${(@)_zrush_recs}" )
       _zrush_words=( "${(@)words}" )
       _zrush_match=( "${(@)mts}" )
       _zrush_disp=( "${(@)words:/*/}" )         # 全要素空(d なし)
@@ -416,6 +432,7 @@ _zrush_finalize() {
   if (( n < 0 )); then
     # 汎用経路: d フィールドあり/異常レコードあり(通常は少数件)
     local r w d
+    local -a recs1=()
     words=() disps=()
     for r in "${(@)_zrush_recs}"; do
       [[ $r == w$'\1'* ]] || continue
@@ -428,13 +445,15 @@ _zrush_finalize() {
       fi
       words+=( "$w" )
       disps+=( "$d" )
+      recs1+=( "$r" )
     done
     mts=( "${(@Q)words}" )
     # NUL を含む候補は送出前に除外(送信側責務)。index は除外後の自前配列基準。
     n=0
-    _zrush_words=() _zrush_match=() _zrush_disp=()
+    _zrush_krecs=() _zrush_words=() _zrush_match=() _zrush_disp=()
     for (( i = 1; i <= $#words; ++i )); do
       [[ $mts[i] == *$'\0'* || $disps[i] == *$'\0'* ]] && continue
+      _zrush_krecs+=( "$recs1[i]" )
       _zrush_words+=( "$words[i]" )
       _zrush_match+=( "$mts[i]" )
       _zrush_disp+=( "$disps[i]" )
@@ -468,9 +487,15 @@ _zrush_finalize() {
 
   local -a fields=( "${(@0)${out%$'\0'}}" )
   _zrush_common_prefix=${fields[1]:-}
-  typeset -ga _zrush_ranked=( "${(@)fields[2,-1]}" )
+  _zrush_ranked=( "${(@)fields[2,-1]}" )
   _zlog "finalize: match ok, ${#_zrush_ranked} ranked, common-prefix=${(qqqq)_zrush_common_prefix}"
   _zrush_render
+  # 候補未着時に Tab が押されていたら、到着した今、設定どおりの挙動を適用する。
+  # 候補 0 件なら何もしない(素の compsys への同期フォールバックはしない)。
+  if (( _zrush_tab_pending )); then
+    _zrush_tab_pending=0
+    (( $#_zrush_shown > 0 )) && _zrush_tab_with_results
+  fi
   return 0
 }
 
@@ -481,25 +506,39 @@ _zrush_render() {  # zle ウィジェット文脈からのみ呼ぶこと
   (( LINES > 1 && maxl > LINES - 1 )) && maxl=$(( LINES - 1 ))
   (( maxl < 1 )) && maxl=1
   local idx text
+  local -i width=$COLUMNS
+  (( _zrush_selected > 0 )) && (( width -= 2 ))   # マーカー分
+  _zrush_shown=()
   for idx in "${(@)_zrush_ranked}"; do
     [[ $idx == <-> ]] || continue
     text=${_zrush_disp[idx]:-${_zrush_match[idx]}}
     text=${text//$'\n'/ }
-    (( COLUMNS > 1 && ${#text} >= COLUMNS )) && text=${text[1,COLUMNS-1]}
+    (( width > 1 && ${#text} >= width )) && text=${text[1,width-1]}
     lines+=( "$text" )
+    _zrush_shown+=( $idx )
     (( $#lines >= maxl )) && break
   done
   if (( $#lines == 0 )); then
     _zrush_clear_display
     return 0
   fi
+  # 選択中はマーカー付与(選択行 '> '、他は桁揃えの 2 スペース)
+  if (( _zrush_selected > 0 )); then
+    (( _zrush_selected > $#lines )) && _zrush_selected=$#lines
+    local -i li
+    for (( li = 1; li <= $#lines; ++li )); do
+      if (( li == _zrush_selected )); then
+        lines[li]="> $lines[li]"
+      else
+        lines[li]="  $lines[li]"
+      fi
+    done
+  fi
   zle -M "${(pj:\n:)lines}"
   _zrush_listing=1
-  _zlog "render: $#lines lines"
+  _zlog "render: $#lines lines selected=$_zrush_selected"
   return 0
 }
-
-typeset -ga _zrush_ranked=()
 
 # ---------------------------------------------------------------- タイマー(デバウンス)
 _zrush_arm_timer() {  # zle ウィジェット文脈
@@ -541,6 +580,9 @@ _zrush_line_pre_redraw() {
   [[ $BUFFER == "$_zrush_last_buffer" ]] && (( CURSOR == _zrush_last_cursor )) && return 0
   _zrush_last_buffer=$BUFFER
   _zrush_last_cursor=$CURSOR
+  # バッファが変化したら選択・未着 Tab 予約は解除して通常フローへ
+  _zrush_selected=0
+  _zrush_tab_pending=0
 
   # 空バッファ(空白のみ含む)では収集も表示もしない(plan の固定挙動)
   if [[ -z ${BUFFER//[[:space:]]/} ]]; then
@@ -568,6 +610,8 @@ _zrush_line_init() {
   _zrush_last_buffer=
   _zrush_last_cursor=-1
   _zrush_listing=0    # 新しい行では表示なしから始まる(zle -M は行を跨いで残らない)
+  _zrush_selected=0
+  _zrush_tab_pending=0
   return 0
 }
 
@@ -577,7 +621,326 @@ _zrush_line_finish() {
   _zrush_disarm_timer
   _zrush_cancel_collection
   _zrush_clear_display
+  _zrush_tab_pending=0
   _zlog "line-finish: cleared"
+  return 0
+}
+
+# ---------------------------------------------------------------- 挿入文字列の再構成(M1-3 実証モデル)
+# <IPREFIX><ipre(-i)><apre(-P)><hpre(-p)><word><hsuf(-s)><asuf(-S)><isuf(-I)>
+# + -f 候補でディレクトリなら合成 '/'(realdir で判定)。
+_zrush_reconstruct() {  # $1=レコード → REPLY=挿入文字列
+                        #   _zrush_rec_prefix=捕獲接頭辞(IPREFIX+hpre)
+                        #   _zrush_rec_nospace=1 なら trailing-space を付けない
+  emulate -L zsh
+  local rec=$1 f t
+  local -A g=()
+  for f in "${(@ps:\2:)rec}"; do
+    t=${f%%$'\1'*}
+    g[$t]=${f#*$'\1'}
+  done
+  local composed=${g[ip]}${g[i]}${g[P]}${g[p]}${g[w]}${g[s]}${g[S]}${g[I]}
+  local -i nospace=0
+  [[ -n ${g[S]}${g[s]}${g[I]} ]] && nospace=1     # -S 系接尾辞を持つ候補
+  if [[ ${g[f]} == 1 && $composed != */ ]] && [[ -d ${g[rd]}${(Q)g[w]} ]]; then
+    composed+=/
+    nospace=1                                      # ディレクトリの合成 /
+  fi
+  typeset -g  REPLY=$composed
+  typeset -g  _zrush_rec_prefix=${g[ip]}${g[p]}
+  typeset -gi _zrush_rec_nospace=$nospace
+  return 0
+}
+
+# ---------------------------------------------------------------- 確定(挿入のみ。実行しない — コード固定)
+_zrush_confirm_index() {  # $1=自前配列(krecs/words/...)の添字
+  emulate -L zsh
+  local -i idx=$1
+  local rec=${_zrush_krecs[idx]:-}
+  [[ -n $rec ]] || return 1
+  _zrush_reconstruct "$rec"
+  local composed=$REPLY prefix=$_zrush_rec_prefix
+  local -i nospace=$_zrush_rec_nospace
+
+  # 置換範囲(plan 決定 + M1-3 実証):
+  #   捕獲接頭辞(IPREFIX+hpre)が保持バッファ末尾(keep)と一致 → 削った末尾領域を置換。
+  #   不一致(部分パス略記の展開等) → 現在語全体を置換。
+  # どちらも結果は「語より前 + 再構成挿入文字列」に一致する(prefix==keep なら
+  # keep のバイト列は composed の接頭辞として保存され、~ 非展開もこれで保証される)。
+  _zrush_widen "$LBUFFER"
+  local word=$REPLY_WORD keep=$REPLY_KEEP
+  local pre=${LBUFFER[1,$#LBUFFER-$#word]}
+  if [[ $prefix == "$keep" ]]; then
+    _zlog "confirm: tail-replace keep=${(qqqq)keep} insert=${(qqqq)composed}"
+  else
+    _zlog "confirm: whole-word-replace (prefix=${(qqqq)prefix} != keep=${(qqqq)keep}) insert=${(qqqq)composed}"
+  fi
+  local newl=$pre$composed
+  if [[ ${ZRUSH_CFG_TRAILING_SPACE:-true} == true ]] && (( ! nospace )); then
+    newl+=' '
+  fi
+  LBUFFER=$newl        # カーソル以降(RBUFFER)には触らない
+
+  # 確定後: 一覧消去・選択解除。再収集はトリガしない(last_buffer を追従させる)
+  _zrush_disarm_timer
+  _zrush_cancel_collection
+  _zrush_clear_display
+  _zrush_tab_pending=0
+  _zrush_last_buffer=$BUFFER
+  _zrush_last_cursor=$CURSOR
+  return 0
+}
+
+# ---------------------------------------------------------------- 選択
+_zrush_select_start() {
+  _zrush_selected=1
+  _zrush_render
+  _zlog "select: start"
+}
+
+_zrush_select_move() {  # $1=+1|-1
+  emulate -L zsh
+  local -i new=$(( _zrush_selected + $1 ))
+  if (( new < 1 )); then
+    # 先頭候補での select-prev は選択解除して通常状態へ(履歴への導線)
+    _zrush_selected=0
+    _zrush_render
+    _zlog "select: released-at-top"
+    return 0
+  fi
+  (( new > $#_zrush_shown )) && new=$#_zrush_shown
+  _zrush_selected=$new
+  _zrush_render
+  _zlog "select: pos=$_zrush_selected"
+  return 0
+}
+
+# ---------------------------------------------------------------- ディスパッチ(状態依存)
+_zrush_call_prev() {  # 前任者チェーンへフォールバック(builtin 直呼びはしない)
+  emulate -L zsh
+  local prev=${_zrush_dsp_prev[$WIDGET]:-}
+  if [[ -n $prev && $prev != undefined-key ]] && (( $+widgets[$prev] )); then
+    _zlog "dispatch: fallback $WIDGET -> $prev"
+    zle $prev -w
+  fi
+  return 0
+}
+
+_zrush_action_next() {
+  if (( _zrush_selected > 0 )); then
+    _zrush_select_move 1
+    return 0
+  fi
+  # 非選択時の優先順位規則(コード固定。判定は BUFFER/CURSOR/HISTNO のみ)
+  if [[ $BUFFER == *$'\n'* && ${BUFFER[CURSOR+1,-1]} == *$'\n'* ]]; then
+    _zlog "next: multiline-branch"
+    _zrush_call_prev; return 0            # ① 複数行バッファの途中行 → カーソル移動
+  fi
+  if (( HISTNO != HISTCMD )); then
+    _zlog "next: hist-branch"
+    _zrush_call_prev; return 0            # ② 履歴移動中 → 履歴戻り
+  fi
+  if (( _zrush_listing && $#_zrush_shown > 0 )); then
+    _zrush_select_start; return 0         # ③ 一覧表示中 → 選択開始
+  fi
+  _zrush_call_prev                        # ④ それ以外 → 既定
+  return 0
+}
+
+_zrush_action_prev() {
+  if (( _zrush_selected > 0 )); then
+    _zrush_select_move -1
+    return 0
+  fi
+  _zrush_call_prev
+  return 0
+}
+
+_zrush_action_confirm() {
+  if (( _zrush_selected > 0 )); then
+    _zrush_confirm_index ${_zrush_shown[_zrush_selected]}
+    return 0
+  fi
+  _zrush_call_prev
+  return 0
+}
+
+_zrush_action_dismiss() {
+  if (( _zrush_selected > 0 || _zrush_listing )); then
+    _zlog "dismiss: closing list"
+    _zrush_clear_display     # バッファには触らない
+    _zrush_tab_pending=0
+    return 0
+  fi
+  _zrush_call_prev
+  return 0
+}
+
+# Tab: [insert].tab の挙動に従う(独立アクションではない)
+_zrush_tab_with_results() {  # 結果が手元にある状態での Tab 挙動
+  emulate -L zsh
+  case ${ZRUSH_CFG_TAB:-menu} in
+    menu)
+      _zrush_select_start
+      ;;
+    insert)
+      (( $#_zrush_shown > 0 )) && _zrush_confirm_index ${_zrush_shown[1]}
+      ;;
+    common-prefix)
+      # クエリが common-prefix の真の接頭辞である場合に限り、
+      # 削った末尾領域を ${(q)} クォートした common-prefix で置き換える(cli-protocol)
+      local cp=$_zrush_common_prefix q=$_zrush_fuzzy
+      if [[ -n $cp && $cp != "$q" && $cp == "$q"* ]]; then
+        _zrush_widen "$LBUFFER"
+        local word=$REPLY_WORD keep=$REPLY_KEEP
+        local pre=${LBUFFER[1,$#LBUFFER-$#word]}
+        LBUFFER=$pre$keep${(q)cp}
+        _zlog "tab: common-prefix inserted ${(qqqq)cp}"
+        # 部分挿入は確定ではない: last_buffer は更新せず、通常フローの再収集に任せる
+      else
+        _zlog "tab: common-prefix condition not met (cp=${(qqqq)cp} q=${(qqqq)q})"
+      fi
+      ;;
+  esac
+  return 0
+}
+
+_zrush_action_tab() {
+  emulate -L zsh
+  if (( _zrush_selected > 0 )); then
+    _zrush_confirm_index ${_zrush_shown[_zrush_selected]}   # 選択中 Tab = 確定
+    return 0
+  fi
+  # 収集中・デバウンス待ち: Tab を記録し、収集を前倒しして到着時に適用
+  if (( _zrush_timer_fd >= 0 )); then
+    _zlog "tab: pending (debounce fast-forward)"
+    _zrush_tab_pending=1
+    _zrush_disarm_timer
+    _zrush_start_request
+    return 0
+  fi
+  if (( _zrush_rfd >= 0 )); then
+    _zlog "tab: pending (collection in flight)"
+    _zrush_tab_pending=1
+    return 0
+  fi
+  if (( _zrush_listing && $#_zrush_shown > 0 )); then
+    _zrush_tab_with_results
+    return 0
+  fi
+  _zrush_call_prev      # 一覧なし・pending なし → 前任者(素の補完など)
+  return 0
+}
+
+_zrush_dispatch() {
+  emulate -L zsh
+  case ${_zrush_dsp_action[$WIDGET]:-} in
+    select-next) _zrush_action_next ;;
+    select-prev) _zrush_action_prev ;;
+    confirm)     _zrush_action_confirm ;;
+    dismiss)     _zrush_action_dismiss ;;
+    tab)         _zrush_action_tab ;;
+    *)           _zrush_call_prev ;;
+  esac
+  return 0
+}
+
+# ---------------------------------------------------------------- キーバインド適用
+# key:<名> → 実際にバインドすべき列の解決($terminfo + 矢印は CSI/SS3 両系統)
+_zrush_key_seqs() {  # $1=key:<名> → reply=(列...)
+  emulate -L zsh
+  local name=${1#key:}
+  local -a seqs=()
+  case $name in
+    up)        seqs=( "${terminfo[kcuu1]:-}" $'\e[A' $'\eOA' ) ;;
+    down)      seqs=( "${terminfo[kcud1]:-}" $'\e[B' $'\eOB' ) ;;
+    left)      seqs=( "${terminfo[kcub1]:-}" $'\e[D' $'\eOD' ) ;;
+    right)     seqs=( "${terminfo[kcuf1]:-}" $'\e[C' $'\eOC' ) ;;
+    shift-tab) seqs=( "${terminfo[kcbt]:-}" ) ;;
+    home)      seqs=( "${terminfo[khome]:-}" ) ;;
+    end)       seqs=( "${terminfo[kend]:-}" ) ;;
+    pgup)      seqs=( "${terminfo[kpp]:-}" ) ;;
+    pgdn)      seqs=( "${terminfo[knp]:-}" ) ;;
+    delete)    seqs=( "${terminfo[kdch1]:-}" ) ;;
+    *) return 1 ;;
+  esac
+  typeset -ga reply=( ${(u)seqs:#} )   # 空除去 + 重複除去
+  (( $#reply > 0 ))
+}
+
+# 1 つのキー列をアクションのディスパッチウィジェットへバインドする。
+# 現在の束縛が自分のディスパッチウィジェットなら、その記録済み前任者を引き継ぐ
+# (リロード再適用で自分自身を前任者として捕まえない — plan 明記)。
+_zrush_bind_one() {  # $1=action $2=キー列(bindkey 表記 or 生列)
+  emulate -L zsh
+  local action=$1 seq=$2
+  local cur=${${(z)"$(builtin bindkey -M main -- "$seq" 2>/dev/null)"}[2]:-}
+  local prev=
+  if [[ $cur == _zrush-dsp-* ]]; then
+    prev=${_zrush_dsp_prev[$cur]:-}
+  elif [[ -n $cur && $cur != undefined-key ]]; then
+    prev=$cur
+  fi
+  local wname=${_zrush_bound[$seq]:-}
+  if [[ -z $wname ]]; then
+    wname=_zrush-dsp-$(( ++_zrush_dsp_n ))
+    zle -N $wname _zrush_dispatch
+  fi
+  _zrush_dsp_prev[$wname]=$prev
+  _zrush_dsp_action[$wname]=$action
+  builtin bindkey -M main -- "$seq" $wname
+  _zrush_new_bound[$seq]=$wname
+  return 0
+}
+
+_zrush_apply_keybinds() {
+  emulate -L zsh
+  local -a kb=( "${(@)ZRUSH_CFG_KEYBINDS}" )
+  if (( $#kb % 2 != 0 )); then
+    # 奇数長(版不整合等の異常)は配列全体を無視して既定を適用し警告(cli-protocol)
+    _zrush_warn "keybinds: malformed ZRUSH_CFG_KEYBINDS (odd length $#kb); using default keybinds"
+    kb=( select-next key:down select-prev key:up confirm 'seq:^M' dismiss 'seq:^G' )
+  elif (( $#kb == 0 )); then
+    kb=( select-next key:down select-prev key:up confirm 'seq:^M' dismiss 'seq:^G' )
+  fi
+  typeset -gA _zrush_new_bound=()
+  local -i i
+  local action spec s
+  local -a reply
+  for (( i = 1; i + 1 <= $#kb; i += 2 )); do
+    action=$kb[i] spec=$kb[i+1]
+    case $spec in
+      seq:*)
+        _zrush_bind_one $action "${spec#seq:}"
+        ;;
+      key:*)
+        if _zrush_key_seqs $spec; then
+          for s in "${(@)reply}"; do
+            _zrush_bind_one $action "$s"
+          done
+        else
+          _zrush_warn "keybinds: no terminfo sequence for '${spec#key:}'; skipping $action"
+        fi
+        ;;
+      *)
+        _zrush_warn "keybinds: unknown key spec '${spec}' for $action; skipping"
+        ;;
+    esac
+  done
+  # Tab は [insert].tab の挙動に従う固定フック(独立アクションではない)
+  _zrush_bind_one tab '^I'
+  # 今回外れたキーは前任者へ戻す
+  local seq w p
+  for seq in "${(@k)_zrush_bound}"; do
+    if [[ -z ${_zrush_new_bound[$seq]:-} ]]; then
+      w=${_zrush_bound[$seq]}
+      p=${_zrush_dsp_prev[$w]:-}
+      builtin bindkey -M main -- "$seq" ${p:-undefined-key}
+      _zlog "keybinds: restored ${(qqqq)seq} -> ${p:-undefined-key}"
+    fi
+  done
+  typeset -gA _zrush_bound=( "${(@kv)_zrush_new_bound}" )
+  unset _zrush_new_bound
   return 0
 }
 
@@ -607,7 +970,7 @@ _zrush_init() {
     return 1
   fi
 
-  zmodload zsh/zpty zsh/system zsh/zutil zsh/parameter zsh/zselect zsh/datetime 2>/dev/null || {
+  zmodload zsh/zpty zsh/system zsh/zutil zsh/parameter zsh/zselect zsh/datetime zsh/terminfo 2>/dev/null || {
     _zrush_warn "required zsh modules unavailable; zrush disabled"
     return 1
   }
@@ -644,6 +1007,9 @@ _zrush_init() {
   add-zle-hook-widget line-finish _zrush-line-finish
   add-zsh-hook precmd _zrush_precmd
   add-zsh-hook zshexit _zrush_zshexit   # 既存の zshexit を壊さない(フック配列経由)
+
+  # キーバインド適用(main キーマップのみ。前任者チェーンを記録)
+  _zrush_apply_keybinds
 
   _zrush_enabled=1
   _zlog "init: enabled (bin=$ZRUSH_BIN proto=$ZRUSH_PROTOCOL_VERSION)"
