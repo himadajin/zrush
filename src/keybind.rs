@@ -106,10 +106,7 @@ pub fn resolve(user: &[Option<String>; 4], warnings: &mut Vec<String>) -> [Strin
             )),
         }
     }
-    loop {
-        let Some(dup) = first_duplicate(&specs) else {
-            break;
-        };
+    while let Some(dup) = first_duplicate(&specs) {
         let group: Vec<usize> = (0..4).filter(|&i| specs[i] == dup).collect();
         let names: Vec<&str> = group.iter().map(|&i| ACTIONS[i]).collect();
         let defaults: Vec<String> = group
