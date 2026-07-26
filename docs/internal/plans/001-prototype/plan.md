@@ -122,7 +122,8 @@ zrush の最終ゴールは、リアルタイム候補一覧・履歴メニュ�
 - **移植性ガードレール** — mac 固有依存を作らない
   - zsh スクリプトから呼ぶ外部コマンドは POSIX 範囲のみ(現状 `sleep` / `stty` を想定)。
   - config パスは `$XDG_CONFIG_HOME` → `~/.config` の解決を自前実装(OS のプラットフォーム慣習パスに寄せない)。
-  - Rust はプラットフォーム固有 API 禁止。
+  - Rust は特定 OS 固有の API を禁止する(mac / Linux の両方で使えない依存を作らない)。
+    両対応の unix 共通 API(例: `std::os::unix::ffi::OsStrExt` による argv の生バイト受理)は許容する。
   - zsh 5.8 に存在しない機能を使わない。
 - **導入形態** — clone → `cargo build --release` → `.zshrc` で source
   - zrush.zsh は自身の位置(`${0:A:h}`)から `../target/release/zrush` を解決する。
