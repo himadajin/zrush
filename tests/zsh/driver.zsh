@@ -291,7 +291,10 @@ log_count() {  # $1=固定文字列 → REPLY: ZRUSH_LOG 内の出現回数
   drain 0.3
 
   # ---------------- (m4-2) 非選択時: Enter=実行・↑=履歴(前任者チェーン) ----------------
-  send_line 'print HISTMARK-ALPHA'
+  # ^M を明示送信する(send_line の zpty -w は ^J を付加するため zrush の
+  # Enter ディスパッチ → 前任者フォールバックを経由しない。監査指摘)
+  send_keys 'print HISTMARK-ALPHA'
+  send_keys $'\r'
   if expect '*HISTMARK-ALPHA*' 5; then
     ok "(m4-2a) 非選択時の Enter は前任者(accept-line)経由でコマンド実行"
   else
