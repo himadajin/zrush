@@ -716,11 +716,16 @@ _zrush_select_move() {  # $1=+1|-1
 }
 
 # ---------------------------------------------------------------- ディスパッチ(状態依存)
+# 前任者はディスパッチ関数の本体引数として埋め込まれ、_zrush_dispatch が
+# ここへ設定する($WIDGET 参照にしないのは、z-sy-h などのウィジェットラッパーが
+# 元ウィジェットを別名(orig-s2h:* 等)で呼び直しても壊れないようにするため)。
+typeset -g _zrush_dispatch_prev=
+
 _zrush_call_prev() {  # 前任者チェーンへフォールバック(builtin 直呼びはしない)
   emulate -L zsh
-  local prev=${_zrush_dsp_prev[$WIDGET]:-}
+  local prev=$_zrush_dispatch_prev
   if [[ -n $prev && $prev != undefined-key ]] && (( $+widgets[$prev] )); then
-    _zlog "dispatch: fallback $WIDGET -> $prev"
+    _zlog "dispatch: fallback -> $prev"
     zle $prev -w
   fi
   return 0
@@ -832,9 +837,10 @@ _zrush_action_tab() {
   return 0
 }
 
-_zrush_dispatch() {
+_zrush_dispatch() {  # $1=action $2=前任者ウィジェット名(バインド時に埋め込み)
   emulate -L zsh
-  case ${_zrush_dsp_action[$WIDGET]:-} in
+  _zrush_dispatch_prev=${2:-}
+  case ${1:-} in
     select-next) _zrush_action_next ;;
     select-prev) _zrush_action_prev ;;
     confirm)     _zrush_action_confirm ;;
@@ -884,10 +890,12 @@ _zrush_bind_one() {  # $1=action $2=キー列(bindkey 表記 or 生列)
   local wname=${_zrush_bound[$seq]:-}
   if [[ -z $wname ]]; then
     wname=_zrush-dsp-$(( ++_zrush_dsp_n ))
-    zle -N $wname _zrush_dispatch
   fi
-  _zrush_dsp_prev[$wname]=$prev
+  _zrush_dsp_prev[$wname]=$prev      # 帳簿(復元・自己捕捉判定用)
   _zrush_dsp_action[$wname]=$action
+  # action と前任者を関数本体に埋め込む(ウィジェットラッパー耐性。上記コメント参照)
+  functions[$wname]="_zrush_dispatch ${(q)action} ${(q)prev}"
+  zle -N $wname
   builtin bindkey -M main -- "$seq" $wname
   _zrush_new_bound[$seq]=$wname
   return 0
