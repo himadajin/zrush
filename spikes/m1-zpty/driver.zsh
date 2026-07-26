@@ -151,6 +151,35 @@ run_capture() {  # $1=buffer text  $2=label  $3=trigger key (省略時 ^X^Z)
 
 clear_line() { send_keys $'\C-u' }   # kill-whole-line
 
+# 広げ収集(ZRUSH_WIDEN=1 前提)から目的候補を選び、その再構成を
+# 「as-typed の実挿入」と突き合わせる(選択→置換の統合確認)。
+compare_widened() {  # $1=label $2=as-typed buffer $3=語領域より前 $4=目的候補(dequoted)
+  local label=$1 buffer=$2 pre=$3 target=$4
+  if ! run_capture $buffer "$label(capture)"; then
+    return 1
+  fi
+  local -i idx=${RAW_ITEMS[(Ie)$target]}
+  local -a caprecs=( "${(@)ITEMS}" )
+  clear_line
+  expect '*HP>*' 3 >/dev/null
+  if (( idx == 0 )); then
+    ng "$label: 広げ収集に目的候補 ${(qqqq)target} が含まれない: ${(j:, :)${(qqqq)RAW_ITEMS[@]}}"
+    return 1
+  fi
+  if ! real_insert $buffer; then
+    ng "$label: 実挿入(^X^R)の結果が取れない"
+    return 1
+  fi
+  reconstruct "${caprecs[idx]}"
+  local recon="$pre$REPLY"
+  if [[ $REAL_BUF == $recon || $REAL_BUF == "$recon " ]]; then
+    ok "$label: 広げ収集候補の再構成 == as-typed 実挿入 ${(qqqq)recon}"
+  else
+    ng "$label: 不一致 recon=${(qqqq)recon} real=${(qqqq)REAL_BUF} rec=${(qqqq)caprecs[idx]}"
+  fi
+  return 0
+}
+
 # 素の compsys に第 1 候補を実挿入させ、結果 BUFFER を取得(^X^R → zrush-real-insert)
 real_insert() {  # $1=buffer text → REAL_BUF
   typeset -g REAL_BUF=
@@ -204,7 +233,32 @@ compare_case() {  # $1=label $2=buffer $3=語領域より前の部分 $4=mode
   return 0
 }
 
+widen_test() {  # $1=buffer $2=期待広げ後 $3=期待クエリ
+  zrush_widen "$1"
+  if [[ $REPLY_WIDENED == "$2" && $REPLY_QUERY == "$3" ]]; then
+    ok "widen: ${(qqqq)1} → ${(qqqq)2} + ${(qqqq)3}"
+  else
+    ng "widen: ${(qqqq)1} → got ${(qqqq)REPLY_WIDENED} + ${(qqqq)REPLY_QUERY}, want ${(qqqq)2} + ${(qqqq)3}"
+  fi
+}
+
 {
+  # ---------------- M1-4 単体テスト: 広げ規則(純関数・pty 不要)----------------
+  source $SPIKE/04-widen.zsh
+  out "==== M1-4: 広げ規則 単体テスト ===="
+  widen_test 'gti'          ''          'gti'
+  widen_test 'docs/inte'    'docs/'     'inte'
+  widen_test '--verbso'     '--'        'verbso'
+  widen_test 'FOO=ba'       'FOO='      'ba'
+  widen_test '~/do'         '~/'        'do'
+  widen_test 'ls docs/inte' 'ls docs/'  'inte'
+  widen_test 'git ch'       'git '      'ch'
+  widen_test 'ls /'         'ls /'      ''       # 語が / そのもの
+  widen_test 'FOO='         'FOO='      ''       # = で終わる
+  widen_test '-'            '-'         ''       # - 単独
+  widen_test ''             ''          ''       # 空語
+  widen_test 'ls '          'ls '       ''       # 現在語が空(複数語)
+
   # ---------------- ホスト起動 ----------------
   start_host || { ng "host 起動失敗"; exit 1 }
   if expect '*MARK-RC-DONE*' 15; then
@@ -367,6 +421,86 @@ compare_case() {  # $1=label $2=buffer $3=語領域より前の部分 $4=mode
   fi
   clear_line
   expect '*HP>*' 3 >/dev/null
+
+  # ================ M1-4: 広げクエリでの収集検証 ================
+  out "==== M1-4: 広げクエリでの収集 ===="
+  send_line "typeset -g ZRUSH_WIDEN=1"
+  expect '*HP>*' 5 >/dev/null
+
+  # --- (a) コマンド位置の空語(gti の広げ結果 = '')→ 全コマンド名(最悪ケース先行計測)---
+  send_line "typeset -g ZRUSH_REPORT_LIMIT=40"
+  expect '*HP>*' 5 >/dev/null
+  if run_capture 'gti' "[m1-4] 空語コマンド収集"; then
+    local -i _cnt=${${${(M)${(s: :)RESULT_LINE}:#count=*}[1]}#count=}
+    if (( _cnt >= 500 )); then
+      ok "[m1-4] 空語(gti→'')で全コマンド名 $_cnt 件を収集 ($RESULT_LINE)"
+    else
+      ng "[m1-4] 空語収集が少なすぎる: $RESULT_LINE"
+    fi
+  fi
+  clear_line
+  expect '*HP>*' 3 >/dev/null
+  send_line "typeset -g ZRUSH_REPORT_LIMIT=0"
+  expect '*HP>*' 5 >/dev/null
+
+  # --- (b) docs/inte の広げ結果(docs/)で docs/ 配下一式 ---
+  if run_capture 'ls docs/inte' "[m1-4] docs/ 収集"; then
+    if has_item internal && has_item user; then
+      ok "[m1-4] 'docs/inte'→広げ 'docs/' で docs/ 配下一式 (internal, user) ($RESULT_LINE)"
+    else
+      ng "[m1-4] docs/ 配下が取れない: ${(j:, :)${(qqqq)RAW_ITEMS[@]}}"
+    fi
+  fi
+  clear_line
+  expect '*HP>*' 3 >/dev/null
+
+  # --- (c) --verbso の広げ結果(--)でオプション集合 ---
+  if run_capture 'tstargs --verbso' "[m1-4] -- 収集"; then
+    if (( $#RAW_ITEMS == 3 )) && has_item '--verbose' && has_item '--file' && has_item '--mode'; then
+      ok "[m1-4] '--verbso'→広げ '--' でオプション集合 3 件 ($RESULT_LINE)"
+    else
+      ng "[m1-4] オプション集合が想定外: ${(j:, :)${(qqqq)RAW_ITEMS[@]}}"
+    fi
+  fi
+  clear_line
+  expect '*HP>*' 3 >/dev/null
+
+  # --- (d) git ch の広げ結果(空語)で git サブコマンド一式 ---
+  if run_capture 'git ch' "[m1-4] git サブコマンド収集"; then
+    local -i _gcnt=${${${(M)${(s: :)RESULT_LINE}:#count=*}[1]}#count=}
+    if has_item checkout && (( _gcnt >= 50 )); then
+      ok "[m1-4] 'git ch'→広げ 'git ' でサブコマンド $_gcnt 件(checkout 含む) ($RESULT_LINE)"
+    else
+      ng "[m1-4] git サブコマンドが取れない: count=$_gcnt has_checkout=$? ($RESULT_LINE)"
+    fi
+  fi
+  clear_line
+  expect '*HP>*' 3 >/dev/null
+
+  # --- (e) ~/do の広げ結果(~/)で HOME 配下 + hpre 未展開 ---
+  if run_capture 'ls ~/do' "[m1-4] ~/ 収集"; then
+    if has_item docs; then
+      local -i _tidx=${RAW_ITEMS[(Ie)docs]}
+      rec_get "${ITEMS[_tidx]}" p
+      if [[ $REPLY == '~/' ]]; then
+        ok "[m1-4] '~/do'→広げ '~/' で HOME 配下が取れ、hpre は未展開 '~/' のまま ($RESULT_LINE)"
+      else
+        ng "[m1-4] hpre が想定外: ${(qqqq)REPLY} rec=${(qqqq)ITEMS[_tidx]}"
+      fi
+    else
+      ng "[m1-4] ~/ 配下が取れない: ${(j:, :)${(qqqq)RAW_ITEMS[@]}}"
+    fi
+  fi
+  clear_line
+  expect '*HP>*' 3 >/dev/null
+
+  # --- 広げ収集 → 候補選択 → 置換、が as-typed 実挿入と一致するか ---
+  compare_widened "[m1-4] 置換統合(docs/inte→internal/)" 'ls docs/inte' 'ls ' 'internal'
+  compare_widened "[m1-4] 置換統合(--verb→--verbose)"    'tstargs --verb' 'tstargs ' '--verbose'
+  compare_widened "[m1-4] 置換統合(~/do→~/docs/)"        'ls ~/do' 'ls ' 'docs'
+
+  send_line "typeset -g ZRUSH_WIDEN="
+  expect '*HP>*' 5 >/dev/null
 
   # ================ vared 方式: 既知の制約の確認 ================
   # fork 元(widget 文脈)で zle が活性のため、fork 内の vared は

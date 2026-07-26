@@ -21,8 +21,8 @@ zmodload zsh/parameter || return 1
 zmodload zsh/datetime
 
 typeset -g  ZRUSH_VARIANT=${ZRUSH_VARIANT:-direct}
-typeset -g  _zrush_query= _zrush_buf= _zrush_pty=
-typeset -gi _zrush_rfd=-1 _zrush_wfd=-1 _zrush_gen=0
+typeset -g  _zrush_query= _zrush_fuzzy= _zrush_buf= _zrush_pty=
+typeset -gi _zrush_rfd=-1 _zrush_wfd=-1 _zrush_gen=0 _zrush_nreads=0
 typeset -gF _zrush_t0=0
 
 # デバッグログ($ZRUSH_LOG が設定されていればファイル追記。fork 内でも使える)
@@ -50,7 +50,9 @@ _zrush_compadd() {
   local -i ret=$?
   (( $#__hits == 0 )) && return ret
 
-  # レコード化して搬出
+  # レコード化して搬出(pipe への書き込みは compadd 呼び出し単位でバッチする —
+  # レコード毎 print だと大量候補時に読み側が 1 レコード 1 read になる: 実測 959 reads/4195 件)
+  local _out=
   local -a _rec
   local -i j
   local _d
@@ -80,8 +82,9 @@ _zrush_compadd() {
     (( $#grpJ ))           && _rec+=( "J"$'\1'"${(v)grpJ}" )
     (( $#grpV ))           && _rec+=( "V"$'\1'"${(v)grpV}" )
     (( $#_mesg ))          && _rec+=( "x"$'\1'"${(v)_mesg}" )
-    print -rn -u $_zrush_wfd -- "${(pj:\2:)_rec}"$'\0'
+    _out+="${(pj:\2:)_rec}"$'\0'
   done
+  print -rn -u $_zrush_wfd -- "$_out"
   _zlog "compadd: exported $#__hits records (P=${(v)apre} S=${(v)asuf} ip=$IPREFIX pr=$PREFIX)"
   # compsys の内部状態(compstate 等)の整合のため素の compadd も実行(FTB :127)
   builtin compadd "$@"
@@ -172,8 +175,18 @@ _zrush_request() {
   emulate -L zsh
   [[ -n $ZRUSH_INTERNAL ]] && return 0
   _zrush_cleanup
-  _zrush_query=$BUFFER
+  # ZRUSH_WIDEN=1 なら広げ規則(04-widen.zsh)を適用して収集クエリを作る
+  if [[ -n $ZRUSH_WIDEN ]] && (( $+functions[zrush_widen] )); then
+    zrush_widen "$LBUFFER"
+    _zrush_query=$REPLY_WIDENED
+    _zrush_fuzzy=$REPLY_QUERY
+    _zlog "request: widened=${(qqqq)_zrush_query} fuzzy=${(qqqq)_zrush_fuzzy}"
+  else
+    _zrush_query=$BUFFER
+    _zrush_fuzzy=
+  fi
   _zrush_t0=$EPOCHREALTIME
+  _zrush_nreads=0
   _zlog "request: query=${(qqqq)_zrush_query} variant=$ZRUSH_VARIANT"
 
   local fifo=${TMPDIR:-/tmp}/zrush-cap-$$-$RANDOM.fifo
@@ -210,6 +223,7 @@ _zrush_on_data() {
   _zlog "on-data: fd=$fd st=$st len=$#chunk err=${2:-}"
   if (( st == 0 )); then
     _zrush_buf+=$chunk
+    (( ++_zrush_nreads ))
     return 0
   fi
   zle -F $fd 2>/dev/null
@@ -232,6 +246,7 @@ _zrush_report() {
   local -F elapsed=$(( EPOCHREALTIME - _zrush_t0 ))
   local -a recs=()
   local bad=
+  local -i bytes=$#_zrush_buf
   if [[ -n $_zrush_buf ]]; then
     if [[ $_zrush_buf == *$'\0' ]]; then
       recs=( "${(@0)${_zrush_buf%$'\0'}}" )
@@ -241,10 +256,18 @@ _zrush_report() {
   fi
   zle -I
   [[ -n $bad ]] && print -r -- "ZRUSH-ERROR unterminated-payload ${(qqqq)bad}"
-  print -r -- "ZRUSH-RESULT count=$#recs elapsed-ms=$(( elapsed * 1000 ))"
+  print -r -- "ZRUSH-RESULT count=$#recs bytes=$bytes reads=$_zrush_nreads elapsed-ms=$(( elapsed * 1000 ))"
+  # 大量候補ケース用: ZRUSH_REPORT_LIMIT>0 なら先頭 N 件だけ印字(count は全件数のまま)
+  local -i limit=${ZRUSH_REPORT_LIMIT:-0}
   local r
+  local -i n=0
   for r in "${(@)recs}"; do
     print -r -- "ZRUSH-ITEM ${(qqqq)r}"
+    (( ++n ))
+    if (( limit > 0 && n >= limit )); then
+      print -r -- "ZRUSH-TRUNC shown=$n of=$#recs"
+      break
+    fi
   done
   print -r -- "ZRUSH-END"
   _zrush_buf=
