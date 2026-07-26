@@ -1,0 +1,25 @@
+[package]
+name = "zrush"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+
+[dependencies]
+# Fuzzy (subsequence) matching for typo mode. Evaluated in M2:
+# - catches subsequence/prefix cases (dcs->docs, inte->internal)
+# - does NOT catch transpositions/substitutions/insertions (gti->git);
+#   those are covered by our own bounded edit-distance logic in matching.rs.
+# Deps: memchr + unicode-segmentation only. No spawn-time impact measured.
+nucleo-matcher = "0.3"
+# Config parsing. default-features off drops the Display/serialization half;
+# "parse" + "serde" is the minimal feature set that provides toml::Table.
+# No proc macros (we walk Value manually for per-key fallback + warnings).
+toml = { version = "1", default-features = false, features = ["parse", "serde"] }
+
+[profile.release]
+# zrush is spawned per keystroke: optimize for startup and size.
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

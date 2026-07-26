@@ -122,7 +122,8 @@ zrush の最終ゴールは、リアルタイム候補一覧・履歴メニュ�
 - **移植性ガードレール** — mac 固有依存を作らない
   - zsh スクリプトから呼ぶ外部コマンドは POSIX 範囲のみ(現状 `sleep` / `stty` を想定)。
   - config パスは `$XDG_CONFIG_HOME` → `~/.config` の解決を自前実装(OS のプラットフォーム慣習パスに寄せない)。
-  - Rust はプラットフォーム固有 API 禁止。
+  - Rust は特定 OS 固有の API を禁止する(mac / Linux の両方で使えない依存を作らない)。
+    両対応の unix 共通 API(例: `std::os::unix::ffi::OsStrExt` による argv の生バイト受理)は許容する。
   - zsh 5.8 に存在しない機能を使わない。
 - **導入形態** — clone → `cargo build --release` → `.zshrc` で source
   - zrush.zsh は自身の位置(`${0:A:h}`)から `../target/release/zrush` を解決する。
@@ -360,6 +361,8 @@ zpty 内部シェル(現在シェルの fork)で compsys を走らせ、**広げ
 - zsh-autocomplete を無効化し zrush に切り替えて日常利用開始。
   気になった挙動をこのディレクトリの `notes-dogfooding.md` に記録し、チューニング。
   チェックリストには通常操作に加えて、端末リサイズ・複数行バッファ(継続行)・tmux 内・accept-line 後の残骸・シェル多重起動・zsh-syntax-highlighting / zsh-abbr との共存(Enter での略語展開を含む)を含める。
+  あいまいマッチの順位の体感も確認する(ティア序列により転置の意図先が沈む場面がある。
+  例: `gti` では gtimeout(前方一致)が git(誤字許容)より上位。必要なら誤字許容ティアの位置づけを再検討する)。
 - Linux 実機検証: 実際に使う Linux 環境(SSH 先サーバ / WSL / コンテナ)に導入し、検証用スクリプトで受け入れ条件 2〜7 を確認したうえでドッグフーディングに含める。
   zsh 5.8 環境が含まれる場合はそこでの動作確認を最低サポートの根拠とする。
 - 完了判定: 2 週間の日常利用(mac + Linux)で「使用をためらう問題」が `notes-dogfooding.md` 上でゼロになったら、確定仕様を `docs/internal/specs/`(挙動仕様・config スキーマ)へ昇格し、`docs/user/` に導入・設定ドキュメントを作成して完了。
