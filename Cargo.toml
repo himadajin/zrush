@@ -2,7 +2,7 @@
 name = "zrush"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 
 [dependencies]
 # Fuzzy (subsequence) matching for typo mode. Evaluated in M2:
