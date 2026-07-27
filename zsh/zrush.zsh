@@ -11,7 +11,11 @@
 #     → zpty fork(現在シェルの fork)内で compsys を駆動し、compadd フックが
 #       候補レコードを「継承 pipe fd」へ NUL 区切りバッチ搬出(終端 = EOF)
 #     → zle -F -w ハンドラが部分読み・再組み立て
-#     → `zrush match` にスナップショット引数で渡し、返却 index 順に zle -M 描画
+#     → `zrush match` にスナップショット引数で渡し、返却 index 順に
+#       POSTDISPLAY + region_highlight で一覧描画(002-display-layer)。
+#       更新は POSTDISPLAY の置き換え(消してから描かない)、選択行や装飾は
+#       region_highlight(自エントリは _zrush_rh で帳簿管理し、zsh 5.9+ では
+#       memo=zrush も付与して z-sy-h 0.8+ との区別に使う)
 #   キャンセル = worker 自己申告 pid のプロセスグループへ SIGINT → zpty -d
 #   (zpty -d の HUP は外部コマンド待ち中の fork に遅延される。zpty -t は使用禁止。
 #    いずれも M1-5 で実測済み)
@@ -40,6 +44,10 @@ typeset -ga _zrush_recs=() _zrush_krecs=() _zrush_words=() _zrush_match=() _zrus
 typeset -ga _zrush_ranked=() _zrush_shown=()
 typeset -g  _zrush_common_prefix=
 typeset -gi _zrush_listing=0
+
+# 描画(POSTDISPLAY + region_highlight)
+typeset -ga _zrush_rh=()      # region_highlight に足した自エントリの帳簿
+typeset -g  _zrush_hl_memo=   # zsh 5.9+ なら ' memo=zrush'
 
 # 選択・Tab 状態
 typeset -gi _zrush_selected=0      # 0=非選択、>0=表示行位置(1 始まり)
@@ -296,10 +304,26 @@ _zrush_disarm_timer() {
   fi
 }
 
+# region_highlight の自エントリだけを外す(他プラグインのエントリに触れない)
+_zrush_rh_clear() {
+  (( $#_zrush_rh )) || return 0
+  region_highlight=( "${(@)region_highlight:|_zrush_rh}" )
+  _zrush_rh=()
+  return 0
+}
+
+_zrush_rh_add() {  # $1=start $2=end $3=spec(オフセットは BUFFER 起点の文字数)
+  local e="$1 $2 $3$_zrush_hl_memo"
+  region_highlight+=( "$e" )
+  _zrush_rh+=( "$e" )
+  return 0
+}
+
 _zrush_clear_display() {  # zle ウィジェット文脈からのみ呼ぶこと
   _zrush_selected=0
   (( _zrush_listing )) || return 0
-  zle -M ""
+  POSTDISPLAY=
+  _zrush_rh_clear
   _zrush_listing=0
   _zrush_recs=() _zrush_krecs=() _zrush_words=() _zrush_match=() _zrush_disp=()
   _zrush_ranked=() _zrush_shown=()
@@ -373,6 +397,10 @@ _zrush_on_data() {  # zle -F -w ハンドラ($1=fd)
   _zrush_worker_pid=
   if (( st == 5 )); then
     _zrush_finalize
+    # zle -F -w ハンドラは戻っても自動再描画されない(zle -M は直接描画して
+    # いたため不要だった)。POSTDISPLAY / region_highlight / 未着 Tab 適用に
+    # よる BUFFER の変更をここで一括反映する。
+    zle -R
   else
     _zlog "on-data: read error st=$st; dropping request"
     _zrush_buf=
@@ -507,7 +535,6 @@ _zrush_render() {  # zle ウィジェット文脈からのみ呼ぶこと
   (( maxl < 1 )) && maxl=1
   local idx text
   local -i width=$COLUMNS
-  (( _zrush_selected > 0 )) && (( width -= 2 ))   # マーカー分
   _zrush_shown=()
   for idx in "${(@)_zrush_ranked}"; do
     [[ $idx == <-> ]] || continue
@@ -522,19 +549,19 @@ _zrush_render() {  # zle ウィジェット文脈からのみ呼ぶこと
     _zrush_clear_display
     return 0
   fi
-  # 選択中はマーカー付与(選択行 '> '、他は桁揃えの 2 スペース)
+  (( _zrush_selected > $#lines )) && _zrush_selected=$#lines
+  # 更新は POSTDISPLAY の置き換え(消してから描かない: 空白の見えないよう一度で差し替える)
+  POSTDISPLAY=$'\n'${(pj:\n:)lines}
+  # 選択行は背景反転系ハイライトで示す(レイアウトは動かさない)
+  _zrush_rh_clear
   if (( _zrush_selected > 0 )); then
-    (( _zrush_selected > $#lines )) && _zrush_selected=$#lines
+    local -i start=$(( $#BUFFER + 1 ))   # 先頭の改行 1 文字分
     local -i li
-    for (( li = 1; li <= $#lines; ++li )); do
-      if (( li == _zrush_selected )); then
-        lines[li]="> $lines[li]"
-      else
-        lines[li]="  $lines[li]"
-      fi
+    for (( li = 1; li < _zrush_selected; ++li )); do
+      (( start += ${#lines[li]} + 1 ))
     done
+    _zrush_rh_add $start $(( start + ${#lines[_zrush_selected]} )) standout
   fi
-  zle -M "${(pj:\n:)lines}"
   _zrush_listing=1
   _zlog "render: $#lines lines selected=$_zrush_selected"
   return 0
@@ -580,9 +607,12 @@ _zrush_line_pre_redraw() {
   [[ $BUFFER == "$_zrush_last_buffer" ]] && (( CURSOR == _zrush_last_cursor )) && return 0
   _zrush_last_buffer=$BUFFER
   _zrush_last_cursor=$CURSOR
-  # バッファが変化したら選択・未着 Tab 予約は解除して通常フローへ
+  # バッファが変化したら選択・未着 Tab 予約は解除して通常フローへ。
+  # 選択ハイライトは BUFFER 起点オフセットがずれるため即外す(一覧テキストは
+  # 次の結果が来るまで残す = 空白の見えない更新)。
   _zrush_selected=0
   _zrush_tab_pending=0
+  _zrush_rh_clear
 
   # 空バッファ(空白のみ含む)では収集も表示もしない(plan の固定挙動)
   if [[ -z ${BUFFER//[[:space:]]/} ]]; then
@@ -609,7 +639,13 @@ _zrush_line_init() {
   emulate -L zsh
   _zrush_last_buffer=
   _zrush_last_cursor=-1
-  _zrush_listing=0    # 新しい行では表示なしから始まる(zle -M は行を跨いで残らない)
+  # POSTDISPLAY は zle -M と違い明示消去が必要。line-finish を経ない終了
+  # (send-break 等)で残った自分の表示をここで確実に畳む。
+  if (( _zrush_listing )); then
+    POSTDISPLAY=
+    _zrush_rh_clear
+    _zrush_listing=0
+  fi
   _zrush_selected=0
   _zrush_tab_pending=0
   return 0
@@ -986,7 +1022,12 @@ _zrush_init() {
     _zrush_warn "zsh/stat unavailable; zrush disabled"
     return 1
   }
-  autoload -Uz add-zsh-hook add-zle-hook-widget
+  autoload -Uz add-zsh-hook add-zle-hook-widget is-at-least
+
+  # region_highlight の memo フィールドは zsh 5.9 から(z-sy-h 0.8+ が自他の
+  # エントリを区別する公式メカニズム)。5.8 では付けない。
+  _zrush_hl_memo=
+  is-at-least 5.9 $ZSH_VERSION && _zrush_hl_memo=' memo=zrush'
 
   _zrush_config_path
   # source 時は無条件で config を 1 回実行(版照合の機会を保証。cli-protocol.md)

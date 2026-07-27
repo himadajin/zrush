@@ -35,6 +35,9 @@ ng()  { out "FAIL: $1"; (( ++FAIL )) }
 
 typeset -g WORK=$(mktemp -d ${TMPDIR:-/tmp}/zrush-coex.XXXXXX)
 export TERM=xterm-256color
+# POSTDISPLAY は zle の表示ロジックを通るため、C ロケールだと UTF-8 バイトが
+# 印字不能文字としてエスケープ表示される。実利用環境と同じ UTF-8 を明示する。
+export LC_ALL=en_US.UTF-8
 export HOME=$PLAYGROUND
 export XDG_CONFIG_HOME=$WORK/xdg
 export ZRUSH_REPO=$REPO
@@ -167,6 +170,21 @@ assert_buffer() {  # $1=期待バッファ $2=ラベル(^Xb ダンプ比較)
 typeset -g DOWN=$'\e[B' UP=$'\e[A' ENTER=$'\r' CTRLC=$'\C-c'
 press() { send_keys $1; drain 0.3 }
 
+clog_count() {  # $1=固定文字列 → REPLY: CURLOG 内の出現回数
+  typeset -g REPLY=0
+  [[ -r $CURLOG ]] && REPLY=$(grep -cF -- $1 $CURLOG 2>/dev/null)
+  return 0
+}
+wait_clog() {  # $1=固定文字列 $2=基準値 $3=timeout(s) → 増えたら 0
+  local -F dl=$(( SECONDS + ${3:-5} ))
+  while (( SECONDS < dl )); do
+    drain 0.15
+    clog_count $1
+    (( REPLY > $2 )) && return 0
+  done
+  return 1
+}
+
 # zrush の基本フロー(一覧→選択→確定)を現在のホストで検証する共通手順
 basic_flow() {  # $1=ラベル接頭辞
   send_keys 'ls docs/inte'
@@ -176,9 +194,10 @@ basic_flow() {  # $1=ラベル接頭辞
     ng "$1: 一覧が出ない"
     return 1
   fi
+  clog_count 'selected=1'; local -i c_sel=$REPLY
   send_keys $DOWN
-  if expect '*> internal*' 5; then
-    ok "$1: ↓ で選択・マーカー"
+  if wait_clog 'selected=1' $c_sel 5; then
+    ok "$1: ↓ で選択(selected=1 で描画)"
   else
     ng "$1: 選択できない"
   fi
@@ -278,8 +297,9 @@ basic_flow() {  # $1=ラベル接頭辞
   else
     ng "(6a) PS2 で一覧が出ない"
   fi
+  clog_count 'selected=1'; local -i c6sel=$REPLY
   send_keys $DOWN
-  expect '*> internal*' 5 && ok "(6b) PS2 で選択開始(末尾行なので優先順位③)" || ng "(6b) PS2 で選択できない"
+  wait_clog 'selected=1' $c6sel 5 && ok "(6b) PS2 で選択開始(末尾行なので優先順位③)" || ng "(6b) PS2 で選択できない"
   press $ENTER
   # 注: PS2 継続は行ごとに独立した zle セッションで、BUFFER は継続行のみを持つ
   # (複数行 BUFFER になるのは ESC-Enter 等の自己挿入改行の場合)。
@@ -349,8 +369,27 @@ basic_flow() {  # $1=ラベル接頭辞
     tm send-keys -t m5 -l 'ls docs/inte'
     if tm_wait '*internal*' 10; then
       ok "(4a) tmux 内で一覧表示"
+      local -i c4sel=0
+      [[ -r $TLOG ]] && c4sel=$(grep -cF 'selected=1' $TLOG 2>/dev/null)
       tm send-keys -t m5 Down
-      tm_wait '*> internal*' 5 && ok "(4b) tmux 内で ↓ 選択(terminfo キー解決)" || ng "(4b) tmux 内で選択できない"
+      local -F dl4=$(( SECONDS + 5 ))
+      local -i c4now=0
+      while (( SECONDS < dl4 )); do
+        command sleep 0.2
+        [[ -r $TLOG ]] && c4now=$(grep -cF 'selected=1' $TLOG 2>/dev/null)
+        (( c4now > c4sel )) && break
+      done
+      if (( c4now > c4sel )); then
+        ok "(4b) tmux 内で ↓ 選択(terminfo キー解決、selected=1 で描画)"
+      else
+        ng "(4b) tmux 内で選択できない"
+      fi
+      # 選択ハイライトの実描画(SGR 7)も観測記録として残す
+      if [[ "$($TMUX_BIN -L $TSOCK -f /dev/null capture-pane -p -e -t m5 2>/dev/null)" == *$'\e[7m'* ]]; then
+        out "OBSV: (4b) tmux ペインに standout(SGR 7)を確認"
+      else
+        out "OBSV: (4b) tmux ペインで standout を確認できず(要実機確認)"
+      fi
       tm send-keys -t m5 Enter
       command sleep 0.5
       tm send-keys -t m5 C-x b

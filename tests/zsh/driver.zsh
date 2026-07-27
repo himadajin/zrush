@@ -32,6 +32,7 @@ ng()  { out "FAIL: $1"; (( ++FAIL )) }
 
 typeset -g WORK=$(mktemp -d ${TMPDIR:-/tmp}/zrush-test.XXXXXX)
 export TERM=vt100
+export LC_ALL=en_US.UTF-8   # POSTDISPLAY の印字可能判定を実利用と同じ UTF-8 にする
 export HOME=$PLAYGROUND    # ~ 保持テスト用(実ホームに触れない)
 # 部分パス略記(接頭辞不一致置換)テスト用の固定ツリー
 mkdir -p $PLAYGROUND/pp/usr/local/bin $PLAYGROUND/pp/usr/share/doc
@@ -270,17 +271,24 @@ log_count() {  # $1=固定文字列 → REPLY: ZRUSH_LOG 内の出現回数
   send_line ': m4-reset'
   sync_prompt
 
-  # ---------------- (m4-1) 選択開始・マーカー・移動・先頭 ↑ で解除 ----------------
+  # ---------------- (m4-1) 選択開始・ハイライト・移動・先頭 ↑ で解除 ----------------
   send_keys 'ls docs/'
   expect '*user*' 10 >/dev/null
   log_count 'select: start';           local -i c_start=$REPLY
   log_count 'select: pos=2';           local -i c_pos2=$REPLY
   log_count 'select: released-at-top'; local -i c_rel=$REPLY
-  send_keys $DOWN            # press() は drain で描画を先に消費するため使わない
-  if expect '*> internal*' 5; then
-    ok "(m4-1a) ↓ で選択開始・マーカー表示"
+  log_count 'selected=1';              local -i c_sel1=$REPLY
+  TRANSCRIPT=            # standout 検査のため選択前の出力を切り離す
+  send_keys $DOWN        # press() は drain で描画を先に消費するため使わない
+  if wait_log 'selected=1' $c_sel1 5; then
+    ok "(m4-1a) ↓ で選択開始(selected=1 で描画)"
   else
-    ng "(m4-1a) マーカーが出ない"
+    ng "(m4-1a) 選択開始の描画が確認できない"
+  fi
+  if [[ $TRANSCRIPT == *$'\e[7m'* ]]; then
+    ok "(m4-1a') 選択行の standout(SGR 7)が pty 出力に現れる"
+  else
+    ng "(m4-1a') standout 列が pty 出力に見えない"
   fi
   press $DOWN
   wait_log 'select: pos=2' $c_pos2 3 && ok "(m4-1b) ↓ で次候補へ移動" || ng "(m4-1b) 候補移動しない"
