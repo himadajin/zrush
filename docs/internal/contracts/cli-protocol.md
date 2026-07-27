@@ -163,9 +163,13 @@ typeset -g  ZRUSH_CFG_HL_MATCH='underline'
 typeset -g  ZRUSH_CFG_HL_HEADING='bold'
 typeset -ga ZRUSH_CFG_KEYBINDS=(
   'select-next'  'key:down'
+  'select-next'  'seq:^N'
   'select-prev'  'key:up'
+  'select-prev'  'seq:^P'
   'select-left'  'key:left'
+  'select-left'  'seq:^B'
   'select-right' 'key:right'
+  'select-right' 'seq:^F'
   'confirm'      'seq:^M'
   'dismiss'      'seq:^G'
 )
@@ -177,6 +181,8 @@ typeset -ga ZRUSH_CFG_WARNINGS=()
   値内の `'` は `'\''` にエスケープする(警告メッセージはユーザー入力由来の任意文字列を含むため必須)。
 - zsh 側は `emulate -L zsh` の統制された文脈で source する(継承 setopt による解釈事故の防止)。
 - `ZRUSH_CFG_KEYBINDS` は「アクション名, キー指定」の平坦な交互配列。
+  **同一アクション名の組は複数回現れ得る**(1 アクション複数キー。config-schema.md)。
+  zsh 側は各組を独立に bindkey する。キーが 1 つも現れないアクションは束縛しない。
   - `seq:<bindkey列>`: Rust 側で正規化が完結したもの(例: `ctrl-g` → `seq:^G`)。
     zsh はそのまま `bindkey` に渡す。
   - `key:<シンボリック名>`: 端末依存キー(例: `up`, `down`, `shift-tab`)。

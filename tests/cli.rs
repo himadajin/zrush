@@ -323,9 +323,13 @@ typeset -g  ZRUSH_CFG_HL_MATCH='underline'
 typeset -g  ZRUSH_CFG_HL_HEADING='bold'
 typeset -ga ZRUSH_CFG_KEYBINDS=(
   'select-next'  'key:down'
+  'select-next'  'seq:^N'
   'select-prev'  'key:up'
+  'select-prev'  'seq:^P'
   'select-left'  'key:left'
+  'select-left'  'seq:^B'
   'select-right' 'key:right'
+  'select-right' 'seq:^F'
   'confirm'      'seq:^M'
   'dismiss'      'seq:^G'
 )

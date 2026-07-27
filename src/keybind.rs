@@ -20,12 +20,34 @@ pub const ACTIONS: [&str; N] = [
     "dismiss",
 ];
 
-/// Default key notation per action (config-schema.md).
-pub const DEFAULT_NOTATIONS: [&str; N] = ["down", "up", "left", "right", "enter", "ctrl-g"];
+/// Default key notations per action (config-schema.md). Multiple keys
+/// per action: arrow keys plus the emacs-style ctrl equivalents.
+pub const DEFAULT_NOTATIONS: [&[&str]; N] = [
+    &["down", "ctrl-n"],
+    &["up", "ctrl-p"],
+    &["left", "ctrl-b"],
+    &["right", "ctrl-f"],
+    &["enter"],
+    &["ctrl-g"],
+];
 
-/// Normalized specs for the default keybinds.
-pub fn default_specs() -> [String; N] {
-    DEFAULT_NOTATIONS.map(|n| normalize(n).expect("default notations are valid"))
+/// Normalized spec lists for the default keybinds.
+pub fn default_specs() -> [Vec<String>; N] {
+    DEFAULT_NOTATIONS.map(|ns| {
+        ns.iter()
+            .map(|n| normalize(n).expect("default notations are valid"))
+            .collect()
+    })
+}
+
+/// Human-readable default list for warning messages
+/// (e.g. `"down"/"ctrl-n"`).
+fn default_desc(i: usize) -> String {
+    DEFAULT_NOTATIONS[i]
+        .iter()
+        .map(|n| format!("\"{n}\""))
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 /// Normalize a config key notation into its `seq:`/`key:` form.
@@ -86,43 +108,75 @@ fn is_plain_char(b: u8) -> bool {
     b.is_ascii_graphic() && !b.is_ascii_uppercase()
 }
 
-/// Resolve the four actions' keybinds from user notations.
+/// Resolve every action's keybind list from user notations.
 ///
-/// - Invalid notation: that action falls back to its default (+ warning).
+/// Element-wise validation (config-schema.md):
+/// - Invalid notation: that element is dropped (+ warning).
 /// - The Tab key (`tab` / `ctrl-i`, normalized seq:^I) cannot be
-///   assigned to an action (config-schema.md): zsh always binds ^I to
-///   the fixed `[insert].tab` behavior hook, so accepting it would
-///   silently swallow the assignment. Validation error: default +
-///   warning.
-/// - Same key on multiple actions (compared AFTER normalization, so
-///   enter = ctrl-m = ^M collide): every action in the group reverts to
-///   its default (+ one warning per group). Repeats until no collision
-///   remains (a reset default can collide with another user-set key);
-///   terminates because defaults are pairwise distinct and every round
-///   moves at least one action onto its default.
-pub fn resolve(user: &[Option<String>; N], warnings: &mut Vec<String>) -> [String; N] {
+///   assigned to an action: zsh always binds ^I to the fixed
+///   `[insert].tab` behavior hook, so accepting it would silently
+///   swallow the assignment. The element is dropped (+ warning).
+/// - Duplicates within one action (after normalization) are dropped
+///   (+ warning).
+/// - A non-empty user list left with no valid element falls back to the
+///   action's default list (+ warning). An explicit empty list is valid
+///   and means "no key bound".
+///
+/// Cross-action rule: the same key on multiple actions (compared AFTER
+/// normalization, so enter = ctrl-m = ^M collide) reverts every
+/// involved action wholly to its default list (+ one warning per
+/// group). Repeats until no collision remains (a reset default can
+/// collide with another user-set key); terminates because default
+/// lists are pairwise disjoint and every round moves at least one
+/// action onto its default.
+pub fn resolve(user: &[Option<Vec<String>>; N], warnings: &mut Vec<String>) -> [Vec<String>; N] {
     let mut specs = default_specs();
-    for (i, notation) in user.iter().enumerate() {
-        let Some(notation) = notation else { continue };
-        match normalize(notation) {
-            Some(spec) if spec == "seq:^I" => warnings.push(format!(
-                "config: [keybind] {}: key \"{}\" is reserved for [insert].tab behavior; using default \"{}\"",
-                ACTIONS[i], notation, DEFAULT_NOTATIONS[i]
-            )),
-            Some(spec) => specs[i] = spec,
-            None => warnings.push(format!(
-                "config: [keybind] {}: unknown key notation \"{}\"; using default \"{}\"",
-                ACTIONS[i], notation, DEFAULT_NOTATIONS[i]
-            )),
+    for (i, notations) in user.iter().enumerate() {
+        let Some(notations) = notations else { continue };
+        let mut list: Vec<String> = Vec::new();
+        let mut dropped = false;
+        for notation in notations {
+            match normalize(notation) {
+                Some(spec) if spec == "seq:^I" => {
+                    warnings.push(format!(
+                        "config: [keybind] {}: key \"{}\" is reserved for [insert].tab behavior; ignoring this key",
+                        ACTIONS[i], notation
+                    ));
+                    dropped = true;
+                }
+                Some(spec) => {
+                    if list.contains(&spec) {
+                        warnings.push(format!(
+                            "config: [keybind] {}: duplicate key \"{}\" ({}); ignoring",
+                            ACTIONS[i], notation, spec
+                        ));
+                    } else {
+                        list.push(spec);
+                    }
+                }
+                None => {
+                    warnings.push(format!(
+                        "config: [keybind] {}: unknown key notation \"{}\"; ignoring this key",
+                        ACTIONS[i], notation
+                    ));
+                    dropped = true;
+                }
+            }
         }
+        if list.is_empty() && dropped {
+            warnings.push(format!(
+                "config: [keybind] {}: no valid key remains; using default {}",
+                ACTIONS[i],
+                default_desc(i)
+            ));
+            continue; // keep the default list
+        }
+        specs[i] = list; // may be legitimately empty (explicit [])
     }
-    while let Some(dup) = first_duplicate(&specs) {
-        let group: Vec<usize> = (0..N).filter(|&i| specs[i] == dup).collect();
+    while let Some(dup) = first_cross_duplicate(&specs) {
+        let group: Vec<usize> = (0..N).filter(|&i| specs[i].contains(&dup)).collect();
         let names: Vec<&str> = group.iter().map(|&i| ACTIONS[i]).collect();
-        let defaults: Vec<String> = group
-            .iter()
-            .map(|&i| format!("\"{}\"", DEFAULT_NOTATIONS[i]))
-            .collect();
+        let defaults: Vec<String> = group.iter().map(|&i| default_desc(i)).collect();
         warnings.push(format!(
             "config: [keybind] {}: same key after normalization ({}); using defaults {}",
             names.join(", "),
@@ -130,17 +184,23 @@ pub fn resolve(user: &[Option<String>; N], warnings: &mut Vec<String>) -> [Strin
             defaults.join(", ")
         ));
         for &i in &group {
-            specs[i] = normalize(DEFAULT_NOTATIONS[i]).expect("default notations are valid");
+            specs[i] = DEFAULT_NOTATIONS[i]
+                .iter()
+                .map(|n| normalize(n).expect("default notations are valid"))
+                .collect();
         }
     }
     specs
 }
 
-fn first_duplicate(specs: &[String; N]) -> Option<String> {
+/// A spec assigned to two or more different actions, if any.
+fn first_cross_duplicate(specs: &[Vec<String>; N]) -> Option<String> {
     for i in 0..N {
-        for j in i + 1..N {
-            if specs[i] == specs[j] {
-                return Some(specs[i].clone());
+        for spec in &specs[i] {
+            for other in specs.iter().skip(i + 1) {
+                if other.contains(spec) {
+                    return Some(spec.clone());
+                }
             }
         }
     }
@@ -232,32 +292,32 @@ mod tests {
         ACTIONS.iter().position(|a| *a == action).unwrap()
     }
 
-    /// User-notation array with the given (action, notation) pairs set.
-    fn user(pairs: &[(&str, &str)]) -> [Option<String>; N] {
-        let mut u: [Option<String>; N] = Default::default();
-        for (action, notation) in pairs {
-            u[idx(action)] = Some((*notation).into());
+    /// User-notation array with the given (action, key list) pairs set.
+    fn user(pairs: &[(&str, &[&str])]) -> [Option<Vec<String>>; N] {
+        let mut u: [Option<Vec<String>>; N] = Default::default();
+        for (action, notations) in pairs {
+            u[idx(action)] = Some(notations.iter().map(|n| (*n).to_string()).collect());
         }
         u
     }
 
     #[test]
-    fn defaults_are_valid_and_distinct() {
+    fn defaults_are_valid_and_pairwise_disjoint() {
         let specs = default_specs();
-        assert_eq!(
-            specs,
-            [
-                "key:down",
-                "key:up",
-                "key:left",
-                "key:right",
-                "seq:^M",
-                "seq:^G"
-            ]
-        );
+        assert_eq!(specs[idx("select-next")], ["key:down", "seq:^N"]);
+        assert_eq!(specs[idx("select-prev")], ["key:up", "seq:^P"]);
+        assert_eq!(specs[idx("select-left")], ["key:left", "seq:^B"]);
+        assert_eq!(specs[idx("select-right")], ["key:right", "seq:^F"]);
+        assert_eq!(specs[idx("confirm")], ["seq:^M"]);
+        assert_eq!(specs[idx("dismiss")], ["seq:^G"]);
+        // the collision fixpoint argument requires pairwise-disjoint defaults
         for i in 0..N {
-            for j in i + 1..N {
-                assert_ne!(specs[i], specs[j]);
+            for s in &specs[i] {
+                for (j, other) in specs.iter().enumerate() {
+                    if i != j {
+                        assert!(!other.contains(s), "{s} in both {i} and {j}");
+                    }
+                }
             }
         }
     }
@@ -271,23 +331,58 @@ mod tests {
     }
 
     #[test]
-    fn resolve_invalid_notation_falls_back_with_warning() {
+    fn resolve_multi_key_list_is_normalized_in_order() {
         let mut w = Vec::new();
-        let specs = resolve(&user(&[("dismiss", "meta-g")]), &mut w);
-        assert_eq!(specs, default_specs());
+        let specs = resolve(&user(&[("select-next", &["ctrl-j", "j", "pgdn"])]), &mut w);
+        assert!(w.is_empty(), "{w:?}");
+        assert_eq!(specs[idx("select-next")], ["seq:^J", "seq:j", "key:pgdn"]);
+    }
+
+    #[test]
+    fn resolve_explicit_empty_list_unbinds_the_action() {
+        let mut w = Vec::new();
+        let specs = resolve(&user(&[("select-left", &[])]), &mut w);
+        assert!(w.is_empty(), "{w:?}");
+        assert!(specs[idx("select-left")].is_empty());
+    }
+
+    #[test]
+    fn resolve_invalid_element_is_dropped_others_kept() {
+        let mut w = Vec::new();
+        let specs = resolve(&user(&[("dismiss", &["meta-g", "ctrl-x"])]), &mut w);
+        assert_eq!(specs[idx("dismiss")], ["seq:^X"]);
         assert_eq!(w.len(), 1);
         assert!(w[0].contains("dismiss"), "{}", w[0]);
         assert!(w[0].contains("unknown key notation \"meta-g\""), "{}", w[0]);
-        assert!(w[0].contains("using default \"ctrl-g\""), "{}", w[0]);
+        assert!(w[0].contains("ignoring this key"), "{}", w[0]);
+    }
+
+    #[test]
+    fn resolve_no_valid_element_falls_back_to_default_list() {
+        let mut w = Vec::new();
+        let specs = resolve(&user(&[("select-prev", &["meta-p"])]), &mut w);
+        assert_eq!(specs, default_specs());
+        assert_eq!(w.len(), 2);
+        assert!(w[1].contains("no valid key remains"), "{}", w[1]);
+        assert!(w[1].contains("\"up\"/\"ctrl-p\""), "{}", w[1]);
+    }
+
+    #[test]
+    fn resolve_duplicate_within_action_is_deduped_with_warning() {
+        let mut w = Vec::new();
+        let specs = resolve(&user(&[("confirm", &["enter", "ctrl-m"])]), &mut w);
+        assert_eq!(specs[idx("confirm")], ["seq:^M"]);
+        assert_eq!(w.len(), 1);
+        assert!(w[0].contains("duplicate key \"ctrl-m\" (seq:^M)"), "{}", w[0]);
     }
 
     #[test]
     fn resolve_rejects_tab_key_assignment() {
         for notation in ["tab", "ctrl-i"] {
             let mut w = Vec::new();
-            let specs = resolve(&user(&[("confirm", notation)]), &mut w);
+            let specs = resolve(&user(&[("confirm", &[notation])]), &mut w);
             assert_eq!(specs, default_specs(), "notation {notation:?}");
-            assert_eq!(w.len(), 1, "notation {notation:?}");
+            assert_eq!(w.len(), 2, "notation {notation:?}");
             assert!(w[0].contains("confirm"), "{}", w[0]);
             assert!(
                 w[0].contains(&format!(
@@ -296,7 +391,7 @@ mod tests {
                 "{}",
                 w[0]
             );
-            assert!(w[0].contains("using default \"enter\""), "{}", w[0]);
+            assert!(w[1].contains("no valid key remains"), "{}", w[1]);
         }
     }
 
@@ -306,18 +401,24 @@ mod tests {
         // dismiss = "ctrl-m" then collides with that default -> the
         // duplicate loop reverts both, two warnings total.
         let mut w = Vec::new();
-        let specs = resolve(&user(&[("confirm", "tab"), ("dismiss", "ctrl-m")]), &mut w);
-        assert_eq!(specs, default_specs());
-        assert_eq!(w.len(), 2);
+        let specs = resolve(
+            &user(&[("confirm", &["tab", "space"]), ("dismiss", &["ctrl-m"])]),
+            &mut w,
+        );
+        // confirm: tab dropped -> [space]; dismiss = ^M no longer
+        // collides with confirm (which lost its default enter), so it
+        // stays as the user set it.
+        assert_eq!(specs[idx("confirm")], ["seq: "]);
+        assert_eq!(specs[idx("dismiss")], ["seq:^M"]);
+        assert_eq!(w.len(), 1);
         assert!(w[0].contains("reserved for [insert].tab"), "{}", w[0]);
-        assert!(w[1].contains("same key after normalization"), "{}", w[1]);
     }
 
     #[test]
     fn resolve_detects_duplicates_after_normalization() {
-        // confirm stays default "enter" (seq:^M); dismiss = ctrl-m collides.
+        // confirm stays default ["enter"] (seq:^M); dismiss = ctrl-m collides.
         let mut w = Vec::new();
-        let specs = resolve(&user(&[("dismiss", "ctrl-m")]), &mut w);
+        let specs = resolve(&user(&[("dismiss", &["ctrl-m"])]), &mut w);
         assert_eq!(specs, default_specs(), "both revert to defaults");
         assert_eq!(w.len(), 1);
         assert!(w[0].contains("confirm, dismiss"), "{}", w[0]);
@@ -325,13 +426,28 @@ mod tests {
     }
 
     #[test]
+    fn resolve_collision_on_one_list_element_reverts_whole_lists() {
+        // select-next keeps a list; one of its elements collides with
+        // dismiss -> both actions revert wholly to their default lists.
+        let mut w = Vec::new();
+        let specs = resolve(
+            &user(&[("select-next", &["j", "ctrl-x"]), ("dismiss", &["ctrl-x"])]),
+            &mut w,
+        );
+        assert_eq!(specs, default_specs());
+        assert_eq!(w.len(), 1);
+        assert!(w[0].contains("select-next, dismiss"), "{}", w[0]);
+        assert!(w[0].contains("seq:^X"), "{}", w[0]);
+    }
+
+    #[test]
     fn resolve_duplicate_group_reverts_all_members() {
         let mut w = Vec::new();
         let specs = resolve(
             &user(&[
-                ("select-next", "x"),
-                ("select-prev", "x"),
-                ("confirm", "x"),
+                ("select-next", &["x"]),
+                ("select-prev", &["x"]),
+                ("confirm", &["x"]),
             ]),
             &mut w,
         );
@@ -346,27 +462,19 @@ mod tests {
 
     #[test]
     fn resolve_cascading_duplicate_reaches_fixpoint() {
-        // select-prev and confirm both bind "x" -> reset to up / enter.
+        // select-prev and confirm both bind "x" -> reset to defaults.
         // dismiss user-binds "up", which now collides with the reset
-        // select-prev -> a second round resets that pair too.
+        // select-prev default -> a second round resets that pair too.
         let mut w = Vec::new();
         let specs = resolve(
-            &user(&[("select-prev", "x"), ("confirm", "x"), ("dismiss", "up")]),
+            &user(&[
+                ("select-prev", &["x"]),
+                ("confirm", &["x"]),
+                ("dismiss", &["up"]),
+            ]),
             &mut w,
         );
         assert_eq!(specs, default_specs());
         assert_eq!(w.len(), 2);
-    }
-
-    #[test]
-    fn resolve_left_right_accept_user_notation() {
-        let mut w = Vec::new();
-        let specs = resolve(
-            &user(&[("select-left", "ctrl-b"), ("select-right", "ctrl-f")]),
-            &mut w,
-        );
-        assert!(w.is_empty(), "{w:?}");
-        assert_eq!(specs[idx("select-left")], "seq:^B");
-        assert_eq!(specs[idx("select-right")], "seq:^F");
     }
 }
