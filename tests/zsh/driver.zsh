@@ -400,13 +400,14 @@ log_count() {  # $1=固定文字列 → REPLY: ZRUSH_LOG 内の出現回数
   assert_buffer 'ls docs/internal' "(m4-8a) Tab(common-prefix): クエリが真の接頭辞のとき共通部を挿入"
   clear_line
   drain 0.3
-  log_count 'finalize: match ok'; local -i c_mok=$REPLY
-  send_keys 'gti'
-  wait_log 'finalize: match ok' $c_mok 10 || ng "(m4-8b 前提) gti の match が来ない"
-  log_count 'condition not met'; local -i c_ncp=$REPLY
+  # 伸びないケース: gd/a1 → prefix 階層 {a10..a19} の LCP "a1" == クエリ
+  # → フォールバックで先頭候補 a10 を確定挿入(trailing-space 込み)
+  send_keys 'ls gd/a1'
+  expect '*a10*' 10 >/dev/null
+  log_count 'fallback -> insert top'; local -i c_fb=$REPLY
   press $TAB
-  wait_log 'condition not met' $c_ncp 3 && ok "(m4-8b) Tab(common-prefix): typo クエリでは何もしない" || ng "(m4-8b) 条件外で挿入された疑い"
-  assert_buffer 'gti' "(m4-8b') バッファ不変を確認"
+  assert_buffer 'ls gd/a10 ' "(m4-8b) Tab(common-prefix): 伸びないときは先頭候補を確定挿入('ls gd/a10 ')"
+  wait_log 'fallback -> insert top' $c_fb 2 && ok "(m4-8b') フォールバック経路を通った" || ng "(m4-8b') フォールバック経路が記録されない"
   clear_line
   drain 0.3
 

@@ -5,8 +5,9 @@ zrush.zsh(zsh 側)と `zrush` バイナリ(Rust 側)の入出力仕様。
 
 ## プロトコル版
 
-- **PROTOCOL_VERSION = 2**(v2: `zrush match` の出力に候補ごとのマッチ位置フィールドを追加。
-  002-display-layer のマッチ箇所ハイライト用)
+- **PROTOCOL_VERSION = 3**
+  (v2: `zrush match` の出力に候補ごとのマッチ位置フィールドを追加(002)。
+  v3: common-prefix の計算対象を prefix 階層マッチに変更(003))
 - `zrush config` の出力に `ZRUSH_PROTOCOL_VERSION` が含まれる。
   zrush.zsh は自身が期待する版番号と照合し、不一致なら警告を 1 回表示して動作は継続する
   (git pull 後の rebuild し忘れ検知)。
@@ -91,13 +92,18 @@ zrush match --query <fuzzy-query> \
   - zsh 側は match-text をそのまま表示している場合のみ使う
     (display-text 表示時は適用しない。切り詰め時は範囲を表示長にクリップする)。
 
-- `common-prefix`: **全マッチ候補**(max-lines 打ち切り前)の match-text の
-  バイト単位最長共通接頭辞。マッチ 0 件・共通部分なしのときは空フィールド。
-  `tab = "common-prefix"` の挙動(config-schema.md)のために返す:
-  zsh 側は「クエリが common-prefix の真の接頭辞である場合に限り、
-  削った末尾領域を `${(q)}` でクォートした common-prefix で置き換える」
-  (typo マッチではクエリと乖離した接頭辞になり得るため、入力を縮める・別文字列に置き換える挿入はしない。
-  条件を満たさない Tab は何もしない)。詳細挙動仕様は M4 で specs に昇格する。
+- `common-prefix`: **prefix 階層のマッチ**(match-text がクエリで始まる候補。
+  max-lines 打ち切り前)の match-text のバイト単位最長共通接頭辞。
+  空クエリでは全マッチが prefix 階層。
+  マッチ 0 件・prefix 階層 0 件・共通部分なしのときは空フィールド。
+  substring 以下の階層はクエリの接頭辞拡張になり得ないため計算に含めない(v3)。
+  `tab = "common-prefix"` の挙動(config-schema.md)のために返す。zsh 側の規範:
+  - クエリが common-prefix の真のバイト接頭辞である場合、削った末尾領域を
+    `${(q)}` でクォートした common-prefix で置き換える(as-typed の接頭辞拡張のみ。
+    入力を縮める・別文字列に置き換える挿入はしない)。
+  - それ以外(空・クエリと同一・バイト接頭辞でない。smart-case の大文字小文字差で
+    ずれるケースを含む)は**先頭候補を確定挿入**する(`tab = "insert"` と同じ確定動作)。
+    候補 0 件なら何もしない。
 - マッチ 0 件なら `common-prefix`(空)のみ出力(exit 0)。
 - 総フィールド数は `1 + 2 × 件数`(共通接頭辞 + index/match-spans の組)。
 - 総マッチ件数は返さない(「+truncated 表示」を導入するときに版番号を上げて拡張する)。

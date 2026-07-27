@@ -91,9 +91,9 @@ fn match_ranks_tiers_and_reports_common_prefix() {
     let (code, out) = run_match(&typo_args("doc", "10"), &stdin);
     assert_eq!(code, 0);
     // prefix-exact(4) > prefix(2) > substring(1) > edit(3: doc~dot); "xxx" excluded.
-    // LCP of {mydocs, docs, dot-config, doc} is empty.
+    // LCP spans prefix-tier matches only (v3): {docs, doc} -> "doc".
     let (lcp, pairs) = parse_out(&out);
-    assert_eq!(lcp, b"");
+    assert_eq!(lcp, b"doc");
     let idx: Vec<&[u8]> = pairs.iter().map(|p| p.0.as_slice()).collect();
     assert_eq!(idx, [&b"4"[..], b"2", b"1", b"3"]);
     // spans: 4=doc (prefix, whole), 2=docs (prefix), 1=mydocs (substring
@@ -108,8 +108,9 @@ fn match_typo_transposition_gti() {
     let (code, out) = run_match(&typo_args("gti", "10"), &stdin);
     assert_eq!(code, 0);
     // git and git-lfs match via the edit tier, grep does not.
+    // No prefix-tier match -> empty common prefix (v3).
     let (lcp, pairs) = parse_out(&out);
-    assert_eq!(lcp, b"git");
+    assert_eq!(lcp, b"");
     let idx: Vec<&[u8]> = pairs.iter().map(|p| p.0.as_slice()).collect();
     assert_eq!(idx, [&b"1"[..], b"3"]);
     // edit-tier spans cover the aligned (corrected-query) prefix
@@ -138,8 +139,20 @@ fn match_edit_tier_ranks_close_corrections_first() {
     let (code, out) = run_match(&typo_args("gti", "10"), &stdin);
     assert_eq!(code, 0);
     let (lcp, _) = parse_out(&out);
-    assert_eq!(lcp, b"g");
+    assert_eq!(lcp, b"", "edit-tier matches carry no common prefix (v3)");
     assert_eq!(ranked(&out), [&b"3"[..], b"1", b"4", b"2"]);
+}
+
+#[test]
+fn match_common_prefix_spans_prefix_tier_only() {
+    // Prefix tier {checkout, check-attr} -> LCP "check"; the substring
+    // match sparse-checkout must not dilute it (v3).
+    let stdin = candidates(&[b"checkout", b"check-attr", b"sparse-checkout"]);
+    let (code, out) = run_match(&typo_args("chec", "10"), &stdin);
+    assert_eq!(code, 0);
+    let (lcp, pairs) = parse_out(&out);
+    assert_eq!(lcp, b"check");
+    assert_eq!(pairs.len(), 3, "all three still match and rank");
 }
 
 #[test]
@@ -310,7 +323,7 @@ fn config_without_file_prints_contract_default_output() {
     let (code, out) = run_config(&dir);
     assert_eq!(code, 0);
     let expected = "\
-typeset -g  ZRUSH_PROTOCOL_VERSION='2'
+typeset -g  ZRUSH_PROTOCOL_VERSION='3'
 typeset -g  ZRUSH_CFG_MAX_LINES='10'
 typeset -g  ZRUSH_CFG_DELAY_MS='50'
 typeset -g  ZRUSH_CFG_MIN_INPUT='0'
