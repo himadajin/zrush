@@ -6,15 +6,25 @@
 //! - `key:<symbolic name>`    — terminal-dependent keys (up, shift-tab, ...);
 //!   zsh resolves them via $terminfo. Rust only validates the notation.
 
+/// Number of bindable actions.
+pub const N: usize = 6;
+
 /// Bindable actions, in output order. Index-aligned with
 /// [`DEFAULT_NOTATIONS`] and the resolved spec arrays.
-pub const ACTIONS: [&str; 4] = ["select-next", "select-prev", "confirm", "dismiss"];
+pub const ACTIONS: [&str; N] = [
+    "select-next",
+    "select-prev",
+    "select-left",
+    "select-right",
+    "confirm",
+    "dismiss",
+];
 
 /// Default key notation per action (config-schema.md).
-pub const DEFAULT_NOTATIONS: [&str; 4] = ["down", "up", "enter", "ctrl-g"];
+pub const DEFAULT_NOTATIONS: [&str; N] = ["down", "up", "left", "right", "enter", "ctrl-g"];
 
 /// Normalized specs for the default keybinds.
-pub fn default_specs() -> [String; 4] {
+pub fn default_specs() -> [String; N] {
     DEFAULT_NOTATIONS.map(|n| normalize(n).expect("default notations are valid"))
 }
 
@@ -90,7 +100,7 @@ fn is_plain_char(b: u8) -> bool {
 ///   remains (a reset default can collide with another user-set key);
 ///   terminates because defaults are pairwise distinct and every round
 ///   moves at least one action onto its default.
-pub fn resolve(user: &[Option<String>; 4], warnings: &mut Vec<String>) -> [String; 4] {
+pub fn resolve(user: &[Option<String>; N], warnings: &mut Vec<String>) -> [String; N] {
     let mut specs = default_specs();
     for (i, notation) in user.iter().enumerate() {
         let Some(notation) = notation else { continue };
@@ -107,7 +117,7 @@ pub fn resolve(user: &[Option<String>; 4], warnings: &mut Vec<String>) -> [Strin
         }
     }
     while let Some(dup) = first_duplicate(&specs) {
-        let group: Vec<usize> = (0..4).filter(|&i| specs[i] == dup).collect();
+        let group: Vec<usize> = (0..N).filter(|&i| specs[i] == dup).collect();
         let names: Vec<&str> = group.iter().map(|&i| ACTIONS[i]).collect();
         let defaults: Vec<String> = group
             .iter()
@@ -126,9 +136,9 @@ pub fn resolve(user: &[Option<String>; 4], warnings: &mut Vec<String>) -> [Strin
     specs
 }
 
-fn first_duplicate(specs: &[String; 4]) -> Option<String> {
-    for i in 0..4 {
-        for j in i + 1..4 {
+fn first_duplicate(specs: &[String; N]) -> Option<String> {
+    for i in 0..N {
+        for j in i + 1..N {
             if specs[i] == specs[j] {
                 return Some(specs[i].clone());
             }
@@ -217,12 +227,36 @@ mod tests {
         }
     }
 
+    /// Index of an action name in ACTIONS (test helper).
+    fn idx(action: &str) -> usize {
+        ACTIONS.iter().position(|a| *a == action).unwrap()
+    }
+
+    /// User-notation array with the given (action, notation) pairs set.
+    fn user(pairs: &[(&str, &str)]) -> [Option<String>; N] {
+        let mut u: [Option<String>; N] = Default::default();
+        for (action, notation) in pairs {
+            u[idx(action)] = Some((*notation).into());
+        }
+        u
+    }
+
     #[test]
     fn defaults_are_valid_and_distinct() {
         let specs = default_specs();
-        assert_eq!(specs, ["key:down", "key:up", "seq:^M", "seq:^G"]);
-        for i in 0..4 {
-            for j in i + 1..4 {
+        assert_eq!(
+            specs,
+            [
+                "key:down",
+                "key:up",
+                "key:left",
+                "key:right",
+                "seq:^M",
+                "seq:^G"
+            ]
+        );
+        for i in 0..N {
+            for j in i + 1..N {
                 assert_ne!(specs[i], specs[j]);
             }
         }
@@ -231,7 +265,7 @@ mod tests {
     #[test]
     fn resolve_all_unset_gives_defaults_no_warnings() {
         let mut w = Vec::new();
-        let specs = resolve(&[None, None, None, None], &mut w);
+        let specs = resolve(&Default::default(), &mut w);
         assert_eq!(specs, default_specs());
         assert!(w.is_empty());
     }
@@ -239,7 +273,7 @@ mod tests {
     #[test]
     fn resolve_invalid_notation_falls_back_with_warning() {
         let mut w = Vec::new();
-        let specs = resolve(&[None, None, None, Some("meta-g".into())], &mut w);
+        let specs = resolve(&user(&[("dismiss", "meta-g")]), &mut w);
         assert_eq!(specs, default_specs());
         assert_eq!(w.len(), 1);
         assert!(w[0].contains("dismiss"), "{}", w[0]);
@@ -251,7 +285,7 @@ mod tests {
     fn resolve_rejects_tab_key_assignment() {
         for notation in ["tab", "ctrl-i"] {
             let mut w = Vec::new();
-            let specs = resolve(&[None, None, Some(notation.into()), None], &mut w);
+            let specs = resolve(&user(&[("confirm", notation)]), &mut w);
             assert_eq!(specs, default_specs(), "notation {notation:?}");
             assert_eq!(w.len(), 1, "notation {notation:?}");
             assert!(w[0].contains("confirm"), "{}", w[0]);
@@ -272,10 +306,7 @@ mod tests {
         // dismiss = "ctrl-m" then collides with that default -> the
         // duplicate loop reverts both, two warnings total.
         let mut w = Vec::new();
-        let specs = resolve(
-            &[None, None, Some("tab".into()), Some("ctrl-m".into())],
-            &mut w,
-        );
+        let specs = resolve(&user(&[("confirm", "tab"), ("dismiss", "ctrl-m")]), &mut w);
         assert_eq!(specs, default_specs());
         assert_eq!(w.len(), 2);
         assert!(w[0].contains("reserved for [insert].tab"), "{}", w[0]);
@@ -286,7 +317,7 @@ mod tests {
     fn resolve_detects_duplicates_after_normalization() {
         // confirm stays default "enter" (seq:^M); dismiss = ctrl-m collides.
         let mut w = Vec::new();
-        let specs = resolve(&[None, None, None, Some("ctrl-m".into())], &mut w);
+        let specs = resolve(&user(&[("dismiss", "ctrl-m")]), &mut w);
         assert_eq!(specs, default_specs(), "both revert to defaults");
         assert_eq!(w.len(), 1);
         assert!(w[0].contains("confirm, dismiss"), "{}", w[0]);
@@ -297,7 +328,11 @@ mod tests {
     fn resolve_duplicate_group_reverts_all_members() {
         let mut w = Vec::new();
         let specs = resolve(
-            &[Some("x".into()), Some("x".into()), Some("x".into()), None],
+            &user(&[
+                ("select-next", "x"),
+                ("select-prev", "x"),
+                ("confirm", "x"),
+            ]),
             &mut w,
         );
         assert_eq!(specs, default_specs());
@@ -316,10 +351,22 @@ mod tests {
         // select-prev -> a second round resets that pair too.
         let mut w = Vec::new();
         let specs = resolve(
-            &[None, Some("x".into()), Some("x".into()), Some("up".into())],
+            &user(&[("select-prev", "x"), ("confirm", "x"), ("dismiss", "up")]),
             &mut w,
         );
         assert_eq!(specs, default_specs());
         assert_eq!(w.len(), 2);
+    }
+
+    #[test]
+    fn resolve_left_right_accept_user_notation() {
+        let mut w = Vec::new();
+        let specs = resolve(
+            &user(&[("select-left", "ctrl-b"), ("select-right", "ctrl-f")]),
+            &mut w,
+        );
+        assert!(w.is_empty(), "{w:?}");
+        assert_eq!(specs[idx("select-left")], "seq:^B");
+        assert_eq!(specs[idx("select-right")], "seq:^F");
     }
 }

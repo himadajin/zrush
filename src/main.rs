@@ -47,9 +47,10 @@ fn usage() -> ExitCode {
 
 /// `zrush match`: stdin carries 3 NUL-terminated fields per candidate
 /// (`<index> NUL <match-text> NUL <display-text> NUL`); stdout is
-/// `<common-prefix> NUL <index> NUL ...` (indices rank-ordered, top
-/// max-lines). Unknown/invalid arguments: exit 2. Malformed stream
-/// (field count not a multiple of 3, non-digit index): exit 3.
+/// `<common-prefix> NUL (<index> NUL <match-spans> NUL)*` (rank-ordered,
+/// top max-lines; spans per cli-protocol.md v2). Unknown/invalid
+/// arguments: exit 2. Malformed stream (field count not a multiple of 3,
+/// non-digit index): exit 3.
 fn cmd_match(args: &[OsString]) -> ExitCode {
     let mut query: Option<Vec<u8>> = None;
     let mut mode: Option<Mode> = None;
@@ -126,11 +127,20 @@ fn cmd_match(args: &[OsString]) -> ExitCode {
     let lcp = matching::common_prefix(matched_texts.into_iter());
     let order = ranking::rank(&scored, max_lines);
 
-    let mut out = Vec::with_capacity(lcp.len() + 1 + order.len() * 8);
+    let mut out = Vec::with_capacity(lcp.len() + 1 + order.len() * 16);
     out.extend_from_slice(lcp);
     out.push(0);
     for pos in order {
         out.extend_from_slice(candidates[pos].0);
+        out.push(0);
+        // Spans are extracted only for the emitted (top max-lines)
+        // candidates — a cheap second pass per candidate.
+        for (i, (s, e)) in qm.spans(candidates[pos].1).into_iter().enumerate() {
+            if i > 0 {
+                out.push(b',');
+            }
+            let _ = write!(out, "{s}-{e}");
+        }
         out.push(0);
     }
     if std::io::stdout().write_all(&out).is_err() {

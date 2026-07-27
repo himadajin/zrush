@@ -11,7 +11,11 @@
 #     → zpty fork(現在シェルの fork)内で compsys を駆動し、compadd フックが
 #       候補レコードを「継承 pipe fd」へ NUL 区切りバッチ搬出(終端 = EOF)
 #     → zle -F -w ハンドラが部分読み・再組み立て
-#     → `zrush match` にスナップショット引数で渡し、返却 index 順に zle -M 描画
+#     → `zrush match` にスナップショット引数で渡し、返却 index 順に
+#       POSTDISPLAY + region_highlight で一覧描画(002-display-layer)。
+#       更新は POSTDISPLAY の置き換え(消してから描かない)、選択行や装飾は
+#       region_highlight(自エントリは _zrush_rh で帳簿管理し、zsh 5.9+ では
+#       memo=zrush も付与して z-sy-h 0.8+ との区別に使う)
 #   キャンセル = worker 自己申告 pid のプロセスグループへ SIGINT → zpty -d
 #   (zpty -d の HUP は外部コマンド待ち中の fork に遅延される。zpty -t は使用禁止。
 #    いずれも M1-5 で実測済み)
@@ -24,7 +28,7 @@ typeset -g _zrush_source_dir=${${(%):-%N}:A:h}
 # ---------------------------------------------------------------- グローバル状態
 typeset -g  ZRUSH_BIN=${ZRUSH_BIN:-$_zrush_source_dir/../target/release/zrush}
 typeset -gi _zrush_enabled=0
-typeset -gi _ZRUSH_EXPECTED_PROTO=1
+typeset -gi _ZRUSH_EXPECTED_PROTO=2
 typeset -g  _zrush_cfg_path= _zrush_cfg_mtime= _zrush_cfg_warn_shown=
 typeset -gi _zrush_match_warned=0 _zrush_proto_warned=0
 
@@ -38,12 +42,25 @@ typeset -gi _zrush_last_cursor=-1
 # 受信結果(選択・確定でも使う: レコード原本と挿入形を保持する)
 typeset -ga _zrush_recs=() _zrush_krecs=() _zrush_words=() _zrush_match=() _zrush_disp=()
 typeset -ga _zrush_ranked=() _zrush_shown=()
+typeset -gA _zrush_spans=()   # 候補 index → match-spans(cli-protocol v2)
 typeset -g  _zrush_common_prefix=
 typeset -gi _zrush_listing=0
 
+# 描画(POSTDISPLAY + region_highlight)
+typeset -ga _zrush_rh=()      # region_highlight に足した自エントリの帳簿
+typeset -g  _zrush_rh_sel=    # うち選択ハイライトのエントリ(打鍵時に単独で外す)
+typeset -g  _zrush_hl_memo=   # zsh 5.9+ なら ' memo=zrush'
+
 # 選択・Tab 状態
-typeset -gi _zrush_selected=0      # 0=非選択、>0=表示行位置(1 始まり)
+typeset -gi _zrush_selected=0      # 0=非選択、>0=表示順位置(1 始まり、列優先)
 typeset -gi _zrush_tab_pending=0   # 候補未着時に Tab が押された
+
+# 表示位置ごとのグリッド情報(select-left/right の列ジャンプ幅とグループ範囲)
+typeset -ga _zrush_pos_rows=() _zrush_pos_gs=() _zrush_pos_ge=()
+typeset -gi _zrush_render_retry=0
+
+# グリッドの列数上限。取得件数の見積もり(--max-lines = max-lines × この値)と対。
+typeset -gi _ZRUSH_MAX_COLS=8
 
 # キーバインド(ディスパッチウィジェット → 前任者/アクション)
 typeset -gA _zrush_dsp_prev=() _zrush_dsp_action=() _zrush_bound=()
@@ -207,6 +224,11 @@ _zrush_compadd() {
 _zrush_capture_complete() {
   _zlog "fork: completion widget invoked (context=${curcontext:-none})"
   unset 'compstate[vared]'
+  # グループ情報を決定的に流させる(fork 内のみ。ユーザーの対話シェルの
+  # zstyle には触れない)。group-name '' でタグごとにグループ分割、
+  # descriptions format '%d' で -X 見出しが素の説明文になる。
+  zstyle ':completion:*' group-name ''
+  zstyle ':completion:*:descriptions' format '%d'
   unfunction compadd 2>/dev/null   # 他プラグインの compadd ラッパー除去
   functions[compadd]=$functions[_zrush_compadd]
   {
@@ -296,13 +318,68 @@ _zrush_disarm_timer() {
   fi
 }
 
+# region_highlight の自エントリだけを外す(他プラグインのエントリに触れない)。
+# 注意: zle はバッファ編集のたびにエントリのオフセットを書き換えるため、
+# 追加時の値との完全一致では消せない。5.9+ は memo=zrush で同定する。
+# 5.8(memo なし)は「自エントリは常に POSTDISPLAY 領域(開始 >= $#BUFFER)」
+# で消す(同領域に他プラグインの装飾があれば巻き添えになる劣化を許容)。
+_zrush_rh_clear() {
+  (( $#_zrush_rh )) || return 0
+  if [[ -n $_zrush_hl_memo ]]; then
+    region_highlight=( "${(@)region_highlight:#*memo=zrush(|-sel)}" )
+  else
+    region_highlight=( "${(@)region_highlight:|_zrush_rh}" )
+    local e
+    local -a keep=()
+    for e in "${(@)region_highlight}"; do
+      if [[ $e == <->" "* ]] && (( ${e%% *} >= $#BUFFER )); then
+        continue
+      fi
+      keep+=( "$e" )
+    done
+    region_highlight=( "${(@)keep}" )
+  fi
+  _zrush_rh=()
+  _zrush_rh_sel=
+  return 0
+}
+
+# 選択ハイライトだけを外す(打鍵・カーソル移動時: 選択は解除されるが、
+# 一覧テキストと match/見出しの装飾は次の結果が来るまで残す)
+_zrush_rh_clear_sel() {
+  [[ -n $_zrush_rh_sel ]] || return 0
+  if [[ -n $_zrush_hl_memo ]]; then
+    region_highlight=( "${(@)region_highlight:#*memo=zrush-sel}" )
+  else
+    # 5.8: 値一致で外せる場合のみ(バッファ編集後は zle がオフセットを
+    # 書き換えて一致しない。その場合は次の render まで残る劣化を許容)
+    local -a _sel=( "$_zrush_rh_sel" )
+    region_highlight=( "${(@)region_highlight:|_sel}" )
+  fi
+  local -a _sel2=( "$_zrush_rh_sel" )
+  _zrush_rh=( "${(@)_zrush_rh:|_sel2}" )
+  _zrush_rh_sel=
+  return 0
+}
+
+_zrush_rh_add() {  # $1=start $2=end $3=spec [$4=memo 接尾辞(-sel)]
+                   # オフセットは BUFFER 起点の文字数
+  local e="$1 $2 $3${_zrush_hl_memo:+ memo=zrush${4:-}}"
+  region_highlight+=( "$e" )
+  _zrush_rh+=( "$e" )
+  [[ ${4:-} == -sel ]] && _zrush_rh_sel=$e
+  return 0
+}
+
 _zrush_clear_display() {  # zle ウィジェット文脈からのみ呼ぶこと
   _zrush_selected=0
   (( _zrush_listing )) || return 0
-  zle -M ""
+  POSTDISPLAY=
+  _zrush_rh_clear
   _zrush_listing=0
   _zrush_recs=() _zrush_krecs=() _zrush_words=() _zrush_match=() _zrush_disp=()
-  _zrush_ranked=() _zrush_shown=()
+  _zrush_ranked=() _zrush_shown=() _zrush_spans=()
+  _zrush_pos_rows=() _zrush_pos_gs=() _zrush_pos_ge=()
   _zrush_common_prefix=
 }
 
@@ -373,6 +450,10 @@ _zrush_on_data() {  # zle -F -w ハンドラ($1=fd)
   _zrush_worker_pid=
   if (( st == 5 )); then
     _zrush_finalize
+    # zle -F -w ハンドラは戻っても自動再描画されない(zle -M は直接描画して
+    # いたため不要だった)。POSTDISPLAY / region_highlight / 未着 Tab 適用に
+    # よる BUFFER の変更をここで一括反映する。
+    zle -R
   else
     _zlog "on-data: read error st=$st; dropping request"
     _zrush_buf=
@@ -386,6 +467,7 @@ _zrush_finalize() {
   local payload=$_zrush_buf
   _zrush_buf=
   _zrush_recs=() _zrush_words=() _zrush_match=() _zrush_disp=() _zrush_ranked=()
+  _zrush_spans=()
   _zrush_common_prefix=
 
   if [[ -n $payload ]]; then
@@ -469,10 +551,11 @@ _zrush_finalize() {
 
   # zrush match(設定スナップショットを引数で渡す純関数。stderr は端末に流さない)
   local out
+  # 取得件数はグリッド容量の上限(max-lines 行 × 最大列数)まで
   out=$(print -rn -- "$stdin_payload" | \
         "$ZRUSH_BIN" match --query "$_zrush_fuzzy" --mode "$ZRUSH_CFG_MODE" \
                            --smart-case "$ZRUSH_CFG_SMART_CASE" \
-                           --max-lines "$ZRUSH_CFG_MAX_LINES" 2>/dev/null)
+                           --max-lines $(( ${ZRUSH_CFG_MAX_LINES:-10} * _ZRUSH_MAX_COLS )) 2>/dev/null)
   local -i rc=$?
   if (( rc != 0 )); then
     if (( ! _zrush_match_warned )); then
@@ -485,9 +568,15 @@ _zrush_finalize() {
     return 0
   fi
 
+  # v2: 共通接頭辞のあと index / match-spans の組が並ぶ(cli-protocol.md)
   local -a fields=( "${(@0)${out%$'\0'}}" )
   _zrush_common_prefix=${fields[1]:-}
-  _zrush_ranked=( "${(@)fields[2,-1]}" )
+  _zrush_ranked=()
+  local -i fi
+  for (( fi = 2; fi + 1 <= $#fields; fi += 2 )); do
+    _zrush_ranked+=( "${fields[fi]}" )
+    [[ -n ${fields[fi+1]} ]] && _zrush_spans[${fields[fi]}]=${fields[fi+1]}
+  done
   _zlog "finalize: match ok, ${#_zrush_ranked} ranked, common-prefix=${(qqqq)_zrush_common_prefix}"
   _zrush_render
   # 候補未着時に Tab が押されていたら、到着した今、設定どおりの挙動を適用する。
@@ -501,42 +590,198 @@ _zrush_finalize() {
 
 _zrush_render() {  # zle ウィジェット文脈からのみ呼ぶこと
   emulate -L zsh
-  local -a lines=()
+  # 注意: 代入なしの local 再宣言は、既に値のある変数を「name=value」と
+  # 標準出力へ表示してしまう(TYPESET_SILENT 無効時の zsh 仕様)。
+  # ウィジェット内での表示は zle 画面を壊すため、宣言はループ外に置いた上で
+  # 保険として typesetsilent を立てる。
+  setopt localoptions typesetsilent
   local -i maxl=${ZRUSH_CFG_MAX_LINES:-10}
   (( LINES > 1 && maxl > LINES - 1 )) && maxl=$(( LINES - 1 ))
   (( maxl < 1 )) && maxl=1
-  local idx text
-  local -i width=$COLUMNS
-  (( _zrush_selected > 0 )) && (( width -= 2 ))   # マーカー分
-  _zrush_shown=()
+  local -i width=$(( COLUMNS - 1 ))
+  (( width < 1 )) && width=1
+
+  # ハイライト指定(config スナップショット。空文字列 = 装飾なし)
+  local hl_sel=${ZRUSH_CFG_HL_SELECTED-standout}
+  local hl_mat=${ZRUSH_CFG_HL_MATCH-underline}
+  local hl_head=${ZRUSH_CFG_HL_HEADING-bold}
+
+  # 表示対象(妥当 index のみ、グリッド容量の上限まで)とテキスト・グループ。
+  # グループ同定は J(タグ単位で一意)優先、見出し表示は X(説明文)優先。
+  # マッチ位置は match-text をそのまま表示する場合のみ使う(cli-protocol v2)。
+  local -a items=() texts=() gkey=() ghd=() spanstr=()
+  local idx text rec x j
   for idx in "${(@)_zrush_ranked}"; do
     [[ $idx == <-> ]] || continue
-    text=${_zrush_disp[idx]:-${_zrush_match[idx]}}
+    if [[ -n ${_zrush_disp[idx]:-} ]]; then
+      text=${_zrush_disp[idx]}
+      spanstr+=( '' )
+    else
+      text=${_zrush_match[idx]}
+      spanstr+=( "${_zrush_spans[$idx]:-}" )
+    fi
     text=${text//$'\n'/ }
-    (( width > 1 && ${#text} >= width )) && text=${text[1,width-1]}
-    lines+=( "$text" )
-    _zrush_shown+=( $idx )
-    (( $#lines >= maxl )) && break
+    rec=${_zrush_krecs[idx]:-}
+    x= j=
+    [[ $rec == *$'\2'X$'\1'* ]] && x=${${rec#*$'\2'X$'\1'}%%$'\2'*}
+    [[ $rec == *$'\2'J$'\1'* ]] && j=${${rec#*$'\2'J$'\1'}%%$'\2'*}
+    [[ $j == -default- ]] && j=
+    items+=( $idx )
+    texts+=( "$text" )
+    gkey+=( "${j:-$x}" )
+    ghd+=( "${x:-$j}" )
+    (( $#items >= maxl * _ZRUSH_MAX_COLS )) && break
   done
+  if (( $#items == 0 )); then
+    _zrush_clear_display
+    return 0
+  fi
+
+  # グループ分割(最良ランクの出現順。グループ内はランク順のまま)
+  local -A gord=()
+  local -a gheads=() gmembers=()
+  local -i ng=0 i
+  local key
+  for (( i = 1; i <= $#items; ++i )); do
+    key="k:${gkey[i]}"
+    if [[ -z ${gord[$key]:-} ]]; then
+      gord[$key]=$(( ++ng ))
+      gheads[ng]=${gkey[i]:+${ghd[i]}}   # キーなし(無グループ)は見出しなし
+    fi
+    gmembers[${gord[$key]}]+=" $i"
+  done
+
+  # グループごとに列優先グリッドを組み、行予算(maxl)内へ詰める。
+  # セル幅はグループ内一様(最大表示幅 + ガター 2)、表示幅は ${(m)#}。
+  # 幅の計測は取得済み全メンバーで行う(表示から漏れる候補ぶん列数が控えめに
+  # なり得るが、行のはみ出しは起きない安全側)。
+  local -a lines=() hl=()     # hl: "行番号 行内オフセット 文字数 spec"
+  _zrush_shown=()
+  local -a pos_rows=() pos_gs=() pos_ge=() gi=()
+  local -i gut=2 budget=maxl ord p r c w
+  local -i sel=$_zrush_selected
+  local -i gmaxw cols grows gcount gstart gend ii cello ms me kept
+  local head cell line sp sel_hl=
+  for (( ord = 1; ord <= ng; ++ord )); do
+    (( budget < 1 )) && break
+    gi=( ${=gmembers[ord]} )
+    head=${gheads[ord]:-}
+    if [[ -n $head ]]; then
+      if (( budget >= 2 )); then
+        if (( ${(m)#head} > width )); then
+          head=${(mr:$width:)head}
+          # 全角境界の切り詰めは幅を 1 桁超え得る((mr) は切り上げ)。超えたら 1 文字落とす
+          (( ${(m)#head} > width )) && head=${(mr:$width:)head[1,-2]}
+        fi
+        lines+=( "$head" )
+        [[ -n $hl_head ]] && hl+=( "$#lines 0 ${#head} $hl_head" )
+        (( budget -= 1 ))
+      elif (( $#lines )); then
+        break   # 途中グループの見出しが予算に入らないときはここで打ち切り
+      fi        # 先頭グループ(まだ何も出ていない)なら見出しを諦めて候補だけ出す
+    fi
+    gmaxw=1
+    for i in $gi; do
+      w=${(m)#texts[i]}
+      (( w > gmaxw )) && gmaxw=w
+    done
+    (( gmaxw > width )) && gmaxw=width
+    cols=$(( (width + gut) / (gmaxw + gut) ))
+    (( cols < 1 )) && cols=1
+    (( cols > _ZRUSH_MAX_COLS )) && cols=_ZRUSH_MAX_COLS
+    grows=$(( ($#gi + cols - 1) / cols ))
+    (( grows > budget )) && grows=budget
+    gcount=$(( cols * grows ))
+    (( gcount > $#gi )) && gcount=$#gi
+    cols=$(( (gcount + grows - 1) / grows ))   # 端数で余った列を詰める
+    gstart=$(( $#_zrush_shown + 1 ))
+    gend=$(( gstart + gcount - 1 ))
+    for (( r = 1; r <= grows; ++r )); do
+      line=
+      for (( c = 1; c <= cols; ++c )); do
+        p=$(( (c - 1) * grows + r ))
+        (( p > gcount )) && break
+        (( c > 1 )) && line+='  '
+        ii=$gi[p]
+        cell=${(mr:$gmaxw:)texts[ii]}
+        # 全角境界の切り詰めはセル幅を 1 桁超え得る。超えたら 1 文字落として再パディング
+        (( ${(m)#cell} > gmaxw )) && cell=${(mr:$gmaxw:)cell[1,-2]}
+        cello=${#line}
+        if (( gstart + p - 1 == sel )); then
+          # 選択エントリは -sel タグで別管理(打鍵時に単独で外すため)
+          [[ -n $hl_sel ]] && sel_hl="$(( $#lines + 1 )) $cello ${#cell}"
+        elif [[ -n $hl_mat && -n ${spanstr[ii]} ]]; then
+          # マッチ範囲(文字オフセット)。切り詰めで残った文字数にクリップする。
+          # 選択セルには適用しない(選択装飾を優先)。
+          kept=${#texts[ii]}
+          (( ${(m)#texts[ii]} > gmaxw )) && kept=${#cell}
+          for sp in ${(s:,:)spanstr[ii]}; do
+            [[ $sp == <->-<-> ]] || continue
+            ms=${sp%%-*}
+            me=${sp#*-}
+            (( me > kept )) && me=kept
+            (( ms >= me )) && continue
+            hl+=( "$(( $#lines + 1 )) $(( cello + ms )) $(( me - ms )) $hl_mat" )
+          done
+        fi
+        line+=$cell
+      done
+      lines+=( "$line" )
+    done
+    for (( p = 1; p <= gcount; ++p )); do
+      _zrush_shown+=( ${items[$gi[p]]} )
+      pos_rows+=( $grows )
+      pos_gs+=( $gstart )
+      pos_ge+=( $gend )
+    done
+    (( budget -= grows ))
+  done
+
+  # 行が 1 つも組めなかったら一覧なし扱い(保険。先頭グループは見出しを
+  # 諦めてでも必ず 1 行出すため、通常ここには来ない)
   if (( $#lines == 0 )); then
     _zrush_clear_display
     return 0
   fi
-  # 選択中はマーカー付与(選択行 '> '、他は桁揃えの 2 スペース)
-  if (( _zrush_selected > 0 )); then
-    (( _zrush_selected > $#lines )) && _zrush_selected=$#lines
-    local -i li
-    for (( li = 1; li <= $#lines; ++li )); do
-      if (( li == _zrush_selected )); then
-        lines[li]="> $lines[li]"
-      else
-        lines[li]="  $lines[li]"
-      fi
-    done
+
+  # 予算打ち切りで選択位置が表示から漏れた場合はクランプして一度だけ組み直す
+  # (通常フローでは起きない: 選択操作は前回の表示範囲でクランプ済み)
+  if (( _zrush_selected > $#_zrush_shown )); then
+    _zrush_selected=$#_zrush_shown
+    if (( ! _zrush_render_retry )); then
+      _zrush_render_retry=1
+      _zrush_render
+      _zrush_render_retry=0
+      return 0
+    fi
   fi
-  zle -M "${(pj:\n:)lines}"
+  _zrush_pos_rows=( "${(@)pos_rows}" )
+  _zrush_pos_gs=( "${(@)pos_gs}" )
+  _zrush_pos_ge=( "${(@)pos_ge}" )
+
+  # 更新は POSTDISPLAY の置き換え(消してから描かない: 空白の見えないよう一度で差し替える)
+  POSTDISPLAY=$'\n'${(pj:\n:)lines}
+  # 装飾(選択セルの standout・見出し)は region_highlight で。レイアウトは動かさない
+  _zrush_rh_clear
+  local -a lstart=()
+  local -i off=$(( $#BUFFER + 1 ))   # 先頭の改行 1 文字分
+  for (( r = 1; r <= $#lines; ++r )); do
+    lstart[r]=$off
+    (( off += ${#lines[r]} + 1 ))
+  done
+  local e
+  local -a f
+  for e in "${(@)hl}"; do
+    f=( ${=e} )
+    # spec は 4 語目以降(ユーザー設定の spec が空白を含んでも壊さない)
+    _zrush_rh_add $(( lstart[$f[1]] + f[2] )) $(( lstart[$f[1]] + f[2] + f[3] )) "${(j: :)f[4,-1]}"
+  done
+  if [[ -n $sel_hl ]]; then
+    f=( ${=sel_hl} )
+    _zrush_rh_add $(( lstart[$f[1]] + f[2] )) $(( lstart[$f[1]] + f[2] + f[3] )) "$hl_sel" -sel
+  fi
   _zrush_listing=1
-  _zlog "render: $#lines lines selected=$_zrush_selected"
+  _zlog "render: $#lines lines shown=$#_zrush_shown selected=$_zrush_selected"
   return 0
 }
 
@@ -580,9 +825,13 @@ _zrush_line_pre_redraw() {
   [[ $BUFFER == "$_zrush_last_buffer" ]] && (( CURSOR == _zrush_last_cursor )) && return 0
   _zrush_last_buffer=$BUFFER
   _zrush_last_cursor=$CURSOR
-  # バッファが変化したら選択・未着 Tab 予約は解除して通常フローへ
+  # バッファが変化したら選択・未着 Tab 予約は解除して通常フローへ。
+  # 選択ハイライトだけ即外す(選択が解除されるため)。一覧テキストと
+  # match/見出しの装飾は次の結果が来るまで残す(空白・点滅の見えない更新。
+  # 装飾のオフセットは zle がバッファ編集に追従して書き換えるためずれない)。
   _zrush_selected=0
   _zrush_tab_pending=0
+  _zrush_rh_clear_sel
 
   # 空バッファ(空白のみ含む)では収集も表示もしない(plan の固定挙動)
   if [[ -z ${BUFFER//[[:space:]]/} ]]; then
@@ -609,7 +858,13 @@ _zrush_line_init() {
   emulate -L zsh
   _zrush_last_buffer=
   _zrush_last_cursor=-1
-  _zrush_listing=0    # 新しい行では表示なしから始まる(zle -M は行を跨いで残らない)
+  # POSTDISPLAY は zle -M と違い明示消去が必要。line-finish を経ない終了
+  # (send-break 等)で残った自分の表示をここで確実に畳む。
+  if (( _zrush_listing )); then
+    POSTDISPLAY=
+    _zrush_rh_clear
+    _zrush_listing=0
+  fi
   _zrush_selected=0
   _zrush_tab_pending=0
   return 0
@@ -715,6 +970,22 @@ _zrush_select_move() {  # $1=+1|-1
   return 0
 }
 
+_zrush_select_hmove() {  # $1=+1|-1(列ジャンプ = ±グリッド行数。グループ範囲内でクランプ)
+  emulate -L zsh
+  local -i p=$_zrush_selected
+  local -i rows=${_zrush_pos_rows[p]:-1}
+  local -i lo=${_zrush_pos_gs[p]:-1}
+  local -i hi=${_zrush_pos_ge[p]:-$#_zrush_shown}
+  local -i new=$(( p + $1 * rows ))
+  (( new < lo )) && new=lo
+  (( new > hi )) && new=hi
+  (( new == p )) && return 0
+  _zrush_selected=$new
+  _zrush_render
+  _zlog "select: pos=$_zrush_selected"
+  return 0
+}
+
 # ---------------------------------------------------------------- ディスパッチ(状態依存)
 # 前任者はディスパッチ関数の本体引数として埋め込まれ、_zrush_dispatch が
 # ここへ設定する($WIDGET 参照にしないのは、z-sy-h などのウィジェットラッパーが
@@ -755,6 +1026,26 @@ _zrush_action_next() {
 _zrush_action_prev() {
   if (( _zrush_selected > 0 )); then
     _zrush_select_move -1
+    return 0
+  fi
+  _zrush_call_prev
+  return 0
+}
+
+# select-left / select-right: 選択中のみ列ジャンプ。非選択時は前任者
+# (既定バインドの ← → ではカーソル移動)へフォールバックする。
+_zrush_action_left() {
+  if (( _zrush_selected > 0 )); then
+    _zrush_select_hmove -1
+    return 0
+  fi
+  _zrush_call_prev
+  return 0
+}
+
+_zrush_action_right() {
+  if (( _zrush_selected > 0 )); then
+    _zrush_select_hmove 1
     return 0
   fi
   _zrush_call_prev
@@ -841,12 +1132,14 @@ _zrush_dispatch() {  # $1=action $2=前任者ウィジェット名(バインド�
   emulate -L zsh
   _zrush_dispatch_prev=${2:-}
   case ${1:-} in
-    select-next) _zrush_action_next ;;
-    select-prev) _zrush_action_prev ;;
-    confirm)     _zrush_action_confirm ;;
-    dismiss)     _zrush_action_dismiss ;;
-    tab)         _zrush_action_tab ;;
-    *)           _zrush_call_prev ;;
+    select-next)  _zrush_action_next ;;
+    select-prev)  _zrush_action_prev ;;
+    select-left)  _zrush_action_left ;;
+    select-right) _zrush_action_right ;;
+    confirm)      _zrush_action_confirm ;;
+    dismiss)      _zrush_action_dismiss ;;
+    tab)          _zrush_action_tab ;;
+    *)            _zrush_call_prev ;;
   esac
   return 0
 }
@@ -904,12 +1197,17 @@ _zrush_bind_one() {  # $1=action $2=キー列(bindkey 表記 or 生列)
 _zrush_apply_keybinds() {
   emulate -L zsh
   local -a kb=( "${(@)ZRUSH_CFG_KEYBINDS}" )
+  local -a kb_default=(
+    select-next key:down select-prev key:up
+    select-left key:left select-right key:right
+    confirm 'seq:^M' dismiss 'seq:^G'
+  )
   if (( $#kb % 2 != 0 )); then
     # 奇数長(版不整合等の異常)は配列全体を無視して既定を適用し警告(cli-protocol)
     _zrush_warn "keybinds: malformed ZRUSH_CFG_KEYBINDS (odd length $#kb); using default keybinds"
-    kb=( select-next key:down select-prev key:up confirm 'seq:^M' dismiss 'seq:^G' )
+    kb=( "${(@)kb_default}" )
   elif (( $#kb == 0 )); then
-    kb=( select-next key:down select-prev key:up confirm 'seq:^M' dismiss 'seq:^G' )
+    kb=( "${(@)kb_default}" )
   fi
   typeset -gA _zrush_new_bound=()
   local -i i
@@ -986,7 +1284,12 @@ _zrush_init() {
     _zrush_warn "zsh/stat unavailable; zrush disabled"
     return 1
   }
-  autoload -Uz add-zsh-hook add-zle-hook-widget
+  autoload -Uz add-zsh-hook add-zle-hook-widget is-at-least
+
+  # region_highlight の memo フィールドは zsh 5.9 から(z-sy-h 0.8+ が自他の
+  # エントリを区別する公式メカニズム)。5.8 では付けない。
+  _zrush_hl_memo=
+  is-at-least 5.9 $ZSH_VERSION && _zrush_hl_memo=' memo=zrush'
 
   _zrush_config_path
   # source 時は無条件で config を 1 回実行(版照合の機会を保証。cli-protocol.md)

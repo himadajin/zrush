@@ -217,6 +217,86 @@ impl QueryMatcher {
         }
         None
     }
+
+    /// Matched spans in one candidate's match-text, for the stdout
+    /// match-spans field (cli-protocol.md v2). Char offsets over the
+    /// lossy UTF-8 reading, 0-based end-exclusive, sorted and merged;
+    /// empty = no position info (empty query or no match).
+    ///
+    /// Second pass by design: callers run this only on the top-ranked
+    /// (at most max-lines) candidates, so the per-candidate re-match is
+    /// cheap and `score()` stays allocation-free for the full set.
+    pub fn spans(&mut self, cand_raw: &[u8]) -> Vec<(usize, usize)> {
+        if self.query.is_empty() {
+            return Vec::new();
+        }
+        let QueryMatcher {
+            mode,
+            fold,
+            query,
+            query_str,
+            nucleo,
+            hay_fold_buf,
+            hay_char_buf,
+            query_char_buf,
+        } = self;
+        let q: &[u8] = query;
+        let cand: &[u8] = if *fold {
+            hay_fold_buf.clear();
+            hay_fold_buf.extend(cand_raw.iter().map(u8::to_ascii_lowercase));
+            hay_fold_buf
+        } else {
+            cand_raw
+        };
+
+        // ASCII folding preserves byte offsets, so byte positions found
+        // on the folded form index the raw form identically.
+        if cand.starts_with(q) {
+            return vec![(0, char_count(&cand[..q.len()]))];
+        }
+        if *mode == Mode::Prefix {
+            return Vec::new();
+        }
+        if q.len() <= cand.len()
+            && let Some(pos) = cand.windows(q.len()).position(|w| w == q)
+        {
+            return vec![(char_count(&cand[..pos]), char_count(&cand[..pos + q.len()]))];
+        }
+        if *mode == Mode::Substring {
+            return Vec::new();
+        }
+        if q.len() >= 2
+            && let Some(em) = prefix_edit_within_one(q, cand)
+        {
+            // The aligned (corrected-query) prefix of the candidate.
+            let consumed = cand.len() - em.suffix_len;
+            return vec![(0, char_count(&cand[..consumed]))];
+        }
+        let cand_lossy = String::from_utf8_lossy(cand);
+        let hay = Utf32Str::new(&cand_lossy, hay_char_buf);
+        let needle = Utf32Str::new(query_str, query_char_buf);
+        let mut indices: Vec<u32> = Vec::new();
+        if nucleo.fuzzy_indices(hay, needle, &mut indices).is_none() {
+            return Vec::new();
+        }
+        indices.sort_unstable();
+        indices.dedup();
+        let mut out: Vec<(usize, usize)> = Vec::new();
+        for i in indices {
+            let i = i as usize;
+            match out.last_mut() {
+                Some(last) if last.1 == i => last.1 = i + 1,
+                _ => out.push((i, i + 1)),
+            }
+        }
+        out
+    }
+}
+
+/// Char count of a byte slice under the lossy UTF-8 reading (the span
+/// offset unit; cli-protocol.md v2).
+fn char_count(bytes: &[u8]) -> usize {
+    String::from_utf8_lossy(bytes).chars().count()
 }
 
 /// How the single edit reads. Declaration order = intra-tier preference

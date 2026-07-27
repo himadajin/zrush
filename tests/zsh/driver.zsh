@@ -32,9 +32,13 @@ ng()  { out "FAIL: $1"; (( ++FAIL )) }
 
 typeset -g WORK=$(mktemp -d ${TMPDIR:-/tmp}/zrush-test.XXXXXX)
 export TERM=vt100
+export LC_ALL=en_US.UTF-8   # POSTDISPLAY の印字可能判定を実利用と同じ UTF-8 にする
 export HOME=$PLAYGROUND    # ~ 保持テスト用(実ホームに触れない)
 # 部分パス略記(接頭辞不一致置換)テスト用の固定ツリー
 mkdir -p $PLAYGROUND/pp/usr/local/bin $PLAYGROUND/pp/usr/share/doc
+# グリッド表示テスト用の短名 30 件(a01..a30 → 8 列 × 4 行になる幅)
+mkdir -p $PLAYGROUND/gd
+for _gi in {01..30}; do : >| $PLAYGROUND/gd/a$_gi; done
 export ZRUSH_REPO=$REPO
 export ZRUSH_TEST_TMP=$WORK
 export ZDOTDIR=$WORK/zdot
@@ -60,6 +64,9 @@ expect() {  # $1=glob $2=timeout(s)
       EXPECT_BUF+=$chunk
       TRANSCRIPT+=$chunk
       [[ $EXPECT_BUF == ${~pat} ]] && return 0
+      # マッチ箇所ハイライト等の SGR が語の途中に挟まるため、SGR を
+      # 剥がした形でも照合する(生パターン指定のテストは上で先に通る)
+      [[ ${EXPECT_BUF//$'\e['[0-9;]#m/} == ${~pat} ]] && return 0
     fi
   done
   return 1
@@ -158,7 +165,8 @@ log_count() {  # $1=固定文字列 → REPLY: ZRUSH_LOG 内の出現回数
   drain 0.4                     # 収集開始まで待つ(delay 50ms + fork)
   local -F t0=$SECONDS
   send_keys 'zzz'               # 収集中の追加タイプ
-  if expect '*zzz*' 2; then
+  # エコーの間には一覧の装飾更新のエスケープ列が挟まり得るため z の連続では見ない
+  if expect '*z*z*z*' 2; then
     ok "(d) huge 収集中も追加タイプが即エコーされる($(( SECONDS - t0 ))s)"
   else
     ng "(d) huge 収集中に入力がブロックされた"
@@ -270,17 +278,24 @@ log_count() {  # $1=固定文字列 → REPLY: ZRUSH_LOG 内の出現回数
   send_line ': m4-reset'
   sync_prompt
 
-  # ---------------- (m4-1) 選択開始・マーカー・移動・先頭 ↑ で解除 ----------------
+  # ---------------- (m4-1) 選択開始・ハイライト・移動・先頭 ↑ で解除 ----------------
   send_keys 'ls docs/'
   expect '*user*' 10 >/dev/null
   log_count 'select: start';           local -i c_start=$REPLY
   log_count 'select: pos=2';           local -i c_pos2=$REPLY
   log_count 'select: released-at-top'; local -i c_rel=$REPLY
-  send_keys $DOWN            # press() は drain で描画を先に消費するため使わない
-  if expect '*> internal*' 5; then
-    ok "(m4-1a) ↓ で選択開始・マーカー表示"
+  log_count 'selected=1';              local -i c_sel1=$REPLY
+  TRANSCRIPT=            # standout 検査のため選択前の出力を切り離す
+  send_keys $DOWN        # press() は drain で描画を先に消費するため使わない
+  if wait_log 'selected=1' $c_sel1 5; then
+    ok "(m4-1a) ↓ で選択開始(selected=1 で描画)"
   else
-    ng "(m4-1a) マーカーが出ない"
+    ng "(m4-1a) 選択開始の描画が確認できない"
+  fi
+  if [[ $TRANSCRIPT == *$'\e[7m'* ]]; then
+    ok "(m4-1a') 選択行の standout(SGR 7)が pty 出力に現れる"
+  else
+    ng "(m4-1a') standout 列が pty 出力に見えない"
   fi
   press $DOWN
   wait_log 'select: pos=2' $c_pos2 3 && ok "(m4-1b) ↓ で次候補へ移動" || ng "(m4-1b) 候補移動しない"
@@ -416,6 +431,93 @@ log_count() {  # $1=固定文字列 → REPLY: ZRUSH_LOG 内の出現回数
     ng "(m4-10a) 未着時 Tab が適用されない"
   fi
   wait_log 'tab: pending' $c_pend 2 && ok "(m4-10b) pending 経路を通った" || ng "(m4-10b) pending 経路が記録されない"
+  clear_line
+  drain 0.3
+
+  # ---------------- (d2-1) 複数列グリッドと左右移動 ----------------
+  local RIGHT=$'\e[C' LEFT=$'\e[D'
+  send_keys 'ls gd/'
+  # a01..a30(2 文字語 + セル幅 3)→ 8 列 × 4 行、列優先なので行 1 は a01 a05 a09 ...
+  if expect '*a01  a05*' 10; then
+    ok "(d2-1a) 列優先グリッドで複数候補が 1 行に並ぶ(a01  a05)"
+  else
+    ng "(d2-1a) グリッド行が確認できない"
+  fi
+  log_count 'render: 5 lines shown=30'
+  if (( REPLY > 0 )); then
+    ok "(d2-1b) 30 件が見出し 1 行 + 8 列 × 4 行に収まる"
+  else
+    ng "(d2-1b) グリッド形状が期待と違う(render: 5 lines shown=30 がログにない)"
+  fi
+  log_count 'select: pos=5'; local -i c_gp5=$REPLY
+  send_keys $DOWN            # 選択開始(pos=1)
+  drain 0.3
+  send_keys $RIGHT           # 右の列へ = +rows(4)
+  wait_log 'select: pos=5' $c_gp5 3 && ok "(d2-1c) → で右の列へ(pos 1→5)" || ng "(d2-1c) 列ジャンプしない"
+  log_count 'select: pos=1'; local -i c_gp1=$REPLY
+  send_keys $LEFT
+  wait_log 'select: pos=1' $c_gp1 3 && ok "(d2-1d) ← で左の列へ戻る(pos 5→1)" || ng "(d2-1d) 左ジャンプしない"
+  press $CTRLG
+  # 非選択時の ← は前任者チェーン(カーソル移動)へフォールバックする
+  log_count 'dispatch: fallback'; local -i c_gfb=$REPLY
+  send_keys $LEFT
+  wait_log 'dispatch: fallback' $c_gfb 3 && ok "(d2-1e) 非選択時の ← は前任者へフォールバック" || ng "(d2-1e) 非選択 ← が奪われている"
+  clear_line
+  drain 0.3
+
+  # ---------------- (d3-1) グループ見出し ----------------
+  send_keys 'ls docs/inte'
+  if expect '*file*internal*' 10; then
+    ok "(d3-1a) ファイル候補にグループ見出し 'file' が付く"
+  else
+    ng "(d3-1a) 見出し 'file' が出ない"
+  fi
+  clear_line
+  drain 0.3
+  send_keys 'git chec'
+  if expect '*main porcelain command*checkout*' 15; then
+    ok "(d3-1b) git サブコマンドに見出し 'main porcelain command' が付く"
+  else
+    ng "(d3-1b) git サブコマンドの見出しが出ない"
+  fi
+  drain 0.3
+  # (d3-1c) 複数グループ + spans の render で変数表示が漏れない
+  # (回帰: 代入なしの local 再宣言は既存値を標準出力へ表示する zsh 仕様)
+  if [[ $TRANSCRIPT != *sp=* && $TRANSCRIPT != *gcount=* ]]; then
+    ok "(d3-1c) render の変数表示リーク(sp=/gcount=)がない"
+  else
+    ng "(d3-1c) render が変数を標準出力へ漏らしている(sp=/gcount= を検出)"
+  fi
+  clear_line
+  drain 0.3
+
+  # ---------------- (d4-1) マッチ箇所ハイライトと [display.highlight] ----------------
+  TRANSCRIPT=
+  send_keys 'ls docs/inte'
+  expect '*internal*' 10 >/dev/null
+  drain 0.3
+  # 既定 match="underline": vt100 の smul = \e[4m がマッチ箇所に出る
+  if [[ $TRANSCRIPT == *$'\e[4m'* ]]; then
+    ok "(d4-1a) マッチ箇所の underline(SGR 4)が pty 出力に現れる"
+  else
+    ng "(d4-1a) underline 列が pty 出力に見えない"
+  fi
+  clear_line
+  drain 0.3
+  # match = "" で装飾なしに変更 → 自動反映で underline が消える
+  command sleep 1.1
+  print -r -- $'[display.highlight]\nmatch = ""' > $XDG_CONFIG_HOME/zrush/config.toml
+  send_line ': cfg-hl'
+  sync_prompt
+  TRANSCRIPT=
+  send_keys 'ls docs/inte'
+  expect '*internal*' 10 >/dev/null
+  drain 0.3
+  if [[ $TRANSCRIPT != *$'\e[4m'* ]]; then
+    ok "(d4-1b) match=\"\" の自動反映で underline が消える"
+  else
+    ng "(d4-1b) match=\"\" 後も underline が出ている"
+  fi
   clear_line
   drain 0.3
 
