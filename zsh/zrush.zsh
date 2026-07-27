@@ -28,7 +28,7 @@ typeset -g _zrush_source_dir=${${(%):-%N}:A:h}
 # ---------------------------------------------------------------- グローバル状態
 typeset -g  ZRUSH_BIN=${ZRUSH_BIN:-$_zrush_source_dir/../target/release/zrush}
 typeset -gi _zrush_enabled=0
-typeset -gi _ZRUSH_EXPECTED_PROTO=2
+typeset -gi _ZRUSH_EXPECTED_PROTO=3
 typeset -g  _zrush_cfg_path= _zrush_cfg_mtime= _zrush_cfg_warn_shown=
 typeset -gi _zrush_match_warned=0 _zrush_proto_warned=0
 
@@ -1083,8 +1083,9 @@ _zrush_tab_with_results() {  # 結果が手元にある状態での Tab 挙動
       (( $#_zrush_shown > 0 )) && _zrush_confirm_index ${_zrush_shown[1]}
       ;;
     common-prefix)
-      # クエリが common-prefix の真の接頭辞である場合に限り、
-      # 削った末尾領域を ${(q)} クォートした common-prefix で置き換える(cli-protocol)
+      # クエリが common-prefix(prefix 階層マッチの LCP)の真の接頭辞である場合、
+      # 削った末尾領域を ${(q)} クォートした common-prefix で置き換える。
+      # 伸びない場合は先頭候補を確定挿入する(insert と同じ。cli-protocol v3)
       local cp=$_zrush_common_prefix q=$_zrush_fuzzy
       if [[ -n $cp && $cp != "$q" && $cp == "$q"* ]]; then
         _zrush_widen "$LBUFFER"
@@ -1094,7 +1095,8 @@ _zrush_tab_with_results() {  # 結果が手元にある状態での Tab 挙動
         _zlog "tab: common-prefix inserted ${(qqqq)cp}"
         # 部分挿入は確定ではない: last_buffer は更新せず、通常フローの再収集に任せる
       else
-        _zlog "tab: common-prefix condition not met (cp=${(qqqq)cp} q=${(qqqq)q})"
+        _zlog "tab: common-prefix fallback -> insert top (cp=${(qqqq)cp} q=${(qqqq)q})"
+        (( $#_zrush_shown > 0 )) && _zrush_confirm_index ${_zrush_shown[1]}
       fi
       ;;
   esac

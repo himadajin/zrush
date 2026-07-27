@@ -115,16 +115,20 @@ fn cmd_match(args: &[OsString]) -> ExitCode {
 
     let mut qm = matching::QueryMatcher::new(&query, mode, smart_case);
     let mut scored = Vec::new();
-    let mut matched_texts: Vec<&[u8]> = Vec::new();
+    let mut prefix_texts: Vec<&[u8]> = Vec::new();
     for (pos, (_, text)) in candidates.iter().enumerate() {
         if let Some(ms) = qm.score(text) {
             scored.push((pos, ms));
-            matched_texts.push(text);
+            // The common prefix spans only prefix-tier matches (before
+            // max-lines truncation): lower tiers cannot extend the
+            // as-typed query and would only dilute the LCP (v3).
+            if ms.tier == matching::Tier::Prefix {
+                prefix_texts.push(text);
+            }
         }
     }
 
-    // Common prefix spans ALL matches (before max-lines truncation).
-    let lcp = matching::common_prefix(matched_texts.into_iter());
+    let lcp = matching::common_prefix(prefix_texts.into_iter());
     let order = ranking::rank(&scored, max_lines);
 
     let mut out = Vec::with_capacity(lcp.len() + 1 + order.len() * 16);
