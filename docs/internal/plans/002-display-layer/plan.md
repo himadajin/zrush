@@ -1,5 +1,9 @@
 # 002-display-layer 実装計画
 
+**状態: 完了(2026-07-28)。** D1〜D5 を実装・検証し、ドッグフーディングで
+対象 5 件の解消を体感確認した(notes-dogfooding.md)。
+001 plan.md・contracts への反映も完了。
+
 ## 背景と目的
 
 M5 ドッグフーディング(`../001-prototype/notes-dogfooding.md`)で「使用をためらう」問題 5 件を記録した。
