@@ -162,7 +162,8 @@ log_count() {  # $1=固定文字列 → REPLY: ZRUSH_LOG 内の出現回数
   drain 0.4                     # 収集開始まで待つ(delay 50ms + fork)
   local -F t0=$SECONDS
   send_keys 'zzz'               # 収集中の追加タイプ
-  if expect '*zzz*' 2; then
+  # エコーの間には一覧の装飾更新のエスケープ列が挟まり得るため z の連続では見ない
+  if expect '*z*z*z*' 2; then
     ok "(d) huge 収集中も追加タイプが即エコーされる($(( SECONDS - t0 ))s)"
   else
     ng "(d) huge 収集中に入力がブロックされた"
@@ -439,11 +440,11 @@ log_count() {  # $1=固定文字列 → REPLY: ZRUSH_LOG 内の出現回数
   else
     ng "(d2-1a) グリッド行が確認できない"
   fi
-  log_count 'render: 4 lines cols=8'
+  log_count 'render: 5 lines shown=30'
   if (( REPLY > 0 )); then
-    ok "(d2-1b) 30 件が 8 列 × 4 行に収まる"
+    ok "(d2-1b) 30 件が見出し 1 行 + 8 列 × 4 行に収まる"
   else
-    ng "(d2-1b) グリッド形状が期待と違う(render: 4 lines cols=8 がログにない)"
+    ng "(d2-1b) グリッド形状が期待と違う(render: 5 lines shown=30 がログにない)"
   fi
   log_count 'select: pos=5'; local -i c_gp5=$REPLY
   send_keys $DOWN            # 選択開始(pos=1)
@@ -458,6 +459,24 @@ log_count() {  # $1=固定文字列 → REPLY: ZRUSH_LOG 内の出現回数
   log_count 'dispatch: fallback'; local -i c_gfb=$REPLY
   send_keys $LEFT
   wait_log 'dispatch: fallback' $c_gfb 3 && ok "(d2-1e) 非選択時の ← は前任者へフォールバック" || ng "(d2-1e) 非選択 ← が奪われている"
+  clear_line
+  drain 0.3
+
+  # ---------------- (d3-1) グループ見出し ----------------
+  send_keys 'ls docs/inte'
+  if expect '*file*internal*' 10; then
+    ok "(d3-1a) ファイル候補にグループ見出し 'file' が付く"
+  else
+    ng "(d3-1a) 見出し 'file' が出ない"
+  fi
+  clear_line
+  drain 0.3
+  send_keys 'git chec'
+  if expect '*main porcelain command*checkout*' 15; then
+    ok "(d3-1b) git サブコマンドに見出し 'main porcelain command' が付く"
+  else
+    ng "(d3-1b) git サブコマンドの見出しが出ない"
+  fi
   clear_line
   drain 0.3
 

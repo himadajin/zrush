@@ -52,7 +52,10 @@ typeset -g  _zrush_hl_memo=   # zsh 5.9+ なら ' memo=zrush'
 # 選択・Tab 状態
 typeset -gi _zrush_selected=0      # 0=非選択、>0=表示順位置(1 始まり、列優先)
 typeset -gi _zrush_tab_pending=0   # 候補未着時に Tab が押された
-typeset -gi _zrush_grid_rows=1     # 直近描画のグリッド行数(select-left/right の列ジャンプ幅)
+
+# 表示位置ごとのグリッド情報(select-left/right の列ジャンプ幅とグループ範囲)
+typeset -ga _zrush_pos_rows=() _zrush_pos_gs=() _zrush_pos_ge=()
+typeset -gi _zrush_render_retry=0
 
 # グリッドの列数上限。取得件数の見積もり(--max-lines = max-lines × この値)と対。
 typeset -gi _ZRUSH_MAX_COLS=8
@@ -219,6 +222,11 @@ _zrush_compadd() {
 _zrush_capture_complete() {
   _zlog "fork: completion widget invoked (context=${curcontext:-none})"
   unset 'compstate[vared]'
+  # グループ情報を決定的に流させる(fork 内のみ。ユーザーの対話シェルの
+  # zstyle には触れない)。group-name '' でタグごとにグループ分割、
+  # descriptions format '%d' で -X 見出しが素の説明文になる。
+  zstyle ':completion:*' group-name ''
+  zstyle ':completion:*:descriptions' format '%d'
   unfunction compadd 2>/dev/null   # 他プラグインの compadd ラッパー除去
   functions[compadd]=$functions[_zrush_compadd]
   {
@@ -308,10 +316,27 @@ _zrush_disarm_timer() {
   fi
 }
 
-# region_highlight の自エントリだけを外す(他プラグインのエントリに触れない)
+# region_highlight の自エントリだけを外す(他プラグインのエントリに触れない)。
+# 注意: zle はバッファ編集のたびにエントリのオフセットを書き換えるため、
+# 追加時の値との完全一致では消せない。5.9+ は memo=zrush で同定する。
+# 5.8(memo なし)は「自エントリは常に POSTDISPLAY 領域(開始 >= $#BUFFER)」
+# で消す(同領域に他プラグインの装飾があれば巻き添えになる劣化を許容)。
 _zrush_rh_clear() {
   (( $#_zrush_rh )) || return 0
-  region_highlight=( "${(@)region_highlight:|_zrush_rh}" )
+  if [[ -n $_zrush_hl_memo ]]; then
+    region_highlight=( "${(@)region_highlight:#*memo=zrush}" )
+  else
+    region_highlight=( "${(@)region_highlight:|_zrush_rh}" )
+    local e
+    local -a keep=()
+    for e in "${(@)region_highlight}"; do
+      if [[ $e == <->" "* ]] && (( ${e%% *} >= $#BUFFER )); then
+        continue
+      fi
+      keep+=( "$e" )
+    done
+    region_highlight=( "${(@)keep}" )
+  fi
   _zrush_rh=()
   return 0
 }
@@ -331,6 +356,7 @@ _zrush_clear_display() {  # zle ウィジェット文脈からのみ呼ぶこと
   _zrush_listing=0
   _zrush_recs=() _zrush_krecs=() _zrush_words=() _zrush_match=() _zrush_disp=()
   _zrush_ranked=() _zrush_shown=()
+  _zrush_pos_rows=() _zrush_pos_gs=() _zrush_pos_ge=()
   _zrush_common_prefix=
 }
 
@@ -540,15 +566,23 @@ _zrush_render() {  # zle ウィジェット文脈からのみ呼ぶこと
   local -i width=$(( COLUMNS - 1 ))
   (( width < 1 )) && width=1
 
-  # 表示対象(妥当 index のみ、グリッド容量の上限まで)と表示テキスト
-  local -a items=() texts=()
-  local idx text
+  # 表示対象(妥当 index のみ、グリッド容量の上限まで)とテキスト・グループ。
+  # グループ同定は J(タグ単位で一意)優先、見出し表示は X(説明文)優先。
+  local -a items=() texts=() gkey=() ghd=()
+  local idx text rec x j
   for idx in "${(@)_zrush_ranked}"; do
     [[ $idx == <-> ]] || continue
     text=${_zrush_disp[idx]:-${_zrush_match[idx]}}
     text=${text//$'\n'/ }
+    rec=${_zrush_krecs[idx]:-}
+    x= j=
+    [[ $rec == *$'\2'X$'\1'* ]] && x=${${rec#*$'\2'X$'\1'}%%$'\2'*}
+    [[ $rec == *$'\2'J$'\1'* ]] && j=${${rec#*$'\2'J$'\1'}%%$'\2'*}
+    [[ $j == -default- ]] && j=
     items+=( $idx )
     texts+=( "$text" )
+    gkey+=( "${j:-$x}" )
+    ghd+=( "${x:-$j}" )
     (( $#items >= maxl * _ZRUSH_MAX_COLS )) && break
   done
   if (( $#items == 0 )); then
@@ -556,65 +590,113 @@ _zrush_render() {  # zle ウィジェット文脈からのみ呼ぶこと
     return 0
   fi
 
-  # 列優先グリッド: 一様セル幅(候補全体の最大表示幅)。幅の計測は表示上限まで
-  # の全候補で行う(容量端数で表示から漏れる候補ぶんだけ列数が控えめになり得る
-  # が、行のはみ出しは起きない安全側)。表示幅は ${(m)#} で全角を 2 桁と数える。
-  local -i gut=2 maxw=1 i w
+  # グループ分割(最良ランクの出現順。グループ内はランク順のまま)
+  local -A gord=()
+  local -a gheads=() gmembers=()
+  local -i ng=0 i
+  local key
   for (( i = 1; i <= $#items; ++i )); do
-    w=${(m)#texts[i]}
-    (( w > maxw )) && maxw=w
+    key="k:${gkey[i]}"
+    if [[ -z ${gord[$key]:-} ]]; then
+      gord[$key]=$(( ++ng ))
+      gheads[ng]=${gkey[i]:+${ghd[i]}}   # キーなし(無グループ)は見出しなし
+    fi
+    gmembers[${gord[$key]}]+=" $i"
   done
-  (( maxw > width )) && maxw=width
-  local -i cols=$(( (width + gut) / (maxw + gut) ))
-  (( cols < 1 )) && cols=1
-  (( cols > _ZRUSH_MAX_COLS )) && cols=_ZRUSH_MAX_COLS
-  local -i rows=$(( ($#items + cols - 1) / cols ))
-  (( rows > maxl )) && rows=maxl
-  local -i count=$(( cols * rows ))
-  (( count > $#items )) && count=$#items
-  cols=$(( (count + rows - 1) / rows ))   # 端数で余った列を詰める
 
-  _zrush_shown=( "${(@)items[1,count]}" )
-  _zrush_grid_rows=$rows
-  (( _zrush_selected > count )) && _zrush_selected=count
-
-  # 行の組み立て(列優先: 表示順 p は列内を下に進む)。セル本体は幅 maxw に
-  # 切り詰め/パディング。選択セルは組み立て時に文字オフセットを記録する
-  # (パディングは表示幅基準のため、オフセットは文字数で追跡するしかない)。
-  local -a lines=()
-  local -i r c p sel_line=0 sel_off=0 sel_len=0
-  local line cell
-  for (( r = 1; r <= rows; ++r )); do
-    line=
-    for (( c = 1; c <= cols; ++c )); do
-      p=$(( (c - 1) * rows + r ))
-      (( p > count )) && break
-      (( c > 1 )) && line+='  '
-      cell=${(mr:$maxw:)texts[p]}
-      if (( p == _zrush_selected )); then
-        sel_line=$r
-        sel_off=${#line}
-        sel_len=${#cell}
-      fi
-      line+=$cell
+  # グループごとに列優先グリッドを組み、行予算(maxl)内へ詰める。
+  # セル幅はグループ内一様(最大表示幅 + ガター 2)、表示幅は ${(m)#}。
+  # 幅の計測は取得済み全メンバーで行う(表示から漏れる候補ぶん列数が控えめに
+  # なり得るが、行のはみ出しは起きない安全側)。
+  local -a lines=() hl=()     # hl: "行番号 行内オフセット 文字数 spec"
+  _zrush_shown=()
+  local -a pos_rows=() pos_gs=() pos_ge=()
+  local -i gut=2 budget=maxl ord p r c w
+  local -i sel=$_zrush_selected
+  local head cell line
+  for (( ord = 1; ord <= ng; ++ord )); do
+    (( budget < 1 )) && break
+    local -a gi=( ${=gmembers[ord]} )
+    head=${gheads[ord]:-}
+    if [[ -n $head ]]; then
+      (( budget < 2 )) && break        # 見出し + 最低 1 行が入らなければ打ち切り
+      (( ${(m)#head} > width )) && head=${(mr:$width:)head}
+      lines+=( "$head" )
+      hl+=( "$#lines 0 ${#head} bold" )
+      (( budget -= 1 ))
+    fi
+    local -i gmaxw=1 cols grows gcount
+    for i in $gi; do
+      w=${(m)#texts[i]}
+      (( w > gmaxw )) && gmaxw=w
     done
-    lines+=( "$line" )
+    (( gmaxw > width )) && gmaxw=width
+    cols=$(( (width + gut) / (gmaxw + gut) ))
+    (( cols < 1 )) && cols=1
+    (( cols > _ZRUSH_MAX_COLS )) && cols=_ZRUSH_MAX_COLS
+    grows=$(( ($#gi + cols - 1) / cols ))
+    (( grows > budget )) && grows=budget
+    gcount=$(( cols * grows ))
+    (( gcount > $#gi )) && gcount=$#gi
+    cols=$(( (gcount + grows - 1) / grows ))   # 端数で余った列を詰める
+    local -i gstart=$(( $#_zrush_shown + 1 ))
+    local -i gend=$(( gstart + gcount - 1 ))
+    for (( r = 1; r <= grows; ++r )); do
+      line=
+      for (( c = 1; c <= cols; ++c )); do
+        p=$(( (c - 1) * grows + r ))
+        (( p > gcount )) && break
+        (( c > 1 )) && line+='  '
+        cell=${(mr:$gmaxw:)texts[$gi[p]]}
+        if (( gstart + p - 1 == sel )); then
+          hl+=( "$(( $#lines + 1 )) ${#line} ${#cell} standout" )
+        fi
+        line+=$cell
+      done
+      lines+=( "$line" )
+    done
+    for (( p = 1; p <= gcount; ++p )); do
+      _zrush_shown+=( ${items[$gi[p]]} )
+      pos_rows+=( $grows )
+      pos_gs+=( $gstart )
+      pos_ge+=( $gend )
+    done
+    (( budget -= grows ))
   done
+
+  # 予算打ち切りで選択位置が表示から漏れた場合はクランプして一度だけ組み直す
+  # (通常フローでは起きない: 選択操作は前回の表示範囲でクランプ済み)
+  if (( _zrush_selected > $#_zrush_shown )); then
+    _zrush_selected=$#_zrush_shown
+    if (( ! _zrush_render_retry )); then
+      _zrush_render_retry=1
+      _zrush_render
+      _zrush_render_retry=0
+      return 0
+    fi
+  fi
+  _zrush_pos_rows=( "${(@)pos_rows}" )
+  _zrush_pos_gs=( "${(@)pos_gs}" )
+  _zrush_pos_ge=( "${(@)pos_ge}" )
 
   # 更新は POSTDISPLAY の置き換え(消してから描かない: 空白の見えないよう一度で差し替える)
   POSTDISPLAY=$'\n'${(pj:\n:)lines}
-  # 選択セルは背景反転系ハイライトで示す(レイアウトは動かさない)
+  # 装飾(選択セルの standout・見出し)は region_highlight で。レイアウトは動かさない
   _zrush_rh_clear
-  if (( sel_line > 0 )); then
-    local -i start=$(( $#BUFFER + 1 ))   # 先頭の改行 1 文字分
-    for (( r = 1; r < sel_line; ++r )); do
-      (( start += ${#lines[r]} + 1 ))
-    done
-    (( start += sel_off ))
-    _zrush_rh_add $start $(( start + sel_len )) standout
-  fi
+  local -a lstart=()
+  local -i off=$(( $#BUFFER + 1 ))   # 先頭の改行 1 文字分
+  for (( r = 1; r <= $#lines; ++r )); do
+    lstart[r]=$off
+    (( off += ${#lines[r]} + 1 ))
+  done
+  local e
+  local -a f
+  for e in "${(@)hl}"; do
+    f=( ${=e} )
+    _zrush_rh_add $(( lstart[$f[1]] + f[2] )) $(( lstart[$f[1]] + f[2] + f[3] )) $f[4]
+  done
   _zrush_listing=1
-  _zlog "render: $#lines lines cols=$cols selected=$_zrush_selected"
+  _zlog "render: $#lines lines shown=$#_zrush_shown selected=$_zrush_selected"
   return 0
 }
 
@@ -802,12 +884,16 @@ _zrush_select_move() {  # $1=+1|-1
   return 0
 }
 
-_zrush_select_hmove() {  # $1=+1|-1(列ジャンプ = ±グリッド行数。範囲外はクランプ)
+_zrush_select_hmove() {  # $1=+1|-1(列ジャンプ = ±グリッド行数。グループ範囲内でクランプ)
   emulate -L zsh
-  local -i new=$(( _zrush_selected + $1 * _zrush_grid_rows ))
-  (( new < 1 )) && new=1
-  (( new > $#_zrush_shown )) && new=$#_zrush_shown
-  (( new == _zrush_selected )) && return 0
+  local -i p=$_zrush_selected
+  local -i rows=${_zrush_pos_rows[p]:-1}
+  local -i lo=${_zrush_pos_gs[p]:-1}
+  local -i hi=${_zrush_pos_ge[p]:-$#_zrush_shown}
+  local -i new=$(( p + $1 * rows ))
+  (( new < lo )) && new=lo
+  (( new > hi )) && new=hi
+  (( new == p )) && return 0
   _zrush_selected=$new
   _zrush_render
   _zlog "select: pos=$_zrush_selected"
