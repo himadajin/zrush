@@ -27,7 +27,8 @@ docs/
   作業完了時に、plans に残った確定内容を昇格させる。
 - ドキュメントは常に「最新の姿」だけを書く。
   経緯・履歴・レビュー記録の類は残さない(履歴は git が持つ)。
-- 現在進行中の計画: `docs/internal/plans/001-prototype/`(M5 ドッグフーディング)
+- 現在進行中の計画: `docs/internal/plans/001-prototype/`(M5 ドッグフーディング)、
+  `docs/internal/plans/003-tab-common-prefix/`(Tab 共通接頭辞挙動の改善)
 
 ## コミットメッセージ
 
