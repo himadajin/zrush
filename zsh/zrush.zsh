@@ -28,7 +28,7 @@ typeset -g _zrush_source_dir=${${(%):-%N}:A:h}
 # ---------------------------------------------------------------- グローバル状態
 typeset -g  ZRUSH_BIN=${ZRUSH_BIN:-$_zrush_source_dir/../target/release/zrush}
 typeset -gi _zrush_enabled=0
-typeset -gi _ZRUSH_EXPECTED_PROTO=1
+typeset -gi _ZRUSH_EXPECTED_PROTO=2
 typeset -g  _zrush_cfg_path= _zrush_cfg_mtime= _zrush_cfg_warn_shown=
 typeset -gi _zrush_match_warned=0 _zrush_proto_warned=0
 
@@ -42,6 +42,7 @@ typeset -gi _zrush_last_cursor=-1
 # 受信結果(選択・確定でも使う: レコード原本と挿入形を保持する)
 typeset -ga _zrush_recs=() _zrush_krecs=() _zrush_words=() _zrush_match=() _zrush_disp=()
 typeset -ga _zrush_ranked=() _zrush_shown=()
+typeset -gA _zrush_spans=()   # 候補 index → match-spans(cli-protocol v2)
 typeset -g  _zrush_common_prefix=
 typeset -gi _zrush_listing=0
 
@@ -355,7 +356,7 @@ _zrush_clear_display() {  # zle ウィジェット文脈からのみ呼ぶこと
   _zrush_rh_clear
   _zrush_listing=0
   _zrush_recs=() _zrush_krecs=() _zrush_words=() _zrush_match=() _zrush_disp=()
-  _zrush_ranked=() _zrush_shown=()
+  _zrush_ranked=() _zrush_shown=() _zrush_spans=()
   _zrush_pos_rows=() _zrush_pos_gs=() _zrush_pos_ge=()
   _zrush_common_prefix=
 }
@@ -444,6 +445,7 @@ _zrush_finalize() {
   local payload=$_zrush_buf
   _zrush_buf=
   _zrush_recs=() _zrush_words=() _zrush_match=() _zrush_disp=() _zrush_ranked=()
+  _zrush_spans=()
   _zrush_common_prefix=
 
   if [[ -n $payload ]]; then
@@ -544,9 +546,15 @@ _zrush_finalize() {
     return 0
   fi
 
+  # v2: 共通接頭辞のあと index / match-spans の組が並ぶ(cli-protocol.md)
   local -a fields=( "${(@0)${out%$'\0'}}" )
   _zrush_common_prefix=${fields[1]:-}
-  _zrush_ranked=( "${(@)fields[2,-1]}" )
+  _zrush_ranked=()
+  local -i fi
+  for (( fi = 2; fi + 1 <= $#fields; fi += 2 )); do
+    _zrush_ranked+=( "${fields[fi]}" )
+    [[ -n ${fields[fi+1]} ]] && _zrush_spans[${fields[fi]}]=${fields[fi+1]}
+  done
   _zlog "finalize: match ok, ${#_zrush_ranked} ranked, common-prefix=${(qqqq)_zrush_common_prefix}"
   _zrush_render
   # 候補未着時に Tab が押されていたら、到着した今、設定どおりの挙動を適用する。
@@ -566,13 +574,25 @@ _zrush_render() {  # zle ウィジェット文脈からのみ呼ぶこと
   local -i width=$(( COLUMNS - 1 ))
   (( width < 1 )) && width=1
 
+  # ハイライト指定(config スナップショット。空文字列 = 装飾なし)
+  local hl_sel=${ZRUSH_CFG_HL_SELECTED-standout}
+  local hl_mat=${ZRUSH_CFG_HL_MATCH-underline}
+  local hl_head=${ZRUSH_CFG_HL_HEADING-bold}
+
   # 表示対象(妥当 index のみ、グリッド容量の上限まで)とテキスト・グループ。
   # グループ同定は J(タグ単位で一意)優先、見出し表示は X(説明文)優先。
-  local -a items=() texts=() gkey=() ghd=()
+  # マッチ位置は match-text をそのまま表示する場合のみ使う(cli-protocol v2)。
+  local -a items=() texts=() gkey=() ghd=() spanstr=()
   local idx text rec x j
   for idx in "${(@)_zrush_ranked}"; do
     [[ $idx == <-> ]] || continue
-    text=${_zrush_disp[idx]:-${_zrush_match[idx]}}
+    if [[ -n ${_zrush_disp[idx]:-} ]]; then
+      text=${_zrush_disp[idx]}
+      spanstr+=( '' )
+    else
+      text=${_zrush_match[idx]}
+      spanstr+=( "${_zrush_spans[$idx]:-}" )
+    fi
     text=${text//$'\n'/ }
     rec=${_zrush_krecs[idx]:-}
     x= j=
@@ -622,7 +642,7 @@ _zrush_render() {  # zle ウィジェット文脈からのみ呼ぶこと
       (( budget < 2 )) && break        # 見出し + 最低 1 行が入らなければ打ち切り
       (( ${(m)#head} > width )) && head=${(mr:$width:)head}
       lines+=( "$head" )
-      hl+=( "$#lines 0 ${#head} bold" )
+      [[ -n $hl_head ]] && hl+=( "$#lines 0 ${#head} $hl_head" )
       (( budget -= 1 ))
     fi
     local -i gmaxw=1 cols grows gcount
@@ -641,15 +661,32 @@ _zrush_render() {  # zle ウィジェット文脈からのみ呼ぶこと
     cols=$(( (gcount + grows - 1) / grows ))   # 端数で余った列を詰める
     local -i gstart=$(( $#_zrush_shown + 1 ))
     local -i gend=$(( gstart + gcount - 1 ))
+    local -i ii cello ms me kept
+    local sp
     for (( r = 1; r <= grows; ++r )); do
       line=
       for (( c = 1; c <= cols; ++c )); do
         p=$(( (c - 1) * grows + r ))
         (( p > gcount )) && break
         (( c > 1 )) && line+='  '
-        cell=${(mr:$gmaxw:)texts[$gi[p]]}
+        ii=$gi[p]
+        cell=${(mr:$gmaxw:)texts[ii]}
+        cello=${#line}
         if (( gstart + p - 1 == sel )); then
-          hl+=( "$(( $#lines + 1 )) ${#line} ${#cell} standout" )
+          [[ -n $hl_sel ]] && hl+=( "$(( $#lines + 1 )) $cello ${#cell} $hl_sel" )
+        elif [[ -n $hl_mat && -n ${spanstr[ii]} ]]; then
+          # マッチ範囲(文字オフセット)。切り詰めで残った文字数にクリップする。
+          # 選択セルには適用しない(選択装飾を優先)。
+          kept=${#texts[ii]}
+          (( ${(m)#texts[ii]} > gmaxw )) && kept=${#cell}
+          for sp in ${(s:,:)spanstr[ii]}; do
+            [[ $sp == <->-<-> ]] || continue
+            ms=${sp%%-*}
+            me=${sp#*-}
+            (( me > kept )) && me=kept
+            (( ms >= me )) && continue
+            hl+=( "$(( $#lines + 1 )) $(( cello + ms )) $(( me - ms )) $hl_mat" )
+          done
         fi
         line+=$cell
       done
@@ -693,7 +730,8 @@ _zrush_render() {  # zle ウィジェット文脈からのみ呼ぶこと
   local -a f
   for e in "${(@)hl}"; do
     f=( ${=e} )
-    _zrush_rh_add $(( lstart[$f[1]] + f[2] )) $(( lstart[$f[1]] + f[2] + f[3] )) $f[4]
+    # spec は 4 語目以降(ユーザー設定の spec が空白を含んでも壊さない)
+    _zrush_rh_add $(( lstart[$f[1]] + f[2] )) $(( lstart[$f[1]] + f[2] + f[3] )) "${(j: :)f[4,-1]}"
   done
   _zrush_listing=1
   _zlog "render: $#lines lines shown=$#_zrush_shown selected=$_zrush_selected"

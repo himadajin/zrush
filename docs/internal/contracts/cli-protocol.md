@@ -5,7 +5,8 @@ zrush.zsh(zsh 側)と `zrush` バイナリ(Rust 側)の入出力仕様。
 
 ## プロトコル版
 
-- **PROTOCOL_VERSION = 1**
+- **PROTOCOL_VERSION = 2**(v2: `zrush match` の出力に候補ごとのマッチ位置フィールドを追加。
+  002-display-layer のマッチ箇所ハイライト用)
 - `zrush config` の出力に `ZRUSH_PROTOCOL_VERSION` が含まれる。
   zrush.zsh は自身が期待する版番号と照合し、不一致なら警告を 1 回表示して動作は継続する
   (git pull 後の rebuild し忘れ検知)。
@@ -72,11 +73,23 @@ zrush match --query <fuzzy-query> \
 
 ### stdout(結果)
 
-先頭に共通接頭辞フィールド、続いてランク順(良い順)に上位 `max-lines` 件の `index`:
+先頭に共通接頭辞フィールド、続いてランク順(良い順)に上位 `max-lines` 件の
+`index` と `match-spans` の組:
 
 ```
-<common-prefix> NUL <index> NUL <index> NUL ...
+<common-prefix> NUL <index> NUL <match-spans> NUL <index> NUL <match-spans> NUL ...
 ```
+
+- `match-spans`: その候補の match-text 中でクエリがマッチした範囲のリスト。
+  形式は `開始-終了` を `,` で連結(例: `0-2,4-6`)。
+  - オフセットは **文字単位**(match-text を lossy UTF-8 解釈したときの
+    Unicode スカラー値の並びに対する 0 始まり・終端排他)。
+    zsh 側の文字インデックスと一致させるための選択で、
+    不正 UTF-8 バイトを含む候補では双方の解釈差によりズレ得る(ベストエフォート)。
+  - 範囲はソート済み・重複なし・隣接はマージ済み。
+  - 空フィールド = 位置情報なし(空クエリなど)。ハイライトしない。
+  - zsh 側は match-text をそのまま表示している場合のみ使う
+    (display-text 表示時は適用しない。切り詰め時は範囲を表示長にクリップする)。
 
 - `common-prefix`: **全マッチ候補**(max-lines 打ち切り前)の match-text の
   バイト単位最長共通接頭辞。マッチ 0 件・共通部分なしのときは空フィールド。
@@ -86,6 +99,7 @@ zrush match --query <fuzzy-query> \
   (typo マッチではクエリと乖離した接頭辞になり得るため、入力を縮める・別文字列に置き換える挿入はしない。
   条件を満たさない Tab は何もしない)。詳細挙動仕様は M4 で specs に昇格する。
 - マッチ 0 件なら `common-prefix`(空)のみ出力(exit 0)。
+- 総フィールド数は `1 + 2 × 件数`(共通接頭辞 + index/match-spans の組)。
 - 総マッチ件数は返さない(「+truncated 表示」を導入するときに版番号を上げて拡張する)。
 
 ### マッチング・ランキングの意味論
@@ -136,7 +150,7 @@ zrush config
 ### stdout(zsh source 形式)
 
 ```zsh
-typeset -g  ZRUSH_PROTOCOL_VERSION='1'
+typeset -g  ZRUSH_PROTOCOL_VERSION='2'
 typeset -g  ZRUSH_CFG_MAX_LINES='10'
 typeset -g  ZRUSH_CFG_DELAY_MS='50'
 typeset -g  ZRUSH_CFG_MIN_INPUT='0'
@@ -144,6 +158,9 @@ typeset -g  ZRUSH_CFG_MODE='typo'
 typeset -g  ZRUSH_CFG_SMART_CASE='true'
 typeset -g  ZRUSH_CFG_TAB='menu'
 typeset -g  ZRUSH_CFG_TRAILING_SPACE='true'
+typeset -g  ZRUSH_CFG_HL_SELECTED='standout'
+typeset -g  ZRUSH_CFG_HL_MATCH='underline'
+typeset -g  ZRUSH_CFG_HL_HEADING='bold'
 typeset -ga ZRUSH_CFG_KEYBINDS=(
   'select-next'  'key:down'
   'select-prev'  'key:up'

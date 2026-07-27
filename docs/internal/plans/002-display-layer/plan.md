@@ -94,13 +94,13 @@ M5 の完了判定・ドッグフーディング記録は 001 側(`notes-dogfood
   - 値は zsh の highlight 指定文字列(region_highlight の spec: `standout`, `fg=blue,bold` など)を
     そのまま受け渡す。Rust の検証は「文字列であること」まで、解釈は zle に委ねる
     (不正 spec は zle が無視する。検証規則の詳細は D4 で config-schema.md に確定)。
-  - キーの絵姿(既定値は実装時に見た目で確定):
+  - キーと既定値(D4 で確定。配色に依存しない属性系を既定にする):
 
     ```toml
     [display.highlight]
-    selected = "standout"      # 選択行
-    match    = "fg=blue"       # マッチ箇所
-    heading  = "fg=green"      # グループ見出し
+    selected = "standout"      # 選択セル
+    match    = "underline"     # マッチ箇所(選択セルには適用しない)
+    heading  = "bold"          # グループ見出し
     ```
 
 - **打鍵遅延の切り分け** — 差し替え完了後に計測で行う(体感の混入源である描画空白を先に除く)。
@@ -180,5 +180,4 @@ M5 の完了判定・ドッグフーディング記録は 001 側(`notes-dogfood
 ## 未解決事項(実装中に判断)
 
 - zsh 5.8(memo= なし)+ z-sy-h 併用時のハイライト劣化の扱い — 5.8 実機確認時に決定。
-- `[display.highlight]` の既定値と検証規則の詳細 — D4 で config-schema.md に確定。
 - 打鍵遅延の修正方式(タイマー常駐化ほか)— D5 の計測後に決定。

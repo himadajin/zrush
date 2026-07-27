@@ -14,6 +14,20 @@
 | `delay-ms` | 整数 | `50` | 0〜10000 | バッファ変化から収集開始までのデバウンス遅延 |
 | `min-input` | 整数 | `0` | 0〜100 | 一覧表示を開始する現在語の最小文字数(空バッファは常に対象外) |
 
+## [display.highlight]
+
+一覧の装飾。値は zsh の highlight 指定文字列(`region_highlight` の spec:
+`standout`, `bold`, `underline`, `fg=blue,bold` など)をそのまま zsh へ渡す。
+
+| キー | 型 | 既定値 | 意味 |
+|---|---|---|---|
+| `selected` | 文字列 | `"standout"` | 選択中セルの装飾 |
+| `match` | 文字列 | `"underline"` | マッチ箇所の装飾(match-text 表示時のみ。選択中セルには適用しない) |
+| `heading` | 文字列 | `"bold"` | グループ見出し行の装飾 |
+
+- 検証は「文字列であること」まで。spec の解釈は zle に委ねる(不正な spec は zle が無視する)。
+- **空文字列は「装飾なし」**(region_highlight エントリを追加しない)。
+
 ## [matching]
 
 | キー | 型 | 既定値 | 制約 | 意味 |

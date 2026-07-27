@@ -64,6 +64,9 @@ expect() {  # $1=glob $2=timeout(s)
       EXPECT_BUF+=$chunk
       TRANSCRIPT+=$chunk
       [[ $EXPECT_BUF == ${~pat} ]] && return 0
+      # マッチ箇所ハイライト等の SGR が語の途中に挟まるため、SGR を
+      # 剥がした形でも照合する(生パターン指定のテストは上で先に通る)
+      [[ ${EXPECT_BUF//$'\e['[0-9;]#m/} == ${~pat} ]] && return 0
     fi
   done
   return 1
@@ -476,6 +479,36 @@ log_count() {  # $1=固定文字列 → REPLY: ZRUSH_LOG 内の出現回数
     ok "(d3-1b) git サブコマンドに見出し 'main porcelain command' が付く"
   else
     ng "(d3-1b) git サブコマンドの見出しが出ない"
+  fi
+  clear_line
+  drain 0.3
+
+  # ---------------- (d4-1) マッチ箇所ハイライトと [display.highlight] ----------------
+  TRANSCRIPT=
+  send_keys 'ls docs/inte'
+  expect '*internal*' 10 >/dev/null
+  drain 0.3
+  # 既定 match="underline": vt100 の smul = \e[4m がマッチ箇所に出る
+  if [[ $TRANSCRIPT == *$'\e[4m'* ]]; then
+    ok "(d4-1a) マッチ箇所の underline(SGR 4)が pty 出力に現れる"
+  else
+    ng "(d4-1a) underline 列が pty 出力に見えない"
+  fi
+  clear_line
+  drain 0.3
+  # match = "" で装飾なしに変更 → 自動反映で underline が消える
+  command sleep 1.1
+  print -r -- $'[display.highlight]\nmatch = ""' > $XDG_CONFIG_HOME/zrush/config.toml
+  send_line ': cfg-hl'
+  sync_prompt
+  TRANSCRIPT=
+  send_keys 'ls docs/inte'
+  expect '*internal*' 10 >/dev/null
+  drain 0.3
+  if [[ $TRANSCRIPT != *$'\e[4m'* ]]; then
+    ok "(d4-1b) match=\"\" の自動反映で underline が消える"
+  else
+    ng "(d4-1b) match=\"\" 後も underline が出ている"
   fi
   clear_line
   drain 0.3

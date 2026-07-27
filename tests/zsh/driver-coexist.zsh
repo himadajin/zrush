@@ -133,6 +133,9 @@ expect() {
       EXPECT_BUF+=$chunk
       TRANSCRIPT+=$chunk
       [[ $EXPECT_BUF == ${~pat} ]] && return 0
+      # マッチ箇所ハイライト等の SGR が語の途中に挟まるため、SGR を
+      # 剥がした形でも照合する(生パターン指定のテストは上で先に通る)
+      [[ ${EXPECT_BUF//$'\e['[0-9;]#m/} == ${~pat} ]] && return 0
     fi
   done
   return 1

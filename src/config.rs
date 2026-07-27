@@ -13,7 +13,7 @@ use crate::keybind;
 use crate::matching::Mode;
 
 /// Protocol version emitted as ZRUSH_PROTOCOL_VERSION (cli-protocol.md).
-pub const PROTOCOL_VERSION: &str = "1";
+pub const PROTOCOL_VERSION: &str = "2";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TabBehavior {
@@ -48,6 +48,11 @@ pub struct Config {
     pub max_lines: u32,
     pub delay_ms: u32,
     pub min_input: u32,
+    // [display.highlight] — zsh region_highlight specs, passed through
+    // verbatim; empty string = no decoration (config-schema.md).
+    pub hl_selected: String,
+    pub hl_match: String,
+    pub hl_heading: String,
     // [matching]
     pub mode: Mode,
     pub smart_case: bool,
@@ -65,6 +70,9 @@ impl Default for Config {
             max_lines: 10,
             delay_ms: 50,
             min_input: 0,
+            hl_selected: "standout".into(),
+            hl_match: "underline".into(),
+            hl_heading: "bold".into(),
             mode: Mode::Typo,
             smart_case: true,
             tab: TabBehavior::Menu,
@@ -174,6 +182,36 @@ fn apply_key(
     warnings: &mut Vec<String>,
 ) {
     match (table, key) {
+        ("display", "highlight") => {
+            let Some(sub) = val.as_table() else {
+                warnings.push(format!(
+                    "config: [display.highlight]: expected a table, got {}; using defaults",
+                    fmt_got(val)
+                ));
+                return;
+            };
+            for (k, v) in sub {
+                let target = match k.as_str() {
+                    "selected" => &mut cfg.hl_selected,
+                    "match" => &mut cfg.hl_match,
+                    "heading" => &mut cfg.hl_heading,
+                    _ => {
+                        warnings.push(format!(
+                            "config: [display.highlight] unknown key \"{k}\"; ignoring"
+                        ));
+                        continue;
+                    }
+                };
+                if let Some(s) = v.as_str() {
+                    *target = s.to_string();
+                } else {
+                    warnings.push(format!(
+                        "config: [display.highlight] {k}: expected string, got {}; using default \"{target}\"",
+                        fmt_got(v)
+                    ));
+                }
+            }
+        }
         ("display", "max-lines") => cfg.max_lines = int_val(val, table, key, 1, 1000, 10, warnings),
         ("display", "delay-ms") => cfg.delay_ms = int_val(val, table, key, 0, 10000, 50, warnings),
         ("display", "min-input") => cfg.min_input = int_val(val, table, key, 0, 100, 0, warnings),
@@ -286,7 +324,7 @@ pub fn to_zsh(result: &LoadResult) -> String {
     use std::fmt::Write as _;
     let c = &result.config;
     let mut o = String::new();
-    let scalars: [(&str, String); 8] = [
+    let scalars: [(&str, String); 11] = [
         ("ZRUSH_PROTOCOL_VERSION", PROTOCOL_VERSION.to_string()),
         ("ZRUSH_CFG_MAX_LINES", c.max_lines.to_string()),
         ("ZRUSH_CFG_DELAY_MS", c.delay_ms.to_string()),
@@ -295,6 +333,9 @@ pub fn to_zsh(result: &LoadResult) -> String {
         ("ZRUSH_CFG_SMART_CASE", c.smart_case.to_string()),
         ("ZRUSH_CFG_TAB", c.tab.as_str().to_string()),
         ("ZRUSH_CFG_TRAILING_SPACE", c.trailing_space.to_string()),
+        ("ZRUSH_CFG_HL_SELECTED", c.hl_selected.clone()),
+        ("ZRUSH_CFG_HL_MATCH", c.hl_match.clone()),
+        ("ZRUSH_CFG_HL_HEADING", c.hl_heading.clone()),
     ];
     for (name, value) in &scalars {
         let _ = writeln!(o, "typeset -g  {name}={}", sq(value));
@@ -326,6 +367,9 @@ mod tests {
         assert_eq!(c.max_lines, 10);
         assert_eq!(c.delay_ms, 50);
         assert_eq!(c.min_input, 0);
+        assert_eq!(c.hl_selected, "standout");
+        assert_eq!(c.hl_match, "underline");
+        assert_eq!(c.hl_heading, "bold");
         assert_eq!(c.mode, Mode::Typo);
         assert!(c.smart_case);
         assert_eq!(c.tab, TabBehavior::Menu);
@@ -359,6 +403,11 @@ mod tests {
             delay-ms = 100
             min-input = 2
 
+            [display.highlight]
+            selected = "fg=blue,standout"
+            match = ""
+            heading = "fg=green"
+
             [matching]
             mode = "substring"
             smart-case = false
@@ -385,9 +434,45 @@ mod tests {
         assert!(!c.smart_case);
         assert_eq!(c.tab, TabBehavior::Insert);
         assert!(!c.trailing_space);
+        assert_eq!(c.hl_selected, "fg=blue,standout");
+        assert_eq!(c.hl_match, "", "empty string means no decoration");
+        assert_eq!(c.hl_heading, "fg=green");
         assert_eq!(
             c.keybinds,
             ["seq:^N", "seq:^P", "seq:^B", "seq:^F", "seq: ", "seq:^["]
+        );
+    }
+
+    #[test]
+    fn highlight_invalid_and_unknown_keys_fall_back() {
+        let r = parse("[display.highlight]\nselected = 5\nmatchh = \"bold\"\n");
+        assert_eq!(r.config.hl_selected, "standout");
+        assert_eq!(r.warnings.len(), 2);
+        assert!(
+            r.warnings.iter().any(|w| w.contains(
+                "[display.highlight] selected: expected string, got 5; using default \"standout\""
+            )),
+            "{:?}",
+            r.warnings
+        );
+        assert!(
+            r.warnings
+                .iter()
+                .any(|w| w.contains("[display.highlight] unknown key \"matchh\"; ignoring")),
+            "{:?}",
+            r.warnings
+        );
+    }
+
+    #[test]
+    fn highlight_non_table_falls_back() {
+        let r = parse("[display]\nhighlight = \"standout\"\n");
+        assert_eq!(r.config.hl_selected, "standout");
+        assert!(
+            r.warnings[0]
+                .contains("[display.highlight]: expected a table, got \"standout\"; using defaults"),
+            "{}",
+            r.warnings[0]
         );
     }
 
@@ -524,7 +609,7 @@ mod tests {
     fn default_output_matches_contract_example() {
         let out = to_zsh(&LoadResult::default());
         let expected = "\
-typeset -g  ZRUSH_PROTOCOL_VERSION='1'
+typeset -g  ZRUSH_PROTOCOL_VERSION='2'
 typeset -g  ZRUSH_CFG_MAX_LINES='10'
 typeset -g  ZRUSH_CFG_DELAY_MS='50'
 typeset -g  ZRUSH_CFG_MIN_INPUT='0'
@@ -532,6 +617,9 @@ typeset -g  ZRUSH_CFG_MODE='typo'
 typeset -g  ZRUSH_CFG_SMART_CASE='true'
 typeset -g  ZRUSH_CFG_TAB='menu'
 typeset -g  ZRUSH_CFG_TRAILING_SPACE='true'
+typeset -g  ZRUSH_CFG_HL_SELECTED='standout'
+typeset -g  ZRUSH_CFG_HL_MATCH='underline'
+typeset -g  ZRUSH_CFG_HL_HEADING='bold'
 typeset -ga ZRUSH_CFG_KEYBINDS=(
   'select-next'  'key:down'
   'select-prev'  'key:up'
