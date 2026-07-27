@@ -48,6 +48,7 @@ typeset -gi _zrush_listing=0
 
 # 描画(POSTDISPLAY + region_highlight)
 typeset -ga _zrush_rh=()      # region_highlight に足した自エントリの帳簿
+typeset -g  _zrush_rh_sel=    # うち選択ハイライトのエントリ(打鍵時に単独で外す)
 typeset -g  _zrush_hl_memo=   # zsh 5.9+ なら ' memo=zrush'
 
 # 選択・Tab 状態
@@ -325,7 +326,7 @@ _zrush_disarm_timer() {
 _zrush_rh_clear() {
   (( $#_zrush_rh )) || return 0
   if [[ -n $_zrush_hl_memo ]]; then
-    region_highlight=( "${(@)region_highlight:#*memo=zrush}" )
+    region_highlight=( "${(@)region_highlight:#*memo=zrush(|-sel)}" )
   else
     region_highlight=( "${(@)region_highlight:|_zrush_rh}" )
     local e
@@ -339,13 +340,34 @@ _zrush_rh_clear() {
     region_highlight=( "${(@)keep}" )
   fi
   _zrush_rh=()
+  _zrush_rh_sel=
   return 0
 }
 
-_zrush_rh_add() {  # $1=start $2=end $3=spec(オフセットは BUFFER 起点の文字数)
-  local e="$1 $2 $3$_zrush_hl_memo"
+# 選択ハイライトだけを外す(打鍵・カーソル移動時: 選択は解除されるが、
+# 一覧テキストと match/見出しの装飾は次の結果が来るまで残す)
+_zrush_rh_clear_sel() {
+  [[ -n $_zrush_rh_sel ]] || return 0
+  if [[ -n $_zrush_hl_memo ]]; then
+    region_highlight=( "${(@)region_highlight:#*memo=zrush-sel}" )
+  else
+    # 5.8: 値一致で外せる場合のみ(バッファ編集後は zle がオフセットを
+    # 書き換えて一致しない。その場合は次の render まで残る劣化を許容)
+    local -a _sel=( "$_zrush_rh_sel" )
+    region_highlight=( "${(@)region_highlight:|_sel}" )
+  fi
+  local -a _sel2=( "$_zrush_rh_sel" )
+  _zrush_rh=( "${(@)_zrush_rh:|_sel2}" )
+  _zrush_rh_sel=
+  return 0
+}
+
+_zrush_rh_add() {  # $1=start $2=end $3=spec [$4=memo 接尾辞(-sel)]
+                   # オフセットは BUFFER 起点の文字数
+  local e="$1 $2 $3${_zrush_hl_memo:+ memo=zrush${4:-}}"
   region_highlight+=( "$e" )
   _zrush_rh+=( "$e" )
+  [[ ${4:-} == -sel ]] && _zrush_rh_sel=$e
   return 0
 }
 
@@ -568,6 +590,11 @@ _zrush_finalize() {
 
 _zrush_render() {  # zle ウィジェット文脈からのみ呼ぶこと
   emulate -L zsh
+  # 注意: 代入なしの local 再宣言は、既に値のある変数を「name=value」と
+  # 標準出力へ表示してしまう(TYPESET_SILENT 無効時の zsh 仕様)。
+  # ウィジェット内での表示は zle 画面を壊すため、宣言はループ外に置いた上で
+  # 保険として typesetsilent を立てる。
+  setopt localoptions typesetsilent
   local -i maxl=${ZRUSH_CFG_MAX_LINES:-10}
   (( LINES > 1 && maxl > LINES - 1 )) && maxl=$(( LINES - 1 ))
   (( maxl < 1 )) && maxl=1
@@ -630,22 +657,30 @@ _zrush_render() {  # zle ウィジェット文脈からのみ呼ぶこと
   # なり得るが、行のはみ出しは起きない安全側)。
   local -a lines=() hl=()     # hl: "行番号 行内オフセット 文字数 spec"
   _zrush_shown=()
-  local -a pos_rows=() pos_gs=() pos_ge=()
+  local -a pos_rows=() pos_gs=() pos_ge=() gi=()
   local -i gut=2 budget=maxl ord p r c w
   local -i sel=$_zrush_selected
-  local head cell line
+  local -i gmaxw cols grows gcount gstart gend ii cello ms me kept
+  local head cell line sp sel_hl=
   for (( ord = 1; ord <= ng; ++ord )); do
     (( budget < 1 )) && break
-    local -a gi=( ${=gmembers[ord]} )
+    gi=( ${=gmembers[ord]} )
     head=${gheads[ord]:-}
     if [[ -n $head ]]; then
-      (( budget < 2 )) && break        # 見出し + 最低 1 行が入らなければ打ち切り
-      (( ${(m)#head} > width )) && head=${(mr:$width:)head}
-      lines+=( "$head" )
-      [[ -n $hl_head ]] && hl+=( "$#lines 0 ${#head} $hl_head" )
-      (( budget -= 1 ))
+      if (( budget >= 2 )); then
+        if (( ${(m)#head} > width )); then
+          head=${(mr:$width:)head}
+          # 全角境界の切り詰めは幅を 1 桁超え得る((mr) は切り上げ)。超えたら 1 文字落とす
+          (( ${(m)#head} > width )) && head=${(mr:$width:)head[1,-2]}
+        fi
+        lines+=( "$head" )
+        [[ -n $hl_head ]] && hl+=( "$#lines 0 ${#head} $hl_head" )
+        (( budget -= 1 ))
+      elif (( $#lines )); then
+        break   # 途中グループの見出しが予算に入らないときはここで打ち切り
+      fi        # 先頭グループ(まだ何も出ていない)なら見出しを諦めて候補だけ出す
     fi
-    local -i gmaxw=1 cols grows gcount
+    gmaxw=1
     for i in $gi; do
       w=${(m)#texts[i]}
       (( w > gmaxw )) && gmaxw=w
@@ -659,10 +694,8 @@ _zrush_render() {  # zle ウィジェット文脈からのみ呼ぶこと
     gcount=$(( cols * grows ))
     (( gcount > $#gi )) && gcount=$#gi
     cols=$(( (gcount + grows - 1) / grows ))   # 端数で余った列を詰める
-    local -i gstart=$(( $#_zrush_shown + 1 ))
-    local -i gend=$(( gstart + gcount - 1 ))
-    local -i ii cello ms me kept
-    local sp
+    gstart=$(( $#_zrush_shown + 1 ))
+    gend=$(( gstart + gcount - 1 ))
     for (( r = 1; r <= grows; ++r )); do
       line=
       for (( c = 1; c <= cols; ++c )); do
@@ -671,9 +704,12 @@ _zrush_render() {  # zle ウィジェット文脈からのみ呼ぶこと
         (( c > 1 )) && line+='  '
         ii=$gi[p]
         cell=${(mr:$gmaxw:)texts[ii]}
+        # 全角境界の切り詰めはセル幅を 1 桁超え得る。超えたら 1 文字落として再パディング
+        (( ${(m)#cell} > gmaxw )) && cell=${(mr:$gmaxw:)cell[1,-2]}
         cello=${#line}
         if (( gstart + p - 1 == sel )); then
-          [[ -n $hl_sel ]] && hl+=( "$(( $#lines + 1 )) $cello ${#cell} $hl_sel" )
+          # 選択エントリは -sel タグで別管理(打鍵時に単独で外すため)
+          [[ -n $hl_sel ]] && sel_hl="$(( $#lines + 1 )) $cello ${#cell}"
         elif [[ -n $hl_mat && -n ${spanstr[ii]} ]]; then
           # マッチ範囲(文字オフセット)。切り詰めで残った文字数にクリップする。
           # 選択セルには適用しない(選択装飾を優先)。
@@ -700,6 +736,13 @@ _zrush_render() {  # zle ウィジェット文脈からのみ呼ぶこと
     done
     (( budget -= grows ))
   done
+
+  # 行が 1 つも組めなかったら一覧なし扱い(保険。先頭グループは見出しを
+  # 諦めてでも必ず 1 行出すため、通常ここには来ない)
+  if (( $#lines == 0 )); then
+    _zrush_clear_display
+    return 0
+  fi
 
   # 予算打ち切りで選択位置が表示から漏れた場合はクランプして一度だけ組み直す
   # (通常フローでは起きない: 選択操作は前回の表示範囲でクランプ済み)
@@ -733,6 +776,10 @@ _zrush_render() {  # zle ウィジェット文脈からのみ呼ぶこと
     # spec は 4 語目以降(ユーザー設定の spec が空白を含んでも壊さない)
     _zrush_rh_add $(( lstart[$f[1]] + f[2] )) $(( lstart[$f[1]] + f[2] + f[3] )) "${(j: :)f[4,-1]}"
   done
+  if [[ -n $sel_hl ]]; then
+    f=( ${=sel_hl} )
+    _zrush_rh_add $(( lstart[$f[1]] + f[2] )) $(( lstart[$f[1]] + f[2] + f[3] )) "$hl_sel" -sel
+  fi
   _zrush_listing=1
   _zlog "render: $#lines lines shown=$#_zrush_shown selected=$_zrush_selected"
   return 0
@@ -779,11 +826,12 @@ _zrush_line_pre_redraw() {
   _zrush_last_buffer=$BUFFER
   _zrush_last_cursor=$CURSOR
   # バッファが変化したら選択・未着 Tab 予約は解除して通常フローへ。
-  # 選択ハイライトは BUFFER 起点オフセットがずれるため即外す(一覧テキストは
-  # 次の結果が来るまで残す = 空白の見えない更新)。
+  # 選択ハイライトだけ即外す(選択が解除されるため)。一覧テキストと
+  # match/見出しの装飾は次の結果が来るまで残す(空白・点滅の見えない更新。
+  # 装飾のオフセットは zle がバッファ編集に追従して書き換えるためずれない)。
   _zrush_selected=0
   _zrush_tab_pending=0
-  _zrush_rh_clear
+  _zrush_rh_clear_sel
 
   # 空バッファ(空白のみ含む)では収集も表示もしない(plan の固定挙動)
   if [[ -z ${BUFFER//[[:space:]]/} ]]; then

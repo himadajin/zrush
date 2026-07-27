@@ -480,6 +480,14 @@ log_count() {  # $1=固定文字列 → REPLY: ZRUSH_LOG 内の出現回数
   else
     ng "(d3-1b) git サブコマンドの見出しが出ない"
   fi
+  drain 0.3
+  # (d3-1c) 複数グループ + spans の render で変数表示が漏れない
+  # (回帰: 代入なしの local 再宣言は既存値を標準出力へ表示する zsh 仕様)
+  if [[ $TRANSCRIPT != *sp=* && $TRANSCRIPT != *gcount=* ]]; then
+    ok "(d3-1c) render の変数表示リーク(sp=/gcount=)がない"
+  else
+    ng "(d3-1c) render が変数を標準出力へ漏らしている(sp=/gcount= を検出)"
+  fi
   clear_line
   drain 0.3
 
