@@ -145,10 +145,12 @@ typeset -g  ZRUSH_CFG_SMART_CASE='true'
 typeset -g  ZRUSH_CFG_TAB='menu'
 typeset -g  ZRUSH_CFG_TRAILING_SPACE='true'
 typeset -ga ZRUSH_CFG_KEYBINDS=(
-  'select-next' 'key:down'
-  'select-prev' 'key:up'
-  'confirm'     'seq:^M'
-  'dismiss'     'seq:^G'
+  'select-next'  'key:down'
+  'select-prev'  'key:up'
+  'select-left'  'key:left'
+  'select-right' 'key:right'
+  'confirm'      'seq:^M'
+  'dismiss'      'seq:^G'
 )
 typeset -ga ZRUSH_CFG_WARNINGS=()
 ```

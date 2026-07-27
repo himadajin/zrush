@@ -50,8 +50,12 @@ typeset -ga _zrush_rh=()      # region_highlight に足した自エントリの�
 typeset -g  _zrush_hl_memo=   # zsh 5.9+ なら ' memo=zrush'
 
 # 選択・Tab 状態
-typeset -gi _zrush_selected=0      # 0=非選択、>0=表示行位置(1 始まり)
+typeset -gi _zrush_selected=0      # 0=非選択、>0=表示順位置(1 始まり、列優先)
 typeset -gi _zrush_tab_pending=0   # 候補未着時に Tab が押された
+typeset -gi _zrush_grid_rows=1     # 直近描画のグリッド行数(select-left/right の列ジャンプ幅)
+
+# グリッドの列数上限。取得件数の見積もり(--max-lines = max-lines × この値)と対。
+typeset -gi _ZRUSH_MAX_COLS=8
 
 # キーバインド(ディスパッチウィジェット → 前任者/アクション)
 typeset -gA _zrush_dsp_prev=() _zrush_dsp_action=() _zrush_bound=()
@@ -497,10 +501,11 @@ _zrush_finalize() {
 
   # zrush match(設定スナップショットを引数で渡す純関数。stderr は端末に流さない)
   local out
+  # 取得件数はグリッド容量の上限(max-lines 行 × 最大列数)まで
   out=$(print -rn -- "$stdin_payload" | \
         "$ZRUSH_BIN" match --query "$_zrush_fuzzy" --mode "$ZRUSH_CFG_MODE" \
                            --smart-case "$ZRUSH_CFG_SMART_CASE" \
-                           --max-lines "$ZRUSH_CFG_MAX_LINES" 2>/dev/null)
+                           --max-lines $(( ${ZRUSH_CFG_MAX_LINES:-10} * _ZRUSH_MAX_COLS )) 2>/dev/null)
   local -i rc=$?
   if (( rc != 0 )); then
     if (( ! _zrush_match_warned )); then
@@ -529,41 +534,87 @@ _zrush_finalize() {
 
 _zrush_render() {  # zle ウィジェット文脈からのみ呼ぶこと
   emulate -L zsh
-  local -a lines=()
   local -i maxl=${ZRUSH_CFG_MAX_LINES:-10}
   (( LINES > 1 && maxl > LINES - 1 )) && maxl=$(( LINES - 1 ))
   (( maxl < 1 )) && maxl=1
+  local -i width=$(( COLUMNS - 1 ))
+  (( width < 1 )) && width=1
+
+  # 表示対象(妥当 index のみ、グリッド容量の上限まで)と表示テキスト
+  local -a items=() texts=()
   local idx text
-  local -i width=$COLUMNS
-  _zrush_shown=()
   for idx in "${(@)_zrush_ranked}"; do
     [[ $idx == <-> ]] || continue
     text=${_zrush_disp[idx]:-${_zrush_match[idx]}}
     text=${text//$'\n'/ }
-    (( width > 1 && ${#text} >= width )) && text=${text[1,width-1]}
-    lines+=( "$text" )
-    _zrush_shown+=( $idx )
-    (( $#lines >= maxl )) && break
+    items+=( $idx )
+    texts+=( "$text" )
+    (( $#items >= maxl * _ZRUSH_MAX_COLS )) && break
   done
-  if (( $#lines == 0 )); then
+  if (( $#items == 0 )); then
     _zrush_clear_display
     return 0
   fi
-  (( _zrush_selected > $#lines )) && _zrush_selected=$#lines
+
+  # 列優先グリッド: 一様セル幅(候補全体の最大表示幅)。幅の計測は表示上限まで
+  # の全候補で行う(容量端数で表示から漏れる候補ぶんだけ列数が控えめになり得る
+  # が、行のはみ出しは起きない安全側)。表示幅は ${(m)#} で全角を 2 桁と数える。
+  local -i gut=2 maxw=1 i w
+  for (( i = 1; i <= $#items; ++i )); do
+    w=${(m)#texts[i]}
+    (( w > maxw )) && maxw=w
+  done
+  (( maxw > width )) && maxw=width
+  local -i cols=$(( (width + gut) / (maxw + gut) ))
+  (( cols < 1 )) && cols=1
+  (( cols > _ZRUSH_MAX_COLS )) && cols=_ZRUSH_MAX_COLS
+  local -i rows=$(( ($#items + cols - 1) / cols ))
+  (( rows > maxl )) && rows=maxl
+  local -i count=$(( cols * rows ))
+  (( count > $#items )) && count=$#items
+  cols=$(( (count + rows - 1) / rows ))   # 端数で余った列を詰める
+
+  _zrush_shown=( "${(@)items[1,count]}" )
+  _zrush_grid_rows=$rows
+  (( _zrush_selected > count )) && _zrush_selected=count
+
+  # 行の組み立て(列優先: 表示順 p は列内を下に進む)。セル本体は幅 maxw に
+  # 切り詰め/パディング。選択セルは組み立て時に文字オフセットを記録する
+  # (パディングは表示幅基準のため、オフセットは文字数で追跡するしかない)。
+  local -a lines=()
+  local -i r c p sel_line=0 sel_off=0 sel_len=0
+  local line cell
+  for (( r = 1; r <= rows; ++r )); do
+    line=
+    for (( c = 1; c <= cols; ++c )); do
+      p=$(( (c - 1) * rows + r ))
+      (( p > count )) && break
+      (( c > 1 )) && line+='  '
+      cell=${(mr:$maxw:)texts[p]}
+      if (( p == _zrush_selected )); then
+        sel_line=$r
+        sel_off=${#line}
+        sel_len=${#cell}
+      fi
+      line+=$cell
+    done
+    lines+=( "$line" )
+  done
+
   # 更新は POSTDISPLAY の置き換え(消してから描かない: 空白の見えないよう一度で差し替える)
   POSTDISPLAY=$'\n'${(pj:\n:)lines}
-  # 選択行は背景反転系ハイライトで示す(レイアウトは動かさない)
+  # 選択セルは背景反転系ハイライトで示す(レイアウトは動かさない)
   _zrush_rh_clear
-  if (( _zrush_selected > 0 )); then
+  if (( sel_line > 0 )); then
     local -i start=$(( $#BUFFER + 1 ))   # 先頭の改行 1 文字分
-    local -i li
-    for (( li = 1; li < _zrush_selected; ++li )); do
-      (( start += ${#lines[li]} + 1 ))
+    for (( r = 1; r < sel_line; ++r )); do
+      (( start += ${#lines[r]} + 1 ))
     done
-    _zrush_rh_add $start $(( start + ${#lines[_zrush_selected]} )) standout
+    (( start += sel_off ))
+    _zrush_rh_add $start $(( start + sel_len )) standout
   fi
   _zrush_listing=1
-  _zlog "render: $#lines lines selected=$_zrush_selected"
+  _zlog "render: $#lines lines cols=$cols selected=$_zrush_selected"
   return 0
 }
 
@@ -751,6 +802,18 @@ _zrush_select_move() {  # $1=+1|-1
   return 0
 }
 
+_zrush_select_hmove() {  # $1=+1|-1(列ジャンプ = ±グリッド行数。範囲外はクランプ)
+  emulate -L zsh
+  local -i new=$(( _zrush_selected + $1 * _zrush_grid_rows ))
+  (( new < 1 )) && new=1
+  (( new > $#_zrush_shown )) && new=$#_zrush_shown
+  (( new == _zrush_selected )) && return 0
+  _zrush_selected=$new
+  _zrush_render
+  _zlog "select: pos=$_zrush_selected"
+  return 0
+}
+
 # ---------------------------------------------------------------- ディスパッチ(状態依存)
 # 前任者はディスパッチ関数の本体引数として埋め込まれ、_zrush_dispatch が
 # ここへ設定する($WIDGET 参照にしないのは、z-sy-h などのウィジェットラッパーが
@@ -791,6 +854,26 @@ _zrush_action_next() {
 _zrush_action_prev() {
   if (( _zrush_selected > 0 )); then
     _zrush_select_move -1
+    return 0
+  fi
+  _zrush_call_prev
+  return 0
+}
+
+# select-left / select-right: 選択中のみ列ジャンプ。非選択時は前任者
+# (既定バインドの ← → ではカーソル移動)へフォールバックする。
+_zrush_action_left() {
+  if (( _zrush_selected > 0 )); then
+    _zrush_select_hmove -1
+    return 0
+  fi
+  _zrush_call_prev
+  return 0
+}
+
+_zrush_action_right() {
+  if (( _zrush_selected > 0 )); then
+    _zrush_select_hmove 1
     return 0
   fi
   _zrush_call_prev
@@ -877,12 +960,14 @@ _zrush_dispatch() {  # $1=action $2=前任者ウィジェット名(バインド�
   emulate -L zsh
   _zrush_dispatch_prev=${2:-}
   case ${1:-} in
-    select-next) _zrush_action_next ;;
-    select-prev) _zrush_action_prev ;;
-    confirm)     _zrush_action_confirm ;;
-    dismiss)     _zrush_action_dismiss ;;
-    tab)         _zrush_action_tab ;;
-    *)           _zrush_call_prev ;;
+    select-next)  _zrush_action_next ;;
+    select-prev)  _zrush_action_prev ;;
+    select-left)  _zrush_action_left ;;
+    select-right) _zrush_action_right ;;
+    confirm)      _zrush_action_confirm ;;
+    dismiss)      _zrush_action_dismiss ;;
+    tab)          _zrush_action_tab ;;
+    *)            _zrush_call_prev ;;
   esac
   return 0
 }
@@ -940,12 +1025,17 @@ _zrush_bind_one() {  # $1=action $2=キー列(bindkey 表記 or 生列)
 _zrush_apply_keybinds() {
   emulate -L zsh
   local -a kb=( "${(@)ZRUSH_CFG_KEYBINDS}" )
+  local -a kb_default=(
+    select-next key:down select-prev key:up
+    select-left key:left select-right key:right
+    confirm 'seq:^M' dismiss 'seq:^G'
+  )
   if (( $#kb % 2 != 0 )); then
     # 奇数長(版不整合等の異常)は配列全体を無視して既定を適用し警告(cli-protocol)
     _zrush_warn "keybinds: malformed ZRUSH_CFG_KEYBINDS (odd length $#kb); using default keybinds"
-    kb=( select-next key:down select-prev key:up confirm 'seq:^M' dismiss 'seq:^G' )
+    kb=( "${(@)kb_default}" )
   elif (( $#kb == 0 )); then
-    kb=( select-next key:down select-prev key:up confirm 'seq:^M' dismiss 'seq:^G' )
+    kb=( "${(@)kb_default}" )
   fi
   typeset -gA _zrush_new_bound=()
   local -i i

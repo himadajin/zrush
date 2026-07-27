@@ -260,10 +260,12 @@ typeset -g  ZRUSH_CFG_SMART_CASE='true'
 typeset -g  ZRUSH_CFG_TAB='menu'
 typeset -g  ZRUSH_CFG_TRAILING_SPACE='true'
 typeset -ga ZRUSH_CFG_KEYBINDS=(
-  'select-next' 'key:down'
-  'select-prev' 'key:up'
-  'confirm'     'seq:^M'
-  'dismiss'     'seq:^G'
+  'select-next'  'key:down'
+  'select-prev'  'key:up'
+  'select-left'  'key:left'
+  'select-right' 'key:right'
+  'confirm'      'seq:^M'
+  'dismiss'      'seq:^G'
 )
 typeset -ga ZRUSH_CFG_WARNINGS=()
 ";
@@ -279,7 +281,7 @@ fn config_applies_file_values() {
     let (code, out) = run_config(&dir);
     assert_eq!(code, 0);
     assert!(out.contains("ZRUSH_CFG_MAX_LINES='5'"), "{out}");
-    assert!(out.contains("'select-next' 'seq:^N'"), "{out}");
+    assert!(out.contains("'select-next'  'seq:^N'"), "{out}");
     assert!(out.contains("ZRUSH_CFG_WARNINGS=()"), "{out}");
 }
 
@@ -313,8 +315,8 @@ fn config_keybind_duplicate_after_normalization() {
     let dir = xdg_dir("dup", Some("[keybind]\ndismiss = \"ctrl-m\"\n"));
     let (code, out) = run_config(&dir);
     assert_eq!(code, 0);
-    assert!(out.contains("'confirm'     'seq:^M'"), "{out}");
-    assert!(out.contains("'dismiss'     'seq:^G'"), "{out}");
+    assert!(out.contains("'confirm'      'seq:^M'"), "{out}");
+    assert!(out.contains("'dismiss'      'seq:^G'"), "{out}");
     assert!(out.contains("same key after normalization"), "{out}");
 }
 

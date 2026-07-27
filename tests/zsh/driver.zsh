@@ -36,6 +36,9 @@ export LC_ALL=en_US.UTF-8   # POSTDISPLAY の印字可能判定を実利用と�
 export HOME=$PLAYGROUND    # ~ 保持テスト用(実ホームに触れない)
 # 部分パス略記(接頭辞不一致置換)テスト用の固定ツリー
 mkdir -p $PLAYGROUND/pp/usr/local/bin $PLAYGROUND/pp/usr/share/doc
+# グリッド表示テスト用の短名 30 件(a01..a30 → 8 列 × 4 行になる幅)
+mkdir -p $PLAYGROUND/gd
+for _gi in {01..30}; do : >| $PLAYGROUND/gd/a$_gi; done
 export ZRUSH_REPO=$REPO
 export ZRUSH_TEST_TMP=$WORK
 export ZDOTDIR=$WORK/zdot
@@ -424,6 +427,37 @@ log_count() {  # $1=固定文字列 → REPLY: ZRUSH_LOG 内の出現回数
     ng "(m4-10a) 未着時 Tab が適用されない"
   fi
   wait_log 'tab: pending' $c_pend 2 && ok "(m4-10b) pending 経路を通った" || ng "(m4-10b) pending 経路が記録されない"
+  clear_line
+  drain 0.3
+
+  # ---------------- (d2-1) 複数列グリッドと左右移動 ----------------
+  local RIGHT=$'\e[C' LEFT=$'\e[D'
+  send_keys 'ls gd/'
+  # a01..a30(2 文字語 + セル幅 3)→ 8 列 × 4 行、列優先なので行 1 は a01 a05 a09 ...
+  if expect '*a01  a05*' 10; then
+    ok "(d2-1a) 列優先グリッドで複数候補が 1 行に並ぶ(a01  a05)"
+  else
+    ng "(d2-1a) グリッド行が確認できない"
+  fi
+  log_count 'render: 4 lines cols=8'
+  if (( REPLY > 0 )); then
+    ok "(d2-1b) 30 件が 8 列 × 4 行に収まる"
+  else
+    ng "(d2-1b) グリッド形状が期待と違う(render: 4 lines cols=8 がログにない)"
+  fi
+  log_count 'select: pos=5'; local -i c_gp5=$REPLY
+  send_keys $DOWN            # 選択開始(pos=1)
+  drain 0.3
+  send_keys $RIGHT           # 右の列へ = +rows(4)
+  wait_log 'select: pos=5' $c_gp5 3 && ok "(d2-1c) → で右の列へ(pos 1→5)" || ng "(d2-1c) 列ジャンプしない"
+  log_count 'select: pos=1'; local -i c_gp1=$REPLY
+  send_keys $LEFT
+  wait_log 'select: pos=1' $c_gp1 3 && ok "(d2-1d) ← で左の列へ戻る(pos 5→1)" || ng "(d2-1d) 左ジャンプしない"
+  press $CTRLG
+  # 非選択時の ← は前任者チェーン(カーソル移動)へフォールバックする
+  log_count 'dispatch: fallback'; local -i c_gfb=$REPLY
+  send_keys $LEFT
+  wait_log 'dispatch: fallback' $c_gfb 3 && ok "(d2-1e) 非選択時の ← は前任者へフォールバック" || ng "(d2-1e) 非選択 ← が奪われている"
   clear_line
   drain 0.3
 

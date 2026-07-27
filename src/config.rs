@@ -56,7 +56,7 @@ pub struct Config {
     pub trailing_space: bool,
     // [keybind] — normalized seq:/key: specs, index-aligned with
     // keybind::ACTIONS.
-    pub keybinds: [String; 4],
+    pub keybinds: [String; keybind::N],
 }
 
 impl Default for Config {
@@ -131,7 +131,7 @@ pub fn parse(source: &str) -> LoadResult {
     };
 
     let mut cfg = Config::default();
-    let mut kb_user: [Option<String>; 4] = [const { None }; 4];
+    let mut kb_user: [Option<String>; keybind::N] = Default::default();
 
     for (tname, tval) in &table {
         match tname.as_str() {
@@ -167,7 +167,7 @@ pub fn parse(source: &str) -> LoadResult {
 
 fn apply_key(
     cfg: &mut Config,
-    kb_user: &mut [Option<String>; 4],
+    kb_user: &mut [Option<String>; keybind::N],
     table: &str,
     key: &str,
     val: &toml::Value,
@@ -301,7 +301,7 @@ pub fn to_zsh(result: &LoadResult) -> String {
     }
     o.push_str("typeset -ga ZRUSH_CFG_KEYBINDS=(\n");
     for (action, spec) in keybind::ACTIONS.iter().zip(&c.keybinds) {
-        let _ = writeln!(o, "  {:<13} {}", sq(action), sq(spec));
+        let _ = writeln!(o, "  {:<14} {}", sq(action), sq(spec));
     }
     o.push_str(")\n");
     if result.warnings.is_empty() {
@@ -330,7 +330,17 @@ mod tests {
         assert!(c.smart_case);
         assert_eq!(c.tab, TabBehavior::Menu);
         assert!(c.trailing_space);
-        assert_eq!(c.keybinds, ["key:down", "key:up", "seq:^M", "seq:^G"]);
+        assert_eq!(
+            c.keybinds,
+            [
+                "key:down",
+                "key:up",
+                "key:left",
+                "key:right",
+                "seq:^M",
+                "seq:^G"
+            ]
+        );
     }
 
     #[test]
@@ -360,6 +370,8 @@ mod tests {
             [keybind]
             select-next = "ctrl-n"
             select-prev = "ctrl-p"
+            select-left = "ctrl-b"
+            select-right = "ctrl-f"
             confirm = "space"
             dismiss = "escape"
             "#,
@@ -373,7 +385,10 @@ mod tests {
         assert!(!c.smart_case);
         assert_eq!(c.tab, TabBehavior::Insert);
         assert!(!c.trailing_space);
-        assert_eq!(c.keybinds, ["seq:^N", "seq:^P", "seq: ", "seq:^["]);
+        assert_eq!(
+            c.keybinds,
+            ["seq:^N", "seq:^P", "seq:^B", "seq:^F", "seq: ", "seq:^["]
+        );
     }
 
     #[test]
@@ -518,10 +533,12 @@ typeset -g  ZRUSH_CFG_SMART_CASE='true'
 typeset -g  ZRUSH_CFG_TAB='menu'
 typeset -g  ZRUSH_CFG_TRAILING_SPACE='true'
 typeset -ga ZRUSH_CFG_KEYBINDS=(
-  'select-next' 'key:down'
-  'select-prev' 'key:up'
-  'confirm'     'seq:^M'
-  'dismiss'     'seq:^G'
+  'select-next'  'key:down'
+  'select-prev'  'key:up'
+  'select-left'  'key:left'
+  'select-right' 'key:right'
+  'confirm'      'seq:^M'
+  'dismiss'      'seq:^G'
 )
 typeset -ga ZRUSH_CFG_WARNINGS=()
 ";
