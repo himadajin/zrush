@@ -59,9 +59,9 @@ pub struct Config {
     // [insert]
     pub tab: TabBehavior,
     pub trailing_space: bool,
-    // [keybind] — normalized seq:/key: specs, index-aligned with
-    // keybind::ACTIONS.
-    pub keybinds: [String; keybind::N],
+    // [keybind] — normalized seq:/key: spec lists (one action may bind
+    // several keys), index-aligned with keybind::ACTIONS.
+    pub keybinds: [Vec<String>; keybind::N],
 }
 
 impl Default for Config {
@@ -139,7 +139,7 @@ pub fn parse(source: &str) -> LoadResult {
     };
 
     let mut cfg = Config::default();
-    let mut kb_user: [Option<String>; keybind::N] = Default::default();
+    let mut kb_user: [Option<Vec<String>>; keybind::N] = Default::default();
 
     for (tname, tval) in &table {
         match tname.as_str() {
@@ -175,7 +175,7 @@ pub fn parse(source: &str) -> LoadResult {
 
 fn apply_key(
     cfg: &mut Config,
-    kb_user: &mut [Option<String>; keybind::N],
+    kb_user: &mut [Option<Vec<String>>; keybind::N],
     table: &str,
     key: &str,
     val: &toml::Value,
@@ -243,14 +243,29 @@ fn apply_key(
         }
         ("keybind", _) => {
             if let Some(i) = keybind::ACTIONS.iter().position(|a| *a == key) {
-                if let Some(s) = val.as_str() {
-                    kb_user[i] = Some(s.to_string());
-                } else {
-                    warnings.push(format!(
-                        "config: [keybind] {key}: expected string, got {}; using default \"{}\"",
-                        fmt_got(val),
-                        keybind::DEFAULT_NOTATIONS[i]
-                    ));
+                // string = one-element list; array = key list (schema).
+                match val {
+                    toml::Value::String(s) => kb_user[i] = Some(vec![s.clone()]),
+                    toml::Value::Array(items) => {
+                        let mut list = Vec::with_capacity(items.len());
+                        for item in items {
+                            if let Some(s) = item.as_str() {
+                                list.push(s.to_string());
+                            } else {
+                                warnings.push(format!(
+                                    "config: [keybind] {key}: expected string element, got {}; ignoring this element",
+                                    fmt_got(item)
+                                ));
+                            }
+                        }
+                        kb_user[i] = Some(list);
+                    }
+                    _ => {
+                        warnings.push(format!(
+                            "config: [keybind] {key}: expected string or array of strings, got {}; using default",
+                            fmt_got(val)
+                        ));
+                    }
                 }
             } else {
                 warnings.push(format!("config: [{table}] unknown key \"{key}\"; ignoring"));
@@ -341,8 +356,10 @@ pub fn to_zsh(result: &LoadResult) -> String {
         let _ = writeln!(o, "typeset -g  {name}={}", sq(value));
     }
     o.push_str("typeset -ga ZRUSH_CFG_KEYBINDS=(\n");
-    for (action, spec) in keybind::ACTIONS.iter().zip(&c.keybinds) {
-        let _ = writeln!(o, "  {:<14} {}", sq(action), sq(spec));
+    for (action, specs) in keybind::ACTIONS.iter().zip(&c.keybinds) {
+        for spec in specs {
+            let _ = writeln!(o, "  {:<14} {}", sq(action), sq(spec));
+        }
     }
     o.push_str(")\n");
     if result.warnings.is_empty() {
@@ -374,17 +391,7 @@ mod tests {
         assert!(c.smart_case);
         assert_eq!(c.tab, TabBehavior::Menu);
         assert!(c.trailing_space);
-        assert_eq!(
-            c.keybinds,
-            [
-                "key:down",
-                "key:up",
-                "key:left",
-                "key:right",
-                "seq:^M",
-                "seq:^G"
-            ]
-        );
+        assert_eq!(c.keybinds, keybind::default_specs());
     }
 
     #[test]
@@ -417,10 +424,9 @@ mod tests {
             trailing-space = false
 
             [keybind]
-            select-next = "ctrl-n"
-            select-prev = "ctrl-p"
-            select-left = "ctrl-b"
-            select-right = "ctrl-f"
+            select-next = ["ctrl-j", "j"]
+            select-prev = "ctrl-k"
+            select-left = []
             confirm = "space"
             dismiss = "escape"
             "#,
@@ -437,9 +443,27 @@ mod tests {
         assert_eq!(c.hl_selected, "fg=blue,standout");
         assert_eq!(c.hl_match, "", "empty string means no decoration");
         assert_eq!(c.hl_heading, "fg=green");
-        assert_eq!(
-            c.keybinds,
-            ["seq:^N", "seq:^P", "seq:^B", "seq:^F", "seq: ", "seq:^["]
+        // array, bare string (= one-element list), explicit empty list,
+        // and an untouched action keeping its multi-key default
+        assert_eq!(c.keybinds[0], vec!["seq:^J", "seq:j"]);
+        assert_eq!(c.keybinds[1], vec!["seq:^K"]);
+        assert!(c.keybinds[2].is_empty());
+        assert_eq!(c.keybinds[3], vec!["key:right", "seq:^F"]);
+        assert_eq!(c.keybinds[4], vec!["seq: "]);
+        assert_eq!(c.keybinds[5], vec!["seq:^["]);
+    }
+
+    #[test]
+    fn keybind_array_with_non_string_element_drops_only_that_element() {
+        let r = parse("[keybind]\nselect-next = [\"ctrl-j\", 5]\n");
+        assert_eq!(r.config.keybinds[0], vec!["seq:^J"]);
+        assert_eq!(r.warnings.len(), 1);
+        assert!(
+            r.warnings[0].contains(
+                "[keybind] select-next: expected string element, got 5; ignoring this element"
+            ),
+            "{}",
+            r.warnings[0]
         );
     }
 
@@ -576,8 +600,9 @@ mod tests {
         let r = parse("[keybind]\nconfirm = 5\n");
         assert_eq!(r.config.keybinds, keybind::default_specs());
         assert!(
-            r.warnings[0]
-                .contains("[keybind] confirm: expected string, got 5; using default \"enter\""),
+            r.warnings[0].contains(
+                "[keybind] confirm: expected string or array of strings, got 5; using default"
+            ),
             "{}",
             r.warnings[0]
         );
@@ -622,9 +647,13 @@ typeset -g  ZRUSH_CFG_HL_MATCH='underline'
 typeset -g  ZRUSH_CFG_HL_HEADING='bold'
 typeset -ga ZRUSH_CFG_KEYBINDS=(
   'select-next'  'key:down'
+  'select-next'  'seq:^N'
   'select-prev'  'key:up'
+  'select-prev'  'seq:^P'
   'select-left'  'key:left'
+  'select-left'  'seq:^B'
   'select-right' 'key:right'
+  'select-right' 'seq:^F'
   'confirm'      'seq:^M'
   'dismiss'      'seq:^G'
 )

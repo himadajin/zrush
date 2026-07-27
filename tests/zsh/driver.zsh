@@ -465,6 +465,28 @@ log_count() {  # $1=固定文字列 → REPLY: ZRUSH_LOG 内の出現回数
   clear_line
   drain 0.3
 
+  # ---------------- (kb-1) emacs 系の既定キー(ctrl-n/p/b/f)----------------
+  send_keys 'ls gd/'
+  expect '*a01  a05*' 10 >/dev/null
+  log_count 'select: start'; local -i c_kbs=$REPLY
+  send_keys $'\C-n'
+  wait_log 'select: start' $c_kbs 3 && ok "(kb-1a) ctrl-n で選択開始(↓ と同じ優先順位規則)" || ng "(kb-1a) ctrl-n で選択が始まらない"
+  log_count 'select: pos=5'; local -i c_kb5=$REPLY
+  send_keys $'\C-f'
+  wait_log 'select: pos=5' $c_kb5 3 && ok "(kb-1b) ctrl-f で右の列へ(pos 1→5)" || ng "(kb-1b) ctrl-f が効かない"
+  log_count 'select: pos=1'; local -i c_kb1=$REPLY
+  send_keys $'\C-b'
+  wait_log 'select: pos=1' $c_kb1 3 && ok "(kb-1c) ctrl-b で左の列へ(pos 5→1)" || ng "(kb-1c) ctrl-b が効かない"
+  log_count 'select: released-at-top'; local -i c_kbr=$REPLY
+  send_keys $'\C-p'
+  wait_log 'select: released-at-top' $c_kbr 3 && ok "(kb-1d) 先頭で ctrl-p → 選択解除(↑ と同じ)" || ng "(kb-1d) ctrl-p で解除されない"
+  # 非選択時の ctrl-p は前任者(履歴)へフォールバック
+  log_count 'dispatch: fallback'; local -i c_kbf=$REPLY
+  send_keys $'\C-p'
+  wait_log 'dispatch: fallback' $c_kbf 3 && ok "(kb-1e) 非選択時の ctrl-p は前任者へフォールバック" || ng "(kb-1e) 非選択 ctrl-p が奪われている"
+  clear_line
+  drain 0.3
+
   # ---------------- (d3-1) グループ見出し ----------------
   send_keys 'ls docs/inte'
   if expect '*file*internal*' 10; then

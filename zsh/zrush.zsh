@@ -1198,8 +1198,10 @@ _zrush_apply_keybinds() {
   emulate -L zsh
   local -a kb=( "${(@)ZRUSH_CFG_KEYBINDS}" )
   local -a kb_default=(
-    select-next key:down select-prev key:up
-    select-left key:left select-right key:right
+    select-next  key:down  select-next  'seq:^N'
+    select-prev  key:up    select-prev  'seq:^P'
+    select-left  key:left  select-left  'seq:^B'
+    select-right key:right select-right 'seq:^F'
     confirm 'seq:^M' dismiss 'seq:^G'
   )
   if (( $#kb % 2 != 0 )); then

@@ -49,6 +49,9 @@ zsh-autocomplete を無効化し zrush に切り替えた日常利用(mac + Linu
 
 - 状況: 選択中に ctrl+p / ctrl+n を押しても候補移動にならない(既定は ↑↓ のみ)。
 - 期待と実際: 手癖では上下移動は ctrl+p/n であり、既定で ↑↓ と同様に選択移動に効いてほしい。config の `[keybind]` で変えられるだけでは不足(既定値の問題)。使用をためらうレベル。
+- 対処: `[keybind]` を 1 アクション複数キー(文字列 / 配列)に拡張し、既定を
+  `["down","ctrl-n"]` / `["up","ctrl-p"]`(select-left/right も `ctrl-b`/`ctrl-f` を追加)へ変更
+  (`feat(keybind): multi-key actions with emacs-style defaults`)。体感確認待ち。
 
 ### 2026-07-27 / mac — 候補が縦一列で走査しづらい
 
