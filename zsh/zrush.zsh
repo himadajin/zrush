@@ -41,6 +41,7 @@ typeset -gi _zrush_last_cursor=-1
 
 # 受信結果(選択・確定でも使う: レコード原本と挿入形を保持する)
 typeset -ga _zrush_recs=() _zrush_krecs=() _zrush_words=() _zrush_match=() _zrush_disp=()
+typeset -g  _zrush_payload=   # `zrush match` 用 stdin(解析済みレコードと対で保持)
 typeset -ga _zrush_ranked=() _zrush_shown=()
 typeset -gA _zrush_spans=()   # 候補 index → match-spans(cli-protocol v2)
 typeset -g  _zrush_common_prefix=
@@ -378,6 +379,7 @@ _zrush_clear_display() {  # zle ウィジェット文脈からのみ呼ぶこと
   _zrush_rh_clear
   _zrush_listing=0
   _zrush_recs=() _zrush_krecs=() _zrush_words=() _zrush_match=() _zrush_disp=()
+  _zrush_payload=
   _zrush_ranked=() _zrush_shown=() _zrush_spans=()
   _zrush_pos_rows=() _zrush_pos_gs=() _zrush_pos_ge=()
   _zrush_common_prefix=
@@ -466,9 +468,18 @@ _zrush_finalize() {
   setopt localoptions no_monitor no_notify
   local payload=$_zrush_buf
   _zrush_buf=
-  _zrush_recs=() _zrush_words=() _zrush_match=() _zrush_disp=() _zrush_ranked=()
-  _zrush_spans=()
-  _zrush_common_prefix=
+  _zrush_parse_records "$payload"
+  _zrush_apply_results
+  return 0
+}
+
+# 収集 payload → 自前配列(krecs/words/match/disp)+ `zrush match` 用 stdin(_zrush_payload)
+_zrush_parse_records() {  # $1=収集 payload(NUL 区切りレコード列、終端 NUL)
+  emulate -L zsh
+  setopt localoptions no_monitor no_notify
+  local payload=$1
+  _zrush_recs=() _zrush_krecs=() _zrush_words=() _zrush_match=() _zrush_disp=()
+  _zrush_payload=
 
   if [[ -n $payload ]]; then
     if [[ $payload == *$'\0' ]]; then
@@ -485,7 +496,6 @@ _zrush_finalize() {
   # d フィールドが無い典型ケースは配列一括演算の高速経路で処理する
   # (30k 件で ループ ~1.6s → ~35ms を実測)。
   local -i i n=0
-  local stdin_payload=
   local -a words=() disps=() mts=()
   local NUL=$'\0'
   if [[ ${(pj::)_zrush_recs} != *$'\2'd$'\1'* ]]; then
@@ -502,7 +512,7 @@ _zrush_finalize() {
         local -a _idxs=( {1..$n} )
         local -a _mts2=( "${(@)mts/%/$NUL}" )   # 各要素末尾に空 display フィールドを畳み込む
         local -a _zip=( "${(@)_idxs:^_mts2}" )
-        stdin_payload=${(pj:\0:)_zip}$'\0'
+        _zrush_payload=${(pj:\0:)_zip}$'\0'
       fi
     else
       n=-1   # 汎用経路へ
@@ -540,10 +550,21 @@ _zrush_finalize() {
       _zrush_match+=( "$mts[i]" )
       _zrush_disp+=( "$disps[i]" )
       (( ++n ))
-      stdin_payload+="$n"$'\0'"$mts[i]"$'\0'"$disps[i]"$'\0'
+      _zrush_payload+="$n"$'\0'"$mts[i]"$'\0'"$disps[i]"$'\0'
     done
   fi
+  return 0
+}
 
+# match 実行 → 描画 → 未着 Tab の適用。入力は自前配列と _zrush_payload
+# (parse 直後とキャッシュヒット経路の両方から呼ばれる)。
+_zrush_apply_results() {
+  emulate -L zsh
+  setopt localoptions no_monitor no_notify
+  _zrush_ranked=() _zrush_spans=()
+  _zrush_common_prefix=
+
+  local -i n=$#_zrush_words
   if (( n == 0 )); then
     _zrush_render   # 0 件 → 一覧を消す
     return 0
@@ -552,7 +573,7 @@ _zrush_finalize() {
   # zrush match(設定スナップショットを引数で渡す純関数。stderr は端末に流さない)
   local out
   # 取得件数はグリッド容量の上限(max-lines 行 × 最大列数)まで
-  out=$(print -rn -- "$stdin_payload" | \
+  out=$(print -rn -- "$_zrush_payload" | \
         "$ZRUSH_BIN" match --query "$_zrush_fuzzy" --mode "$ZRUSH_CFG_MODE" \
                            --smart-case "$ZRUSH_CFG_SMART_CASE" \
                            --max-lines $(( ${ZRUSH_CFG_MAX_LINES:-10} * _ZRUSH_MAX_COLS )) 2>/dev/null)
