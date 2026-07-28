@@ -88,6 +88,31 @@ ctrl+p/n の既定キーバインドは 002 のスコープ外とし、1 アク�
 - 期待と実際: 期待は zsh-autocomplete 並みの初速。実際の打鍵→初回表示は「デバウンス 50ms + fork+compsys 収集(ファイル補完で実測 35ms、全コマンド収集はより重い)+ match 往復 ~5ms」で 100ms 超になり得る。旧 .zshrc の zsh-autocomplete も min-delay 0.05 だったため、デバウンス分は同条件で、差はデバウンス後の収集・描画にある。
 - 切り分け方針: 実環境 ZRUSH_LOG での区間計測(pre-redraw → request → finalize → render)、`delay-ms = 0` でのデバウンス寄与の確認、zsh-autocomplete との同条件比較、zsh-autocomplete の収集方式(キャッシュ等)の調査。結果次第で収集アーキテクチャの見直し(キャッシュ・常駐化 = 001 plan スコープ外の布石)を検討する。
 - 使用をためらうレベル(M5 完了条件に直接かかる)。
+- 2026-07-29 計測(`tests/zsh/driver-latency.zsh`。中央値。min=隔離、real=実 .zshrc):
+
+  | ケース | first-paint(min / real) | 内訳 debounce / spawn / compsys / match+他 |
+  |---|---|---|
+  | コマンド名(whic・cla) | 192ms / 222ms | 52 / 7〜22 / **92〜107** / 15〜30 |
+  | ファイル(docs/inte) | 114ms / 115ms | 52 / 11〜16 / 16〜19 / ~10 |
+  | git サブコマンド(git chec) | 239ms / 236ms | 52 / 7〜11 / 133〜139 / ~15 |
+
+  - real ≈ min(実 rc は RSS 7.5MB と軽く fork 影響なし)。`delay-ms = 0` は cmd/git で
+    ~30ms 短縮、file は不変(連打時はキー処理パスに収集開始コストが乗るため、
+    デバウンス全廃は逆効果面あり)。履歴ガードレール(ハッシュ不変)確認済み。
+- zsh-autocomplete との突き合わせ: ヘッドレスホストでは ZAC ワーカーの compadd ラッパーが
+  parse error で全滅し実測不能(ZAC 自身のログで確認。実端末利用日はエラー 0)。
+  ソース読解では ZAC も「デバウンス(既定 0.05s、**計測 overhead を減算**)→ fork →
+  内部 zpty で compsys」の同型アーキテクチャで、決定的な差は **ZAC は as-typed の語で
+  compsys を回す**こと(あいまい化は matcher-list 系に委ねる。001 で不採用にした方式)。
+- as-typed 模擬計測(widen を無効化した zrush): コマンド名の compsys 92ms → **16ms**
+  (広げ収集プレミアム ≈ 75ms)。git は as-typed でも 135〜145ms
+  (`_git` が語に関わらず全サブコマンドを生成するため。ZAC も同等コストのはず)。
+- **結論**: 「間」の正体は デバウンス 50ms + コマンド位置の広げ収集(空語で全コマンド名
+  ~90ms)+ zrush 固有オーバーヘッド(fifo 外部コマンド ~8ms + match 往復 5〜20ms)。
+  ファイル補完が快適なのは広げ収集が安い(ディレクトリ内列挙で as-typed と同等)ため。
+- 改善レバー(効果順): ① コマンド位置の空語収集のキャッシュ(~75〜90ms 短縮。
+  無効化条件の設計が必要 → 新プラン級) ② デバウンスの実効化(ZAC 式 overhead 減算
+  または既定引き下げ。~10〜40ms) ③ fifo の外部コマンド排除(~8ms)。
 
 ### 2026-07-28 / mac — Tab(common-prefix)が体感無反応(共通部分がほぼ出ない)
 
