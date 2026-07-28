@@ -567,6 +567,112 @@ log_count() {  # $1=固定文字列 → REPLY: ZRUSH_LOG 内の出現回数
   fi
   sync_prompt
 
+  # ================================================================ 004: 空語収集キャッシュ
+  # (cc-1) 2 回目のコマンド位置クエリでヒットし、fork なしで一覧が出る
+  clear_line
+  drain 0.5
+  log_count 'cache: saved'; local -i cc_sv=$REPLY
+  send_keys 'whic'
+  expect '*which*' 10 >/dev/null
+  wait_log 'cache: saved' $cc_sv 5 || :   # 1 回目がヒットでも可(いずれにせよ温まる)
+  clear_line
+  drain 0.5
+  log_count 'cache: hit';          local -i cc_hit=$REPLY
+  log_count 'request: collecting'; local -i cc_col=$REPLY
+  TRANSCRIPT=
+  send_keys 'whic'
+  if wait_log 'cache: hit' $cc_hit 5; then
+    ok "(cc-1a) 2 回目のコマンド位置クエリでキャッシュヒット"
+  else
+    ng "(cc-1a) キャッシュヒットが記録されない"
+  fi
+  drain 0.5
+  # wait_log の drain が pty 出力を先に消費するため、expect ではなく累積
+  # TRANSCRIPT を SGR 除去後に照合する(d4 と同じ流儀)
+  if [[ ${TRANSCRIPT//$'\e['[0-9;]#m/} == *which* ]]; then
+    ok "(cc-1b) ヒット経路でも一覧が描画される(which を確認)"
+  else
+    ng "(cc-1b) ヒット時に一覧が出ない"
+  fi
+  log_count 'request: collecting'; local -i cc_col2=$REPLY
+  if (( cc_col2 == cc_col )); then
+    ok "(cc-1c) ヒット時は収集 fork が起きない ($cc_col → $cc_col2)"
+  else
+    ng "(cc-1c) ヒットのはずが収集が走った ($cc_col → $cc_col2)"
+  fi
+  clear_line
+  drain 0.3
+
+  # (cc-2) alias 追加 → フィンガープリントミスで再収集し、新候補が一覧に出る
+  log_count 'cache: miss (fingerprint)'; local -i cc_fp=$REPLY
+  send_line 'alias zrushtestalias=ls'
+  sync_prompt
+  send_keys 'zrushtestali'
+  if expect '*zrushtestalias*' 10; then
+    ok "(cc-2a) alias 追加が次の一覧に反映される"
+  else
+    ng "(cc-2a) 追加した alias が一覧に出ない"
+  fi
+  wait_log 'cache: miss (fingerprint)' $cc_fp 3 && \
+    ok "(cc-2b) alias 追加でフィンガープリントミス" || \
+    ng "(cc-2b) fingerprint ミスが記録されない"
+  clear_line
+  drain 0.3
+
+  # (cc-3) PATH へのディレクトリ追加 → ミスして新バイナリが一覧に出る
+  mkdir -p $WORK/xbin
+  print -r -- '#!/bin/sh' > $WORK/xbin/zrushtestbin1
+  chmod +x $WORK/xbin/zrushtestbin1
+  log_count 'cache: miss (fingerprint)'; cc_fp=$REPLY
+  send_line "path+=($WORK/xbin)"
+  sync_prompt
+  send_keys 'zrushtestbin'
+  if expect '*zrushtestbin1*' 10; then
+    ok "(cc-3a) PATH 追加ディレクトリのバイナリが一覧に反映される"
+  else
+    ng "(cc-3a) PATH 追加後のバイナリが一覧に出ない"
+  fi
+  wait_log 'cache: miss (fingerprint)' $cc_fp 3 && \
+    ok "(cc-3b) PATH 変更でフィンガープリントミス" || \
+    ng "(cc-3b) PATH 変更のミスが記録されない"
+  clear_line
+  drain 0.3
+
+  # (cc-4) PATH 上の既存ディレクトリへの実行ファイル追加 → dir mtime でミスし反映
+  command sleep 1.1   # mtime 秒粒度対策
+  print -r -- '#!/bin/sh' > $WORK/xbin/zrushtestbin2
+  chmod +x $WORK/xbin/zrushtestbin2
+  log_count 'cache: miss (fingerprint)'; cc_fp=$REPLY
+  send_keys 'zrushtestbin'
+  if expect '*zrushtestbin2*' 10; then
+    ok "(cc-4a) PATH 上ディレクトリへのバイナリ追加が一覧に反映される"
+  else
+    ng "(cc-4a) 追加バイナリが一覧に出ない"
+  fi
+  wait_log 'cache: miss (fingerprint)' $cc_fp 3 && \
+    ok "(cc-4b) ディレクトリ mtime 変化でフィンガープリントミス" || \
+    ng "(cc-4b) mtime 変化のミスが記録されない"
+  clear_line
+  drain 0.3
+
+  # (cc-5) TTL 失効でミス(ホスト内で TTL を 1 秒に縮めて検証)
+  send_line '_ZRUSH_CC_TTL=1'
+  sync_prompt
+  send_keys 'whic'                 # 温め(ミスでもヒットでも保存済みになる)
+  expect '*which*' 10 >/dev/null
+  clear_line
+  drain 0.3
+  command sleep 2.5                # TTL=1s を確実に超える(秒粒度の丸め込み)
+  log_count 'cache: miss (ttl)'; local -i cc_ttl=$REPLY
+  send_keys 'whic'
+  wait_log 'cache: miss (ttl)' $cc_ttl 5 && \
+    ok "(cc-5) TTL 失効でミスし再収集する" || \
+    ng "(cc-5) TTL ミスが記録されない"
+  clear_line
+  drain 0.3
+  send_line '_ZRUSH_CC_TTL=300'
+  sync_prompt
+
   out "SUMMARY: PASS=$PASS FAIL=$FAIL"
 } always {
   zpty -d host 2>/dev/null
