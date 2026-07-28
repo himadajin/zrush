@@ -8,7 +8,7 @@
 # ホスト:
 #   min-zrush     zsh -d -i + minimal.zshrc(隔離)
 #   min-zrush-d0  同上 + delay-ms = 0(デバウンス寄与の分離)
-#   min-zac       zsh -d -i + zsh-autocomplete(min-delay 0.05 = zrush 既定と同条件)
+#   min-zac       zsh -d -i + zsh-autocomplete(min-delay 0.05 = zrush 旧既定 50ms と同条件)
 #   real-zrush    zsh -i + 実 ~/.zshrc(実環境。履歴ガードレール付き)
 #
 # 計測:
@@ -305,8 +305,8 @@ typeset -g HIST_HASH_BEFORE=
 [[ -r ~/.zsh_history ]] && HIST_HASH_BEFORE=$(shasum ~/.zsh_history 2>/dev/null)
 
 {
-  # ============ min-zrush(既定 delay 50ms)============
-  out "==== min-zrush(隔離 + 既定 delay-ms=50)===="
+  # ============ min-zrush(既定 delay 30ms)============
+  out "==== min-zrush(隔離 + 既定 delay-ms=30)===="
   if start_min_zrush min-zrush $WORK/xdg-default; then
     host_rss; out "INFO: RSS=${REPLY}KB"
     paint_break_case min-zrush "cmd 1st (whic)"   'whic'         'which'   # 初回 = キャッシュミス

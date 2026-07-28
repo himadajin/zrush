@@ -910,7 +910,7 @@ _zrush_render() {  # zle ウィジェット文脈からのみ呼ぶこと
 _zrush_arm_timer() {  # zle ウィジェット文脈
   emulate -L zsh
   _zrush_disarm_timer
-  local -i delay=${ZRUSH_CFG_DELAY_MS:-50}
+  local -i delay=${ZRUSH_CFG_DELAY_MS:-30}
   if (( delay <= 0 )); then
     _zrush_start_request
     return 0
