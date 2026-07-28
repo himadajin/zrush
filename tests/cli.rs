@@ -325,7 +325,7 @@ fn config_without_file_prints_contract_default_output() {
     let expected = "\
 typeset -g  ZRUSH_PROTOCOL_VERSION='3'
 typeset -g  ZRUSH_CFG_MAX_LINES='10'
-typeset -g  ZRUSH_CFG_DELAY_MS='50'
+typeset -g  ZRUSH_CFG_DELAY_MS='30'
 typeset -g  ZRUSH_CFG_MIN_INPUT='0'
 typeset -g  ZRUSH_CFG_MODE='typo'
 typeset -g  ZRUSH_CFG_SMART_CASE='true'

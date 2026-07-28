@@ -68,7 +68,7 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             max_lines: 10,
-            delay_ms: 50,
+            delay_ms: 30,
             min_input: 0,
             hl_selected: "standout".into(),
             hl_match: "underline".into(),
@@ -213,7 +213,7 @@ fn apply_key(
             }
         }
         ("display", "max-lines") => cfg.max_lines = int_val(val, table, key, 1, 1000, 10, warnings),
-        ("display", "delay-ms") => cfg.delay_ms = int_val(val, table, key, 0, 10000, 50, warnings),
+        ("display", "delay-ms") => cfg.delay_ms = int_val(val, table, key, 0, 10000, 30, warnings),
         ("display", "min-input") => cfg.min_input = int_val(val, table, key, 0, 100, 0, warnings),
         ("matching", "mode") => {
             if let Some(m) = val.as_str().and_then(Mode::parse) {
@@ -382,7 +382,7 @@ mod tests {
     fn defaults_match_schema() {
         let c = Config::default();
         assert_eq!(c.max_lines, 10);
-        assert_eq!(c.delay_ms, 50);
+        assert_eq!(c.delay_ms, 30);
         assert_eq!(c.min_input, 0);
         assert_eq!(c.hl_selected, "standout");
         assert_eq!(c.hl_match, "underline");
@@ -516,7 +516,7 @@ mod tests {
     fn out_of_range_falls_back() {
         let r = parse("[display]\nmax-lines = 0\ndelay-ms = 20000\nmin-input = -1\n");
         assert_eq!(r.config.max_lines, 10);
-        assert_eq!(r.config.delay_ms, 50);
+        assert_eq!(r.config.delay_ms, 30);
         assert_eq!(r.config.min_input, 0);
         assert_eq!(r.warnings.len(), 3);
         assert!(
@@ -636,7 +636,7 @@ mod tests {
         let expected = "\
 typeset -g  ZRUSH_PROTOCOL_VERSION='3'
 typeset -g  ZRUSH_CFG_MAX_LINES='10'
-typeset -g  ZRUSH_CFG_DELAY_MS='50'
+typeset -g  ZRUSH_CFG_DELAY_MS='30'
 typeset -g  ZRUSH_CFG_MIN_INPUT='0'
 typeset -g  ZRUSH_CFG_MODE='typo'
 typeset -g  ZRUSH_CFG_SMART_CASE='true'

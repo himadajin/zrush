@@ -8,7 +8,7 @@
 # ホスト:
 #   min-zrush     zsh -d -i + minimal.zshrc(隔離)
 #   min-zrush-d0  同上 + delay-ms = 0(デバウンス寄与の分離)
-#   min-zac       zsh -d -i + zsh-autocomplete(min-delay 0.05 = zrush 既定と同条件)
+#   min-zac       zsh -d -i + zsh-autocomplete(min-delay 0.05 = zrush 旧既定 50ms と同条件)
 #   real-zrush    zsh -i + 実 ~/.zshrc(実環境。履歴ガードレール付き)
 #
 # 計測:
@@ -176,6 +176,47 @@ paint_break_case() {  # $1=host-label $2=case-label $3=keys $4=pattern
   return 0
 }
 
+# キャッシュヒット経路の区間分解(004): arm → request → cache hit → match → render
+breakdown_hit_last() {  # $1=logfile $2=先頭スキップ行数
+  local -a L=( ${(f)"$(<$1)"} )
+  L=( "${(@)L[$(( $2 + 1 )),-1]}" )
+  local -i i ir=0
+  for (( i = $#L; i >= 1; --i )); do
+    [[ $L[i] == *" render: "* ]] && { ir=i; break }
+  done
+  (( ir )) || { out "WARN: breakdown-hit: render 行が見つからない"; return 1 }
+  local -F t_render t_match t_hit t_req t_arm
+  t_render=0; t_match=0; t_hit=0; t_req=0; t_arm=0
+  ts_of $L[ir]; t_render=$REPLY
+  for (( i = ir - 1; i >= 1; --i )); do
+    case $L[i] in
+      *" finalize: match ok"*) (( t_match == 0 )) && { ts_of $L[i]; t_match=$REPLY } ;;
+      *" cache: hit"*)         (( t_hit == 0 ))   && { ts_of $L[i]; t_hit=$REPLY } ;;
+      *" request: widened"*)   (( t_req == 0 ))   && { ts_of $L[i]; t_req=$REPLY } ;;
+      *" MEAS-arm"*)           (( t_req != 0 )) && { ts_of $L[i]; t_arm=$REPLY; break } ;;
+    esac
+  done
+  (( t_arm && t_req && t_hit && t_match )) || \
+    { out "WARN: breakdown-hit: チェーン不完全(ヒットしていない?)"; return 1 }
+  printf 'BREAK | debounce=%4.0f | cache-check=%4.0f | match=%4.0f | render=%4.0f | total(arm→render)=%5.0f ms\n' \
+    $(( (t_req - t_arm) * 1000 )) \
+    $(( (t_hit - t_req) * 1000 )) \
+    $(( (t_match - t_hit) * 1000 )) \
+    $(( (t_render - t_match) * 1000 )) \
+    $(( (t_render - t_arm) * 1000 )) >&2
+  return 0
+}
+
+paint_break_hit_case() {  # 事前の同種ケースでキャッシュが温まっている前提
+  local -i skip=0
+  [[ -r $HOSTLOG ]] && skip=$(wc -l < $HOSTLOG)
+  paint_once $3 $4 20 || { out "WARN: [$1/$2] 不達"; return 1 }
+  out "CASE  | ${(r:12:)1} | ${(r:18:)2} | first-paint=$(fmt $REPLY)ms"
+  breakdown_hit_last $HOSTLOG $skip
+  drain 0.6
+  return 0
+}
+
 # ---------------------------------------------------------------- ホスト
 typeset -g MEAS_RC=$WORK/meas.zsh
 cat > $MEAS_RC <<'EOF'
@@ -264,15 +305,17 @@ typeset -g HIST_HASH_BEFORE=
 [[ -r ~/.zsh_history ]] && HIST_HASH_BEFORE=$(shasum ~/.zsh_history 2>/dev/null)
 
 {
-  # ============ min-zrush(既定 delay 50ms)============
-  out "==== min-zrush(隔離 + 既定 delay-ms=50)===="
+  # ============ min-zrush(既定 delay 30ms)============
+  out "==== min-zrush(隔離 + 既定 delay-ms=30)===="
   if start_min_zrush min-zrush $WORK/xdg-default; then
     host_rss; out "INFO: RSS=${REPLY}KB"
-    paint_break_case min-zrush "cmd (whic)"       'whic'         'which'
+    paint_break_case min-zrush "cmd 1st (whic)"   'whic'         'which'   # 初回 = キャッシュミス
     paint_break_case min-zrush "file (docs/inte)" 'ls docs/inte' 'internal'
     paint_break_case min-zrush "git (git chec)"   'git chec'     'checkout'
-    # 中央値用に追加試行
-    paint_case min-zrush "cmd (whic)"       'whic'         'which'
+    # キャッシュヒット(004): 上の cmd ケースで温まった 2 回目以降
+    paint_break_hit_case min-zrush "cmd hit (whic)" 'whic'       'which'
+    # 中央値用に追加試行(cmd はヒット、file/git はキャッシュ対象外)
+    paint_case min-zrush "cmd hit (whic)"   'whic'         'which'
     paint_case min-zrush "file (docs/inte)" 'ls docs/inte' 'internal'
     paint_case min-zrush "git (git chec)"   'git chec'     'checkout'
   else
@@ -309,10 +352,11 @@ typeset -g HIST_HASH_BEFORE=
   out "==== real-zrush(実 ~/.zshrc)===="
   if start_real_zrush; then
     host_rss; out "INFO: RSS=${REPLY}KB"
-    paint_break_case real "cmd (cla)"        'cla'          'clang'
+    paint_break_case real "cmd 1st (cla)"    'cla'          'clang'   # 初回 = キャッシュミス
     paint_break_case real "file (docs/inte)" 'ls docs/inte' 'internal'
     paint_break_case real "git (git chec)"   'git chec'     'checkout'
-    paint_case real "cmd (cla)"        'cla'          'clang'
+    paint_break_hit_case real "cmd hit (cla)" 'cla'         'clang'
+    paint_case real "cmd hit (cla)"    'cla'          'clang'
     paint_case real "file (docs/inte)" 'ls docs/inte' 'internal'
     paint_case real "git (git chec)"   'git chec'     'checkout'
   else

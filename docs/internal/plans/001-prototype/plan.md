@@ -239,7 +239,7 @@ source 順: zsh-abbr より後(前任者チェーンが zsh-abbr のキー束縛
 ```toml
 [display]
 max-lines = 10   # 一覧の最大行数
-delay-ms  = 50   # 表示までの遅延
+delay-ms  = 30   # 表示までの遅延
 min-input = 0    # 表示を開始する最小入力文字数
 
 [matching]

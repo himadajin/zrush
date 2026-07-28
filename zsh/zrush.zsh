@@ -41,6 +41,7 @@ typeset -gi _zrush_last_cursor=-1
 
 # 受信結果(選択・確定でも使う: レコード原本と挿入形を保持する)
 typeset -ga _zrush_recs=() _zrush_krecs=() _zrush_words=() _zrush_match=() _zrush_disp=()
+typeset -g  _zrush_payload=   # `zrush match` 用 stdin(解析済みレコードと対で保持)
 typeset -ga _zrush_ranked=() _zrush_shown=()
 typeset -gA _zrush_spans=()   # 候補 index → match-spans(cli-protocol v2)
 typeset -g  _zrush_common_prefix=
@@ -54,6 +55,15 @@ typeset -g  _zrush_hl_memo=   # zsh 5.9+ なら ' memo=zrush'
 # 選択・Tab 状態
 typeset -gi _zrush_selected=0      # 0=非選択、>0=表示順位置(1 始まり、列優先)
 typeset -gi _zrush_tab_pending=0   # 候補未着時に Tab が押された
+
+# 空語(コマンド位置)収集のキャッシュ(004: プロンプトを跨いで保持)。
+# 作業配列とは別変数。無効化は使用時フィンガープリント + TTL(固定値)。
+typeset -gi _zrush_cc_valid=0
+typeset -g  _zrush_cc_fp=          # 保存時のフィンガープリント
+typeset -gi _zrush_cc_time=0       # 保存時刻(EPOCHSECONDS)
+typeset -ga _zrush_cc_krecs=() _zrush_cc_words=() _zrush_cc_match=() _zrush_cc_disp=()
+typeset -g  _zrush_cc_payload=
+typeset -gi _ZRUSH_CC_TTL=300      # 秒。「同数の入れ替わり」への保険(設定項目にしない)
 
 # 表示位置ごとのグリッド情報(select-left/right の列ジャンプ幅とグループ範囲)
 typeset -ga _zrush_pos_rows=() _zrush_pos_gs=() _zrush_pos_ge=()
@@ -378,9 +388,82 @@ _zrush_clear_display() {  # zle ウィジェット文脈からのみ呼ぶこと
   _zrush_rh_clear
   _zrush_listing=0
   _zrush_recs=() _zrush_krecs=() _zrush_words=() _zrush_match=() _zrush_disp=()
+  _zrush_payload=
   _zrush_ranked=() _zrush_shown=() _zrush_spans=()
   _zrush_pos_rows=() _zrush_pos_gs=() _zrush_pos_ge=()
   _zrush_common_prefix=
+}
+
+# ---------------------------------------------------------------- 空語収集キャッシュ(004)
+# フィンガープリント(→ REPLY): $PATH 文字列 + PATH 各ディレクトリの mtime
+# + 関数/エイリアス/ビルトイン数。ディレクトリ mtime がバイナリの追加・削除を拾う。
+# $#commands は使わない(コマンドハッシュは遅延充填で、集合と無関係にサイズが育つ)。
+# autocd 有効、または PATH に相対要素(空要素・非絶対パス)がある場合のみ $PWD を
+# 含める(これらの場合のみ空語候補が PWD に依存し得るため)。
+_zrush_cc_fingerprint() {
+  emulate -L zsh
+  local fp=$PATH
+  local d
+  local -i rel=0
+  local -a st
+  for d in $path; do
+    [[ $d == /* ]] || rel=1
+    if zstat -A st +mtime $d 2>/dev/null; then
+      fp+=":$st[1]"
+    else
+      fp+=":-"
+    fi
+  done
+  fp+=":$#functions:$#aliases:$#builtins"
+  if [[ -o autocd ]] || (( rel )); then
+    fp+=":$PWD"
+  fi
+  typeset -g REPLY=$fp
+  return 0
+}
+
+_zrush_cc_invalidate() {
+  _zrush_cc_valid=0
+  _zrush_cc_fp=
+  _zrush_cc_krecs=() _zrush_cc_words=() _zrush_cc_match=() _zrush_cc_disp=()
+  _zrush_cc_payload=
+  return 0
+}
+
+_zrush_cc_check() {  # 0=ヒット(使用可)。ミス時は理由をログして非 0
+  emulate -L zsh
+  if (( ! _zrush_cc_valid )); then
+    _zlog "cache: miss (empty)"
+    return 1
+  fi
+  if (( EPOCHSECONDS - _zrush_cc_time > _ZRUSH_CC_TTL )); then
+    _zlog "cache: miss (ttl)"
+    _zrush_cc_invalidate
+    return 1
+  fi
+  _zrush_cc_fingerprint
+  if [[ $REPLY != "$_zrush_cc_fp" ]]; then
+    _zlog "cache: miss (fingerprint)"
+    _zrush_cc_invalidate
+    return 1
+  fi
+  _zlog "cache: hit (${#_zrush_cc_words} candidates)"
+  return 0
+}
+
+_zrush_cc_save() {  # 解析済みの作業配列 + payload をキャッシュへ複製
+  emulate -L zsh
+  _zrush_cc_fingerprint
+  _zrush_cc_fp=$REPLY
+  _zrush_cc_time=$EPOCHSECONDS
+  _zrush_cc_krecs=( "${(@)_zrush_krecs}" )
+  _zrush_cc_words=( "${(@)_zrush_words}" )
+  _zrush_cc_match=( "${(@)_zrush_match}" )
+  _zrush_cc_disp=( "${(@)_zrush_disp}" )
+  _zrush_cc_payload=$_zrush_payload
+  _zrush_cc_valid=1
+  _zlog "cache: saved ${#_zrush_cc_words} candidates"
+  return 0
 }
 
 # 収集リクエスト開始(ウィジェット/ハンドラ文脈)
@@ -397,6 +480,21 @@ _zrush_start_request() {
   _zrush_fuzzy=${REPLY_QUERY//$'\0'/}   # --query の NUL 除去は送信側責務
   _zrush_keep=$REPLY_KEEP
   _zlog "request: widened=${(qqqq)_zrush_query} fuzzy=${(qqqq)_zrush_fuzzy}"
+
+  # 空語(コマンド位置)キャッシュ: ヒットなら fork せず解析済み候補で直接
+  # match+render へ。進行中収集のキャンセルは上の cancel で済んでいる。
+  # 呼び出し元がタイマー発火(zle -F -w)の場合は自動再描画されないため zle -R。
+  if [[ -z $_zrush_query ]] && _zrush_cc_check; then
+    _zrush_recs=()
+    _zrush_krecs=( "${(@)_zrush_cc_krecs}" )
+    _zrush_words=( "${(@)_zrush_cc_words}" )
+    _zrush_match=( "${(@)_zrush_cc_match}" )
+    _zrush_disp=( "${(@)_zrush_cc_disp}" )
+    _zrush_payload=$_zrush_cc_payload
+    _zrush_apply_results
+    zle -R
+    return 0
+  fi
 
   # 匿名 pipe(FIFO を両端 open して即 unlink。搬出路は pipe、終端は EOF)
   local fifo=${TMPDIR:-/tmp}/zrush-$$-$RANDOM.fifo
@@ -466,9 +564,22 @@ _zrush_finalize() {
   setopt localoptions no_monitor no_notify
   local payload=$_zrush_buf
   _zrush_buf=
-  _zrush_recs=() _zrush_words=() _zrush_match=() _zrush_disp=() _zrush_ranked=()
-  _zrush_spans=()
-  _zrush_common_prefix=
+  _zrush_parse_records "$payload"
+  # 空語(コマンド位置)収集の成功結果はプロンプトを跨いでキャッシュする(004)
+  if [[ -z $_zrush_query ]] && (( $#_zrush_words > 0 )); then
+    _zrush_cc_save
+  fi
+  _zrush_apply_results
+  return 0
+}
+
+# 収集 payload → 自前配列(krecs/words/match/disp)+ `zrush match` 用 stdin(_zrush_payload)
+_zrush_parse_records() {  # $1=収集 payload(NUL 区切りレコード列、終端 NUL)
+  emulate -L zsh
+  setopt localoptions no_monitor no_notify
+  local payload=$1
+  _zrush_recs=() _zrush_krecs=() _zrush_words=() _zrush_match=() _zrush_disp=()
+  _zrush_payload=
 
   if [[ -n $payload ]]; then
     if [[ $payload == *$'\0' ]]; then
@@ -485,7 +596,6 @@ _zrush_finalize() {
   # d フィールドが無い典型ケースは配列一括演算の高速経路で処理する
   # (30k 件で ループ ~1.6s → ~35ms を実測)。
   local -i i n=0
-  local stdin_payload=
   local -a words=() disps=() mts=()
   local NUL=$'\0'
   if [[ ${(pj::)_zrush_recs} != *$'\2'd$'\1'* ]]; then
@@ -502,7 +612,7 @@ _zrush_finalize() {
         local -a _idxs=( {1..$n} )
         local -a _mts2=( "${(@)mts/%/$NUL}" )   # 各要素末尾に空 display フィールドを畳み込む
         local -a _zip=( "${(@)_idxs:^_mts2}" )
-        stdin_payload=${(pj:\0:)_zip}$'\0'
+        _zrush_payload=${(pj:\0:)_zip}$'\0'
       fi
     else
       n=-1   # 汎用経路へ
@@ -540,10 +650,21 @@ _zrush_finalize() {
       _zrush_match+=( "$mts[i]" )
       _zrush_disp+=( "$disps[i]" )
       (( ++n ))
-      stdin_payload+="$n"$'\0'"$mts[i]"$'\0'"$disps[i]"$'\0'
+      _zrush_payload+="$n"$'\0'"$mts[i]"$'\0'"$disps[i]"$'\0'
     done
   fi
+  return 0
+}
 
+# match 実行 → 描画 → 未着 Tab の適用。入力は自前配列と _zrush_payload
+# (parse 直後とキャッシュヒット経路の両方から呼ばれる)。
+_zrush_apply_results() {
+  emulate -L zsh
+  setopt localoptions no_monitor no_notify
+  _zrush_ranked=() _zrush_spans=()
+  _zrush_common_prefix=
+
+  local -i n=$#_zrush_words
   if (( n == 0 )); then
     _zrush_render   # 0 件 → 一覧を消す
     return 0
@@ -552,7 +673,7 @@ _zrush_finalize() {
   # zrush match(設定スナップショットを引数で渡す純関数。stderr は端末に流さない)
   local out
   # 取得件数はグリッド容量の上限(max-lines 行 × 最大列数)まで
-  out=$(print -rn -- "$stdin_payload" | \
+  out=$(print -rn -- "$_zrush_payload" | \
         "$ZRUSH_BIN" match --query "$_zrush_fuzzy" --mode "$ZRUSH_CFG_MODE" \
                            --smart-case "$ZRUSH_CFG_SMART_CASE" \
                            --max-lines $(( ${ZRUSH_CFG_MAX_LINES:-10} * _ZRUSH_MAX_COLS )) 2>/dev/null)
@@ -789,7 +910,7 @@ _zrush_render() {  # zle ウィジェット文脈からのみ呼ぶこと
 _zrush_arm_timer() {  # zle ウィジェット文脈
   emulate -L zsh
   _zrush_disarm_timer
-  local -i delay=${ZRUSH_CFG_DELAY_MS:-50}
+  local -i delay=${ZRUSH_CFG_DELAY_MS:-30}
   if (( delay <= 0 )); then
     _zrush_start_request
     return 0
