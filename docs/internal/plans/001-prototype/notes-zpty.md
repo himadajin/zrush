@@ -1,7 +1,8 @@
 # notes-zpty: M1 収集方式の結論と計測値
 
 M1(zpty による compsys 候補収集の技術検証)の成果記録。
-検証スクリプトは `spikes/m1-zpty/`(チェックリストと実行方法は同ディレクトリの README)。
+検証スクリプト(`spikes/m1-zpty/`)は役目を終えたため削除済み(必要なら git 履歴を参照)。
+成立した方式は `zsh/zrush.zsh` と `tests/zsh/driver.zsh` に移植済み。
 
 ## 結論: zpty 方式は成立(go)
 
