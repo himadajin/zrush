@@ -3,8 +3,9 @@
 #
 # Usage:
 #   zsh -f tests/zsh/driver.zsh <playground-dir>
-#     The playground must contain docs/{internal,user}, with a large-file directory
-#     at ../huge, matching the spike fixture layout.
+#     The playground must contain docs/{internal,user} (a copy of this repo works),
+#     plus a sibling large-file directory ../huge holding tens of thousands of
+#     files named fileNNNNN.txt (e.g. file00000.txt .. file19999.txt).
 #   Prerequisite: the zrush binary has been built with cargo build --release.
 #
 # Harness:
@@ -276,10 +277,10 @@ log_count() {  # $1=fixed string -> REPLY: occurrence count in ZRUSH_LOG
   # Restore default config after the invalid-config tests.
   command sleep 1.1
   rm -f $XDG_CONFIG_HOME/zrush/config.toml
-  send_line ': m4-reset'
+  send_line ': sel-reset'
   sync_prompt
 
-  # ---------------- (m4-1) Start, highlight, move, and release selection at top ----------------
+  # ---------------- (sel-1) Start, highlight, move, and release selection at top ----------------
   send_keys 'ls docs/'
   expect '*user*' 10 >/dev/null
   log_count 'select: start';           local -i c_start=$REPLY
@@ -289,64 +290,64 @@ log_count() {  # $1=fixed string -> REPLY: occurrence count in ZRUSH_LOG
   TRANSCRIPT=            # isolate pre-selection output for the standout assertion
   send_keys $DOWN        # press() would consume the render while draining
   if wait_log 'selected=1' $c_sel1 5; then
-    ok "(m4-1a) Down starts selection (rendered with selected=1)"
+    ok "(sel-1a) Down starts selection (rendered with selected=1)"
   else
-    ng "(m4-1a) unable to confirm render when selection starts"
+    ng "(sel-1a) unable to confirm render when selection starts"
   fi
   if [[ $TRANSCRIPT == *$'\e[7m'* ]]; then
-    ok "(m4-1a') standout (SGR 7) for selected row appears in pty output"
+    ok "(sel-1a') standout (SGR 7) for selected row appears in pty output"
   else
-    ng "(m4-1a') standout row not visible in pty output"
+    ng "(sel-1a') standout row not visible in pty output"
   fi
   press $DOWN
-  wait_log 'select: pos=2' $c_pos2 3 && ok "(m4-1b) Down moves to the next candidate" || ng "(m4-1b) candidate does not move"
+  wait_log 'select: pos=2' $c_pos2 3 && ok "(sel-1b) Down moves to the next candidate" || ng "(sel-1b) candidate does not move"
   press $UP
   press $UP
-  wait_log 'select: released-at-top' $c_rel 3 && ok "(m4-1c) Up on first candidate → selection released" || ng "(m4-1c) Up on first candidate does not release selection"
+  wait_log 'select: released-at-top' $c_rel 3 && ok "(sel-1c) Up on first candidate → selection released" || ng "(sel-1c) Up on first candidate does not release selection"
   clear_line
   drain 0.3
 
-  # ---------------- (m4-2) Unselected Enter executes; Up traverses history ----------------
+  # ---------------- (sel-2) Unselected Enter executes; Up traverses history ----------------
   # Send ^M explicitly because send_line's zpty -w appends ^J, bypassing zrush's
   # Enter dispatch and predecessor fallback.
   send_keys 'print HISTMARK-ALPHA'
   send_keys $'\r'
   if expect '*HISTMARK-ALPHA*' 5; then
-    ok "(m4-2a) Enter without selection executes command via predecessor (accept-line)"
+    ok "(sel-2a) Enter without selection executes command via predecessor (accept-line)"
   else
-    ng "(m4-2a) Enter does not execute command"
+    ng "(sel-2a) Enter does not execute command"
   fi
   sync_prompt
   send_keys $UP
   if expect '*print HISTMARK-ALPHA*' 5; then
-    ok "(m4-2b) Up without selection navigates history via predecessor"
+    ok "(sel-2b) Up without selection navigates history via predecessor"
   else
-    ng "(m4-2b) Up does not show history"
+    ng "(sel-2b) Up does not show history"
   fi
   drain 0.3
 
-  # ---------------- (m4-3) Down moves toward newer history while browsing ----------------
+  # ---------------- (sel-3) Down moves toward newer history while browsing ----------------
   log_count 'next: hist-branch'; local -i c_hist=$REPLY
   press $DOWN
-  wait_log 'next: hist-branch' $c_hist 3 && ok "(m4-3) Down while navigating history moves forward in history (priority 2)" || ng "(m4-3) hist-branch not taken"
+  wait_log 'next: hist-branch' $c_hist 3 && ok "(sel-3) Down while navigating history moves forward in history (priority 2)" || ng "(sel-3) hist-branch not taken"
   clear_line
   drain 0.3
 
-  # ---------------- (m4-4/5a/6a) Insert-only confirmation, tail replacement, no space for dirs ----------------
+  # ---------------- (ins-1/5a/6a) Insert-only confirmation, tail replacement, no space for dirs ----------------
   send_keys 'ls docs/inte'
   expect '*internal*' 10 >/dev/null
   press $DOWN
   press $ENTER
-  assert_buffer 'ls docs/internal/' "(m4-4) confirmation only inserts (no execution, editing continues) + suffix replacement leaves no space between 'ls docs/internal/' and dir"
+  assert_buffer 'ls docs/internal/' "(ins-1) confirmation only inserts (no execution, editing continues) + suffix replacement leaves no space between 'ls docs/internal/' and dir"
   clear_line
   drain 0.3
 
-  # ---------------- (m4-6b) trailing-space applies to ordinary file candidates ----------------
+  # ---------------- (ins-3b) trailing-space applies to ordinary file candidates ----------------
   send_keys 'ls Cargo.t'
   expect '*Cargo.toml*' 10 >/dev/null
   press $DOWN
   press $ENTER
-  assert_buffer 'ls Cargo.toml ' "(m4-6) trailing-space: confirming a file candidate adds a trailing space"
+  assert_buffer 'ls Cargo.toml ' "(ins-3) trailing-space: confirming a file candidate adds a trailing space"
   clear_line
   drain 0.3
 
@@ -394,47 +395,47 @@ log_count() {  # $1=fixed string -> REPLY: occurrence count in ZRUSH_LOG
   clear_line
   drain 0.3
 
-  # ---------------- (m4-5b) Preserve '~' ----------------
+  # ---------------- (ins-2b) Preserve '~' ----------------
   send_keys 'ls ~/do'
   expect '*docs*' 10 >/dev/null
   press $DOWN
   press $ENTER
-  assert_buffer 'ls ~/docs/' "(m4-5b) ~ remains unexpanded when confirming a ~ candidate (stays 'ls ~/docs/')"
+  assert_buffer 'ls ~/docs/' "(ins-2b) ~ remains unexpanded when confirming a ~ candidate (stays 'ls ~/docs/')"
   clear_line
   drain 0.3
 
-  # ---------------- (m4-5c) Prefix mismatch replaces the whole word (pp/u/lo) ----------------
+  # ---------------- (ins-2c) Prefix mismatch replaces the whole word (pp/u/lo) ----------------
   log_count 'whole-word-replace'; local -i c_ww=$REPLY
   send_keys 'ls pp/u/lo'
   expect '*local*' 10 >/dev/null
   press $DOWN
   press $ENTER
-  assert_buffer 'ls pp/usr/local/' "(m4-5c) confirming a partial path abbreviation replaces the whole word with 'ls pp/usr/local/'"
-  wait_log 'whole-word-replace' $c_ww 2 && ok "(m4-5c') whole-word replacement branch taken" || ng "(m4-5c') whole-word-replace branch not logged"
+  assert_buffer 'ls pp/usr/local/' "(ins-2c) confirming a partial path abbreviation replaces the whole word with 'ls pp/usr/local/'"
+  wait_log 'whole-word-replace' $c_ww 2 && ok "(ins-2c') whole-word replacement branch taken" || ng "(ins-2c') whole-word-replace branch not logged"
   clear_line
   drain 0.3
 
-  # ---------------- (m4-11) dismiss closes the list without changing the buffer ----------------
+  # ---------------- (dis-1) dismiss closes the list without changing the buffer ----------------
   send_keys 'ls docs/'
   expect '*user*' 10 >/dev/null
   log_count 'dismiss: closing list'; local -i c_dis=$REPLY
   press $CTRLG
-  wait_log 'dismiss: closing list' $c_dis 3 && ok "(m4-11a) dismiss closes the list" || ng "(m4-11a) dismiss does not work"
-  assert_buffer 'ls docs/' "(m4-11b) buffer remains unchanged after dismiss"
+  wait_log 'dismiss: closing list' $c_dis 3 && ok "(dis-1a) dismiss closes the list" || ng "(dis-1a) dismiss does not work"
+  assert_buffer 'ls docs/' "(dis-1b) buffer remains unchanged after dismiss"
   clear_line
   drain 0.3
 
-  # ---------------- (m4-7) Tab menu mode starts selection from a visible list ----------------
+  # ---------------- (tab-1) Tab menu mode starts selection from a visible list ----------------
   send_keys 'ls docs/'
   expect '*user*' 10 >/dev/null
   log_count 'select: start'; local -i c_tstart=$REPLY
   press $TAB
-  wait_log 'select: start' $c_tstart 3 && ok "(m4-7) Tab (menu) starts selection" || ng "(m4-7) Tab does not start selection"
+  wait_log 'select: start' $c_tstart 3 && ok "(tab-1) Tab (menu) starts selection" || ng "(tab-1) Tab does not start selection"
   press $CTRLG
   clear_line
   drain 0.3
 
-  # ---------------- (m4-8) Tab common-prefix ----------------
+  # ---------------- (tab-2) Tab common-prefix ----------------
   command sleep 1.1
   print -r -- $'[insert]\ntab = "common-prefix"' > $XDG_CONFIG_HOME/zrush/config.toml
   send_line ': cfg-cp'
@@ -442,7 +443,7 @@ log_count() {  # $1=fixed string -> REPLY: occurrence count in ZRUSH_LOG
   send_keys 'ls docs/inte'
   expect '*internal*' 10 >/dev/null
   press $TAB
-  assert_buffer 'ls docs/internal' "(m4-8a) Tab (common-prefix): inserts common part when query is a true prefix"
+  assert_buffer 'ls docs/internal' "(tab-2a) Tab (common-prefix): inserts common part when query is a true prefix"
   clear_line
   drain 0.3
   # Non-extending case: gd/a1 has prefix-tier {a10..a19} with LCP "a1" equal to
@@ -451,12 +452,12 @@ log_count() {  # $1=fixed string -> REPLY: occurrence count in ZRUSH_LOG
   expect '*a10*' 10 >/dev/null
   log_count 'fallback -> insert top'; local -i c_fb=$REPLY
   press $TAB
-  assert_buffer 'ls gd/a10 ' "(m4-8b) Tab (common-prefix): confirms and inserts top candidate when prefix cannot grow ('ls gd/a10 ')"
-  wait_log 'fallback -> insert top' $c_fb 2 && ok "(m4-8b') fallback path taken" || ng "(m4-8b') fallback path not logged"
+  assert_buffer 'ls gd/a10 ' "(tab-2b) Tab (common-prefix): confirms and inserts top candidate when prefix cannot grow ('ls gd/a10 ')"
+  wait_log 'fallback -> insert top' $c_fb 2 && ok "(tab-2b') fallback path taken" || ng "(tab-2b') fallback path not logged"
   clear_line
   drain 0.3
 
-  # ---------------- (m4-9) Tab insert immediately inserts the top candidate ----------------
+  # ---------------- (tab-3) Tab insert immediately inserts the top candidate ----------------
   command sleep 1.1
   print -r -- $'[insert]\ntab = "insert"' > $XDG_CONFIG_HOME/zrush/config.toml
   send_line ': cfg-ins'
@@ -464,19 +465,19 @@ log_count() {  # $1=fixed string -> REPLY: occurrence count in ZRUSH_LOG
   send_keys 'ls docs/inte'
   expect '*internal*' 10 >/dev/null
   press $TAB
-  assert_buffer 'ls docs/internal/' "(m4-9) Tab (insert) immediately inserts top candidate"
+  assert_buffer 'ls docs/internal/' "(tab-3) Tab (insert) immediately inserts top candidate"
   clear_line
   drain 0.3
 
-  # ---------------- (m4-10) Tab before arrival applies after candidates arrive ----------------
+  # ---------------- (tab-4) Tab before arrival applies after candidates arrive ----------------
   log_count 'tab: pending'; local -i c_pend=$REPLY
   send_keys 'ls docs/inte'$'\t'    # Tab during debounce in the same input burst
   if expect '*ls docs/internal/*' 10; then
-    ok "(m4-10a) Tab before arrival: collection expedited → insert applied on arrival"
+    ok "(tab-4a) Tab before arrival: collection expedited → insert applied on arrival"
   else
-    ng "(m4-10a) Tab before arrival not applied"
+    ng "(tab-4a) Tab before arrival not applied"
   fi
-  wait_log 'tab: pending' $c_pend 2 && ok "(m4-10b) pending path taken" || ng "(m4-10b) pending path not logged"
+  wait_log 'tab: pending' $c_pend 2 && ok "(tab-4b) pending path taken" || ng "(tab-4b) pending path not logged"
   clear_line
   drain 0.3
 
@@ -625,7 +626,7 @@ log_count() {  # $1=fixed string -> REPLY: occurrence count in ZRUSH_LOG
   clear_line
   drain 0.3
 
-  # ---------------- (m4-12) Key-binding changes and odd-length arrays ----------------
+  # ---------------- (kb-2) Key-binding changes and odd-length arrays ----------------
   command sleep 1.1
   print -r -- $'[insert]\ntab = "menu"\n[keybind]\ndismiss = "ctrl-t"' > $XDG_CONFIG_HOME/zrush/config.toml
   send_line ': cfg-key'
@@ -634,9 +635,9 @@ log_count() {  # $1=fixed string -> REPLY: occurrence count in ZRUSH_LOG
   expect '*user*' 10 >/dev/null
   log_count 'dismiss: closing list'; local -i c_dis2=$REPLY
   press $'\C-t'
-  wait_log 'dismiss: closing list' $c_dis2 3 && ok "(m4-12a) dismiss key changed in config (^T) works" || ng "(m4-12a) ^T dismiss does not work"
+  wait_log 'dismiss: closing list' $c_dis2 3 && ok "(kb-2a) dismiss key changed in config (^T) works" || ng "(kb-2a) ^T dismiss does not work"
   log_count 'keybinds: restored'
-  (( REPLY > 0 )) && ok "(m4-12b) removed old key (^G) is restored to predecessor" || ng "(m4-12b) old-key restoration not logged"
+  (( REPLY > 0 )) && ok "(kb-2b) removed old key (^G) is restored to predecessor" || ng "(kb-2b) old-key restoration not logged"
   clear_line
   drain 0.3
 
@@ -651,16 +652,16 @@ log_count() {  # $1=fixed string -> REPLY: occurrence count in ZRUSH_LOG
   press $DOWN
   log_count 'select: start'
   if (( REPLY == c_empty_start )); then
-    ok "(m4-12d) all []: Down falls through to predecessor without starting selection"
+    ok "(kb-2d) all []: Down falls through to predecessor without starting selection"
   else
-    ng "(m4-12d) all []: Down unexpectedly started selection"
+    ng "(kb-2d) all []: Down unexpectedly started selection"
   fi
   clear_line
   send_line 'bindkey -M main "^T"'
   if expect '*transpose-chars*' 5; then
-    ok "(m4-12e) all []: previously bound ^T restored to predecessor"
+    ok "(kb-2e) all []: previously bound ^T restored to predecessor"
   else
-    ng "(m4-12e) all []: ^T predecessor was not restored"
+    ng "(kb-2e) all []: ^T predecessor was not restored"
   fi
   sync_prompt
   send_keys 'ls docs/'
@@ -668,8 +669,8 @@ log_count() {  # $1=fixed string -> REPLY: occurrence count in ZRUSH_LOG
   log_count 'select: start'; local -i c_empty_tab=$REPLY
   press $TAB
   wait_log 'select: start' $c_empty_tab 3 && \
-    ok "(m4-12f) all []: fixed Tab hook still applies [insert].tab=menu" || \
-    ng "(m4-12f) all []: Tab hook no longer starts menu selection"
+    ok "(kb-2f) all []: fixed Tab hook still applies [insert].tab=menu" || \
+    ng "(kb-2f) all []: Tab hook no longer starts menu selection"
   clear_line
   drain 0.3
 
@@ -682,9 +683,9 @@ log_count() {  # $1=fixed string -> REPLY: occurrence count in ZRUSH_LOG
   # load; no fallback to duplicated defaults), and the restored state passes.
   send_line 'typeset -ga _kb_save=("${(@)ZRUSH_CFG_KEYBINDS}"); ZRUSH_CFG_KEYBINDS=(a b c); _zrush_validate_config; print -r -- "VAL_ODD=$?"; ZRUSH_CFG_KEYBINDS=("${(@)_kb_save}"); _zrush_validate_config; print -r -- "VAL_RESTORED=$?"'
   if expect '*VAL_ODD=1*' 5 && expect '*VAL_RESTORED=0*' 5; then
-    ok "(m4-12c) odd-length KEYBINDS rejected as a failed load"
+    ok "(kb-2c) odd-length KEYBINDS rejected as a failed load"
   else
-    ng "(m4-12c) odd-length KEYBINDS not rejected by validation"
+    ng "(kb-2c) odd-length KEYBINDS not rejected by validation"
   fi
   sync_prompt
 
