@@ -63,8 +63,11 @@ fn fields(out: &[u8]) -> Vec<Vec<u8>> {
         .collect()
 }
 
+/// Ranked (index, match-spans) pairs from match output.
+type RankedPairs = Vec<(Vec<u8>, Vec<u8>)>;
+
 /// Parse match output into (common-prefix, [(index, match-spans)]).
-fn parse_out(out: &[u8]) -> (Vec<u8>, Vec<(Vec<u8>, Vec<u8>)>) {
+fn parse_out(out: &[u8]) -> (Vec<u8>, RankedPairs) {
     let f = fields(out);
     assert!(
         f.len() % 2 == 1,
