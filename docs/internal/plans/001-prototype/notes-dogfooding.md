@@ -29,7 +29,7 @@ zsh-autocomplete を無効化し zrush に切り替えた日常利用(mac + Linu
 - [ ] zsh-syntax-highlighting との共存
 - [ ] zsh-abbr との共存(Enter での略語展開)
 - [ ] 全角文字を含む候補の表示
-- [ ] あいまいマッチの順位の体感(`gti` → git、`dcs` で dash > docs の序列が気になるか)
+- [ ] あいまいマッチの順位の体感(`gti` → git、`dcs` で docs > dash の序列が気になるか)
 - [ ] Tab 挙動(common-prefix)の使用感(共通接頭辞挿入後の再収集を含む)
 - [ ] 履歴(↑)との使い分け(フェーズ 1 は履歴メニューなし)
 - [ ] Linux 実機(受け入れ条件 2〜7 を検証用ドライバで確認 + 日常利用)
