@@ -363,7 +363,11 @@ mod tests {
         let specs = resolve(&user(&[("confirm", &["enter", "ctrl-m"])]), &mut w);
         assert_eq!(specs[idx("confirm")], ["seq:^M"]);
         assert_eq!(w.len(), 1);
-        assert!(w[0].contains("duplicate key \"ctrl-m\" (seq:^M)"), "{}", w[0]);
+        assert!(
+            w[0].contains("duplicate key \"ctrl-m\" (seq:^M)"),
+            "{}",
+            w[0]
+        );
     }
 
     #[test]

@@ -487,8 +487,9 @@ mod tests {
         let r = parse("[display]\nhighlight = \"standout\"\n");
         assert_eq!(r.config.hl_selected, "standout");
         assert!(
-            r.warnings[0]
-                .contains("[display.highlight]: expected a table, got \"standout\"; using defaults"),
+            r.warnings[0].contains(
+                "[display.highlight]: expected a table, got \"standout\"; using defaults"
+            ),
             "{}",
             r.warnings[0]
         );
