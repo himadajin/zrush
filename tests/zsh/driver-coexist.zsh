@@ -328,9 +328,9 @@ basic_flow() {  # $1=label prefix
 
   # ================ (4)(8) Inside tmux with resizing ================
   out "==== (4)(8) tmux ===="
-  local TSOCK=zrush-m5-$$
+  local TSOCK=zrush-coex-$$
   tm() { $TMUX_BIN -L $TSOCK -f /dev/null "$@" }
-  tm_cap() { tm capture-pane -p -t m5 2>/dev/null }
+  tm_cap() { tm capture-pane -p -t coex 2>/dev/null }
   tm_wait() {  # $1=glob $2=timeout
     local -F dl=$(( SECONDS + ${2:-10} ))
     while (( SECONDS < dl )); do
@@ -340,21 +340,21 @@ basic_flow() {  # $1=label prefix
     return 1
   }
   local TLOG=$WORK/tmux.log
-  tm new-session -d -s m5 -x 100 -y 30 \
+  tm new-session -d -s coex -x 100 -y 30 \
     "ZDOTDIR=$ZDOT_MIN XDG_CONFIG_HOME=$WORK/xdg HOME=$PLAYGROUND ZRUSH_REPO=$REPO ZRUSH_TEST_TMP=$WORK/t-tmux ZRUSH_LOG=$TLOG exec zsh -d -i" 2>/dev/null
   if tm_wait '*HP>*' 15; then
-    ok "(4) host started inside tmux (TERM=$(tm display-message -p -t m5 '#{client_termname}' 2>/dev/null || print '?'))"
-    tm send-keys -t m5 -l ' print -r -- TERM-INSIDE-$TERM'
-    tm send-keys -t m5 Enter
+    ok "(4) host started inside tmux (TERM=$(tm display-message -p -t coex '#{client_termname}' 2>/dev/null || print '?'))"
+    tm send-keys -t coex -l ' print -r -- TERM-INSIDE-$TERM'
+    tm send-keys -t coex Enter
     tm_wait '*TERM-INSIDE-*' 5 && out "INFO: $(tm_cap | grep -o 'TERM-INSIDE-[a-z0-9-]*' | tail -1)"
     # Before resize, truncate a long candidate line from width 100 to 99.
-    tm send-keys -t m5 -l 'ls wide/lo'
+    tm send-keys -t coex -l 'ls wide/lo'
     if tm_wait '*longname-*' 10; then
       local line1=$(tm_cap | grep -m1 -o 'longname-x*' )
       out "INFO: (8) rendered length at width=100: ${#line1}"
-      tm resize-window -t m5 -x 60 -y 20 2>/dev/null
+      tm resize-window -t coex -x 60 -y 20 2>/dev/null
       command sleep 0.5
-      tm send-keys -t m5 -l 'n'      # trigger redraw for 'ls wide/lon'
+      tm send-keys -t coex -l 'n'      # trigger redraw for 'ls wide/lon'
       command sleep 1.5
       local line2=$(tm_cap | grep -m1 -o 'longname-x*')
       out "INFO: (8) rendered length at width=60: ${#line2}"
@@ -366,15 +366,15 @@ basic_flow() {  # $1=label prefix
     else
       ng "(8) list not displayed inside tmux"
     fi
-    tm send-keys -t m5 C-u
+    tm send-keys -t coex C-u
     command sleep 0.3
     # Basic tmux flow; tmux sends the TERM-equivalent Down sequence resolved by terminfo.
-    tm send-keys -t m5 -l 'ls docs/inte'
+    tm send-keys -t coex -l 'ls docs/inte'
     if tm_wait '*internal*' 10; then
       ok "(4a) list displayed inside tmux"
       local -i c4sel=0
       [[ -r $TLOG ]] && c4sel=$(grep -cF 'selected=1' $TLOG 2>/dev/null)
-      tm send-keys -t m5 Down
+      tm send-keys -t coex Down
       local -F dl4=$(( SECONDS + 5 ))
       local -i c4now=0
       while (( SECONDS < dl4 )); do
@@ -388,14 +388,14 @@ basic_flow() {  # $1=label prefix
         ng "(4b) unable to select inside tmux"
       fi
       # Also record actual selection-highlight rendering (SGR 7).
-      if [[ "$($TMUX_BIN -L $TSOCK -f /dev/null capture-pane -p -e -t m5 2>/dev/null)" == *$'\e[7m'* ]]; then
+      if [[ "$($TMUX_BIN -L $TSOCK -f /dev/null capture-pane -p -e -t coex 2>/dev/null)" == *$'\e[7m'* ]]; then
         out "OBSV: (4b) confirmed standout (SGR 7) in tmux pane"
       else
         out "OBSV: (4b) unable to confirm standout in tmux pane (manual verification required)"
       fi
-      tm send-keys -t m5 Enter
+      tm send-keys -t coex Enter
       command sleep 0.5
-      tm send-keys -t m5 C-x b
+      tm send-keys -t coex C-x b
       local -F dl=$(( SECONDS + 5 ))
       local tlast=
       local -a ttl
@@ -422,7 +422,7 @@ basic_flow() {  # $1=label prefix
 } always {
   local h
   for h in "${(@k)HFD}"; do zpty -d $h 2>/dev/null; done
-  $TMUX_BIN -L zrush-m5-$$ kill-server 2>/dev/null
+  $TMUX_BIN -L zrush-coex-$$ kill-server 2>/dev/null
   [[ -n $WORK && $WORK == */zrush-coex.* ]] && rm -rf $WORK
 }
 (( FAIL == 0 ))
