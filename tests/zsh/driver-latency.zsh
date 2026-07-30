@@ -10,7 +10,11 @@
 #   min-zrush     zsh -d -i + isolated minimal.zshrc
 #   min-zrush-d0  same with delay-ms = 0 to isolate debounce contribution
 #   min-zac       zsh -d -i + zsh-autocomplete with min-delay 0.05
-#   real-zrush    zsh -i + real ~/.zshrc with history safeguards
+#
+# All hosts use a throwaway ZDOTDIR (and, where applicable, XDG_CONFIG_HOME)
+# under $WORK: this driver never reads or sources the real ~/.zshrc, and
+# never touches ~/.zsh_history (AGENTS.md guardrail -- a prior real-
+# environment host here read the real ~/.zshrc/history and was removed).
 #
 # Measurements:
 #   first-paint: elapsed time from key sequence to expected pty text after stripping
@@ -25,12 +29,6 @@
 #                bucket (zsh copying the already-built plan into POSTDISPLAY/
 #                region_highlight)):
 #                arm (last key) -> request -> fork -> compsys -> transport -> plan -> apply
-#
-# Safeguards for the real-environment host:
-#   - Prefix every command with a space for hist_ignore_space.
-#   - Immediately unset HISTFILE and set SAVEHIST=0.
-#   - Verify the ~/.zsh_history hash is unchanged before and after.
-#   - Never write user files.
 emulate -L zsh
 setopt extended_glob
 zmodload zsh/zpty    || { print -u2 FATAL: zpty; exit 1 }
@@ -54,7 +52,7 @@ typeset -g HOST= HOSTLOG= CURXDG=
 typeset -gi HOSTFD=-1 SYNCN=0
 out() { print -r -u2 -- "$@" }
 
-send_line() { zpty -w  $HOST " $1" }   # leading space is mandatory for the real host
+send_line() { zpty -w  $HOST " $1" }   # leading space: harmless hist_ignore_space habit, kept for parity with driver.zsh
 send_keys() { zpty -wn $HOST $1 }
 
 drain() {
@@ -274,24 +272,6 @@ EOF
   return 0
 }
 
-start_real_zrush() {
-  HOST=real HOSTLOG=$WORK/real.log CURXDG=
-  unset ZDOTDIR XDG_CONFIG_HOME ZRUSH_LOG ZRUSH_REPO ZRUSH_TEST_TMP
-  cd $PLAYGROUND || return 1
-  local REPLY=
-  zpty -b $HOST zsh -i || return 1
-  HOSTFD=$REPLY
-  local m=BOOT$(( ++SYNCN ))
-  send_line "print -r -- MARK-'$m'"
-  expect "*MARK-$m*" 60 || return 1
-  drain 0.5
-  run_cmd 'unset HISTFILE; SAVEHIST=0' || return 1
-  run_cmd "export ZRUSH_LOG=$HOSTLOG" || return 1
-  run_cmd "source $MEAS_RC" || return 1
-  run_cmd "cd $PLAYGROUND" || return 1
-  return 0
-}
-
 host_rss() {
   typeset -g REPLY=NA
   local m=R$(( ++SYNCN ))
@@ -313,9 +293,6 @@ host_rss() {
 stop_host() { zpty -d $HOST 2>/dev/null; HOSTFD=-1 }
 
 # ---------------------------------------------------------------- Run
-typeset -g HIST_HASH_BEFORE=
-[[ -r ~/.zsh_history ]] && HIST_HASH_BEFORE=$(shasum ~/.zsh_history 2>/dev/null)
-
 {
   # ============ min-zrush with default 30ms delay ============
   out "==== min-zrush (isolated + default delay-ms=30) ===="
@@ -359,35 +336,9 @@ typeset -g HIST_HASH_BEFORE=
     out "FATAL: min-zac failed to start (ZAC_SRC=$ZAC_SRC)"
   fi
   stop_host
-
-  # ============ real-zrush ============
-  out "==== real-zrush (actual ~/.zshrc) ===="
-  if start_real_zrush; then
-    host_rss; out "INFO: RSS=${REPLY}KB"
-    paint_break_case real "cmd 1st (cla)"    'cla'          'clang'   # first run is a cache miss
-    paint_break_case real "file (docs/inte)" 'ls docs/inte' 'internal'
-    paint_break_case real "git (git chec)"   'git chec'     'checkout'
-    paint_break_hit_case real "cmd hit (cla)" 'cla'         'clang'
-    paint_case real "cmd hit (cla)"    'cla'          'clang'
-    paint_case real "file (docs/inte)" 'ls docs/inte' 'internal'
-    paint_case real "git (git chec)"   'git chec'     'checkout'
-  else
-    out "FATAL: real-zrush failed to start or set up"
-  fi
-  stop_host
 } always {
   zpty -d min-zrush 2>/dev/null
   zpty -d min-d0 2>/dev/null
   zpty -d zac 2>/dev/null
-  zpty -d real 2>/dev/null
-  # Verify the history safeguard.
-  if [[ -n $HIST_HASH_BEFORE ]]; then
-    local now=$(shasum ~/.zsh_history 2>/dev/null)
-    if [[ $now == $HIST_HASH_BEFORE ]]; then
-      out "GUARD: confirmed ~/.zsh_history is unchanged"
-    else
-      out "GUARD-FAIL: ~/.zsh_history changed! (investigation required)"
-    fi
-  fi
   [[ -n $WORK && $WORK == */zrush-lat.* ]] && rm -rf $WORK
 }

@@ -238,6 +238,29 @@ dump_get() {
   clear_line
   drain 0.3
 
+  # Regression (cap-2): a compadd call with zero hits must still tail-call the
+  # real builtin (_zrush_compadd), or compsys internal state can desync and
+  # break the *next* completion. A prefix with no real match yields at least
+  # one zero-hit compadd call inside compsys; a normal completion right after
+  # must still work cleanly.
+  send_keys 'ls fx/basic/ZZZNOMATCH'
+  drain 0.8   # let debounce + collection + the (zero-result) plan settle
+  if dump_get $'\C-xp' TESTPOST && [[ -z ${(Q)REPLY} ]]; then
+    ok "(cap-2a) a prefix with zero real candidates shows no list"
+  else
+    ng "(cap-2a) unexpected listing for a zero-candidate prefix: ${REPLY:-<none>}"
+  fi
+  clear_line
+  drain 0.3
+  send_keys 'ls fx/basic/al'
+  if expect '*alpha.txt*' 10; then
+    ok "(cap-2b) a normal completion right after a zero-candidate one still works (compsys/tail-call state intact)"
+  else
+    ng "(cap-2b) completion broke after a zero-candidate collection"
+  fi
+  clear_line
+  drain 0.3
+
   # ================================================================ (2) Async plumbing does not block input
   # A fake completion function that sleeps inside the fork; the parent shell
   # must keep echoing keystrokes while it runs.
@@ -378,6 +401,32 @@ dump_get() {
   clear_line
   drain 0.3
 
+  # Regression (dis-2): dismiss must cancel any still-armed debounce timer /
+  # in-flight collection for a newer keystroke, or a late-arriving result can
+  # silently reopen the list right after the user closed it. Reproduced with
+  # git's naturally slow (~150ms+) subcommand completion -- no extra fixture
+  # needed. The buffer edit below never goes through a blank state, so the
+  # first (broader) list stays visible (no-flash design) while the narrowing
+  # 'git chec' collection is armed/in flight; dismissing at that instant must
+  # win the race even though the narrower collection is still pending.
+  send_keys 'git c'
+  expect '*checkout*' 10 >/dev/null   # first list showing; _zrush_listing=1
+  send_keys 'hec'                     # -> 'git chec': re-arms debounce/collection
+  send_keys $'\C-g'                   # dismiss immediately, no drain in between
+  drain 1.0                           # comfortably longer than 'git chec' compsys (~150-200ms)
+  if dump_get $'\C-xp' TESTPOST; then
+    local post_dis2=${(Q)REPLY}
+    if [[ -z $post_dis2 ]]; then
+      ok "(dis-2) dismiss cancels the in-flight collection; no late result reopens the list"
+    else
+      ng "(dis-2) list reappeared after dismiss (stale collection not cancelled): ${(qqqq)post_dis2}"
+    fi
+  else
+    ng "(dis-2) POSTDISPLAY dump did not run"
+  fi
+  clear_line
+  drain 0.3
+
   log_count 'line-finish: cleared'; local -i c_fin=$REPLY
   send_keys 'print HISTMARK-ACCEPT'
   send_keys $'\r'
@@ -430,6 +479,36 @@ dump_get() {
   clear_line
   drain 0.3
 
+  # ================================================================ Regression: send-break leaves a clean new prompt (fix 3)
+  # An exit that bypasses _zrush_line_finish (send-break and similar) must
+  # not leak the previous session's plan state into the next one. A
+  # test-only widget dumps _zrush_plan_npos/_zrush_listing directly, since
+  # neither is observable through POSTDISPLAY/BUFFER alone once the new
+  # prompt's line-init has already cleared the display.
+  send_line '_zrt_dump_plan() { _zlog "TESTPLAN=npos=$_zrush_plan_npos listing=$_zrush_listing" }; zle -N _zrt-dump-plan _zrt_dump_plan; bindkey "^Xy" _zrt-dump-plan'
+  sync_prompt
+  send_keys 'ls fx/basic/al'
+  expect '*alpha.txt*' 10 >/dev/null   # real, non-empty _zrush_plan_* now populated
+  send_keys $'\C-c'                    # send-break: abandon the line, bypassing line-finish
+  if sync_prompt 5; then
+    ok "(sb-1a) a new prompt appears after send-break"
+    if dump_get $'\C-xy' TESTPLAN; then
+      if [[ $REPLY == *'npos=0'* && $REPLY == *'listing=0'* ]]; then
+        ok "(sb-1b) plan state is reset after send-break (npos=0, listing=0); no stale candidates leak into the new prompt"
+      else
+        ng "(sb-1b) stale plan state survived send-break: ${REPLY:-<none>}"
+      fi
+    else
+      ng "(sb-1b) plan-state dump did not run"
+    fi
+  else
+    out "SKIP: (sb-1) send-break did not produce a new prompt in this environment; skipping the plan-state check"
+  fi
+  clear_line
+  drain 0.3
+  send_line 'bindkey -r "^Xy"; zle -D _zrt-dump-plan; unfunction _zrt_dump_plan'
+  sync_prompt
+
   # ================================================================ (9) Error path: a broken ZRUSH_BIN
   # Sanity: the (still-working) private binary copy behaves normally first.
   send_keys 'ls fx/basic/al'
@@ -481,6 +560,17 @@ dump_get() {
     ng "(err-1d) shell did not respond after zrush plan failures"
   fi
   sync_prompt
+
+  # Regression (err-2): a pending Tab resolved against a *failed* plan must
+  # never insert anything (_zrush_settle_plan's failure branch discards the
+  # pending Tab outright rather than resolving it, possibly against stale
+  # _zrush_plan_* from an earlier successful query). ZRUSH_BIN is still the
+  # broken copy from the block above.
+  send_keys 'ls fx/basic/al'$'\t'   # Tab races the debounce; the plan fetch will fail
+  drain 1.0
+  assert_buffer 'ls fx/basic/al' "(err-2) pending Tab resolved against a failed plan inserts nothing"
+  clear_line
+  drain 0.3
 
   out "SUMMARY: PASS=$PASS FAIL=$FAIL"
 } always {
