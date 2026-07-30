@@ -42,7 +42,7 @@ pub fn default_specs() -> [Vec<String>; N] {
 
 /// Human-readable default list for warning messages
 /// (e.g. `"down"/"ctrl-n"`).
-fn default_desc(i: usize) -> String {
+pub(crate) fn default_desc(i: usize) -> String {
     DEFAULT_NOTATIONS[i]
         .iter()
         .map(|n| format!("\"{n}\""))

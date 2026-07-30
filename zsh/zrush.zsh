@@ -16,7 +16,7 @@ typeset -g _zrush_source_dir=${${(%):-%N}:A:h}
 typeset -g  ZRUSH_BIN=${ZRUSH_BIN:-$_zrush_source_dir/../target/release/zrush}
 typeset -gi _zrush_enabled=0
 typeset -gi _ZRUSH_EXPECTED_PROTO=1
-typeset -g  _zrush_cfg_path= _zrush_cfg_mtime= _zrush_cfg_warn_shown=
+typeset -g  _zrush_cfg_path= _zrush_cfg_mtime=
 typeset -gi _zrush_match_warned=0 _zrush_proto_warned=0
 # Variables this script consumes from `zrush config` output (validation and rollback)
 typeset -ga _ZRUSH_CFG_VARS=(
@@ -149,18 +149,14 @@ _zrush_validate_config() {
   (( $#ZRUSH_CFG_KEYBINDS % 2 == 0 ))
 }
 
-# Emit config warnings to stderr, one per line.
-# Suppress an unchanged consecutive warning set; a clean result resets the dedupe state.
+# Emit config warnings to stderr, one per line. Loads happen only when the
+# config mtime changes, so this cannot repeat on unchanged prompts.
 _zrush_show_cfg_warnings() {
   emulate -L zsh
-  (( $#ZRUSH_CFG_WARNINGS )) || { _zrush_cfg_warn_shown=; return 0 }
-  local joined=${(pj:\n:)ZRUSH_CFG_WARNINGS}
-  [[ $joined == $_zrush_cfg_warn_shown ]] && return 0
   local w
   for w in "${(@)ZRUSH_CFG_WARNINGS}"; do
     print -ru2 -- "zrush: $w"
   done
-  _zrush_cfg_warn_shown=$joined
   return 0
 }
 
@@ -691,6 +687,7 @@ _zrush_apply_results() {
 
   local -i n=$#_zrush_words
   if (( n == 0 )); then
+    _zrush_tab_pending=0   # a recorded Tab has nothing to apply
     _zrush_render   # zero candidates clears the list
     return 0
   fi
@@ -709,6 +706,7 @@ _zrush_apply_results() {
       _zrush_match_warned=1
     fi
     _zlog "finalize: zrush match exit $rc; discarding"
+    _zrush_tab_pending=0
     _zrush_recs=() _zrush_words=() _zrush_match=() _zrush_disp=()
     _zrush_render
     return 0

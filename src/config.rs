@@ -252,7 +252,17 @@ fn apply_key(
                                 ));
                             }
                         }
-                        kb_user[i] = Some(list);
+                        // A non-empty spec whose every element was dropped falls
+                        // back to the default list, like invalid notations do;
+                        // only an explicit [] disables the action.
+                        if list.is_empty() && !items.is_empty() {
+                            warnings.push(format!(
+                                "config: [keybind] {key}: no valid element remains; using default {}",
+                                keybind::default_desc(i)
+                            ));
+                        } else {
+                            kb_user[i] = Some(list);
+                        }
                     }
                     _ => {
                         warnings.push(format!(
@@ -458,6 +468,21 @@ mod tests {
             ),
             "{}",
             r.warnings[0]
+        );
+    }
+
+    #[test]
+    fn keybind_array_with_no_valid_element_falls_back_to_default() {
+        // Unlike an explicit [], a non-empty array losing every element
+        // keeps the default list (config-schema.md).
+        let r = parse("[keybind]\ndismiss = [1]\n");
+        assert_eq!(r.config.keybinds[5], vec!["seq:^G"]);
+        assert!(
+            r.warnings
+                .iter()
+                .any(|w| w.contains("[keybind] dismiss: no valid element remains; using default")),
+            "{:?}",
+            r.warnings
         );
     }
 
