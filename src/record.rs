@@ -8,8 +8,7 @@
 //! records (first field tag `w`) carry per-candidate `w`/`m`/`d`.
 //!
 //! Zero-copy: every value here borrows from the caller's stdin buffer.
-//! Everything is `pub(crate)` and unused for now (dead_code allowed below)
-//! -- src/plan.rs (step b task 4) is the consumer.
+//! plan.rs is the consumer.
 
 const REC_SEP: u8 = 0; // \0: terminates a record
 const FIELD_SEP: u8 = 2; // \2: joins fields within a record
@@ -57,7 +56,6 @@ pub(crate) struct Candidate<'a> {
 
 impl<'a> Candidate<'a> {
     /// match-text: `m` if present, else `w` (cli-protocol.md "候補レコード").
-    #[allow(dead_code)] // consumed by src/plan.rs (step b task 4)
     pub fn match_text(&self) -> &'a [u8] {
         self.m.unwrap_or(self.w)
     }
@@ -65,7 +63,6 @@ impl<'a> Candidate<'a> {
 
 /// Parsed stdin payload: batch headers and candidates in stream order.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-#[allow(dead_code)] // consumed by src/plan.rs (step b task 4)
 pub(crate) struct Parsed<'a> {
     pub batches: Vec<Batch<'a>>,
     pub candidates: Vec<Candidate<'a>>,
@@ -74,16 +71,15 @@ pub(crate) struct Parsed<'a> {
 /// The only parse error (cli-protocol.md exit code 3): a non-empty stream
 /// whose last byte is not NUL.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // constructed here, matched on in plan.rs (task 4)
 pub(crate) struct FramingError;
 
 /// Parse the full stdin buffer per cli-protocol.md. Exit-code mapping for
 /// `FramingError` is plan.rs's job, not this module's.
-#[allow(dead_code)] // consumed by src/plan.rs (step b task 4)
 pub(crate) fn parse(input: &[u8]) -> Result<Parsed<'_>, FramingError> {
     // NUL-terminated records: a non-empty stream must end with NUL, and
     // stripping it yields exactly the record list (mirrors the v1
-    // field-framing check this replaces in cmd_match).
+    // field-framing check this replaces in `zrush match`'s cmd_match,
+    // now removed).
     let body = match input.last() {
         None => return Ok(Parsed::default()),
         Some(&REC_SEP) => &input[..input.len() - 1],

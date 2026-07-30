@@ -19,7 +19,6 @@ use crate::record::{Batch, Candidate};
 /// (cli-protocol.md: stat failure or a non-directory both read as
 /// `false`). Called at most once, and only when `batch.f == "1"` and the
 /// plain concatenation doesn't already end in `/`.
-#[allow(dead_code)] // consumed by src/plan.rs (step b task 4)
 pub(crate) fn build(
     batch: &Batch<'_>,
     candidate: &Candidate<'_>,

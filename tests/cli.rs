@@ -9,16 +9,18 @@ fn zrush() -> Command {
     Command::new(env!("CARGO_BIN_EXE_zrush"))
 }
 
-/// Run `zrush match` with the given trailing args and stdin bytes.
-fn run_match(extra: &[&str], stdin: &[u8]) -> (i32, Vec<u8>) {
+// ---- zrush plan ----
+
+/// Run `zrush plan` with the given trailing args and stdin bytes.
+fn run_plan(extra: &[&str], stdin: &[u8]) -> (i32, Vec<u8>) {
     let mut child = zrush()
-        .arg("match")
+        .arg("plan")
         .args(extra)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
-        .expect("spawn zrush match");
+        .expect("spawn zrush plan");
     child
         .stdin
         .take()
@@ -29,250 +31,345 @@ fn run_match(extra: &[&str], stdin: &[u8]) -> (i32, Vec<u8>) {
     (out.status.code().expect("exit code"), out.stdout)
 }
 
-fn typo_args<'a>(query: &'a str, max_lines: &'a str) -> Vec<&'a str> {
+/// The full required flag set (cli-protocol.md "起動"); tests override
+/// individual values as needed.
+fn plan_args<'a>(
+    query: &'a str,
+    mode: &'a str,
+    rows: &'a str,
+    width: &'a str,
+    trailing_space: &'a str,
+) -> Vec<&'a str> {
     vec![
         "--query",
         query,
         "--mode",
-        "typo",
+        mode,
         "--smart-case",
         "true",
-        "--max-lines",
-        max_lines,
+        "--rows",
+        rows,
+        "--width",
+        width,
+        "--trailing-space",
+        trailing_space,
     ]
 }
 
-/// Build a candidate stream: 1-based indices, empty display-text.
-fn candidates(texts: &[&[u8]]) -> Vec<u8> {
-    let mut out = Vec::new();
-    for (i, t) in texts.iter().enumerate() {
-        out.extend_from_slice((i + 1).to_string().as_bytes());
-        out.push(0);
-        out.extend_from_slice(t);
-        out.push(0);
-        out.push(0); // empty display-text
+const REC_SEP: u8 = 0;
+const FIELD_SEP: u8 = 2;
+const TAG_SEP: u8 = 1;
+
+/// A batch header record: tag `b` plus the given shared tag/value pairs
+/// (cli-protocol.md "バッチヘッダレコード").
+fn header(fields: &[(&str, &str)]) -> Vec<u8> {
+    let mut r = b"b".to_vec();
+    for (tag, val) in fields {
+        r.push(FIELD_SEP);
+        r.extend_from_slice(tag.as_bytes());
+        r.push(TAG_SEP);
+        r.extend_from_slice(val.as_bytes());
     }
-    out
+    r.push(REC_SEP);
+    r
 }
 
-fn fields(out: &[u8]) -> Vec<Vec<u8>> {
+/// A candidate record with arbitrary tag/value pairs; the first pair's
+/// tag must be `w` to form a valid candidate (cli-protocol.md).
+fn field_record(fields: &[(&str, &str)]) -> Vec<u8> {
+    let mut r = Vec::new();
+    for (i, (tag, val)) in fields.iter().enumerate() {
+        if i > 0 {
+            r.push(FIELD_SEP);
+        }
+        r.extend_from_slice(tag.as_bytes());
+        r.push(TAG_SEP);
+        r.extend_from_slice(val.as_bytes());
+    }
+    r.push(REC_SEP);
+    r
+}
+
+/// A plain candidate record: `w` only.
+fn word(w: &str) -> Vec<u8> {
+    field_record(&[("w", w)])
+}
+
+/// Parsed `zrush plan` stdout: fixed-position fields plus the four
+/// repeated blocks. Asserts the `4 + L + H + 3P` field-count invariant
+/// (cli-protocol.md "stdout(描画プラン)") while parsing.
+struct Plan {
+    common_prefix: Vec<u8>,
+    rows: Vec<Vec<u8>>,
+    highlights: Vec<String>,
+    cells: Vec<String>,
+    nav: Vec<String>,
+    inserts: Vec<Vec<u8>>,
+}
+
+fn parse_plan(out: &[u8]) -> Plan {
     assert_eq!(out.last(), Some(&0u8), "output must be NUL-terminated");
-    out[..out.len() - 1]
+    let f: Vec<Vec<u8>> = out[..out.len() - 1]
         .split(|&b| b == 0)
         .map(<[u8]>::to_vec)
-        .collect()
-}
-
-/// Ranked (index, match-spans) pairs from match output.
-type RankedPairs = Vec<(Vec<u8>, Vec<u8>)>;
-
-/// Parse match output into (common-prefix, [(index, match-spans)]).
-fn parse_out(out: &[u8]) -> (Vec<u8>, RankedPairs) {
-    let f = fields(out);
-    assert!(
-        f.len() % 2 == 1,
-        "output must be 1 + 2n fields, got {}",
-        f.len()
-    );
-    let pairs = f[1..]
-        .chunks_exact(2)
-        .map(|c| (c[0].clone(), c[1].clone()))
         .collect();
-    (f[0].clone(), pairs)
-}
-
-/// Rank-ordered indices only (span fields dropped).
-fn ranked(out: &[u8]) -> Vec<Vec<u8>> {
-    parse_out(out).1.into_iter().map(|p| p.0).collect()
-}
-
-// ---- zrush match ----
-
-#[test]
-fn match_ranks_tiers_and_reports_common_prefix() {
-    let stdin = candidates(&[b"mydocs", b"docs", b"dot-config", b"doc", b"xxx"]);
-    let (code, out) = run_match(&typo_args("doc", "10"), &stdin);
-    assert_eq!(code, 0);
-    // prefix-exact(4) > prefix(2) > substring(1) > edit(3: doc~dot); "xxx" excluded.
-    // LCP spans prefix-tier matches only: {docs, doc} -> "doc".
-    let (lcp, pairs) = parse_out(&out);
-    assert_eq!(lcp, b"doc");
-    let idx: Vec<&[u8]> = pairs.iter().map(|p| p.0.as_slice()).collect();
-    assert_eq!(idx, [&b"4"[..], b"2", b"1", b"3"]);
-    // spans: 4=doc (prefix, whole), 2=docs (prefix), 1=mydocs (substring
-    // at 2..5), 3=dot-config (edit: aligned prefix 0..3)
-    let spans: Vec<&[u8]> = pairs.iter().map(|p| p.1.as_slice()).collect();
-    assert_eq!(spans, [&b"0-3"[..], b"0-3", b"2-5", b"0-3"]);
-}
-
-#[test]
-fn match_typo_transposition_gti() {
-    let stdin = candidates(&[b"git", b"grep", b"git-lfs"]);
-    let (code, out) = run_match(&typo_args("gti", "10"), &stdin);
-    assert_eq!(code, 0);
-    // git and git-lfs match via the edit tier, grep does not.
-    // No prefix-tier match -> empty common prefix.
-    let (lcp, pairs) = parse_out(&out);
-    assert_eq!(lcp, b"");
-    let idx: Vec<&[u8]> = pairs.iter().map(|p| p.0.as_slice()).collect();
-    assert_eq!(idx, [&b"1"[..], b"3"]);
-    // edit-tier spans cover the aligned (corrected-query) prefix
-    let spans: Vec<&[u8]> = pairs.iter().map(|p| p.1.as_slice()).collect();
-    assert_eq!(spans, [&b"0-3"[..], b"0-3"]);
-}
-
-#[test]
-fn match_fuzzy_spans_are_merged_ranges() {
-    // "dcf" on "dot-config" is a scattered subsequence (fuzzy tier):
-    // d(0), c(4), f(7) -> three single-char ranges.
-    let stdin = candidates(&[b"dot-config"]);
-    let (code, out) = run_match(&typo_args("dcf", "10"), &stdin);
-    assert_eq!(code, 0);
-    let (_, pairs) = parse_out(&out);
-    assert_eq!(pairs.len(), 1);
-    assert_eq!(pairs[0].1, b"0-1,4-5,7-8");
-}
-
-#[test]
-fn match_edit_tier_ranks_close_corrections_first() {
-    // All four are edit-tier matches for "gti"; git (transposition,
-    // no unmatched suffix) must beat looser corrections regardless of
-    // stdin order.
-    let stdin = candidates(&[b"gtsort", b"gif2webp", b"git", b"glibtool"]);
-    let (code, out) = run_match(&typo_args("gti", "10"), &stdin);
-    assert_eq!(code, 0);
-    let (lcp, _) = parse_out(&out);
-    assert_eq!(lcp, b"", "edit-tier matches carry no common prefix");
-    assert_eq!(ranked(&out), [&b"3"[..], b"1", b"4", b"2"]);
-}
-
-#[test]
-fn match_common_prefix_spans_prefix_tier_only() {
-    // Prefix tier {checkout, check-attr} -> LCP "check"; the substring
-    // match sparse-checkout must not dilute it.
-    let stdin = candidates(&[b"checkout", b"check-attr", b"sparse-checkout"]);
-    let (code, out) = run_match(&typo_args("chec", "10"), &stdin);
-    assert_eq!(code, 0);
-    let (lcp, pairs) = parse_out(&out);
-    assert_eq!(lcp, b"check");
-    assert_eq!(pairs.len(), 3, "all three still match and rank");
-}
-
-#[test]
-fn match_empty_query_keeps_stdin_order_with_empty_spans() {
-    let stdin = candidates(&[b"bbb", b"aaa", b"ccc"]);
-    let (code, out) = run_match(&typo_args("", "10"), &stdin);
-    assert_eq!(code, 0);
-    let (lcp, pairs) = parse_out(&out);
-    assert_eq!(lcp, b"");
-    for (i, (idx, spans)) in pairs.iter().enumerate() {
-        assert_eq!(idx, (i + 1).to_string().as_bytes());
-        assert_eq!(spans, b"", "empty query carries no position info");
+    assert!(
+        f.len() >= 3,
+        "must have at least common-prefix, L, P: {f:?}"
+    );
+    let l: usize = std::str::from_utf8(&f[1])
+        .unwrap()
+        .parse()
+        .expect("L is a decimal integer");
+    let p: usize = std::str::from_utf8(&f[2])
+        .unwrap()
+        .parse()
+        .expect("P is a decimal integer");
+    let mut i = 3;
+    let rows = f[i..i + l].to_vec();
+    i += l;
+    let h: usize = std::str::from_utf8(&f[i])
+        .unwrap()
+        .parse()
+        .expect("H is a decimal integer");
+    i += 1;
+    let highlights: Vec<String> = f[i..i + h]
+        .iter()
+        .map(|b| String::from_utf8(b.clone()).unwrap())
+        .collect();
+    i += h;
+    let cells: Vec<String> = f[i..i + p]
+        .iter()
+        .map(|b| String::from_utf8(b.clone()).unwrap())
+        .collect();
+    i += p;
+    let nav: Vec<String> = f[i..i + p]
+        .iter()
+        .map(|b| String::from_utf8(b.clone()).unwrap())
+        .collect();
+    i += p;
+    let inserts = f[i..i + p].to_vec();
+    i += p;
+    assert_eq!(i, f.len(), "field count must equal 4 + L + H + 3P");
+    Plan {
+        common_prefix: f[0].clone(),
+        rows,
+        highlights,
+        cells,
+        nav,
+        inserts,
     }
 }
 
 #[test]
-fn match_zero_matches_emits_empty_common_prefix_only() {
-    let stdin = candidates(&[b"alpha", b"beta"]);
-    let (code, out) = run_match(&typo_args("qqqq", "10"), &stdin);
-    assert_eq!(code, 0);
-    assert_eq!(out, b"\0");
+fn plan_rejects_unknown_or_missing_args_with_exit_2() {
+    let (code, _) = run_plan(&["--bogus", "x"], b"");
+    assert_eq!(code, 2);
+    let (code, _) = run_plan(&["--query", "a"], b""); // missing the rest
+    assert_eq!(code, 2);
 }
 
 #[test]
-fn match_empty_stdin_is_valid() {
-    let (code, out) = run_match(&typo_args("abc", "10"), b"");
-    assert_eq!(code, 0);
-    assert_eq!(out, b"\0");
+fn plan_rejects_invalid_enum_and_bool_values_with_exit_2() {
+    let (code, _) = run_plan(&plan_args("a", "fuzzy", "10", "40", "true"), b""); // bad --mode
+    assert_eq!(code, 2);
+    let (code, _) = run_plan(&plan_args("a", "typo", "10", "40", "yes"), b""); // bad --trailing-space
+    assert_eq!(code, 2);
 }
 
 #[test]
-fn match_truncates_to_max_lines_but_lcp_spans_all_matches() {
-    let stdin = candidates(&[b"git-a", b"git-b", b"git-c"]);
-    let (code, out) = run_match(&typo_args("git", "2"), &stdin);
-    assert_eq!(code, 0);
-    // Only 2 indices, but the LCP covers all three matches.
-    let (lcp, _) = parse_out(&out);
-    assert_eq!(lcp, b"git-");
-    assert_eq!(ranked(&out), [&b"1"[..], b"2"]);
+fn plan_rejects_non_numeric_rows_or_width_with_exit_2() {
+    let (code, _) = run_plan(&plan_args("a", "typo", "abc", "40", "true"), b"");
+    assert_eq!(code, 2);
+    let (code, _) = run_plan(&plan_args("a", "typo", "10", "-1", "true"), b"");
+    assert_eq!(code, 2);
 }
 
 #[test]
-fn match_non_utf8_candidate_is_not_dropped() {
-    let stdin = candidates(&[b"caf\xe9.txt", b"other"]);
-    let (code, out) = run_match(
-        &[
-            "--query",
-            "caf",
-            "--mode",
-            "prefix",
-            "--smart-case",
-            "true",
-            "--max-lines",
-            "10",
-        ],
-        &stdin,
+fn plan_rejects_non_terminated_stream_with_exit_3() {
+    let args = plan_args("a", "typo", "10", "40", "true");
+    let mut stdin = header(&[]);
+    stdin.extend(word("git"));
+    stdin.pop(); // drop the final NUL: framing violation
+    let (code, _) = run_plan(&args, &stdin);
+    assert_eq!(code, 3);
+}
+
+#[test]
+fn removed_match_subcommand_now_exits_2() {
+    // `zrush match` (v1) no longer exists; it's just an unknown subcommand.
+    let out = zrush()
+        .args(["match", "--query", "a"])
+        .stderr(Stdio::null())
+        .output()
+        .expect("run");
+    assert_eq!(out.status.code(), Some(2));
+}
+
+#[test]
+fn plan_empty_stdin_is_the_four_field_zero_match_form() {
+    let (code, out) = run_plan(&plan_args("abc", "typo", "10", "40", "true"), b"");
+    assert_eq!(code, 0);
+    assert_eq!(out, b"\x000\x000\x000\x00");
+}
+
+#[test]
+fn plan_zero_matches_is_the_four_field_form() {
+    let mut stdin = header(&[]);
+    stdin.extend(word("alpha"));
+    stdin.extend(word("beta"));
+    let (code, out) = run_plan(&plan_args("zzz", "typo", "10", "40", "true"), &stdin);
+    assert_eq!(code, 0);
+    assert_eq!(out, b"\x000\x000\x000\x00");
+}
+
+#[test]
+fn plan_end_to_end_grouped_payload() {
+    let mut stdin = header(&[("J", "cmds"), ("X", "Commands")]);
+    stdin.extend(word("git"));
+    stdin.extend(word("grep"));
+    // width=9: gmaxw=max(3,4)=4 -> cols=floor(11/6)=1 (single column),
+    // and "Commands" (8 chars) still fits the width budget untruncated.
+    let (code, out) = run_plan(&plan_args("g", "prefix", "10", "9", "true"), &stdin);
+    assert_eq!(code, 0);
+    let p = parse_plan(&out);
+    assert_eq!(p.common_prefix, b"g");
+    assert_eq!(
+        p.rows,
+        vec![b"Commands".to_vec(), b"git ".to_vec(), b"grep".to_vec()]
     );
+    assert_eq!(p.inserts, vec![b"git ".to_vec(), b"grep ".to_vec()]);
+    // Offsets run over the whole listing text ("Commands\ngit \ngrep"):
+    // heading spans [0,8); row 2 starts at char 9; row 3 at char 14.
+    assert_eq!(p.cells, vec!["9 3", "14 4"]);
+    assert!(p.highlights.iter().any(|h| h == "heading 0 0 8"));
+    assert!(p.highlights.iter().any(|h| h == "match 1 9 1"));
+    assert!(p.highlights.iter().any(|h| h == "match 2 14 1"));
+    assert_eq!(p.nav, vec!["2 0 1 2", "2 1 1 2"]);
+}
+
+#[test]
+fn plan_match_text_uses_m_tag_over_w() {
+    let mut stdin = header(&[]);
+    stdin.extend(field_record(&[
+        ("w", "space\\ name.txt"),
+        ("m", "space name.txt"),
+    ]));
+    let (code, out) = run_plan(&plan_args("space", "prefix", "10", "40", "false"), &stdin);
     assert_eq!(code, 0);
-    // Single match: LCP is its full match-text, raw bytes preserved.
-    let (lcp, pairs) = parse_out(&out);
-    assert_eq!(lcp, b"caf\xe9.txt");
-    assert_eq!(pairs.len(), 1);
-    assert_eq!(pairs[0].0, b"1");
-    // span offsets are chars of the lossy reading: c,a,f -> 0-3
-    assert_eq!(pairs[0].1, b"0-3");
+    let p = parse_plan(&out);
+    assert_eq!(p.rows, vec![b"space name.txt".to_vec()]);
+    // Insertion text still uses the quoted `w`, not `m`.
+    assert_eq!(p.inserts, vec![b"space\\ name.txt".to_vec()]);
 }
 
 #[test]
-fn match_rejects_unknown_or_missing_args_with_exit_2() {
-    let (code, _) = run_match(&["--bogus", "x"], b"");
-    assert_eq!(code, 2);
-    let (code, _) = run_match(&["--query", "a"], b""); // missing the rest
-    assert_eq!(code, 2);
-    let (code, _) = run_match(
-        &[
-            "--query",
-            "a",
-            "--mode",
-            "fuzzy",
-            "--smart-case",
-            "true",
-            "--max-lines",
-            "10",
-        ],
-        b"",
-    );
-    assert_eq!(code, 2);
-    let (code, _) = run_match(
-        &[
-            "--query",
-            "a",
-            "--mode",
-            "typo",
-            "--smart-case",
-            "yes",
-            "--max-lines",
-            "10",
-        ],
-        b"",
-    );
-    assert_eq!(code, 2);
+fn plan_d_tag_is_displayed_instead_of_match_text() {
+    let mut stdin = header(&[]);
+    stdin.extend(field_record(&[("w", "raw"), ("d", "Pretty Display")]));
+    let (code, out) = run_plan(&plan_args("", "typo", "10", "40", "false"), &stdin);
+    assert_eq!(code, 0);
+    let p = parse_plan(&out);
+    assert_eq!(p.rows, vec![b"Pretty Display".to_vec()]);
+    assert_eq!(p.inserts, vec![b"raw".to_vec()]);
 }
 
 #[test]
-fn match_rejects_malformed_streams_with_exit_3() {
-    // field count not a multiple of 3
-    let (code, _) = run_match(&typo_args("a", "10"), b"1\0git\0");
-    assert_eq!(code, 3);
-    // final field not NUL-terminated
-    let (code, _) = run_match(&typo_args("a", "10"), b"1\0git\0trailing");
-    assert_eq!(code, 3);
-    // non-digit index
-    let (code, _) = run_match(&typo_args("a", "10"), b"x1\0git\0\0");
-    assert_eq!(code, 3);
-    // empty index
-    let (code, _) = run_match(&typo_args("a", "10"), b"\0git\0\0");
-    assert_eq!(code, 3);
+fn plan_cjk_cell_alignment_pads_by_width_offsets_by_chars() {
+    let mut stdin = header(&[]);
+    stdin.extend(word("日本語")); // 3 chars, display width 6
+    stdin.extend(word("ab"));
+    // width=8: gmaxw=max(6,2)=6 -> cols=floor(10/8)=1 (single column).
+    let (code, out) = run_plan(&plan_args("", "typo", "10", "8", "false"), &stdin);
+    assert_eq!(code, 0);
+    let p = parse_plan(&out);
+    assert_eq!(
+        p.rows,
+        vec!["日本語".as_bytes().to_vec(), b"ab    ".to_vec()]
+    );
+    // Cell range length is char count (3, 2), not display width (6, 2).
+    assert_eq!(p.cells, vec!["0 3", "4 2"]);
+}
+
+#[test]
+fn plan_dir_synthesis_uses_real_filesystem_stat() {
+    let dir = std::env::temp_dir().join(format!("zrush-cli-it-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("child")).expect("mkdir");
+    let rd = format!("{}/", dir.display());
+    let mut stdin = header(&[("f", "1"), ("rd", &rd)]);
+    stdin.extend(word("child"));
+    let (code, out) = run_plan(&plan_args("", "typo", "10", "40", "true"), &stdin);
+    assert_eq!(code, 0);
+    let p = parse_plan(&out);
+    // `/` synthesized (real directory), which also suppresses the
+    // trailing space despite --trailing-space true.
+    assert_eq!(p.inserts, vec![b"child/".to_vec()]);
+    std::fs::remove_dir_all(&dir).expect("cleanup");
+}
+
+#[test]
+fn plan_trailing_space_toggle() {
+    let mut stdin = header(&[]);
+    stdin.extend(word("git"));
+    let (code, on) = run_plan(&plan_args("", "typo", "10", "40", "true"), &stdin);
+    assert_eq!(code, 0);
+    let (code, off) = run_plan(&plan_args("", "typo", "10", "40", "false"), &stdin);
+    assert_eq!(code, 0);
+    assert_eq!(parse_plan(&on).inserts, vec![b"git ".to_vec()]);
+    assert_eq!(parse_plan(&off).inserts, vec![b"git".to_vec()]);
+}
+
+#[test]
+fn plan_ranking_tiers_and_common_prefix() {
+    let mut stdin = header(&[]);
+    for w in ["mydocs", "docs", "dot-config", "doc", "xxx"] {
+        stdin.extend(word(w));
+    }
+    // width=10 == the widest match: gmaxw=10, cols=floor(12/12)=1,
+    // forcing a single column so rows appear in rank order top-to-bottom.
+    let (code, out) = run_plan(&plan_args("doc", "typo", "10", "10", "false"), &stdin);
+    assert_eq!(code, 0);
+    let p = parse_plan(&out);
+    // prefix-exact(doc) > prefix(docs) > substring(mydocs) > edit(dot-config); xxx excluded.
+    assert_eq!(p.common_prefix, b"doc");
+    let pad = |w: &str| format!("{w:<10}").into_bytes();
+    assert_eq!(
+        p.rows,
+        vec![pad("doc"), pad("docs"), pad("mydocs"), pad("dot-config")]
+    );
+}
+
+#[test]
+fn plan_typo_transposition_gti() {
+    let mut stdin = header(&[]);
+    for w in ["git", "grep", "git-lfs"] {
+        stdin.extend(word(w));
+    }
+    // width=8: gmaxw=max(3,7)=7 (over the 2 matches) -> cols=floor(10/9)=1,
+    // forcing a single column so each match gets its own row.
+    let (code, out) = run_plan(&plan_args("gti", "typo", "10", "8", "false"), &stdin);
+    assert_eq!(code, 0);
+    let p = parse_plan(&out);
+    // No prefix-tier match under "gti" -> empty common prefix.
+    assert_eq!(p.common_prefix, b"");
+    assert_eq!(p.rows.len(), 2); // "git" and "git-lfs" via the edit tier; "grep" excluded
+}
+
+#[test]
+fn plan_match_highlight_offset_is_non_trivial_for_a_mid_string_match() {
+    // Regression: layout.rs once misread matching::spans()'s (start, end)
+    // tuples as (start, len). A start==0 span can't distinguish the two
+    // readings; "ar" is a substring of "cargo" at char index 1 (a-r), so
+    // matching::spans() emits (1, 3) -- start != 0, len != 1 -- giving a
+    // highlight of "match 1 1 2" (len 2), not "match 1 1 3" (the old bug's
+    // misreading of end=3 as a length, extending the highlight to "arg").
+    let mut stdin = header(&[]);
+    stdin.extend(word("cargo"));
+    let (code, out) = run_plan(&plan_args("ar", "substring", "10", "40", "false"), &stdin);
+    assert_eq!(code, 0);
+    let p = parse_plan(&out);
+    assert_eq!(p.rows, vec![b"cargo".to_vec()]);
+    assert!(p.highlights.iter().any(|h| h == "match 1 1 2"));
 }
 
 // ---- zrush config ----
@@ -326,7 +423,7 @@ fn config_without_file_prints_contract_default_output() {
     let (code, out) = run_config(&dir);
     assert_eq!(code, 0);
     let expected = "\
-typeset -g  ZRUSH_PROTOCOL_VERSION='1'
+typeset -g  ZRUSH_PROTOCOL_VERSION='2'
 typeset -g  ZRUSH_CFG_MAX_LINES='10'
 typeset -g  ZRUSH_CFG_DELAY_MS='30'
 typeset -g  ZRUSH_CFG_MIN_INPUT='0'

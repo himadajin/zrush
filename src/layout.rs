@@ -38,7 +38,6 @@ pub(crate) enum Role {
 
 impl Role {
     /// The stdout wire token (cli-protocol.md "role ∈ match | heading").
-    #[allow(dead_code)] // consumed by src/plan.rs (step b task 4)
     pub fn as_str(self) -> &'static str {
         match self {
             Role::Match => "match",
@@ -71,7 +70,6 @@ pub(crate) struct Nav {
 /// positions (1-indexed; `positions[p - 1]` etc.), its source candidate,
 /// cell range, and navigation entry.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-#[allow(dead_code)] // consumed by src/plan.rs (step b task 4)
 pub(crate) struct Plan {
     /// L display rows (no trailing/embedded newline per row).
     pub rows: Vec<Vec<u8>>,
@@ -90,12 +88,12 @@ pub(crate) struct Plan {
 /// Build the render plan for a ranked candidate list.
 ///
 /// `candidates` must already be in rank order (matching.rs + ranking.rs);
-/// this module does not re-sort. `spans[i]` are the char spans (over
-/// `candidates[i].match_text()`) from matching.rs, aligned by index; a
+/// this module does not re-sort. `spans[i]` are `matching::QueryMatcher::
+/// spans()`'s (start, end) 0-based end-exclusive char ranges (NOT
+/// (start, len)) over `candidates[i].match_text()`, aligned by index; a
 /// missing or empty entry means no match decoration for that candidate.
 /// `row_budget`/`width` are `--rows`/`--width` (cli-protocol.md
 /// "起動"), assumed >= 1 by the caller but handled gracefully at 0 too.
-#[allow(dead_code)] // consumed by src/plan.rs (step b task 4)
 pub(crate) fn build(
     candidates: &[Candidate<'_>],
     batches: &[Batch<'_>],
@@ -281,9 +279,12 @@ pub(crate) fn build(
         if candidates[cm.candidate].d.is_none()
             && let Some(cand_spans) = spans.get(cm.candidate)
         {
-            for &(s, len) in cand_spans {
+            // matching.rs `spans()`: (start, end), 0-based end-exclusive
+            // char range -- NOT (start, len). Clip both ends to the
+            // truncated cell's char count.
+            for &(s, e) in cand_spans {
                 let cs = s.min(cm.content_chars);
-                let ce = (s + len).min(cm.content_chars);
+                let ce = e.min(cm.content_chars);
                 if ce > cs {
                     highlights.push(Highlight {
                         role: Role::Match,
@@ -668,8 +669,10 @@ mod tests {
     fn match_span_is_clipped_to_truncated_cell() {
         let batches = [batch(b"", b"")];
         let cands = [cand(b"abcdef", None, None, 0)];
-        // A span reaching past the truncation point (width budget 3).
-        let spans = vec![vec![(1usize, 4usize)]]; // chars [1,5) = "bcde"
+        // matching::spans() tuples are (start, end), 0-based
+        // end-exclusive -- chars [1,5) = "bcde", reaching past the
+        // truncation point (width budget 3).
+        let spans = vec![vec![(1usize, 5usize)]];
         let plan = build(&cands, &batches, &spans, 10, 3);
         assert_eq!(plan.rows[0], b"abc");
         let m = plan
@@ -682,10 +685,35 @@ mod tests {
     }
 
     #[test]
+    fn match_span_uses_end_exclusive_semantics_not_start_len() {
+        // Regression: layout.rs once misread matching::spans()'s (start,
+        // end) tuples as (start, len), which happened to be
+        // indistinguishable whenever start == 0. "cargo" matched by "g"
+        // (substring, found at char index 3) produces the real span
+        // matching.rs::spans() would emit: (3, 4) = chars [3,4) = "g"
+        // alone, i.e. len 1 -- not len 4 (mistaken as start=3,len=4) and
+        // not len 2 (the bug actually observed: end misread as start+len
+        // saturating past the candidate).
+        let batches = [batch(b"", b"")];
+        let cands = [cand(b"cargo", None, None, 0)];
+        let spans = vec![vec![(3usize, 4usize)]];
+        let plan = build(&cands, &batches, &spans, 10, 40); // no truncation
+        assert_eq!(plan.rows[0], b"cargo");
+        let m = plan
+            .highlights
+            .iter()
+            .find(|h| h.role == Role::Match)
+            .unwrap();
+        assert_eq!((m.start, m.len), (3, 1));
+    }
+
+    #[test]
     fn display_text_cell_never_gets_match_highlight() {
         let batches = [batch(b"", b"")];
         let cands = [cand(b"raw", None, Some(b"shown"), 0)];
-        let spans = vec![vec![(0usize, 2usize)]];
+        // Non-zero start: a d-tag cell must suppress match decoration
+        // regardless of what the (otherwise unused) span would resolve to.
+        let spans = vec![vec![(1usize, 3usize)]];
         let plan = build(&cands, &batches, &spans, 10, 40);
         assert_eq!(plan.rows[0], b"shown");
         assert!(plan.highlights.iter().all(|h| h.role != Role::Match));
