@@ -508,11 +508,8 @@ _zrush_start_request() {
 
   # See behavior.md "空語収集キャッシュ". zle -F -w callers require explicit redraw.
   if [[ -z $_zrush_query ]] && _zrush_cc_check; then
-    if _zrush_run_plan "$_zrush_cc_payload"; then
-      _zrush_apply_plan
-    else
-      _zrush_clear_display
-    fi
+    _zrush_run_plan "$_zrush_cc_payload"
+    _zrush_settle_plan $?
     zle -R
     return 0
   fi
@@ -592,10 +589,29 @@ _zrush_finalize() {
   if [[ -z $_zrush_query && -n $payload ]]; then
     _zrush_cc_save "$payload"
   fi
-  if _zrush_run_plan "$payload"; then
+  _zrush_run_plan "$payload"
+  _zrush_settle_plan $?
+  return 0
+}
+
+# Apply (or discard, on failure) the plan just fetched by `_zrush_run_plan`,
+# then resolve a Tab recorded before it arrived. $1=0 on success (state
+# already populated), nonzero on failure. Shared by both `_zrush_run_plan`
+# call sites (fresh collection and cache hit) so the pending-Tab handling
+# in behavior.md "Tab" ("候補未着時の Tab は...結果到着時に上記の挙動を適用する")
+# cannot be forgotten on one path but not the other. _zrush_tab_with_results'
+# own branches already no-op on zero candidates, so no extra guard is needed
+# here.
+_zrush_settle_plan() {
+  emulate -L zsh
+  if (( $1 == 0 )); then
     _zrush_apply_plan
   else
     _zrush_clear_display
+  fi
+  if (( _zrush_tab_pending )); then
+    _zrush_tab_pending=0
+    _zrush_tab_with_results
   fi
   return 0
 }
