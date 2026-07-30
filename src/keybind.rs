@@ -1,6 +1,6 @@
 //! Keybind notation normalization.
 //!
-//! Notation table: config-schema.md「キー記法」. Output forms
+//! Notation table: config-schema.md "キー記法". Output forms
 //! (cli-protocol.md):
 //! - `seq:<bindkey sequence>` — fully normalized here (e.g. ctrl-g -> seq:^G).
 //! - `key:<symbolic name>`    — terminal-dependent keys (up, shift-tab, ...);
@@ -110,17 +110,7 @@ fn is_plain_char(b: u8) -> bool {
 
 /// Resolve every action's keybind list from user notations.
 ///
-/// Element-wise validation (config-schema.md):
-/// - Invalid notation: that element is dropped (+ warning).
-/// - The Tab key (`tab` / `ctrl-i`, normalized seq:^I) cannot be
-///   assigned to an action: zsh always binds ^I to the fixed
-///   `[insert].tab` behavior hook, so accepting it would silently
-///   swallow the assignment. The element is dropped (+ warning).
-/// - Duplicates within one action (after normalization) are dropped
-///   (+ warning).
-/// - A non-empty user list left with no valid element falls back to the
-///   action's default list (+ warning). An explicit empty list is valid
-///   and means "no key bound".
+/// Element-wise validation follows config-schema.md "[keybind]".
 ///
 /// Cross-action rule: the same key on multiple actions (compared AFTER
 /// normalization, so enter = ctrl-m = ^M collide) reverts every
@@ -397,9 +387,8 @@ mod tests {
 
     #[test]
     fn resolve_tab_rejection_composes_with_duplicate_resolution() {
-        // confirm = "tab" is rejected -> falls back to enter (seq:^M);
-        // dismiss = "ctrl-m" then collides with that default -> the
-        // duplicate loop reverts both, two warnings total.
+        // Dropping "tab" leaves confirm's "space", so dismiss's "ctrl-m"
+        // does not collide and only the reserved-tab warning is emitted.
         let mut w = Vec::new();
         let specs = resolve(
             &user(&[("confirm", &["tab", "space"]), ("dismiss", &["ctrl-m"])]),

@@ -1,10 +1,8 @@
 //! config.toml parsing, validation, and zsh-sourceable output.
 //!
 //! Schema: docs/internal/contracts/config-schema.md (source of truth).
-//! Rules: never fail startup; validate per key and fall back to the
-//! default for invalid items, collecting one human-readable warning per
-//! error. Only a TOML syntax error invalidates the whole file.
-//! Output format: cli-protocol.md「zrush config」 — typeset assignments
+//! Validation and error handling: config-schema.md.
+//! Output format: cli-protocol.md "zrush config" — typeset assignments
 //! only, every value single-quoted with `'` escaped as `'\''`.
 
 use std::path::PathBuf;
@@ -90,9 +88,8 @@ pub struct LoadResult {
     pub warnings: Vec<String>,
 }
 
-/// Resolve the config path and load it. File absence is normal (all
-/// defaults, no warning); any other read failure degrades to defaults
-/// with a warning — `zrush config` never fails (cli-protocol.md).
+/// Load per config-schema.md validation and error handling.
+/// File absence is normal and uses defaults without a warning.
 pub fn load() -> LoadResult {
     let Some(path) = config_path() else {
         return LoadResult::default();
@@ -110,9 +107,7 @@ pub fn load() -> LoadResult {
     }
 }
 
-/// `$XDG_CONFIG_HOME/zrush/config.toml`, falling back to
-/// `~/.config/zrush/config.toml` when XDG_CONFIG_HOME is unset (or
-/// empty, per the XDG spec's "empty means unset").
+/// Config path resolution per cli-protocol.md.
 fn config_path() -> Option<PathBuf> {
     let base = match std::env::var_os("XDG_CONFIG_HOME") {
         Some(x) if !x.is_empty() => PathBuf::from(x),
@@ -243,7 +238,6 @@ fn apply_key(
         }
         ("keybind", _) => {
             if let Some(i) = keybind::ACTIONS.iter().position(|a| *a == key) {
-                // string = one-element list; array = key list (schema).
                 match val {
                     toml::Value::String(s) => kb_user[i] = Some(vec![s.clone()]),
                     toml::Value::Array(items) => {
