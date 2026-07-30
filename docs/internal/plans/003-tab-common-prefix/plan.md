@@ -41,7 +41,7 @@ M5 ドッグフーディングで「Tab(`common-prefix`)が体感無反応」を
     cp 挿入側は従来どおり as-typed の接頭辞拡張のみで、入力を縮める・
     別文字列に置き換える挿入はしない。
   - 候補 0 件の Tab は従来どおり何もしない。
-- **PROTOCOL_VERSION を 3 に上げる**。
+- **プロトコル版番号を上げる**。
   - common-prefix フィールドの意味変更(全マッチ → prefix 階層のみ)のため
     (cli-protocol.md の版上げ基準「フィールドの意味変更」に該当)。
     フィールドの形式・位置は不変。
@@ -51,12 +51,12 @@ M5 ドッグフーディングで「Tab(`common-prefix`)が体感無反応」を
 ## 実装手順
 
 1. **contracts 更新**(docs 先行):
-   - cli-protocol.md: PROTOCOL_VERSION = 3、common-prefix の定義を
+   - cli-protocol.md: プロトコル版番号を上げ、common-prefix の定義を
      「prefix 階層マッチの match-text のバイト単位 LCP(マッチ 0 件・prefix 階層
      0 件・共通部分なしは空)」へ。zsh 側挙動(規範)にフォールバックを追記。
    - config-schema.md: `[insert].tab` の `common-prefix` 説明を更新。
 2. **Rust**: `cmd_match` の LCP 入力を `Tier::Prefix` のマッチに限定。
-   PROTOCOL_VERSION = 3。単体・CLI テスト追従
+   プロトコル版番号を上げる。単体・CLI テスト追従
    (例: `chec` → prefix 階層 {checkout, check-attr} の LCP "check" を返し、
    substring の sparse-checkout を含めない / `gti` → prefix 階層なしで空)。
 3. **zsh**: `_zrush_tab_with_results` の common-prefix 分岐に

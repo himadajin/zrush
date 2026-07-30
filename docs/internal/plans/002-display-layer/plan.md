@@ -92,7 +92,7 @@ M5 の完了判定・ドッグフーディング記録は 001 側(`notes-dogfood
   - config-schema.md にアクション 2 つを追加(D2 で更新)。Tab キー予約規則は不変。
 - **マッチ箇所ハイライト** — Rust だけがマッチ位置を知っているため、**プロトコルを拡張**する。
   - `zrush match` の stdout を「各 index の後にマッチ位置フィールド」を伴う形に変え、
-    **PROTOCOL_VERSION を 2 に上げる**(cli-protocol.md を D4 で更新)。
+    **プロトコル版番号を上げる**(cli-protocol.md を D4 で更新)。
   - 位置は match-text への文字範囲リスト(lossy UTF-8 解釈の文字オフセット。
     例: `0-1,3-4`。なしは空フィールド)。
     zsh 側は表示文字列上の該当範囲を region_highlight に変換する

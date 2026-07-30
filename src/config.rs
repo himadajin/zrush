@@ -11,7 +11,7 @@ use crate::keybind;
 use crate::matching::Mode;
 
 /// Protocol version emitted as ZRUSH_PROTOCOL_VERSION (cli-protocol.md).
-pub const PROTOCOL_VERSION: &str = "3";
+pub const PROTOCOL_VERSION: &str = "1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TabBehavior {
@@ -628,7 +628,7 @@ mod tests {
     fn default_output_matches_contract_example() {
         let out = to_zsh(&LoadResult::default());
         let expected = "\
-typeset -g  ZRUSH_PROTOCOL_VERSION='3'
+typeset -g  ZRUSH_PROTOCOL_VERSION='1'
 typeset -g  ZRUSH_CFG_MAX_LINES='10'
 typeset -g  ZRUSH_CFG_DELAY_MS='30'
 typeset -g  ZRUSH_CFG_MIN_INPUT='0'

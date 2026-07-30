@@ -15,7 +15,7 @@ typeset -g _zrush_source_dir=${${(%):-%N}:A:h}
 # ---------------------------------------------------------------- Global state
 typeset -g  ZRUSH_BIN=${ZRUSH_BIN:-$_zrush_source_dir/../target/release/zrush}
 typeset -gi _zrush_enabled=0
-typeset -gi _ZRUSH_EXPECTED_PROTO=3
+typeset -gi _ZRUSH_EXPECTED_PROTO=1
 typeset -g  _zrush_cfg_path= _zrush_cfg_mtime= _zrush_cfg_warn_shown=
 typeset -gi _zrush_match_warned=0 _zrush_proto_warned=0
 
