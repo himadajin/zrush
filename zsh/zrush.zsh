@@ -1049,13 +1049,13 @@ _zrush_confirm_index() {  # $1=index into local krecs/words/... arrays
   fi
   LBUFFER=$newl        # leave text after the cursor (RBUFFER) unchanged
 
-  # After confirmation, clear selection/list and align last_buffer to avoid recollection.
+  # After confirmation, clear selection/list. last_buffer stays stale so the next
+  # pre-redraw treats the insertion as a buffer change and triggers recollection,
+  # matching the common-prefix insertion path.
   _zrush_disarm_timer
   _zrush_cancel_collection
   _zrush_clear_display
   _zrush_tab_pending=0
-  _zrush_last_buffer=$BUFFER
-  _zrush_last_cursor=$CURSOR
   return 0
 }
 

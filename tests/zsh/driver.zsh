@@ -350,6 +350,50 @@ log_count() {  # $1=fixed string -> REPLY: occurrence count in ZRUSH_LOG
   clear_line
   drain 0.3
 
+  # ---------------- (cf-1) Confirmation triggers recollection ----------------
+  # The render may land while press() drains, so match the cumulative TRANSCRIPT
+  # after stripping SGR (as in cc-1b) instead of using expect.
+  # Confirming docs/internal/ synthesizes '/'; recollection lists the directory contents.
+  send_keys 'ls docs/inte'
+  expect '*internal*' 10 >/dev/null
+  press $DOWN
+  log_count 'finalize: match ok'; local -i c_cf1=$REPLY
+  TRANSCRIPT=
+  press $ENTER
+  if wait_log 'finalize: match ok' $c_cf1 10; then
+    ok "(cf-1a) confirming a directory triggers recollection"
+  else
+    ng "(cf-1a) no recollection after directory confirmation"
+  fi
+  drain 0.5
+  if [[ ${TRANSCRIPT//$'\e['[0-9;]#m/} == *specs* ]]; then
+    ok "(cf-1a') directory contents listed after confirming docs/internal/"
+  else
+    ng "(cf-1a') directory contents not displayed after confirmation"
+  fi
+  clear_line
+  drain 0.3
+  # Confirming a file adds a trailing space; recollection lists the next argument position.
+  send_keys 'ls Cargo.t'
+  expect '*Cargo.toml*' 10 >/dev/null
+  press $DOWN
+  log_count 'finalize: match ok'; local -i c_cf2=$REPLY
+  TRANSCRIPT=
+  press $ENTER
+  if wait_log 'finalize: match ok' $c_cf2 10; then
+    ok "(cf-1b) confirming with trailing space triggers recollection"
+  else
+    ng "(cf-1b) no recollection after trailing-space confirmation"
+  fi
+  drain 0.5
+  if [[ ${TRANSCRIPT//$'\e['[0-9;]#m/} == *docs* ]]; then
+    ok "(cf-1b') next-argument candidates listed after confirming 'ls Cargo.toml '"
+  else
+    ng "(cf-1b') next-argument candidates not displayed after confirmation"
+  fi
+  clear_line
+  drain 0.3
+
   # ---------------- (m4-5b) Preserve '~' ----------------
   send_keys 'ls ~/do'
   expect '*docs*' 10 >/dev/null
