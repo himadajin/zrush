@@ -5,6 +5,11 @@ edition = "2024"
 rust-version = "1.88"
 
 [dependencies]
+# CLI argument parsing (derive). zrush is spawned per keystroke, but the
+# parse cost is noise vs the ~2ms process spawn itself (empirically
+# measured); declarative parsing's robustness (validation, --help, exit
+# codes) outweighs the +~200KB binary size cost.
+clap = { version = "4.6", features = ["derive"] }
 # Fuzzy (subsequence) matching for typo mode:
 # - catches subsequence/prefix cases (dcs->docs, inte->internal)
 # - does NOT catch transpositions/substitutions/insertions (gti->git);
