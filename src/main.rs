@@ -1,7 +1,8 @@
 //! zrush CLI entry point.
 //!
 //! Subcommands per docs/internal/contracts/cli-protocol.md (source of truth):
-//! - `zrush match` ranks candidates for a query.
+//! - `zrush plan` builds a full render plan (layout, highlights,
+//!   navigation, insertion texts) for a captured candidate stream + query.
 //! - `zrush config` emits zsh-sourceable settings.
 //!
 //! Argument parsing is hand-written on purpose: zrush is spawned per
@@ -10,9 +11,13 @@
 //! macOS + Linux only): user input mid-composition need not be UTF-8.
 
 mod config;
+mod insert;
 mod keybind;
+mod layout;
 mod matching;
+mod plan;
 mod ranking;
+mod record;
 
 use std::ffi::OsString;
 use std::io::{Read, Write};
@@ -29,7 +34,7 @@ const EXIT_PROTOCOL: u8 = 3;
 fn main() -> ExitCode {
     let args: Vec<OsString> = std::env::args_os().skip(1).collect();
     match args.first().and_then(|a| a.to_str()) {
-        Some("match") => cmd_match(&args[1..]),
+        Some("plan") => cmd_plan(&args[1..]),
         Some("config") => cmd_config(&args[1..]),
         _ => usage(),
     }
@@ -37,19 +42,23 @@ fn main() -> ExitCode {
 
 fn usage() -> ExitCode {
     eprintln!(
-        "usage: zrush match --query <q> --mode <prefix|substring|typo> \
-         --smart-case <true|false> --max-lines <N>\n       zrush config"
+        "usage: zrush plan --query <q> --mode <prefix|substring|typo> \
+         --smart-case <true|false> --rows <N> --width <N> \
+         --trailing-space <true|false>\n       zrush config"
     );
     ExitCode::from(EXIT_USAGE)
 }
 
-/// Per cli-protocol.md "zrush match".
-/// Invalid arguments exit 2; malformed input exits 3.
-fn cmd_match(args: &[OsString]) -> ExitCode {
+/// Per cli-protocol.md "zrush plan". Invalid/missing/unknown arguments
+/// exit 2; a framing-broken stdin stream exits 3; stdin/stdout I/O
+/// failure exits 1.
+fn cmd_plan(args: &[OsString]) -> ExitCode {
     let mut query: Option<Vec<u8>> = None;
     let mut mode: Option<Mode> = None;
     let mut smart_case: Option<bool> = None;
-    let mut max_lines: Option<usize> = None;
+    let mut rows: Option<usize> = None;
+    let mut width: Option<usize> = None;
+    let mut trailing_space: Option<bool> = None;
 
     let mut it = args.iter();
     while let Some(flag) = it.next() {
@@ -67,15 +76,29 @@ fn cmd_match(args: &[OsString]) -> ExitCode {
                 Some("false") => smart_case = Some(false),
                 _ => return usage(),
             },
-            b"--max-lines" => match value.to_str().and_then(|s| s.parse::<usize>().ok()) {
-                Some(n) => max_lines = Some(n),
-                None => return usage(),
+            // 0 is rejected: cli-protocol.md guarantees zsh clamps both
+            // to >= 1 before invoking; a 0 here indicates misuse, not a
+            // legitimate degenerate budget (layout.rs still handles 0
+            // gracefully as defense in depth, but the CLI contract treats
+            // it as a usage error).
+            b"--rows" => match value.to_str().and_then(|s| s.parse::<usize>().ok()) {
+                Some(n) if n > 0 => rows = Some(n),
+                _ => return usage(),
+            },
+            b"--width" => match value.to_str().and_then(|s| s.parse::<usize>().ok()) {
+                Some(n) if n > 0 => width = Some(n),
+                _ => return usage(),
+            },
+            b"--trailing-space" => match value.to_str() {
+                Some("true") => trailing_space = Some(true),
+                Some("false") => trailing_space = Some(false),
+                _ => return usage(),
             },
             _ => return usage(),
         }
     }
-    let (Some(query), Some(mode), Some(smart_case), Some(max_lines)) =
-        (query, mode, smart_case, max_lines)
+    let (Some(query), Some(mode), Some(smart_case), Some(rows), Some(width), Some(trailing_space)) =
+        (query, mode, smart_case, rows, width, trailing_space)
     else {
         return usage();
     };
@@ -85,62 +108,31 @@ fn cmd_match(args: &[OsString]) -> ExitCode {
         return ExitCode::from(EXIT_INTERNAL);
     }
 
-    // Fields are NUL-terminated: a non-empty stream must end with NUL,
-    // and stripping it yields exactly the field list.
-    let fields: Vec<&[u8]> = match data.last() {
-        None => Vec::new(),
-        Some(0) => data[..data.len() - 1].split(|&b| b == 0).collect(),
-        Some(_) => return ExitCode::from(EXIT_PROTOCOL),
+    let params = plan::Params {
+        query,
+        mode,
+        smart_case,
+        rows,
+        width,
+        trailing_space,
     };
-    if !fields.len().is_multiple_of(3) {
-        return ExitCode::from(EXIT_PROTOCOL);
-    }
-
-    let mut candidates: Vec<(&[u8], &[u8])> = Vec::with_capacity(fields.len() / 3);
-    for record in fields.chunks_exact(3) {
-        let index = record[0];
-        if index.is_empty() || !index.iter().all(u8::is_ascii_digit) {
-            return ExitCode::from(EXIT_PROTOCOL);
-        }
-        candidates.push((index, record[1]));
-    }
-
-    let mut qm = matching::QueryMatcher::new(&query, mode, smart_case);
-    let mut scored = Vec::new();
-    let mut prefix_texts: Vec<&[u8]> = Vec::new();
-    for (pos, (_, text)) in candidates.iter().enumerate() {
-        if let Some(ms) = qm.score(text) {
-            scored.push((pos, ms));
-            // Prefix-tier only, pre-truncation (cli-protocol.md).
-            if ms.tier == matching::Tier::Prefix {
-                prefix_texts.push(text);
-            }
-        }
-    }
-
-    let lcp = matching::common_prefix(prefix_texts.into_iter());
-    let order = ranking::rank(&scored, max_lines);
-
-    let mut out = Vec::with_capacity(lcp.len() + 1 + order.len() * 16);
-    out.extend_from_slice(lcp);
-    out.push(0);
-    for pos in order {
-        out.extend_from_slice(candidates[pos].0);
-        out.push(0);
-        // Spans are extracted only for the emitted (top max-lines)
-        // candidates — a cheap second pass per candidate.
-        for (i, (s, e)) in qm.spans(candidates[pos].1).into_iter().enumerate() {
-            if i > 0 {
-                out.push(b',');
-            }
-            let _ = write!(out, "{s}-{e}");
-        }
-        out.push(0);
-    }
+    let out = match plan::run(&params, &data, &real_is_dir) {
+        Ok(out) => out,
+        Err(plan::Error::Framing) => return ExitCode::from(EXIT_PROTOCOL),
+    };
     if std::io::stdout().write_all(&out).is_err() {
         return ExitCode::from(EXIT_INTERNAL);
     }
     ExitCode::SUCCESS
+}
+
+/// `-f` directory-synthesis stat (cli-protocol.md "挿入テキスト"):
+/// resolved against the process's current directory, following symlinks
+/// (`fs::metadata`, not `symlink_metadata`). Stat failure or a non-
+/// directory target both read as "not a directory".
+fn real_is_dir(path: &[u8]) -> bool {
+    let os = std::ffi::OsStr::from_bytes(path);
+    std::fs::metadata(os).map(|m| m.is_dir()).unwrap_or(false)
 }
 
 /// Per cli-protocol.md "zrush config", including config-error fallback.

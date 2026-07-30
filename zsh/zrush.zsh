@@ -3,6 +3,13 @@
 # Requirements: zsh 5.8+, source after compinit, after zsh-abbr, and before
 # zsh-syntax-highlighting. $ZRUSH_BIN overrides ../target/release/zrush.
 #
+# zsh captures compsys candidates in a forked shell and hands the raw
+# capture stream straight to `zrush plan` (Rust), which performs matching,
+# ranking, grouping, grid layout, highlight/navigation-table computation,
+# and insertion-text construction. This file only captures and applies:
+# it does not parse candidate records, compute layout, or reconstruct
+# insertion text itself.
+#
 # See docs/internal/specs/behavior.md for observable behavior and architecture.
 # See docs/internal/contracts/cli-protocol.md for the zsh/Rust boundary.
 #
@@ -11,12 +18,31 @@
 # Capture the source directory; re-sourcing is allowed and reinitializes state.
 typeset -g _zrush_source_dir=${${(%):-%N}:A:h}
 
+# ---------------------------------------------------------------- Re-source teardown
+# Re-sourcing this file is supported, but the `typeset -g` block right below
+# immediately resets fd/zpty/timer identifiers to -1/empty -- if a previous
+# sourcing already completed _zrush_init (_zrush_enabled=1), its live
+# timer/collection/zpty worker/region_highlight entries must be torn down
+# FIRST, using the still-defined functions and still-live values left over
+# from that previous sourcing, or they would be stranded (leaked fds, an
+# orphaned worker, dangling region_highlight entries). On a first-ever
+# sourcing _zrush_enabled is unset, so this is a no-op.
+# Keybind predecessor chains need no action here: they are embedded in each
+# dispatch widget's own function body at bind time (_zrush_bind_one), not
+# read from these globals, so _zrush_apply_keybinds' normal re-application
+# later in _zrush_init already handles them correctly on re-source.
+if (( ${+_zrush_enabled} )) && (( _zrush_enabled )); then
+  (( $+functions[_zrush_disarm_timer] ))      && _zrush_disarm_timer
+  (( $+functions[_zrush_cancel_collection] )) && _zrush_cancel_collection
+  (( $+functions[_zrush_rh_clear] ))          && _zrush_rh_clear
+fi
+
 # ---------------------------------------------------------------- Global state
 typeset -g  ZRUSH_BIN=${ZRUSH_BIN:-$_zrush_source_dir/../target/release/zrush}
 typeset -gi _zrush_enabled=0
-typeset -gi _ZRUSH_EXPECTED_PROTO=1
+typeset -gi _ZRUSH_EXPECTED_PROTO=2
 typeset -g  _zrush_cfg_path= _zrush_cfg_mtime=
-typeset -gi _zrush_match_warned=0 _zrush_proto_warned=0
+typeset -gi _zrush_plan_warned=0 _zrush_proto_warned=0
 # Variables this script consumes from `zrush config` output (validation and rollback)
 typeset -ga _ZRUSH_CFG_VARS=(
   ZRUSH_CFG_MAX_LINES ZRUSH_CFG_DELAY_MS ZRUSH_CFG_MIN_INPUT
@@ -32,12 +58,16 @@ typeset -g  _zrush_pending_buffer=
 typeset -g  _zrush_last_buffer=
 typeset -gi _zrush_last_cursor=-1
 
-# Received results, retaining source records and insertion forms for selection and confirmation
-typeset -ga _zrush_recs=() _zrush_krecs=() _zrush_words=() _zrush_match=() _zrush_disp=()
-typeset -g  _zrush_payload=   # stdin for `zrush match`, paired with parsed records
-typeset -ga _zrush_ranked=() _zrush_shown=()
-typeset -gA _zrush_spans=()   # candidate index -> match-spans (cli-protocol.md)
-typeset -g  _zrush_common_prefix=
+# Render plan received from `zrush plan` (cli-protocol.md "stdout(描画プラン)").
+# zsh applies these verbatim; it never recomputes layout, offsets, or spans.
+typeset -g  _zrush_plan_text=          # L display-row texts, \n-joined
+typeset -gi _zrush_plan_nlines=0       # L
+typeset -gi _zrush_plan_npos=0         # P
+typeset -ga _zrush_plan_hl=()          # H entries, each "role pos start len"
+typeset -ga _zrush_plan_cells=()       # P entries, each "start len" (1-based by position)
+typeset -ga _zrush_plan_nav=()         # P entries, each "next prev left right"
+typeset -ga _zrush_plan_insert=()      # P entries, completed insertion text
+typeset -g  _zrush_plan_cp=            # common-prefix
 typeset -gi _zrush_listing=0
 
 # Rendering (POSTDISPLAY + region_highlight)
@@ -50,20 +80,14 @@ typeset -gi _zrush_selected=0      # 0=unselected; >0=one-based, column-major di
 typeset -gi _zrush_tab_pending=0   # Tab was pressed before candidates arrived
 
 # See docs/internal/specs/behavior.md "空語収集キャッシュ".
-# Cache storage is separate from working arrays and survives across prompts.
-typeset -gi _zrush_cc_valid=0
+# Cache storage is separate from working state and survives across prompts.
+# The stored payload is the raw capture stream (pid record already stripped,
+# cli-protocol.md "候補レコード" / "スキップ規律"), fed to `zrush plan` unparsed
+# on a hit; an empty fingerprint means no cache entry.
 typeset -g  _zrush_cc_fp=          # fingerprint at save time
 typeset -gi _zrush_cc_time=0       # save time (EPOCHSECONDS)
-typeset -ga _zrush_cc_krecs=() _zrush_cc_words=() _zrush_cc_match=() _zrush_cc_disp=()
 typeset -g  _zrush_cc_payload=
 typeset -gi _ZRUSH_CC_TTL=300      # seconds; catches same-count replacement and is not configurable
-
-# Per-position grid metadata for select-left/right strides and group bounds
-typeset -ga _zrush_pos_rows=() _zrush_pos_gs=() _zrush_pos_ge=()
-typeset -gi _zrush_render_retry=0
-
-# Grid column limit, also used to estimate --max-lines as max-lines times this value
-typeset -gi _ZRUSH_MAX_COLS=8
 
 # Key bindings (dispatch widget -> predecessor/action)
 typeset -gA _zrush_dsp_prev=() _zrush_bound=()
@@ -178,9 +202,12 @@ _zrush_precmd() {
 
 # ---------------------------------------------------------------- Capture inside the fork
 # compadd hook installed in functions[compadd] only inside the fork.
-# Encode each candidate and its metadata as \2-joined <tag>\1<value> fields.
-# Batch NUL-terminated records once per compadd call because per-record writes caused
-# one read per record and measurably degraded large candidate sets.
+# Emits the v2 wire format (cli-protocol.md "stdin(捕獲レコード)"): one batch
+# header record (tag `b`, then whichever of P/p/S/s/i/I/ip/f/rd/X/J are
+# non-empty) followed by one thin record per candidate (`w`, optional `m`
+# only when it differs from `w`, optional `d`). Batch NUL-terminated records
+# once per compadd call because per-record writes caused one read per record
+# and measurably degraded large candidate sets.
 _zrush_compadd() {
   builtin setopt localoptions extendedglob norcexpandparam noshglob
   local -A apre hpre asuf hsuf ipre isuf dscrs _oad grpJ
@@ -197,58 +224,74 @@ _zrush_compadd() {
   local -a __hits __dscr
   (( $#dscrs == 1 )) && __dscr=( "${(@P)${(v)dscrs}}" )
   builtin compadd -A __hits -D __dscr "$@"
-  local -i ret=$?
-  (( $#__hits == 0 )) && return ret
 
-  # Drop framing bytes from value fields before encoding; same treatment as NUL.
-  __hits=( "${(@)__hits//(#s)*($'\0'|$'\1'|$'\2')*(#e)/}" )
-  __dscr=( "${(@)__dscr//(#s)*($'\0'|$'\1'|$'\2')*(#e)/}" )
-  local _bad_value="*("$'\0'"|"$'\1'"|"$'\2'")*"
-  local -a __decoded=( "${(@Q)__hits}" )
-  local -i _bad_i
-  while _bad_i=${__decoded[(I)${~_bad_value}]} && (( _bad_i )); do
-    __hits[_bad_i]=
-    __dscr[_bad_i]=
-    __decoded[_bad_i]=
-  done
-  local _rd=
-  if (( $#isfile )); then
-    # Resolve the real directory for insertion-time '/' handling. Tilde expansion
-    # requires the unquoted nested ${}; see notes-zpty.md "置換範囲モデル".
-    _rd=${${(Qe)~${:-$IPREFIX${(v)hpre}}}}
-  fi
-  local -a _vals=(
-    "${(v)apre}" "${(v)hpre}" "${(v)asuf}" "${(v)hsuf}"
-    "${(v)ipre}" "${(v)isuf}" "$IPREFIX"
-    "$_rd" "${expl[2]:-}" "${(v)grpJ}"
-  )
-  _vals=( "${(@)_vals//(#s)*($'\0'|$'\1'|$'\2')*(#e)/}" )
-
-  local _out=
-  local -a _rec
-  local -i j
-  local _d
-  for (( j = 1; j <= $#__hits; ++j )); do
-    _rec=( "w"$'\1'"$__hits[j]" )
-    _d=${__dscr[j]:-}
-    [[ -n $_d ]]           && _rec+=( "d"$'\1'"$_d" )
-    [[ -n $_vals[1] ]]     && _rec+=( "P"$'\1'"$_vals[1]" )
-    [[ -n $_vals[2] ]]     && _rec+=( "p"$'\1'"$_vals[2]" )
-    [[ -n $_vals[3] ]]     && _rec+=( "S"$'\1'"$_vals[3]" )
-    [[ -n $_vals[4] ]]     && _rec+=( "s"$'\1'"$_vals[4]" )
-    [[ -n $_vals[5] ]]     && _rec+=( "i"$'\1'"$_vals[5]" )
-    [[ -n $_vals[6] ]]     && _rec+=( "I"$'\1'"$_vals[6]" )
-    [[ -n $_vals[7] ]]     && _rec+=( "ip"$'\1'"$_vals[7]" )
+  # A zero-hit call still needs the tail-call below (compsys internal state,
+  # e.g. compstate bookkeeping, depends on every compadd invocation actually
+  # reaching the real builtin); only the record-emission side is skippable.
+  if (( $#__hits > 0 )); then
+    # Drop framing bytes from value fields before encoding; same treatment as NUL.
+    __hits=( "${(@)__hits//(#s)*($'\0'|$'\1'|$'\2')*(#e)/}" )
+    __dscr=( "${(@)__dscr//(#s)*($'\0'|$'\1'|$'\2')*(#e)/}" )
+    local _bad_value="*("$'\0'"|"$'\1'"|"$'\2'")*"
+    local -a __decoded=( "${(@Q)__hits}" )
+    local -i _bad_i
+    while _bad_i=${__decoded[(I)${~_bad_value}]} && (( _bad_i )); do
+      __hits[_bad_i]=
+      __dscr[_bad_i]=
+      __decoded[_bad_i]=
+    done
+    local _rd=
     if (( $#isfile )); then
-      _rec+=( "f"$'\1'"1" )
-      [[ -n $_vals[8] ]] && _rec+=( "rd"$'\1'"$_vals[8]" )
+      # Resolve the real directory for insertion-time '/' handling. Tilde expansion
+      # requires the unquoted nested ${}; see notes-zpty.md "置換範囲モデル".
+      _rd=${${(Qe)~${:-$IPREFIX${(v)hpre}}}}
     fi
-    [[ -n $_vals[9] ]]     && _rec+=( "X"$'\1'"$_vals[9]" )
-    [[ -n $_vals[10] ]]    && _rec+=( "J"$'\1'"$_vals[10]" )
-    _out+="${(pj:\2:)_rec}"$'\0'
-  done
-  print -rn -u $_zrush_wfd -- "$_out" 2>/dev/null
-  # Also run the original compadd to keep compsys internal state consistent.
+    local -a _vals=(
+      "${(v)apre}" "${(v)hpre}" "${(v)asuf}" "${(v)hsuf}"
+      "${(v)ipre}" "${(v)isuf}" "$IPREFIX"
+      "$_rd" "${expl[2]:-}" "${(v)grpJ}"
+    )
+    _vals=( "${(@)_vals//(#s)*($'\0'|$'\1'|$'\2')*(#e)/}" )
+
+    # Batch header: shared fields for this compadd call, always emitted even
+    # when every field is empty (cli-protocol.md "バッチヘッダレコード": the
+    # receiver needs it to delimit batch boundaries).
+    local -a _hdr=( "b"$'\1' )
+    [[ -n $_vals[1] ]]  && _hdr+=( "P"$'\1'"$_vals[1]" )
+    [[ -n $_vals[2] ]]  && _hdr+=( "p"$'\1'"$_vals[2]" )
+    [[ -n $_vals[3] ]]  && _hdr+=( "S"$'\1'"$_vals[3]" )
+    [[ -n $_vals[4] ]]  && _hdr+=( "s"$'\1'"$_vals[4]" )
+    [[ -n $_vals[5] ]]  && _hdr+=( "i"$'\1'"$_vals[5]" )
+    [[ -n $_vals[6] ]]  && _hdr+=( "I"$'\1'"$_vals[6]" )
+    [[ -n $_vals[7] ]]  && _hdr+=( "ip"$'\1'"$_vals[7]" )
+    if (( $#isfile )); then
+      _hdr+=( "f"$'\1'"1" )
+      [[ -n $_vals[8] ]] && _hdr+=( "rd"$'\1'"$_vals[8]" )
+    fi
+    [[ -n $_vals[9] ]]  && _hdr+=( "X"$'\1'"$_vals[9]" )
+    [[ -n $_vals[10] ]] && _hdr+=( "J"$'\1'"$_vals[10]" )
+    local _out="${(pj:\2:)_hdr}"$'\0'
+
+    local -a _rec
+    local -i j
+    local _d _m
+    for (( j = 1; j <= $#__hits; ++j )); do
+      # A candidate blanked above for containing framing bytes has nothing
+      # left to send; the contract puts exclusion on the sender (us), so
+      # skip it outright instead of emitting a bare empty-w record (Rust's
+      # own empty-w skip stays as a defensive fallback, not the guarantee).
+      [[ -z $__hits[j] ]] && continue
+      _rec=( "w"$'\1'"$__hits[j]" )
+      _m=$__decoded[j]
+      [[ $_m != "$__hits[j]" ]] && _rec+=( "m"$'\1'"$_m" )
+      _d=${__dscr[j]:-}
+      [[ -n $_d ]] && _rec+=( "d"$'\1'"$_d" )
+      _out+="${(pj:\2:)_rec}"$'\0'
+    done
+    print -rn -u $_zrush_wfd -- "$_out" 2>/dev/null
+  fi
+  # Also run the original compadd to keep compsys internal state consistent,
+  # regardless of whether this call produced any hits.
   builtin compadd "$@"
 }
 
@@ -401,17 +444,26 @@ _zrush_rh_add() {  # $1=start $2=end $3=spec [$4=memo suffix (-sel)]
   return 0
 }
 
+# Reset _zrush_plan_* only, with no display/selection side effects. Shared by
+# _zrush_clear_display (display-gated: no-ops when nothing is showing) and
+# _zrush_settle_plan's failure branch (must reset unconditionally, even when
+# nothing was showing, so stale state from an earlier prompt/query can never
+# survive to be used by a later pending Tab).
+_zrush_reset_plan_state() {
+  _zrush_plan_text= _zrush_plan_nlines=0 _zrush_plan_npos=0
+  _zrush_plan_hl=() _zrush_plan_cells=() _zrush_plan_nav=() _zrush_plan_insert=()
+  _zrush_plan_cp=
+  return 0
+}
+
 _zrush_clear_display() {  # Call only from a ZLE widget context.
   _zrush_selected=0
   (( _zrush_listing )) || return 0
   POSTDISPLAY=
   _zrush_rh_clear
   _zrush_listing=0
-  _zrush_recs=() _zrush_krecs=() _zrush_words=() _zrush_match=() _zrush_disp=()
-  _zrush_payload=
-  _zrush_ranked=() _zrush_shown=() _zrush_spans=()
-  _zrush_pos_rows=() _zrush_pos_gs=() _zrush_pos_ge=()
-  _zrush_common_prefix=
+  _zrush_reset_plan_state
+  return 0
 }
 
 # ---------------------------------------------------------------- Empty-word collection cache
@@ -441,16 +493,15 @@ _zrush_cc_fingerprint() {
 }
 
 _zrush_cc_invalidate() {
-  _zrush_cc_valid=0
   _zrush_cc_fp=
-  _zrush_cc_krecs=() _zrush_cc_words=() _zrush_cc_match=() _zrush_cc_disp=()
   _zrush_cc_payload=
+  _zrush_cc_time=0
   return 0
 }
 
 _zrush_cc_check() {  # 0=usable hit; on a miss, log the reason and return nonzero
   emulate -L zsh
-  if (( ! _zrush_cc_valid )); then
+  if [[ -z $_zrush_cc_fp ]]; then
     _zlog "cache: miss (empty)"
     return 1
   fi
@@ -465,22 +516,17 @@ _zrush_cc_check() {  # 0=usable hit; on a miss, log the reason and return nonzer
     _zrush_cc_invalidate
     return 1
   fi
-  _zlog "cache: hit (${#_zrush_cc_words} candidates)"
+  _zlog "cache: hit (${#_zrush_cc_payload} bytes)"
   return 0
 }
 
-_zrush_cc_save() {  # Copy parsed working arrays and payload into the cache.
+_zrush_cc_save() {  # $1=raw capture payload (pid stripped)
   emulate -L zsh
   _zrush_cc_fingerprint
   _zrush_cc_fp=$REPLY
   _zrush_cc_time=$EPOCHSECONDS
-  _zrush_cc_krecs=( "${(@)_zrush_krecs}" )
-  _zrush_cc_words=( "${(@)_zrush_words}" )
-  _zrush_cc_match=( "${(@)_zrush_match}" )
-  _zrush_cc_disp=( "${(@)_zrush_disp}" )
-  _zrush_cc_payload=$_zrush_payload
-  _zrush_cc_valid=1
-  _zlog "cache: saved ${#_zrush_cc_words} candidates"
+  _zrush_cc_payload=$1
+  _zlog "cache: saved (${#1} bytes)"
   return 0
 }
 
@@ -500,13 +546,8 @@ _zrush_start_request() {
 
   # See behavior.md "空語収集キャッシュ". zle -F -w callers require explicit redraw.
   if [[ -z $_zrush_query ]] && _zrush_cc_check; then
-    _zrush_recs=()
-    _zrush_krecs=( "${(@)_zrush_cc_krecs}" )
-    _zrush_words=( "${(@)_zrush_cc_words}" )
-    _zrush_match=( "${(@)_zrush_cc_match}" )
-    _zrush_disp=( "${(@)_zrush_cc_disp}" )
-    _zrush_payload=$_zrush_cc_payload
-    _zrush_apply_results
+    _zrush_run_plan "$_zrush_cc_payload"
+    _zrush_settle_plan $?
     zle -R
     return 0
   fi
@@ -536,7 +577,7 @@ _zrush_start_request() {
   return 0
 }
 
-# ---------------------------------------------------------------- Receive, match, and render
+# ---------------------------------------------------------------- Receive and finalize
 _zrush_on_data() {  # zle -F -w handler ($1=fd)
   emulate -L zsh
   local -i fd=$1
@@ -573,346 +614,219 @@ _zrush_on_data() {  # zle -F -w handler ($1=fd)
   return 0
 }
 
+# Collection payload (pid already stripped) -> `zrush plan`, applied on success.
+# The payload is handed to `zrush plan` unparsed: record parsing, matching,
+# ranking, layout, and highlight/nav/insert construction are all Rust's job
+# (cli-protocol.md). Cache successful empty-word command-position results
+# across prompts (behavior.md "空語収集キャッシュ").
 _zrush_finalize() {
   emulate -L zsh
   setopt localoptions no_monitor no_notify
   local payload=$_zrush_buf
   _zrush_buf=
-  _zrush_parse_records "$payload"
-  # Cache successful empty-word command-position results across prompts.
-  if [[ -z $_zrush_query ]] && (( $#_zrush_words > 0 )); then
-    _zrush_cc_save
+  # Marks "transport" (fork -> parent pipe) complete, mirroring every other
+  # pipeline stage's own checkpoint; driver-latency.zsh's breakdown reads it.
+  _zlog "finalize: ${#payload} bytes"
+  if [[ -z $_zrush_query && -n $payload ]]; then
+    _zrush_cc_save "$payload"
   fi
-  _zrush_apply_results
+  _zrush_run_plan "$payload"
+  _zrush_settle_plan $?
   return 0
 }
 
-# Collection payload -> local arrays (krecs/words/match/disp) and `_zrush_payload`
-# for `zrush match`.
-_zrush_parse_records() {  # $1=NUL-delimited collection payload ending in NUL
+# Apply (or discard, on failure) the plan just fetched by `_zrush_run_plan`,
+# then resolve a Tab recorded before it arrived. $1=0 on success (state
+# already populated), nonzero on failure. Shared by both `_zrush_run_plan`
+# call sites (fresh collection and cache hit) so the pending-Tab handling
+# in behavior.md "Tab" ("候補未着時の Tab は...結果到着時に上記の挙動を適用する")
+# cannot be forgotten on one path but not the other.
+#
+# On failure, a pending Tab is discarded outright -- it is never resolved
+# against _zrush_plan_* here. _zrush_clear_display no-ops when nothing is
+# currently showing (_zrush_listing == 0), which would otherwise leave a
+# stale, possibly non-empty _zrush_plan_* from an earlier prompt/query in
+# place; teardown here is unconditional so a later pending Tab can never be
+# resolved against it (cli-protocol.md "エラー時の zsh 側挙動").
+_zrush_settle_plan() {
   emulate -L zsh
-  setopt localoptions no_monitor no_notify
-  local payload=$1
-  _zrush_recs=() _zrush_krecs=() _zrush_words=() _zrush_match=() _zrush_disp=()
-  _zrush_payload=
-
-  if [[ -n $payload ]]; then
-    if [[ $payload == *$'\0' ]]; then
-      _zrush_recs=( "${(@0)${payload%$'\0'}}" )
-    else
-      _zlog "finalize: unterminated payload (${#payload} bytes); dropping"
-      _zrush_recs=()
-    fi
-  fi
-  _zlog "finalize: ${#_zrush_recs} records"
-
-  # Parse insertion (w) and display (d) forms; match-text is the (Q)-decoded form.
-  # Per-record zsh loops block for seconds on tens of thousands of candidates, so the
-  # common no-d-field case uses bulk array operations.
-  local -i i n=0
-  local -a words=() disps=() mts=()
-  local NUL=$'\0'
-  if [[ ${(pj::)_zrush_recs} != *$'\2'd$'\1'* ]]; then
-    words=( "${(@)${(@)_zrush_recs#w$'\1'}%%$'\2'*}" )
-    mts=( "${(@Q)words}" )
-    if [[ -z ${(M)words:#(*$'\1'*|)} && -z ${(M)mts:#*$'\0'*} ]]; then
-      # Fast path: no malformed or NUL-containing candidates, so records map 1:1.
-      n=$#words
-      _zrush_krecs=( "${(@)_zrush_recs}" )
-      _zrush_words=( "${(@)words}" )
-      _zrush_match=( "${(@)mts}" )
-      _zrush_disp=( "${(@)words:/*/}" )         # all elements empty (no d field)
-      if (( n > 0 )); then
-        local -a _idxs=( {1..$n} )
-        local -a _mts2=( "${(@)mts/%/$NUL}" )   # append an empty display field to each element
-        local -a _zip=( "${(@)_idxs:^_mts2}" )
-        _zrush_payload=${(pj:\0:)_zip}$'\0'
-      fi
-    else
-      n=-1   # use the general path
+  if (( $1 == 0 )); then
+    _zrush_apply_plan
+    if (( _zrush_tab_pending )); then
+      _zrush_tab_pending=0
+      _zrush_tab_with_results
     fi
   else
-    n=-1
-  fi
-
-  if (( n < 0 )); then
-    # General path for d fields or malformed records, normally a small set.
-    local r w d
-    local -a recs1=()
-    words=() disps=()
-    for r in "${(@)_zrush_recs}"; do
-      [[ $r == w$'\1'* ]] || continue
-      w=${${r#w$'\1'}%%$'\2'*}
-      [[ -n $w ]] || continue
-      if [[ $r == *$'\2'd$'\1'* ]]; then
-        d=${${r#*$'\2'd$'\1'}%%$'\2'*}
-      else
-        d=
-      fi
-      words+=( "$w" )
-      disps+=( "$d" )
-      recs1+=( "$r" )
-    done
-    mts=( "${(@Q)words}" )
-    # The sender drops NUL-containing candidates; indices use the filtered local arrays.
-    n=0
-    _zrush_krecs=() _zrush_words=() _zrush_match=() _zrush_disp=()
-    for (( i = 1; i <= $#words; ++i )); do
-      [[ $mts[i] == *$'\0'* || $disps[i] == *$'\0'* ]] && continue
-      _zrush_krecs+=( "$recs1[i]" )
-      _zrush_words+=( "$words[i]" )
-      _zrush_match+=( "$mts[i]" )
-      _zrush_disp+=( "$disps[i]" )
-      (( ++n ))
-      _zrush_payload+="$n"$'\0'"$mts[i]"$'\0'"$disps[i]"$'\0'
-    done
+    _zrush_selected=0
+    POSTDISPLAY=
+    _zrush_rh_clear
+    _zrush_listing=0
+    _zrush_reset_plan_state
+    _zrush_tab_pending=0
   fi
   return 0
 }
 
-# Match, render, then apply a pending Tab. Inputs are the local arrays and
-# `_zrush_payload`; called after parsing and on cache hits.
-_zrush_apply_results() {
+# ---------------------------------------------------------------- Plan retrieval
+# See docs/internal/contracts/cli-protocol.md "`zrush plan`" and "stdout(描画プラン)".
+# Runs the pure `zrush plan` pipeline over a raw capture payload (fresh
+# collection or a cache hit) and populates _zrush_plan_* on success.
+_zrush_run_plan() {  # $1=raw NUL-terminated capture payload; "" is valid (0 candidates)
   emulate -L zsh
-  setopt localoptions no_monitor no_notify
-  _zrush_ranked=() _zrush_spans=()
-  _zrush_common_prefix=
+  setopt localoptions typesetsilent no_monitor no_notify
+  local payload=$1
 
-  local -i n=$#_zrush_words
-  if (( n == 0 )); then
-    _zrush_tab_pending=0   # a recorded Tab has nothing to apply
-    _zrush_render   # zero candidates clears the list
-    return 0
-  fi
-
-  # `zrush match` is pure over snapshot arguments; suppress stderr to protect ZLE.
-  local out
-  # Fetch at most the grid capacity: max-lines rows times the maximum column count.
-  out=$(print -rn -- "$_zrush_payload" | \
-        "$ZRUSH_BIN" match --query "$_zrush_fuzzy" --mode "$ZRUSH_CFG_MODE" \
-                           --smart-case "$ZRUSH_CFG_SMART_CASE" \
-                           --max-lines $(( ZRUSH_CFG_MAX_LINES * _ZRUSH_MAX_COLS )) 2>/dev/null)
-  local -i rc=$?
-  if (( rc != 0 )); then
-    if (( ! _zrush_match_warned )); then
-      _zrush_warn "zrush match failed (exit $rc); suppressing further warnings this session"
-      _zrush_match_warned=1
-    fi
-    _zlog "finalize: zrush match exit $rc; discarding"
-    _zrush_tab_pending=0
-    _zrush_recs=() _zrush_words=() _zrush_match=() _zrush_disp=()
-    _zrush_render
-    return 0
-  fi
-
-  # See cli-protocol.md "stdout(結果)" for common-prefix and index/span pairs.
-  local -a fields=( "${(@0)${out%$'\0'}}" )
-  _zrush_common_prefix=${fields[1]:-}
-  _zrush_ranked=()
-  local -i fi
-  for (( fi = 2; fi + 1 <= $#fields; fi += 2 )); do
-    _zrush_ranked+=( "${fields[fi]}" )
-    [[ -n ${fields[fi+1]} ]] && _zrush_spans[${fields[fi]}]=${fields[fi+1]}
-  done
-  _zlog "finalize: match ok, ${#_zrush_ranked} ranked, common-prefix=${(qqqq)_zrush_common_prefix}"
-  _zrush_render
-  # Apply a Tab recorded before arrival; zero candidates do nothing without sync fallback.
-  if (( _zrush_tab_pending )); then
-    _zrush_tab_pending=0
-    (( $#_zrush_shown > 0 )) && _zrush_tab_with_results
-  fi
-  return 0
-}
-
-_zrush_render() {  # Call only from a ZLE widget context.
-  emulate -L zsh
-  # In zsh without TYPESET_SILENT, redeclaring a populated local without assignment
-  # writes "name=value" to stdout. Keep declarations outside loops and enable
-  # typesetsilent defensively because any widget output corrupts the ZLE display.
-  setopt localoptions typesetsilent
-  local -i maxl=$ZRUSH_CFG_MAX_LINES
-  (( LINES > 1 && maxl > LINES - 1 )) && maxl=$(( LINES - 1 ))
-  (( maxl < 1 )) && maxl=1
+  # cli-protocol.md "起動": rows = min(max-lines, LINES - 1), clamped to >= 1
+  # unconditionally (not just when LINES > 1 -- LINES <= 1 must still clamp
+  # down to the 1-row floor, not silently keep max-lines).
+  local -i rows=$(( LINES - 1 ))
+  (( rows > ZRUSH_CFG_MAX_LINES )) && rows=$ZRUSH_CFG_MAX_LINES
+  (( rows < 1 )) && rows=1
   local -i width=$(( COLUMNS - 1 ))
   (( width < 1 )) && width=1
 
-  # Highlight specs from the configuration snapshot; empty means no decoration.
+  # `zrush plan` is pure over its arguments and stdin; suppress stderr to protect ZLE.
+  local out
+  out=$(print -rn -- "$payload" | \
+        "$ZRUSH_BIN" plan --query "$_zrush_fuzzy" --mode "$ZRUSH_CFG_MODE" \
+                          --smart-case "$ZRUSH_CFG_SMART_CASE" \
+                          --rows $rows --width $width \
+                          --trailing-space "$ZRUSH_CFG_TRAILING_SPACE" 2>/dev/null)
+  local -i rc=$?
+  if (( rc == 0 )) && _zrush_parse_plan "$out"; then
+    _zlog "plan: ok L=$_zrush_plan_nlines P=$_zrush_plan_npos"
+    return 0
+  fi
+  # cli-protocol.md "エラー時の zsh 側挙動": discard, warn once per session; the
+  # caller is responsible for clearing any existing display.
+  if (( ! _zrush_plan_warned )); then
+    _zrush_warn "zrush plan failed or returned a malformed plan; suppressing further warnings this session"
+    _zrush_plan_warned=1
+  fi
+  _zlog "plan: failed (exit=$rc)"
+  return 1
+}
+
+# Validate and split one `zrush plan` stdout buffer into _zrush_plan_*.
+# Field layout is fixed (cli-protocol.md "stdout(描画プラン)"):
+#   common-prefix, L, P, L rows, H, H "role pos start len", P "start len",
+#   P "next prev left right", P insert texts -- total 4 + L + H + 3P fields.
+_zrush_parse_plan() {  # $1=raw `zrush plan` stdout
+  emulate -L zsh
+  local out=$1
+  [[ $out == *$'\0' ]] || return 1   # final NUL required (cli-protocol.md)
+  local -a f=( "${(@0)${out%$'\0'}}" )
+  local -i n=$#f
+  (( n >= 4 )) || return 1
+  [[ $f[2] == <-> && $f[3] == <-> ]] || return 1
+  local -i L=$f[2] P=$f[3]
+
+  local -i idx=4
+  (( idx + L - 1 <= n )) || return 1
+  local -a rows=( "${(@)f[idx,idx+L-1]}" )
+  (( idx += L ))
+  (( idx <= n )) || return 1
+  [[ $f[idx] == <-> ]] || return 1
+  local -i H=$f[idx]
+  (( idx += 1 ))
+  (( idx + H - 1 <= n )) || return 1
+  local -a hls=( "${(@)f[idx,idx+H-1]}" )
+  (( idx += H ))
+  (( idx + P - 1 <= n )) || return 1
+  local -a cells=( "${(@)f[idx,idx+P-1]}" )
+  (( idx += P ))
+  (( idx + P - 1 <= n )) || return 1
+  local -a navs=( "${(@)f[idx,idx+P-1]}" )
+  (( idx += P ))
+  (( idx + P - 1 <= n )) || return 1
+  local -a inserts=( "${(@)f[idx,idx+P-1]}" )
+  (( idx += P ))
+  (( idx - 1 == n )) || return 1   # exact field count: 4 + L + H + 3P
+
+  # Tuple shapes and value ranges.
+  local e role pos start len
+  local -a tok
+  for e in "${(@)hls}"; do
+    tok=( ${=e} )
+    (( $#tok == 4 )) || return 1
+    role=$tok[1] pos=$tok[2] start=$tok[3] len=$tok[4]
+    [[ $role == match || $role == heading ]] || return 1
+    [[ $pos == <-> && $start == <-> && $len == <-> ]] || return 1
+    (( pos <= P )) || return 1
+  done
+  for e in "${(@)cells}"; do
+    tok=( ${=e} )
+    (( $#tok == 2 )) || return 1
+    [[ $tok[1] == <-> && $tok[2] == <-> ]] || return 1
+  done
+  for e in "${(@)navs}"; do
+    tok=( ${=e} )
+    (( $#tok == 4 )) || return 1
+    [[ $tok[1] == <-> && $tok[2] == <-> && $tok[3] == <-> && $tok[4] == <-> ]] || return 1
+    (( tok[1] <= P && tok[2] <= P && tok[3] <= P && tok[4] <= P )) || return 1
+  done
+
+  _zrush_plan_cp=$f[1]
+  _zrush_plan_nlines=$L
+  _zrush_plan_npos=$P
+  _zrush_plan_text=${(pj:\n:)rows}
+  _zrush_plan_hl=( "${(@)hls}" )
+  _zrush_plan_cells=( "${(@)cells}" )
+  _zrush_plan_nav=( "${(@)navs}" )
+  _zrush_plan_insert=( "${(@)inserts}" )
+  return 0
+}
+
+# ---------------------------------------------------------------- Apply the plan
+# Call only from a ZLE widget context. Applies the last successfully parsed
+# plan (_zrush_plan_*) to POSTDISPLAY and region_highlight without any
+# further computation (cli-protocol.md "適用(zsh 側の規範)").
+_zrush_apply_plan() {
+  emulate -L zsh
+  (( _zrush_selected > _zrush_plan_npos )) && _zrush_selected=$_zrush_plan_npos
+  if (( _zrush_plan_nlines > 0 )); then
+    POSTDISPLAY=$'\n'$_zrush_plan_text
+    _zrush_listing=1
+  else
+    POSTDISPLAY=
+    _zrush_listing=0
+  fi
+  _zrush_apply_highlights
+  _zlog "plan: applied L=$_zrush_plan_nlines P=$_zrush_plan_npos selected=$_zrush_selected"
+  return 0
+}
+
+# Call only from a ZLE widget context. Rebuilds region_highlight from
+# _zrush_plan_hl/_zrush_plan_cells for the current _zrush_selected, without
+# re-fetching or recomputing the plan (cli-protocol.md "ハイライト": match
+# decoration is skipped for the selected cell and replaced by the selected
+# spec built from that position's cell range).
+_zrush_apply_highlights() {
+  emulate -L zsh
+  _zrush_rh_clear
+  (( _zrush_plan_nlines > 0 )) || return 0
   local hl_sel=${ZRUSH_CFG_HL_SELECTED-standout}
   local hl_mat=${ZRUSH_CFG_HL_MATCH-underline}
   local hl_head=${ZRUSH_CFG_HL_HEADING-bold}
-
-  # Build displayable items up to grid capacity. Prefer J for group identity and X
-  # for headings. Apply spans only when displaying match-text directly.
-  local -a items=() texts=() gkey=() ghd=() spanstr=()
-  local idx text rec x j
-  for idx in "${(@)_zrush_ranked}"; do
-    [[ $idx == <-> ]] || continue
-    if [[ -n ${_zrush_disp[idx]:-} ]]; then
-      text=${_zrush_disp[idx]}
-      spanstr+=( '' )
-    else
-      text=${_zrush_match[idx]}
-      spanstr+=( "${_zrush_spans[$idx]:-}" )
-    fi
-    text=${text//$'\n'/ }
-    rec=${_zrush_krecs[idx]:-}
-    x= j=
-    [[ $rec == *$'\2'X$'\1'* ]] && x=${${rec#*$'\2'X$'\1'}%%$'\2'*}
-    [[ $rec == *$'\2'J$'\1'* ]] && j=${${rec#*$'\2'J$'\1'}%%$'\2'*}
-    [[ $j == -default- ]] && j=
-    items+=( $idx )
-    texts+=( "$text" )
-    gkey+=( "${j:-$x}" )
-    ghd+=( "${x:-$j}" )
-    (( $#items >= maxl * _ZRUSH_MAX_COLS )) && break
-  done
-  if (( $#items == 0 )); then
-    _zrush_clear_display
-    return 0
-  fi
-
-  # Split groups by first appearance in rank order, retaining rank order within each group.
-  local -A gord=()
-  local -a gheads=() gmembers=()
-  local -i ng=0 i
-  local key
-  for (( i = 1; i <= $#items; ++i )); do
-    key="k:${gkey[i]}"
-    if [[ -z ${gord[$key]:-} ]]; then
-      gord[$key]=$(( ++ng ))
-      gheads[ng]=${gkey[i]:+${ghd[i]}}   # no key means no group and no heading
-    fi
-    gmembers[${gord[$key]}]+=" $i"
-  done
-
-  # Pack a column-major grid per group within maxl. Width is uniform per group and
-  # measured across all fetched members, conservatively preventing line overflow.
-  local -a lines=() hl=()     # hl: "line-number line-offset character-count spec"
-  _zrush_shown=()
-  local -a pos_rows=() pos_gs=() pos_ge=() gi=()
-  local -i gut=2 budget=maxl ord p r c w
-  local -i sel=$_zrush_selected
-  local -i gmaxw cols grows gcount gstart gend ii cello ms me kept
-  local head cell line sp sel_hl=
-  for (( ord = 1; ord <= ng; ++ord )); do
-    (( budget < 1 )) && break
-    gi=( ${=gmembers[ord]} )
-    head=${gheads[ord]:-}
-    if [[ -n $head ]]; then
-      if (( budget >= 2 )); then
-        if (( ${(m)#head} > width )); then
-          head=${(mr:$width:)head}
-          # (mr) rounds up at a wide-character boundary; drop one character if it overshoots.
-          (( ${(m)#head} > width )) && head=${(mr:$width:)head[1,-2]}
-        fi
-        lines+=( "$head" )
-        [[ -n $hl_head ]] && hl+=( "$#lines 0 ${#head} $hl_head" )
-        (( budget -= 1 ))
-      elif (( $#lines )); then
-        break   # stop when a later group's heading does not fit the row budget
-      fi        # for the first group, omit the heading and still show candidates
-    fi
-    gmaxw=1
-    for i in $gi; do
-      w=${(m)#texts[i]}
-      (( w > gmaxw )) && gmaxw=w
-    done
-    (( gmaxw > width )) && gmaxw=width
-    cols=$(( (width + gut) / (gmaxw + gut) ))
-    (( cols < 1 )) && cols=1
-    (( cols > _ZRUSH_MAX_COLS )) && cols=_ZRUSH_MAX_COLS
-    grows=$(( ($#gi + cols - 1) / cols ))
-    (( grows > budget )) && grows=budget
-    gcount=$(( cols * grows ))
-    (( gcount > $#gi )) && gcount=$#gi
-    cols=$(( (gcount + grows - 1) / grows ))   # compact columns left over after rounding
-    gstart=$(( $#_zrush_shown + 1 ))
-    gend=$(( gstart + gcount - 1 ))
-    for (( r = 1; r <= grows; ++r )); do
-      line=
-      for (( c = 1; c <= cols; ++c )); do
-        p=$(( (c - 1) * grows + r ))
-        (( p > gcount )) && break
-        (( c > 1 )) && line+='  '
-        ii=$gi[p]
-        cell=${(mr:$gmaxw:)texts[ii]}
-        # Wide-boundary rounding may exceed cell width; drop one character and repad.
-        (( ${(m)#cell} > gmaxw )) && cell=${(mr:$gmaxw:)cell[1,-2]}
-        cello=${#line}
-        if (( gstart + p - 1 == sel )); then
-          # Track the selected entry under -sel so input can remove it alone.
-          [[ -n $hl_sel ]] && sel_hl="$(( $#lines + 1 )) $cello ${#cell}"
-        elif [[ -n $hl_mat && -n ${spanstr[ii]} ]]; then
-          # Clip character-offset match spans to the truncated text.
-          # Do not apply them to the selected cell; selection decoration wins.
-          kept=${#texts[ii]}
-          (( ${(m)#texts[ii]} > gmaxw )) && kept=${#cell}
-          for sp in ${(s:,:)spanstr[ii]}; do
-            [[ $sp == <->-<-> ]] || continue
-            ms=${sp%%-*}
-            me=${sp#*-}
-            (( me > kept )) && me=kept
-            (( ms >= me )) && continue
-            hl+=( "$(( $#lines + 1 )) $(( cello + ms )) $(( me - ms )) $hl_mat" )
-          done
-        fi
-        line+=$cell
-      done
-      lines+=( "$line" )
-    done
-    for (( p = 1; p <= gcount; ++p )); do
-      _zrush_shown+=( ${items[$gi[p]]} )
-      pos_rows+=( $grows )
-      pos_gs+=( $gstart )
-      pos_ge+=( $gend )
-    done
-    (( budget -= grows ))
-  done
-
-  # Defensive no-list fallback; normally the first group yields at least one candidate row.
-  if (( $#lines == 0 )); then
-    _zrush_clear_display
-    return 0
-  fi
-
-  # If row-budget clipping hides the selection, clamp and rebuild once. Normal selection
-  # operations already clamp against the previous display.
-  if (( _zrush_selected > $#_zrush_shown )); then
-    _zrush_selected=$#_zrush_shown
-    if (( ! _zrush_render_retry )); then
-      _zrush_render_retry=1
-      _zrush_render
-      _zrush_render_retry=0
-      return 0
-    fi
-  fi
-  _zrush_pos_rows=( "${(@)pos_rows}" )
-  _zrush_pos_gs=( "${(@)pos_gs}" )
-  _zrush_pos_ge=( "${(@)pos_ge}" )
-
-  # Replace POSTDISPLAY atomically to avoid a visible blank between clear and redraw.
-  POSTDISPLAY=$'\n'${(pj:\n:)lines}
-  # Apply selection and heading decoration through region_highlight without changing layout.
-  _zrush_rh_clear
-  local -a lstart=()
   local -i off=$(( $#BUFFER + 1 ))   # account for the leading newline
-  for (( r = 1; r <= $#lines; ++r )); do
-    lstart[r]=$off
-    (( off += ${#lines[r]} + 1 ))
-  done
-  local e
+  local -i sel=$_zrush_selected
+  local e role spec
   local -a f
-  for e in "${(@)hl}"; do
-    f=( ${=e} )
-    # The spec starts at word four so user-configured specs may contain spaces.
-    _zrush_rh_add $(( lstart[$f[1]] + f[2] )) $(( lstart[$f[1]] + f[2] + f[3] )) "${(j: :)f[4,-1]}"
+  for e in "${(@)_zrush_plan_hl}"; do
+    f=( ${=e} )   # role pos start len
+    if [[ $f[1] == match ]]; then
+      (( f[2] == sel )) && continue   # the selected cell's own decoration wins
+      spec=$hl_mat
+    else
+      spec=$hl_head
+    fi
+    [[ -n $spec ]] || continue
+    _zrush_rh_add $(( off + f[3] )) $(( off + f[3] + f[4] )) "$spec"
   done
-  if [[ -n $sel_hl ]]; then
-    f=( ${=sel_hl} )
-    _zrush_rh_add $(( lstart[$f[1]] + f[2] )) $(( lstart[$f[1]] + f[2] + f[3] )) "$hl_sel" -sel
+  if (( sel > 0 )) && [[ -n $hl_sel ]]; then
+    f=( ${=_zrush_plan_cells[sel]} )   # start len
+    _zrush_rh_add $(( off + f[1] )) $(( off + f[1] + f[2] )) "$hl_sel" -sel
   fi
-  _zrush_listing=1
-  _zlog "render: $#lines lines shown=$#_zrush_shown selected=$_zrush_selected"
   return 0
 }
 
@@ -988,13 +902,19 @@ _zrush_line_init() {
   emulate -L zsh
   _zrush_last_buffer=
   _zrush_last_cursor=-1
-  # Unlike zle -M, POSTDISPLAY requires explicit cleanup. Remove stale output left by
-  # exits such as send-break that bypass line-finish.
-  if (( _zrush_listing )); then
-    POSTDISPLAY=
-    _zrush_rh_clear
-    _zrush_listing=0
-  fi
+  # A new ZLE session can follow an exit that bypassed _zrush_line_finish
+  # (send-break and similar). Tear down any leftover timer/collection from
+  # the previous session before it can leak a result (and thus a stray
+  # candidate list or a pending-Tab insertion) into this one, and reset
+  # display/plan state unconditionally -- not just when a listing happened
+  # to be visible, since stale _zrush_plan_* must not survive into a new
+  # session either.
+  _zrush_disarm_timer
+  _zrush_cancel_collection
+  POSTDISPLAY=
+  _zrush_rh_clear
+  _zrush_listing=0
+  _zrush_reset_plan_state
   _zrush_selected=0
   _zrush_tab_pending=0
   return 0
@@ -1011,59 +931,22 @@ _zrush_line_finish() {
   return 0
 }
 
-# ---------------------------------------------------------------- Reconstruct insertion text
-# See docs/internal/specs/behavior.md "確定(挿入)".
-# <IPREFIX><ipre(-i)><apre(-P)><hpre(-p)><word><hsuf(-s)><asuf(-S)><isuf(-I)>
-# Add a synthetic '/' when an -f candidate resolves to a real directory.
-_zrush_reconstruct() {  # $1=record -> REPLY=insertion text
-                        #   _zrush_rec_prefix=captured prefix (IPREFIX+hpre)
-                        #   _zrush_rec_nospace=1 suppresses trailing-space
-  emulate -L zsh
-  local rec=$1 f t
-  local -A g=()
-  for f in "${(@ps:\2:)rec}"; do
-    t=${f%%$'\1'*}
-    g[$t]=${f#*$'\1'}
-  done
-  local composed=${g[ip]}${g[i]}${g[P]}${g[p]}${g[w]}${g[s]}${g[S]}${g[I]}
-  local -i nospace=0
-  [[ -n ${g[S]}${g[s]}${g[I]} ]] && nospace=1     # candidate has a -S-family suffix
-  if [[ ${g[f]} == 1 && $composed != */ ]] && [[ -d ${g[rd]}${(Q)g[w]} ]]; then
-    composed+=/
-    nospace=1                                      # synthetic directory slash
-  fi
-  typeset -g  REPLY=$composed
-  typeset -g  _zrush_rec_prefix=${g[ip]}${g[p]}
-  typeset -gi _zrush_rec_nospace=$nospace
-  return 0
-}
-
 # ---------------------------------------------------------------- Confirmation
-# See docs/internal/specs/behavior.md "確定(挿入)".
-_zrush_confirm_index() {  # $1=index into local krecs/words/... arrays
+# See docs/internal/specs/behavior.md "確定(挿入)" and cli-protocol.md "適用".
+# The insertion text (IPREFIX+ipre+apre+hpre+word+hsuf+asuf+isuf, `-f`
+# directory '/' synthesis, trailing-space) is already fully built by
+# `zrush plan`; this only computes the replacement boundary and swaps it in.
+_zrush_confirm_pos() {  # $1=one-based position into _zrush_plan_insert
   emulate -L zsh
-  local -i idx=$1
-  local rec=${_zrush_krecs[idx]:-}
-  [[ -n $rec ]] || return 1
-  _zrush_reconstruct "$rec"
-  local composed=$REPLY prefix=$_zrush_rec_prefix
-  local -i nospace=$_zrush_rec_nospace
+  local -i pos=$1
+  (( pos >= 1 && pos <= $#_zrush_plan_insert )) || return 1
+  local text=$_zrush_plan_insert[pos]
 
-  # See docs/internal/specs/behavior.md "確定(挿入)" for replacement boundaries.
-  # `composed` retains a matching prefix byte-for-byte, which also preserves '~'.
   _zrush_widen "$LBUFFER"
-  local word=$REPLY_WORD keep=$REPLY_KEEP
+  local word=$REPLY_WORD
   local pre=${LBUFFER[1,$#LBUFFER-$#word]}
-  if [[ $prefix == "$keep" ]]; then
-    _zlog "confirm: tail-replace keep=${(qqqq)keep} insert=${(qqqq)composed}"
-  else
-    _zlog "confirm: whole-word-replace (prefix=${(qqqq)prefix} != keep=${(qqqq)keep}) insert=${(qqqq)composed}"
-  fi
-  local newl=$pre$composed
-  if [[ $ZRUSH_CFG_TRAILING_SPACE == true ]] && (( ! nospace )); then
-    newl+=' '
-  fi
-  LBUFFER=$newl        # leave text after the cursor (RBUFFER) unchanged
+  LBUFFER=$pre$text        # leave text after the cursor (RBUFFER) unchanged
+  _zlog "confirm: pos=$pos insert=${(qqqq)text}"
 
   # After confirmation, clear selection/list. last_buffer stays stale so the next
   # pre-redraw treats the insertion as a buffer change and triggers recollection,
@@ -1077,41 +960,36 @@ _zrush_confirm_index() {  # $1=index into local krecs/words/... arrays
 
 # ---------------------------------------------------------------- Selection
 _zrush_select_start() {
-  _zrush_selected=1
-  _zrush_render
-  _zlog "select: start"
-}
-
-_zrush_select_move() {  # $1=+1|-1
   emulate -L zsh
-  local -i new=$(( _zrush_selected + $1 ))
-  if (( new < 1 )); then
-    # select-prev on the first candidate returns to normal state, preserving access to history.
-    _zrush_selected=0
-    _zrush_render
-    _zlog "select: released-at-top"
-    return 0
-  fi
-  (( new > $#_zrush_shown )) && new=$#_zrush_shown
-  _zrush_selected=$new
-  _zrush_render
-  _zlog "select: pos=$_zrush_selected"
+  (( _zrush_plan_npos > 0 )) || return 0
+  _zrush_selected=1
+  _zrush_apply_highlights
+  _zlog "select: start"
   return 0
 }
 
-_zrush_select_hmove() {  # $1=+1|-1 (column stride = grid rows; clamp within group)
+# Move the current selection using the last plan's navigation table
+# (cli-protocol.md "ナビ"); no re-fetch or re-layout involved. A
+# self-referencing transition (next/left/right clamped at the boundary) is a
+# no-op per the contract; select-prev's transition to 0 at position 1
+# deselects and returns to normal state.
+_zrush_select_dir() {  # $1=next|prev|left|right
   emulate -L zsh
   local -i p=$_zrush_selected
-  local -i rows=${_zrush_pos_rows[p]:-1}
-  local -i lo=${_zrush_pos_gs[p]:-1}
-  local -i hi=${_zrush_pos_ge[p]:-$#_zrush_shown}
-  local -i new=$(( p + $1 * rows ))
-  (( new < lo )) && new=lo
-  (( new > hi )) && new=hi
+  (( p >= 1 && p <= $#_zrush_plan_nav )) || return 0
+  local -a f=( ${=_zrush_plan_nav[p]} )   # next prev left right
+  local -i new
+  case $1 in
+    next)  new=$f[1] ;;
+    prev)  new=$f[2] ;;
+    left)  new=$f[3] ;;
+    right) new=$f[4] ;;
+    *) return 0 ;;
+  esac
   (( new == p )) && return 0
   _zrush_selected=$new
-  _zrush_render
-  _zlog "select: pos=$_zrush_selected"
+  _zrush_apply_highlights
+  _zlog "select: dir=$1 pos=$_zrush_selected"
   return 0
 }
 
@@ -1133,7 +1011,7 @@ _zrush_call_prev() {  # Fall back through the predecessor chain, never directly 
 
 _zrush_action_next() {
   if (( _zrush_selected > 0 )); then
-    _zrush_select_move 1
+    _zrush_select_dir next
     return 0
   fi
   # See docs/internal/specs/behavior.md "選択・キーバインド" for this priority order.
@@ -1145,7 +1023,7 @@ _zrush_action_next() {
     _zlog "next: hist-branch"
     _zrush_call_prev; return 0            # 2. browsing history -> move toward newer history
   fi
-  if (( _zrush_listing && $#_zrush_shown > 0 )); then
+  if (( _zrush_listing && _zrush_plan_npos > 0 )); then
     _zrush_select_start; return 0         # 3. visible list -> start selection
   fi
   _zrush_call_prev                        # 4. otherwise -> predecessor
@@ -1154,7 +1032,7 @@ _zrush_action_next() {
 
 _zrush_action_prev() {
   if (( _zrush_selected > 0 )); then
-    _zrush_select_move -1
+    _zrush_select_dir prev
     return 0
   fi
   _zrush_call_prev
@@ -1165,7 +1043,7 @@ _zrush_action_prev() {
 # predecessor (cursor movement for the default arrow bindings).
 _zrush_action_left() {
   if (( _zrush_selected > 0 )); then
-    _zrush_select_hmove -1
+    _zrush_select_dir left
     return 0
   fi
   _zrush_call_prev
@@ -1174,7 +1052,7 @@ _zrush_action_left() {
 
 _zrush_action_right() {
   if (( _zrush_selected > 0 )); then
-    _zrush_select_hmove 1
+    _zrush_select_dir right
     return 0
   fi
   _zrush_call_prev
@@ -1183,7 +1061,7 @@ _zrush_action_right() {
 
 _zrush_action_confirm() {
   if (( _zrush_selected > 0 )); then
-    _zrush_confirm_index ${_zrush_shown[_zrush_selected]}
+    _zrush_confirm_pos $_zrush_selected
     return 0
   fi
   _zrush_call_prev
@@ -1193,6 +1071,11 @@ _zrush_action_confirm() {
 _zrush_action_dismiss() {
   if (( _zrush_selected > 0 || _zrush_listing )); then
     _zlog "dismiss: closing list"
+    # A still-armed debounce timer or an in-flight collection for a newer
+    # keystroke could otherwise complete after dismiss and silently reopen
+    # the list the user just closed.
+    _zrush_disarm_timer
+    _zrush_cancel_collection
     _zrush_clear_display     # leave the buffer unchanged
     _zrush_tab_pending=0
     return 0
@@ -1209,11 +1092,11 @@ _zrush_tab_with_results() {  # Tab behavior when results are available
       _zrush_select_start
       ;;
     insert)
-      (( $#_zrush_shown > 0 )) && _zrush_confirm_index ${_zrush_shown[1]}
+      (( _zrush_plan_npos > 0 )) && _zrush_confirm_pos 1
       ;;
     common-prefix)
-      # See cli-protocol.md "stdout(結果)" and behavior.md "Tab".
-      local cp=$_zrush_common_prefix q=$_zrush_fuzzy
+      # See cli-protocol.md "common-prefix の意味論" and behavior.md "Tab".
+      local cp=$_zrush_plan_cp q=$_zrush_fuzzy
       if [[ -n $cp && $cp != "$q" && $cp == "$q"* ]]; then
         _zrush_widen "$LBUFFER"
         local word=$REPLY_WORD keep=$REPLY_KEEP
@@ -1223,7 +1106,7 @@ _zrush_tab_with_results() {  # Tab behavior when results are available
         # Partial insertion is not confirmation; leave last_buffer stale to trigger recollection.
       else
         _zlog "tab: common-prefix fallback -> insert top (cp=${(qqqq)cp} q=${(qqqq)q})"
-        (( $#_zrush_shown > 0 )) && _zrush_confirm_index ${_zrush_shown[1]}
+        (( _zrush_plan_npos > 0 )) && _zrush_confirm_pos 1
       fi
       ;;
   esac
@@ -1233,7 +1116,7 @@ _zrush_tab_with_results() {  # Tab behavior when results are available
 _zrush_action_tab() {
   emulate -L zsh
   if (( _zrush_selected > 0 )); then
-    _zrush_confirm_index ${_zrush_shown[_zrush_selected]}   # Tab confirms the selection
+    _zrush_confirm_pos $_zrush_selected   # Tab confirms the selection
     return 0
   fi
   # During debounce or collection, record Tab, fast-forward collection, and apply on arrival.
@@ -1249,7 +1132,7 @@ _zrush_action_tab() {
     _zrush_tab_pending=1
     return 0
   fi
-  if (( _zrush_listing && $#_zrush_shown > 0 )); then
+  if (( _zrush_listing && _zrush_plan_npos > 0 )); then
     _zrush_tab_with_results
     return 0
   fi

@@ -1,21 +1,36 @@
 #!/bin/zsh -f
-# Headless coexistence and real-environment checks for zrush.
+# Headless coexistence and real-environment checks for zrush (protocol v2).
 #
 # Usage:
 #   zsh -f tests/zsh/driver-coexist.zsh <playground-dir>
+#     The playground only needs to exist and be writable; every fixture this
+#     driver needs (a small docs/ tree, a directory with enough files that
+#     collecting it takes non-trivial time, full-width filenames) is created
+#     under it by this script. Re-running against the same playground reuses
+#     the many-files directory instead of rebuilding it (see ensure_many_dir).
 # Prerequisites:
 #   - cargo build --release completed
-#   - /opt/homebrew/share/zsh-abbr, /opt/homebrew/share/zsh-syntax-highlighting
-#   - /opt/homebrew/bin/tmux (started with a dedicated -L socket; no real sessions touched)
+#   - /opt/homebrew/share/zsh-abbr, /opt/homebrew/share/zsh-syntax-highlighting,
+#     /opt/homebrew/bin/tmux (started with a dedicated -L socket; no real sessions
+#     touched). Missing any of these is not fatal: this driver prints SKIP and
+#     exits 0 rather than failing the run on a machine that lacks them.
 #
 # Covers zsh-abbr, z-sy-h, all three together, tmux with resizing, concurrent
-# shells, PS2 continuation, and recorded full-width rendering.
+# shells, PS2 continuation, recorded full-width rendering, and that the
+# memo=zrush region_highlight tag (cli-protocol.md / behavior.md "region_highlight
+# の自エントリ") lets z-sy-h 0.8+'s own entries coexist without either side
+# clobbering the other.
 # All tests isolate ZDOTDIR, HOME, XDG, and ABBR files in temporary storage.
+#
+# Internal-state assertions read the v2 zsh state (_zrush_plan_*, the
+# "select: start"/"select: dir=..." log lines from _zrush_select_start/_dir)
+# rather than v1's _zrush_recs/_zrush_render (removed).
 emulate -L zsh
 setopt extended_glob
 zmodload zsh/zpty    || { print -u2 FATAL: zpty; exit 1 }
 zmodload zsh/zselect || { print -u2 FATAL: zselect; exit 1 }
 zmodload zsh/system  || { print -u2 FATAL: system; exit 1 }
+autoload -Uz is-at-least
 
 typeset -F SECONDS
 typeset -g HERE=${${(%):-%N}:A:h}
@@ -24,9 +39,18 @@ typeset -g PLAYGROUND=${1:?usage: driver-coexist.zsh <playground-dir>}
 typeset -g ABBR_SRC=/opt/homebrew/share/zsh-abbr/zsh-abbr.zsh
 typeset -g ZSYH_SRC=/opt/homebrew/share/zsh-syntax-highlighting/zsh-syntax-highlighting.zsh
 typeset -g TMUX_BIN=/opt/homebrew/bin/tmux
-[[ -d $PLAYGROUND/docs ]] || { print -u2 "FATAL: invalid playground"; exit 1 }
-[[ -r $ABBR_SRC && -r $ZSYH_SRC && -x $TMUX_BIN ]] || { print -u2 "FATAL: dependencies not found"; exit 1 }
+[[ -d $PLAYGROUND && -w $PLAYGROUND ]] || { print -u2 "FATAL: invalid playground: $PLAYGROUND"; exit 1 }
+if [[ ! -r $ABBR_SRC || ! -r $ZSYH_SRC || ! -x $TMUX_BIN ]]; then
+  print -u2 "SKIP: zsh-abbr / zsh-syntax-highlighting / tmux not found on this machine ($ABBR_SRC, $ZSYH_SRC, $TMUX_BIN); nothing to run"
+  exit 0
+fi
 [[ -x $REPO/target/release/zrush ]] || { print -u2 "FATAL: zrush binary not found"; exit 1 }
+
+# The memo=zrush region_highlight tag (used to distinguish this plugin's own
+# entries from z-sy-h's) only exists on zsh 5.9+; the coexistence check below
+# is skipped with a note on older zsh, matching zrush.zsh's own fallback.
+typeset -gi HAVE_MEMO=0
+is-at-least 5.9 $ZSH_VERSION && HAVE_MEMO=1
 
 typeset -gi PASS=0 FAIL=0
 out() { print -r -u2 -- "$@" }
@@ -49,12 +73,51 @@ mkdir -p $PLAYGROUND/wide
 : >| $PLAYGROUND/wide/"jp-日本語の長い名前のファイルで表示崩れを確認する.txt"
 : >| $PLAYGROUND/wide/"jp-これは二つ目の全角ファイル名です.txt"
 
+# Small self-provisioned docs/ tree ('ls docs/inte' -> 'internal', used by
+# basic_flow and several tests below). Idempotent: mkdir -p + `: >|` are both
+# no-ops on a pre-existing playground.
+mkdir -p $PLAYGROUND/docs/internal $PLAYGROUND/docs/user
+: >| $PLAYGROUND/docs/internal/spec.md
+: >| $PLAYGROUND/docs/user/guide.md
+
+# A directory with enough files that collecting it takes non-trivial time,
+# for (5b)'s concurrent-collection check. Regenerating tens of thousands of
+# files on every run is slow, so this only (re)builds when the directory is
+# missing or doesn't already hold exactly MANY_COUNT files -- a playground
+# reused across runs skips straight to the ls below.
+typeset -g MANY_DIR=$PLAYGROUND/many
+typeset -gi MANY_COUNT=5000
+ensure_many_dir() {
+  local -i n=0
+  if [[ -d $MANY_DIR ]]; then
+    n=$(command ls -1 -- $MANY_DIR 2>/dev/null | wc -l)
+  fi
+  if (( n == MANY_COUNT )); then
+    out "INFO: reusing existing $MANY_DIR ($n files)"
+    return 0
+  fi
+  out "INFO: (re)generating $MANY_DIR ($MANY_COUNT files; found $n)"
+  rm -rf $MANY_DIR
+  mkdir -p $MANY_DIR
+  local -i i
+  for (( i = 0; i < MANY_COUNT; ++i )); do
+    : >| $MANY_DIR/$(printf 'file%05d.txt' $i)
+  done
+}
+ensure_many_dir
+
 # ---------------------------------------------------------------- Generate rc files
-# ^Xb dumps BUFFER to ZRUSH_LOG, matching the driver.zsh test helper.
+# ^Xb dumps BUFFER, matching driver.zsh's test helper. ^Xa dumps the *whole*
+# region_highlight array (not just this plugin's own _zrush_rh ledger, unlike
+# driver.zsh's ^Xh) so coexistence tests can see zrush's memo=zrush entries
+# sitting alongside z-sy-h's own entries in the same array.
 typeset -g DUMPW='
 _zrt_dump_buffer() { _zlog "TESTBUF=${(qqqq)BUFFER}" }
 zle -N _zrt-dump-buffer _zrt_dump_buffer
-bindkey "^Xb" _zrt-dump-buffer'
+bindkey "^Xb" _zrt-dump-buffer
+_zrt_dump_allrh() { _zlog "TESTALLRH=${(pj: | :)region_highlight}" }
+zle -N _zrt-dump-allrh _zrt_dump_allrh
+bindkey "^Xa" _zrt-dump-allrh'
 
 mk_zdot() {  # $1=name $2=rc body
   local d=$WORK/zdot-$1
@@ -170,6 +233,23 @@ assert_buffer() {  # $1=expected buffer $2=label; compare ^Xb dump
   return 1
 }
 
+# Trigger a ^Xa dump and return the freshest region_highlight snapshot in REPLY.
+dump_rh_get() {
+  send_keys $'\C-xa'
+  local -F dl=$(( SECONDS + 5 ))
+  local -a tl
+  typeset -g REPLY=
+  while (( SECONDS < dl )); do
+    drain 0.15
+    tl=( ${(f)"$(grep -F 'TESTALLRH=' $CURLOG 2>/dev/null)"} )
+    if (( $#tl )); then
+      typeset -g REPLY=${tl[-1]#*TESTALLRH=}
+      return 0
+    fi
+  done
+  return 1
+}
+
 typeset -g DOWN=$'\e[B' UP=$'\e[A' ENTER=$'\r' CTRLC=$'\C-c'
 press() { send_keys $1; drain 0.3 }
 
@@ -197,10 +277,13 @@ basic_flow() {  # $1=label prefix
     ng "$1: list not displayed"
     return 1
   fi
-  clog_count 'selected=1'; local -i c_sel=$REPLY
+  # v2: selection-only updates go through _zrush_apply_highlights (no plan
+  # re-fetch/log), so "select: start" -- not a re-logged "selected=1" render --
+  # is the event that marks Down actually starting selection.
+  clog_count 'select: start'; local -i c_sel=$REPLY
   send_keys $DOWN
-  if wait_clog 'selected=1' $c_sel 5; then
-    ok "$1: Down starts selection (rendered with selected=1)"
+  if wait_clog 'select: start' $c_sel 5; then
+    ok "$1: Down starts selection (select: start)"
   else
     ng "$1: unable to select"
   fi
@@ -242,6 +325,34 @@ basic_flow() {  # $1=label prefix
     fi
     clear_line
     drain 0.5
+
+    # (2b) memo=zrush lets zrush's own region_highlight entries (the selected
+    # cell) coexist with z-sy-h's own entries (command/argument coloring) in
+    # the same array without either side clobbering the other.
+    if (( HAVE_MEMO )); then
+      send_keys 'ls docs/inte'
+      expect '*internal*' 10 >/dev/null
+      clog_count 'select: start'; local -i c_rh=$REPLY
+      send_keys $DOWN
+      wait_clog 'select: start' $c_rh 5 >/dev/null
+      if dump_rh_get; then
+        local -a rhparts=( ${(s: | :)REPLY} )
+        local -i total=$#rhparts
+        local -i mine=${#${(M)rhparts:#*memo=zrush*}}
+        if [[ $REPLY == *'memo=zrush'* ]] && (( total > mine )); then
+          ok "(2b) region_highlight: zrush's memo=zrush entries coexist with z-sy-h's own entries ($mine/$total memo-tagged)"
+        else
+          ng "(2b) memo=zrush coexistence check failed (total=$total mine=$mine): ${REPLY:-<none>}"
+        fi
+      else
+        ng "(2b) region_highlight dump did not run"
+      fi
+      clear_line
+      drain 0.3
+    else
+      out "SKIP: (2b) memo=zrush unavailable on zsh <5.9 ($ZSH_VERSION)"
+    fi
+
     basic_flow "(2c)"   # listing + selection + confirmation exercises pre-redraw and wrapped dispatch
   else
     ng "(2) z-sy-h host failed to start"
@@ -275,11 +386,11 @@ basic_flow() {  # $1=label prefix
   if start_host h1 $ZDOT_MIN $WORK/h1.log $WORK/t1 && start_host h2 $ZDOT_MIN $WORK/h2.log $WORK/t2; then
     ok "(5) two hosts started concurrently"
     use_host h1 $WORK/h1.log; send_keys 'ls docs/inte'
-    use_host h2 $WORK/h2.log; send_keys 'ls ../huge/file0000'
+    use_host h2 $WORK/h2.log; send_keys 'ls many/file0000'
     use_host h1 $WORK/h1.log
     expect '*internal*' 10 && ok "(5a) host1 list displayed (concurrent collection)" || ng "(5a) host1 failed"
     use_host h2 $WORK/h2.log
-    expect '*file00000.txt*' 30 && ok "(5b) host2 list displayed (concurrent huge collection)" || ng "(5b) host2 failed"
+    expect '*file00000.txt*' 30 && ok "(5b) host2 list displayed (concurrent many-file collection)" || ng "(5b) host2 failed"
     use_host h1 $WORK/h1.log; press $DOWN; press $ENTER
     assert_buffer 'ls docs/internal/' "(5c) host1 confirms correctly with multiple instances"
     clear_line
@@ -300,9 +411,9 @@ basic_flow() {  # $1=label prefix
   else
     ng "(6a) list not displayed under PS2"
   fi
-  clog_count 'selected=1'; local -i c6sel=$REPLY
+  clog_count 'select: start'; local -i c6sel=$REPLY
   send_keys $DOWN
-  wait_clog 'selected=1' $c6sel 5 && ok "(6b) selection starts under PS2 (priority 3 because this is the last line)" || ng "(6b) unable to select under PS2"
+  wait_clog 'select: start' $c6sel 5 && ok "(6b) selection starts under PS2 (priority 3 because this is the last line)" || ng "(6b) unable to select under PS2"
   press $ENTER
   # Each PS2 continuation line has its own ZLE session, so BUFFER contains only that
   # line. A multiline BUFFER instead requires a self-inserted newline such as ESC-Enter.
@@ -373,17 +484,17 @@ basic_flow() {  # $1=label prefix
     if tm_wait '*internal*' 10; then
       ok "(4a) list displayed inside tmux"
       local -i c4sel=0
-      [[ -r $TLOG ]] && c4sel=$(grep -cF 'selected=1' $TLOG 2>/dev/null)
+      [[ -r $TLOG ]] && c4sel=$(grep -cF 'select: start' $TLOG 2>/dev/null)
       tm send-keys -t coex Down
       local -F dl4=$(( SECONDS + 5 ))
       local -i c4now=0
       while (( SECONDS < dl4 )); do
         command sleep 0.2
-        [[ -r $TLOG ]] && c4now=$(grep -cF 'selected=1' $TLOG 2>/dev/null)
+        [[ -r $TLOG ]] && c4now=$(grep -cF 'select: start' $TLOG 2>/dev/null)
         (( c4now > c4sel )) && break
       done
       if (( c4now > c4sel )); then
-        ok "(4b) Down selects inside tmux (terminfo key resolution, rendered with selected=1)"
+        ok "(4b) Down selects inside tmux (terminfo key resolution, select: start logged)"
       else
         ng "(4b) unable to select inside tmux"
       fi

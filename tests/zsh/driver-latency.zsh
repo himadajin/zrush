@@ -1,5 +1,6 @@
 #!/bin/zsh -f
-# Latency driver for isolating time from key input to the first candidate paint.
+# Latency driver for isolating time from key input to the first candidate paint
+# (protocol v2).
 #
 # Usage: zsh -f tests/zsh/driver-latency.zsh <playground-dir>
 #   Prerequisite: cargo build --release completed. Use a real-terminal TERM
@@ -9,19 +10,25 @@
 #   min-zrush     zsh -d -i + isolated minimal.zshrc
 #   min-zrush-d0  same with delay-ms = 0 to isolate debounce contribution
 #   min-zac       zsh -d -i + zsh-autocomplete with min-delay 0.05
-#   real-zrush    zsh -i + real ~/.zshrc with history safeguards
+#
+# All hosts use a throwaway ZDOTDIR (and, where applicable, XDG_CONFIG_HOME)
+# under $WORK: this driver never reads or sources the real ~/.zshrc, and
+# never touches ~/.zsh_history (AGENTS.md guardrail -- a prior real-
+# environment host here read the real ~/.zshrc/history and was removed).
 #
 # Measurements:
 #   first-paint: elapsed time from key sequence to expected pty text after stripping
 #                SGR, with roughly 10ms zselect resolution
-#   breakdown  : ZRUSH_LOG intervals:
-#                arm (last key) -> request -> fork -> compsys -> records -> match -> render
-#
-# Safeguards for the real-environment host:
-#   - Prefix every command with a space for hist_ignore_space.
-#   - Immediately unset HISTFILE and set SAVEHIST=0.
-#   - Verify the ~/.zsh_history hash is unchanged before and after.
-#   - Never write user files.
+#   breakdown  : ZRUSH_LOG intervals, keyed off zsh's own _zlog checkpoints
+#                (cli-protocol.md / zsh/zrush.zsh -- v2 moved matching, ranking,
+#                grid layout, and highlight/nav-table construction out of zsh
+#                and into the single `zrush plan` external call, so what v1
+#                split into a "match" (Rust) bucket + a "render" (zsh grid/
+#                highlight computation) bucket is now one "plan" bucket (the
+#                whole `zrush plan` round trip) followed by a thin "apply"
+#                bucket (zsh copying the already-built plan into POSTDISPLAY/
+#                region_highlight)):
+#                arm (last key) -> request -> fork -> compsys -> transport -> plan -> apply
 emulate -L zsh
 setopt extended_glob
 zmodload zsh/zpty    || { print -u2 FATAL: zpty; exit 1 }
@@ -45,7 +52,7 @@ typeset -g HOST= HOSTLOG= CURXDG=
 typeset -gi HOSTFD=-1 SYNCN=0
 out() { print -r -u2 -- "$@" }
 
-send_line() { zpty -w  $HOST " $1" }   # leading space is mandatory for the real host
+send_line() { zpty -w  $HOST " $1" }   # leading space: harmless hist_ignore_space habit, kept for parity with driver.zsh
 send_keys() { zpty -wn $HOST $1 }
 
 drain() {
@@ -138,31 +145,34 @@ breakdown_last() {  # $1=logfile $2=number of leading lines to skip -> one table
   L=( "${(@)L[$(( $2 + 1 )),-1]}" )
   local -i i ir=0
   for (( i = $#L; i >= 1; --i )); do
-    [[ $L[i] == *" render: "* ]] && { ir=i; break }
+    [[ $L[i] == *" plan: applied "* ]] && { ir=i; break }
   done
-  (( ir )) || { out "WARN: breakdown: render line not found"; return 1 }
-  local -F t_render t_match t_rec t_comp t_fork t_req t_arm
-  t_render=0; t_match=0; t_rec=0; t_comp=0; t_fork=0; t_req=0; t_arm=0
-  ts_of $L[ir]; t_render=$REPLY
+  (( ir )) || { out "WARN: breakdown: 'plan: applied' line not found"; return 1 }
+  local -F t_apply t_plan t_xfer t_comp t_fork t_req t_arm
+  t_apply=0; t_plan=0; t_xfer=0; t_comp=0; t_fork=0; t_req=0; t_arm=0
+  ts_of $L[ir]; t_apply=$REPLY
   for (( i = ir - 1; i >= 1; --i )); do
     case $L[i] in
-      *" finalize: match ok"*)       (( t_match == 0 )) && { ts_of $L[i]; t_match=$REPLY } ;;
-      *" finalize: "*" records"*)    (( t_rec == 0 ))   && { ts_of $L[i]; t_rec=$REPLY } ;;
+      # v2: `zrush plan` does matching/ranking/layout/highlights/nav/insert in
+      # one external call, replacing v1's separate "finalize: match ok" (Rust
+      # match) + the zsh-side render/layout leg now folded into "plan: ok".
+      *" plan: ok "*)                (( t_plan == 0 ))  && { ts_of $L[i]; t_plan=$REPLY } ;;
+      *" finalize: "*" bytes"*)      (( t_xfer == 0 ))  && { ts_of $L[i]; t_xfer=$REPLY } ;;
       *" fork: _main_complete "*)    (( t_comp == 0 ))  && { ts_of $L[i]; t_comp=$REPLY } ;;
       *" fork: start "*)             (( t_fork == 0 ))  && { ts_of $L[i]; t_fork=$REPLY } ;;
       *" request: widened"*)         (( t_req == 0 ))   && { ts_of $L[i]; t_req=$REPLY } ;;
       *" MEAS-arm"*)                 (( t_req != 0 )) && { ts_of $L[i]; t_arm=$REPLY; break } ;;
     esac
   done
-  (( t_arm && t_req && t_fork && t_comp && t_rec && t_match )) || { out "WARN: breakdown: incomplete chain"; return 1 }
-  printf 'BREAK | debounce=%4.0f | spawn=%4.0f | compsys=%5.0f | transport=%4.0f | match=%4.0f | render=%4.0f | total(arm→render)=%5.0f ms\n' \
+  (( t_arm && t_req && t_fork && t_comp && t_xfer && t_plan )) || { out "WARN: breakdown: incomplete chain"; return 1 }
+  printf 'BREAK | debounce=%4.0f | spawn=%4.0f | compsys=%5.0f | transport=%4.0f | plan=%4.0f | apply=%4.0f | total(arm→apply)=%5.0f ms\n' \
     $(( (t_req - t_arm) * 1000 )) \
     $(( (t_fork - t_req) * 1000 )) \
     $(( (t_comp - t_fork) * 1000 )) \
-    $(( (t_rec - t_comp) * 1000 )) \
-    $(( (t_match - t_rec) * 1000 )) \
-    $(( (t_render - t_match) * 1000 )) \
-    $(( (t_render - t_arm) * 1000 )) >&2
+    $(( (t_xfer - t_comp) * 1000 )) \
+    $(( (t_plan - t_xfer) * 1000 )) \
+    $(( (t_apply - t_plan) * 1000 )) \
+    $(( (t_apply - t_arm) * 1000 )) >&2
   return 0
 }
 
@@ -176,34 +186,34 @@ paint_break_case() {  # $1=host-label $2=case-label $3=keys $4=pattern
   return 0
 }
 
-# Cache-hit breakdown: arm -> request -> cache hit -> match -> render
+# Cache-hit breakdown: arm -> request -> cache hit -> plan -> apply
 breakdown_hit_last() {  # $1=logfile $2=number of leading lines to skip
   local -a L=( ${(f)"$(<$1)"} )
   L=( "${(@)L[$(( $2 + 1 )),-1]}" )
   local -i i ir=0
   for (( i = $#L; i >= 1; --i )); do
-    [[ $L[i] == *" render: "* ]] && { ir=i; break }
+    [[ $L[i] == *" plan: applied "* ]] && { ir=i; break }
   done
-  (( ir )) || { out "WARN: breakdown-hit: render line not found"; return 1 }
-  local -F t_render t_match t_hit t_req t_arm
-  t_render=0; t_match=0; t_hit=0; t_req=0; t_arm=0
-  ts_of $L[ir]; t_render=$REPLY
+  (( ir )) || { out "WARN: breakdown-hit: 'plan: applied' line not found"; return 1 }
+  local -F t_apply t_plan t_hit t_req t_arm
+  t_apply=0; t_plan=0; t_hit=0; t_req=0; t_arm=0
+  ts_of $L[ir]; t_apply=$REPLY
   for (( i = ir - 1; i >= 1; --i )); do
     case $L[i] in
-      *" finalize: match ok"*) (( t_match == 0 )) && { ts_of $L[i]; t_match=$REPLY } ;;
-      *" cache: hit"*)         (( t_hit == 0 ))   && { ts_of $L[i]; t_hit=$REPLY } ;;
-      *" request: widened"*)   (( t_req == 0 ))   && { ts_of $L[i]; t_req=$REPLY } ;;
-      *" MEAS-arm"*)           (( t_req != 0 )) && { ts_of $L[i]; t_arm=$REPLY; break } ;;
+      *" plan: ok "*)         (( t_plan == 0 )) && { ts_of $L[i]; t_plan=$REPLY } ;;
+      *" cache: hit"*)        (( t_hit == 0 ))  && { ts_of $L[i]; t_hit=$REPLY } ;;
+      *" request: widened"*)  (( t_req == 0 ))  && { ts_of $L[i]; t_req=$REPLY } ;;
+      *" MEAS-arm"*)          (( t_req != 0 )) && { ts_of $L[i]; t_arm=$REPLY; break } ;;
     esac
   done
-  (( t_arm && t_req && t_hit && t_match )) || \
+  (( t_arm && t_req && t_hit && t_plan )) || \
     { out "WARN: breakdown-hit: incomplete chain (cache miss?)"; return 1 }
-  printf 'BREAK | debounce=%4.0f | cache-check=%4.0f | match=%4.0f | render=%4.0f | total(arm→render)=%5.0f ms\n' \
+  printf 'BREAK | debounce=%4.0f | cache-check=%4.0f | plan=%4.0f | apply=%4.0f | total(arm→apply)=%5.0f ms\n' \
     $(( (t_req - t_arm) * 1000 )) \
     $(( (t_hit - t_req) * 1000 )) \
-    $(( (t_match - t_hit) * 1000 )) \
-    $(( (t_render - t_match) * 1000 )) \
-    $(( (t_render - t_arm) * 1000 )) >&2
+    $(( (t_plan - t_hit) * 1000 )) \
+    $(( (t_apply - t_plan) * 1000 )) \
+    $(( (t_apply - t_arm) * 1000 )) >&2
   return 0
 }
 
@@ -262,24 +272,6 @@ EOF
   return 0
 }
 
-start_real_zrush() {
-  HOST=real HOSTLOG=$WORK/real.log CURXDG=
-  unset ZDOTDIR XDG_CONFIG_HOME ZRUSH_LOG ZRUSH_REPO ZRUSH_TEST_TMP
-  cd $PLAYGROUND || return 1
-  local REPLY=
-  zpty -b $HOST zsh -i || return 1
-  HOSTFD=$REPLY
-  local m=BOOT$(( ++SYNCN ))
-  send_line "print -r -- MARK-'$m'"
-  expect "*MARK-$m*" 60 || return 1
-  drain 0.5
-  run_cmd 'unset HISTFILE; SAVEHIST=0' || return 1
-  run_cmd "export ZRUSH_LOG=$HOSTLOG" || return 1
-  run_cmd "source $MEAS_RC" || return 1
-  run_cmd "cd $PLAYGROUND" || return 1
-  return 0
-}
-
 host_rss() {
   typeset -g REPLY=NA
   local m=R$(( ++SYNCN ))
@@ -301,9 +293,6 @@ host_rss() {
 stop_host() { zpty -d $HOST 2>/dev/null; HOSTFD=-1 }
 
 # ---------------------------------------------------------------- Run
-typeset -g HIST_HASH_BEFORE=
-[[ -r ~/.zsh_history ]] && HIST_HASH_BEFORE=$(shasum ~/.zsh_history 2>/dev/null)
-
 {
   # ============ min-zrush with default 30ms delay ============
   out "==== min-zrush (isolated + default delay-ms=30) ===="
@@ -347,35 +336,9 @@ typeset -g HIST_HASH_BEFORE=
     out "FATAL: min-zac failed to start (ZAC_SRC=$ZAC_SRC)"
   fi
   stop_host
-
-  # ============ real-zrush ============
-  out "==== real-zrush (actual ~/.zshrc) ===="
-  if start_real_zrush; then
-    host_rss; out "INFO: RSS=${REPLY}KB"
-    paint_break_case real "cmd 1st (cla)"    'cla'          'clang'   # first run is a cache miss
-    paint_break_case real "file (docs/inte)" 'ls docs/inte' 'internal'
-    paint_break_case real "git (git chec)"   'git chec'     'checkout'
-    paint_break_hit_case real "cmd hit (cla)" 'cla'         'clang'
-    paint_case real "cmd hit (cla)"    'cla'          'clang'
-    paint_case real "file (docs/inte)" 'ls docs/inte' 'internal'
-    paint_case real "git (git chec)"   'git chec'     'checkout'
-  else
-    out "FATAL: real-zrush failed to start or set up"
-  fi
-  stop_host
 } always {
   zpty -d min-zrush 2>/dev/null
   zpty -d min-d0 2>/dev/null
   zpty -d zac 2>/dev/null
-  zpty -d real 2>/dev/null
-  # Verify the history safeguard.
-  if [[ -n $HIST_HASH_BEFORE ]]; then
-    local now=$(shasum ~/.zsh_history 2>/dev/null)
-    if [[ $now == $HIST_HASH_BEFORE ]]; then
-      out "GUARD: confirmed ~/.zsh_history is unchanged"
-    else
-      out "GUARD-FAIL: ~/.zsh_history changed! (investigation required)"
-    fi
-  fi
   [[ -n $WORK && $WORK == */zrush-lat.* ]] && rm -rf $WORK
 }
