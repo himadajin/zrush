@@ -5,7 +5,6 @@
 #
 # See docs/internal/specs/behavior.md for observable behavior and architecture.
 # See docs/internal/contracts/cli-protocol.md for the zsh/Rust boundary.
-# See docs/internal/plans/001-prototype/notes-zpty.md for M1 measurements.
 #
 # Set ZRUSH_LOG=<file> to append timestamped debug traces; unset is a no-op.
 
