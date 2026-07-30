@@ -608,6 +608,19 @@ fn config_rejects_arguments_with_exit_2() {
 }
 
 #[test]
+fn help_flag_exits_0() {
+    // Human-facing affordance (cli-protocol.md "終了コード"): zsh never
+    // invokes --help, but it must not read as a usage error.
+    let out = zrush()
+        .arg("--help")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .expect("run");
+    assert_eq!(out.status.code(), Some(0));
+}
+
+#[test]
 fn unknown_subcommand_exits_2() {
     let out = zrush()
         .arg("bogus")
