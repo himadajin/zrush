@@ -11,6 +11,7 @@
 
 mod config;
 mod keybind;
+mod layout;
 mod matching;
 mod ranking;
 mod record;

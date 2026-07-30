@@ -15,6 +15,11 @@ nucleo-matcher = "0.3"
 # "parse" + "serde" is the minimal feature set that provides toml::Table.
 # No proc macros (we walk Value manually for per-key fallback + warnings).
 toml = { version = "1", default-features = false, features = ["parse", "serde"] }
+# Terminal display width for grid cell padding/truncation (layout.rs).
+# Character-count offsets (spans, highlight ranges) stay separate from
+# width (cli-protocol.md "オフセット規律") -- this crate is only consulted
+# for the width side of that split.
+unicode-width = "0.2"
 
 [profile.release]
 # zrush is spawned per keystroke: optimize for startup and size.
