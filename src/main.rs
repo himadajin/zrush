@@ -13,6 +13,7 @@ mod config;
 mod keybind;
 mod matching;
 mod ranking;
+mod record;
 
 use std::ffi::OsString;
 use std::io::{Read, Write};
