@@ -20,7 +20,7 @@ typeset -g  _zrush_cfg_path= _zrush_cfg_mtime= _zrush_cfg_warn_shown=
 typeset -gi _zrush_match_warned=0 _zrush_proto_warned=0
 
 # Collection request state
-typeset -g  _zrush_query= _zrush_fuzzy= _zrush_keep= _zrush_buf= _zrush_pty= _zrush_worker_pid=
+typeset -g  _zrush_query= _zrush_fuzzy= _zrush_buf= _zrush_pty= _zrush_worker_pid=
 typeset -gi _zrush_rfd=-1 _zrush_wfd=-1 _zrush_gen=0 _zrush_timer_fd=-1
 typeset -g  _zrush_pending_buffer=
 typeset -g  _zrush_last_buffer=
@@ -30,7 +30,7 @@ typeset -gi _zrush_last_cursor=-1
 typeset -ga _zrush_recs=() _zrush_krecs=() _zrush_words=() _zrush_match=() _zrush_disp=()
 typeset -g  _zrush_payload=   # stdin for `zrush match`, paired with parsed records
 typeset -ga _zrush_ranked=() _zrush_shown=()
-typeset -gA _zrush_spans=()   # candidate index -> match-spans (CLI protocol v2)
+typeset -gA _zrush_spans=()   # candidate index -> match-spans (cli-protocol.md)
 typeset -g  _zrush_common_prefix=
 typeset -gi _zrush_listing=0
 
@@ -60,7 +60,7 @@ typeset -gi _zrush_render_retry=0
 typeset -gi _ZRUSH_MAX_COLS=8
 
 # Key bindings (dispatch widget -> predecessor/action)
-typeset -gA _zrush_dsp_prev=() _zrush_dsp_action=() _zrush_bound=()
+typeset -gA _zrush_dsp_prev=() _zrush_bound=()
 typeset -gi _zrush_dsp_n=0
 
 # ---------------------------------------------------------------- Utilities
@@ -481,7 +481,6 @@ _zrush_start_request() {
   _zrush_widen "$LBUFFER"
   _zrush_query=$REPLY_WIDENED
   _zrush_fuzzy=${REPLY_QUERY//$'\0'/}   # the sender must strip NUL from --query
-  _zrush_keep=$REPLY_KEEP
   _zlog "request: widened=${(qqqq)_zrush_query} fuzzy=${(qqqq)_zrush_fuzzy}"
 
   # See behavior.md "空語収集キャッシュ". zle -F -w callers require explicit redraw.
@@ -1298,7 +1297,6 @@ _zrush_bind_one() {  # $1=action $2=key sequence in bindkey notation or raw form
     wname=_zrush-dsp-$(( ++_zrush_dsp_n ))
   fi
   _zrush_dsp_prev[$wname]=$prev      # ledger for restoration and self-capture detection
-  _zrush_dsp_action[$wname]=$action
   # Embed action and predecessor in the function body to tolerate widget wrappers; see above.
   functions[$wname]="_zrush_dispatch ${(q)action} ${(q)prev}"
   zle -N $wname
