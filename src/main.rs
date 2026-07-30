@@ -111,7 +111,7 @@ fn cmd_match(args: &[OsString]) -> ExitCode {
     for (pos, (_, text)) in candidates.iter().enumerate() {
         if let Some(ms) = qm.score(text) {
             scored.push((pos, ms));
-            // Prefix-tier only, pre-truncation (cli-protocol.md v3).
+            // Prefix-tier only, pre-truncation (cli-protocol.md).
             if ms.tier == matching::Tier::Prefix {
                 prefix_texts.push(text);
             }

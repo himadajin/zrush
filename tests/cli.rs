@@ -63,7 +63,7 @@ fn fields(out: &[u8]) -> Vec<Vec<u8>> {
         .collect()
 }
 
-/// Parse v2 match output into (common-prefix, [(index, match-spans)]).
+/// Parse match output into (common-prefix, [(index, match-spans)]).
 fn parse_out(out: &[u8]) -> (Vec<u8>, Vec<(Vec<u8>, Vec<u8>)>) {
     let f = fields(out);
     assert!(
@@ -91,7 +91,7 @@ fn match_ranks_tiers_and_reports_common_prefix() {
     let (code, out) = run_match(&typo_args("doc", "10"), &stdin);
     assert_eq!(code, 0);
     // prefix-exact(4) > prefix(2) > substring(1) > edit(3: doc~dot); "xxx" excluded.
-    // LCP spans prefix-tier matches only (v3): {docs, doc} -> "doc".
+    // LCP spans prefix-tier matches only: {docs, doc} -> "doc".
     let (lcp, pairs) = parse_out(&out);
     assert_eq!(lcp, b"doc");
     let idx: Vec<&[u8]> = pairs.iter().map(|p| p.0.as_slice()).collect();
@@ -108,7 +108,7 @@ fn match_typo_transposition_gti() {
     let (code, out) = run_match(&typo_args("gti", "10"), &stdin);
     assert_eq!(code, 0);
     // git and git-lfs match via the edit tier, grep does not.
-    // No prefix-tier match -> empty common prefix (v3).
+    // No prefix-tier match -> empty common prefix.
     let (lcp, pairs) = parse_out(&out);
     assert_eq!(lcp, b"");
     let idx: Vec<&[u8]> = pairs.iter().map(|p| p.0.as_slice()).collect();
@@ -139,14 +139,14 @@ fn match_edit_tier_ranks_close_corrections_first() {
     let (code, out) = run_match(&typo_args("gti", "10"), &stdin);
     assert_eq!(code, 0);
     let (lcp, _) = parse_out(&out);
-    assert_eq!(lcp, b"", "edit-tier matches carry no common prefix (v3)");
+    assert_eq!(lcp, b"", "edit-tier matches carry no common prefix");
     assert_eq!(ranked(&out), [&b"3"[..], b"1", b"4", b"2"]);
 }
 
 #[test]
 fn match_common_prefix_spans_prefix_tier_only() {
     // Prefix tier {checkout, check-attr} -> LCP "check"; the substring
-    // match sparse-checkout must not dilute it (v3).
+    // match sparse-checkout must not dilute it.
     let stdin = candidates(&[b"checkout", b"check-attr", b"sparse-checkout"]);
     let (code, out) = run_match(&typo_args("chec", "10"), &stdin);
     assert_eq!(code, 0);

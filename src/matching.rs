@@ -4,7 +4,7 @@
 //! (source of truth). `dcf` -> `dot-config` is a scattered fuzzy match;
 //! `dcs` -> `docs` is a one-edit match.
 //!
-//! The M2 evaluation chose a hybrid: direct bytes for prefix/substring,
+//! The matcher is a hybrid: direct bytes for prefix/substring,
 //! nucleo strict-subsequence scoring for fuzzy, and bounded prefix edit
 //! distance for transposition/substitution/insertion, which nucleo
 //! cannot catch and the edit tier handles.
@@ -200,7 +200,7 @@ impl QueryMatcher {
     }
 
     /// Matched spans in one candidate's match-text, for the stdout
-    /// match-spans field (cli-protocol.md v2). Char offsets over the
+    /// match-spans field (cli-protocol.md). Char offsets over the
     /// lossy UTF-8 reading, 0-based end-exclusive, sorted and merged;
     /// empty = no position info (empty query or no match).
     ///
@@ -275,7 +275,7 @@ impl QueryMatcher {
 }
 
 /// Char count of a byte slice under the lossy UTF-8 reading (the span
-/// offset unit; cli-protocol.md v2).
+/// offset unit; cli-protocol.md).
 fn char_count(bytes: &[u8]) -> usize {
     String::from_utf8_lossy(bytes).chars().count()
 }
