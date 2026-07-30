@@ -202,7 +202,7 @@ typeset -ga ZRUSH_CFG_WARNINGS=()
   - `key:<シンボリック名>`: 端末依存キー(例: `up`, `down`, `shift-tab`)。
     zsh 側が `$terminfo` を参照して解決する(矢印は CSI/SS3 両系統を bindkey)。
   - 正規化の詳細と対応キー一覧は config-schema.md。
-  - 要素数が奇数の場合(版不整合等の異常)、zsh 側は配列全体を無視して既定キーバインドを適用し警告する。
+  - 要素数が奇数の場合(異常出力)、出力全体をロード失敗として扱う(「エラー時の zsh 側挙動」参照)。
   - bindkey の適用先はメインキーマップ(`main`)のみ(フェーズ 1)。
 - `ZRUSH_CFG_WARNINGS` は設定エラーの人間可読メッセージの配列(正常時は空)。
   表示のタイミング・体裁は zsh 側の責務(config-schema.md「検証とエラーの扱い」)。
@@ -210,7 +210,9 @@ typeset -ga ZRUSH_CFG_WARNINGS=()
 
 ### エラー時の zsh 側挙動(規範)
 
-- exit 非 0 または出力が source 不能の場合: 前回の設定値があればそれを維持して継続する。
+- exit 非 0、出力が source 不能、または source 結果が出力仕様を満たさない場合
+  (zsh が消費する変数の欠落、`ZRUSH_CFG_KEYBINDS` の奇数長)、ロード失敗として扱う:
+  前回の設定値があればそれを維持して継続する。
   **source 時(初回)に失敗した場合は警告を表示して zrush を無効化する**
   (フック・キーバインドを登録しない。既定値表を zsh 側へ複製すると真実の二重化になるため)。
 - `zrush config` の stderr は端末に流さない(警告は `ZRUSH_CFG_WARNINGS` 経由が唯一の経路)。

@@ -678,12 +678,13 @@ log_count() {  # $1=fixed string -> REPLY: occurrence count in ZRUSH_LOG
   rm -f $XDG_CONFIG_HOME/zrush/config.toml
   send_line ': cfg-key-reset'
   sync_prompt
-  # Host-side unit check: odd-length KEYBINDS ignores the whole array, defaults, and warns.
-  send_line 'ZRUSH_CFG_KEYBINDS=(a b c); _zrush_apply_keybinds'
-  if expect '*odd length*' 5; then
-    ok "(m4-12c) odd-length KEYBINDS ignored with defaults + warning"
+  # Host-side unit check: odd-length KEYBINDS fails config validation (a failed
+  # load; no fallback to duplicated defaults), and the restored state passes.
+  send_line 'typeset -ga _kb_save=("${(@)ZRUSH_CFG_KEYBINDS}"); ZRUSH_CFG_KEYBINDS=(a b c); _zrush_validate_config; print -r -- "VAL_ODD=$?"; ZRUSH_CFG_KEYBINDS=("${(@)_kb_save}"); _zrush_validate_config; print -r -- "VAL_RESTORED=$?"'
+  if expect '*VAL_ODD=1*' 5 && expect '*VAL_RESTORED=0*' 5; then
+    ok "(m4-12c) odd-length KEYBINDS rejected as a failed load"
   else
-    ng "(m4-12c) odd-length warning not displayed"
+    ng "(m4-12c) odd-length KEYBINDS not rejected by validation"
   fi
   sync_prompt
 

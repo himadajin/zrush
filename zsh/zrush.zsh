@@ -18,6 +18,13 @@ typeset -gi _zrush_enabled=0
 typeset -gi _ZRUSH_EXPECTED_PROTO=1
 typeset -g  _zrush_cfg_path= _zrush_cfg_mtime= _zrush_cfg_warn_shown=
 typeset -gi _zrush_match_warned=0 _zrush_proto_warned=0
+# Variables this script consumes from `zrush config` output (validation and rollback)
+typeset -ga _ZRUSH_CFG_VARS=(
+  ZRUSH_CFG_MAX_LINES ZRUSH_CFG_DELAY_MS ZRUSH_CFG_MIN_INPUT
+  ZRUSH_CFG_MODE ZRUSH_CFG_SMART_CASE ZRUSH_CFG_TAB ZRUSH_CFG_TRAILING_SPACE
+  ZRUSH_CFG_HL_SELECTED ZRUSH_CFG_HL_MATCH ZRUSH_CFG_HL_HEADING
+  ZRUSH_CFG_KEYBINDS ZRUSH_CFG_WARNINGS
+)
 
 # Collection request state
 typeset -g  _zrush_query= _zrush_fuzzy= _zrush_buf= _zrush_pty= _zrush_worker_pid=
@@ -109,9 +116,16 @@ _zrush_load_config() {
   emulate -L zsh
   local out
   out=$("$ZRUSH_BIN" config 2>/dev/null) || return 1
+  # eval assigns the globals in place, so snapshot the previous values first;
+  # a failed load rolls back (a failed reload keeps the previous configuration).
+  local rollback=
+  (( $+ZRUSH_PROTOCOL_VERSION )) && \
+    rollback=$(typeset -p ZRUSH_PROTOCOL_VERSION "${(@)_ZRUSH_CFG_VARS}" 2>/dev/null)
   # The protocol restricts output to static typeset assignments; evaluate in this controlled scope.
-  eval "$out" 2>/dev/null || return 1
-  [[ -n $ZRUSH_PROTOCOL_VERSION ]] || return 1
+  if ! eval "$out" 2>/dev/null || ! _zrush_validate_config; then
+    [[ -n $rollback ]] && eval "$rollback"
+    return 1
+  fi
   # A version mismatch warns once and does not disable the session.
   if [[ $ZRUSH_PROTOCOL_VERSION != $_ZRUSH_EXPECTED_PROTO ]] && (( ! _zrush_proto_warned )); then
     _zrush_warn "protocol version mismatch: zsh expects $_ZRUSH_EXPECTED_PROTO, binary reports $ZRUSH_PROTOCOL_VERSION (rebuild zrush?)"
@@ -121,6 +135,18 @@ _zrush_load_config() {
   _zrush_cfg_mtime=$REPLY
   _zrush_show_cfg_warnings
   return 0
+}
+
+# The loaded output must assign every variable this script consumes and an
+# even-length keybind array (cli-protocol.md); anything less fails the load.
+_zrush_validate_config() {
+  emulate -L zsh
+  [[ -n $ZRUSH_PROTOCOL_VERSION ]] || return 1
+  local v
+  for v in "${(@)_ZRUSH_CFG_VARS}"; do
+    (( ${(P)+v} )) || return 1
+  done
+  (( $#ZRUSH_CFG_KEYBINDS % 2 == 0 ))
 }
 
 # Emit config warnings to stderr, one per line.
@@ -675,7 +701,7 @@ _zrush_apply_results() {
   out=$(print -rn -- "$_zrush_payload" | \
         "$ZRUSH_BIN" match --query "$_zrush_fuzzy" --mode "$ZRUSH_CFG_MODE" \
                            --smart-case "$ZRUSH_CFG_SMART_CASE" \
-                           --max-lines $(( ${ZRUSH_CFG_MAX_LINES:-10} * _ZRUSH_MAX_COLS )) 2>/dev/null)
+                           --max-lines $(( ZRUSH_CFG_MAX_LINES * _ZRUSH_MAX_COLS )) 2>/dev/null)
   local -i rc=$?
   if (( rc != 0 )); then
     if (( ! _zrush_match_warned )); then
@@ -713,7 +739,7 @@ _zrush_render() {  # Call only from a ZLE widget context.
   # writes "name=value" to stdout. Keep declarations outside loops and enable
   # typesetsilent defensively because any widget output corrupts the ZLE display.
   setopt localoptions typesetsilent
-  local -i maxl=${ZRUSH_CFG_MAX_LINES:-10}
+  local -i maxl=$ZRUSH_CFG_MAX_LINES
   (( LINES > 1 && maxl > LINES - 1 )) && maxl=$(( LINES - 1 ))
   (( maxl < 1 )) && maxl=1
   local -i width=$(( COLUMNS - 1 ))
@@ -903,7 +929,7 @@ _zrush_render() {  # Call only from a ZLE widget context.
 _zrush_arm_timer() {  # ZLE widget context
   emulate -L zsh
   _zrush_disarm_timer
-  local -i delay=${ZRUSH_CFG_DELAY_MS:-30}
+  local -i delay=$ZRUSH_CFG_DELAY_MS
   if (( delay <= 0 )); then
     _zrush_start_request
     return 0
@@ -956,7 +982,7 @@ _zrush_line_pre_redraw() {
 
   # Apply min-input to the current word; blank buffers were handled above.
   _zrush_widen "$LBUFFER"
-  if (( ${#REPLY_WORD} < ${ZRUSH_CFG_MIN_INPUT:-0} )); then
+  if (( ${#REPLY_WORD} < ZRUSH_CFG_MIN_INPUT )); then
     _zrush_disarm_timer
     _zrush_cancel_collection
     _zrush_clear_display
@@ -1043,7 +1069,7 @@ _zrush_confirm_index() {  # $1=index into local krecs/words/... arrays
     _zlog "confirm: whole-word-replace (prefix=${(qqqq)prefix} != keep=${(qqqq)keep}) insert=${(qqqq)composed}"
   fi
   local newl=$pre$composed
-  if [[ ${ZRUSH_CFG_TRAILING_SPACE:-true} == true ]] && (( ! nospace )); then
+  if [[ $ZRUSH_CFG_TRAILING_SPACE == true ]] && (( ! nospace )); then
     newl+=' '
   fi
   LBUFFER=$newl        # leave text after the cursor (RBUFFER) unchanged
@@ -1187,7 +1213,7 @@ _zrush_action_dismiss() {
 # Tab follows [insert].tab rather than acting as an independent action.
 _zrush_tab_with_results() {  # Tab behavior when results are available
   emulate -L zsh
-  case ${ZRUSH_CFG_TAB:-menu} in
+  case $ZRUSH_CFG_TAB in
     menu)
       _zrush_select_start
       ;;
@@ -1307,21 +1333,8 @@ _zrush_bind_one() {  # $1=action $2=key sequence in bindkey notation or raw form
 
 _zrush_apply_keybinds() {
   emulate -L zsh
+  # Validation guarantees an even-length array; empty means bind nothing.
   local -a kb=( "${(@)ZRUSH_CFG_KEYBINDS}" )
-  local -a kb_default=(
-    select-next  key:down  select-next  'seq:^N'
-    select-prev  key:up    select-prev  'seq:^P'
-    select-left  key:left  select-left  'seq:^B'
-    select-right key:right select-right 'seq:^F'
-    confirm 'seq:^M' dismiss 'seq:^G'
-  )
-  if (( $#kb % 2 != 0 )); then
-    # The protocol requires an odd-length array to fall back wholesale and warn.
-    _zrush_warn "keybinds: malformed ZRUSH_CFG_KEYBINDS (odd length $#kb); using default keybinds"
-    kb=( "${(@)kb_default}" )
-  elif (( ! ${+ZRUSH_CFG_KEYBINDS} )); then
-    kb=( "${(@)kb_default}" )
-  fi
   typeset -gA _zrush_new_bound=()
   local -i i
   local action spec s
