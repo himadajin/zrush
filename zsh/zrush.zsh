@@ -5,7 +5,7 @@
 #
 # See docs/internal/specs/behavior.md for observable behavior and architecture.
 # See docs/internal/contracts/cli-protocol.md for the zsh/Rust boundary.
-# See docs/internal/plans/001-prototype/notes-zpty.md for zpty constraints and measurements.
+# See docs/internal/plans/001-prototype/notes-zpty.md for M1 measurements.
 #
 # Set ZRUSH_LOG=<file> to append timestamped debug traces; unset is a no-op.
 
@@ -184,12 +184,12 @@ _zrush_precmd() {
 # one read per record and measurably degraded large candidate sets.
 _zrush_compadd() {
   builtin setopt localoptions extendedglob norcexpandparam noshglob
-  local -A apre hpre asuf hsuf ipre isuf dscrs _oad _mesg grpJ grpV
+  local -A apre hpre asuf hsuf ipre isuf dscrs _oad grpJ
   local -a isfile _opts __ expl
   zparseopts -a _opts P:=apre p:=hpre S:=asuf s:=hsuf i:=ipre I:=isuf \
-             d:=dscrs X+:=expl O:=_oad A:=_oad D:=_oad f=isfile x:=_mesg \
+             d:=dscrs X+:=expl O:=_oad A:=_oad D:=_oad f=isfile x:=__ \
              r: R: W: F: M+: E: q e Q n U C \
-             J:=grpJ V:=grpV a=__ l=__ k=__ o::=__ 1=__ 2=__
+             J:=grpJ V:=__ a=__ l=__ k=__ o::=__ 1=__ 2=__
   # -O/-A/-D are internal matching/array calls; delegate without counting candidates.
   if (( $#_oad != 0 )); then
     builtin compadd "$@"
@@ -220,8 +220,8 @@ _zrush_compadd() {
   fi
   local -a _vals=(
     "${(v)apre}" "${(v)hpre}" "${(v)asuf}" "${(v)hsuf}"
-    "${(v)ipre}" "${(v)isuf}" "$IPREFIX" "$ISUFFIX" "$PREFIX" "$SUFFIX"
-    "$_rd" "${expl[2]:-}" "${(v)grpJ}" "${(v)grpV}" "${(v)_mesg}"
+    "${(v)ipre}" "${(v)isuf}" "$IPREFIX"
+    "$_rd" "${expl[2]:-}" "${(v)grpJ}"
   )
   _vals=( "${(@)_vals//(#s)*($'\0'|$'\1'|$'\2')*(#e)/}" )
 
@@ -240,18 +240,12 @@ _zrush_compadd() {
     [[ -n $_vals[5] ]]     && _rec+=( "i"$'\1'"$_vals[5]" )
     [[ -n $_vals[6] ]]     && _rec+=( "I"$'\1'"$_vals[6]" )
     [[ -n $_vals[7] ]]     && _rec+=( "ip"$'\1'"$_vals[7]" )
-    [[ -n $_vals[8] ]]     && _rec+=( "is"$'\1'"$_vals[8]" )
-    [[ -n $_vals[9] ]]     && _rec+=( "pr"$'\1'"$_vals[9]" )
-    [[ -n $_vals[10] ]]    && _rec+=( "su"$'\1'"$_vals[10]" )
-    (( ${_opts[(I)-U]} ))  && _rec+=( "U"$'\1'"1" )
     if (( $#isfile )); then
       _rec+=( "f"$'\1'"1" )
-      [[ -n $_vals[11] ]] && _rec+=( "rd"$'\1'"$_vals[11]" )
+      [[ -n $_vals[8] ]] && _rec+=( "rd"$'\1'"$_vals[8]" )
     fi
-    [[ -n $_vals[12] ]]    && _rec+=( "X"$'\1'"$_vals[12]" )
-    [[ -n $_vals[13] ]]    && _rec+=( "J"$'\1'"$_vals[13]" )
-    [[ -n $_vals[14] ]]    && _rec+=( "V"$'\1'"$_vals[14]" )
-    [[ -n $_vals[15] ]]    && _rec+=( "x"$'\1'"$_vals[15]" )
+    [[ -n $_vals[9] ]]     && _rec+=( "X"$'\1'"$_vals[9]" )
+    [[ -n $_vals[10] ]]    && _rec+=( "J"$'\1'"$_vals[10]" )
     _out+="${(pj:\2:)_rec}"$'\0'
   done
   print -rn -u $_zrush_wfd -- "$_out" 2>/dev/null
@@ -615,7 +609,7 @@ _zrush_parse_records() {  # $1=NUL-delimited collection payload ending in NUL
 
   # Parse insertion (w) and display (d) forms; match-text is the (Q)-decoded form.
   # Per-record zsh loops block for seconds on tens of thousands of candidates, so the
-  # common no-d-field case uses bulk array operations (30k: measured ~1.6s -> ~35ms).
+  # common no-d-field case uses bulk array operations.
   local -i i n=0
   local -a words=() disps=() mts=()
   local NUL=$'\0'
