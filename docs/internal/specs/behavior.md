@@ -37,6 +37,14 @@ zrush の挙動の規範。
   キャンセルは worker 自己申告 pid のプロセスグループへの SIGINT → `zpty -d`。
 - 新しいリクエストの開始時に進行中の収集をキャンセルする。
   古いリクエストの結果が後から到着しても表示に使わない。
+- fork 側の衛生(コードに固定): 継承フック(precmd / preexec / chpwd /
+  zshaddhistory / periodic / zshexit)と zle-* フックを無効化し、`SAVEHIST=0` で
+  実履歴を保護する。`zpty -wn` で改行付加を防ぐ。
+  `zpty -t` は使わない(無出力の子で数秒ブロックし得る)。
+- compadd フックの pipe 書き込みは compadd 呼び出し単位のバッチで行う
+  (レコード毎の書き込みは読み手の read 回数を増やし、大量候補で顕著に遅くなる)。
+- compsys 初期化済みの検知は `$+functions[_main_complete]` による
+  (zsh-autocomplete が compinit を代行する構成も検出できる)。
 
 ## 空語収集キャッシュ
 
@@ -125,7 +133,8 @@ zrush の挙動の規範。
 
 - 設定はプロンプト表示ごとに config.toml の mtime を確認して自動反映する
   (明示リロードなし。検証・フォールバック規則は config-schema.md)。
-- 設定警告は stderr に 1 行ずつ表示し、同一内容は config が変化するまで再表示しない。
+- 設定警告は config を(再)読み込みしたプロンプトで stderr に 1 行ずつ表示する
+  (再読み込みは mtime 変化時のみのため、変化のないプロンプトで再表示されない)。
 - zsh スクリプトとバイナリのプロトコル版が不一致の場合は警告を 1 回表示して動作継続する。
 
 ## プラグイン共存

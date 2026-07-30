@@ -1,8 +1,8 @@
 # 003-tab-common-prefix 実装計画
 
 **状態: 実装完了(2026-07-28 マージ)。**
-フォールバック(分岐点での先頭候補確定挿入)の体感は賛否があり、
-現状維持で経過観察中(検討記録は `../001-prototype/notes-dogfooding.md`)。
+フォールバック(分岐点での先頭候補確定挿入)は経過観察の結果、
+現状維持のまま解決(検討記録は `../001-prototype/notes-dogfooding.md`)。
 
 ## 背景と目的
 
@@ -61,10 +61,10 @@ M5 ドッグフーディングで「Tab(`common-prefix`)が体感無反応」を
    substring の sparse-checkout を含めない / `gti` → prefix 階層なしで空)。
 3. **zsh**: `_zrush_tab_with_results` の common-prefix 分岐に
    「条件を満たさなければ `_zrush_confirm_index ${_zrush_shown[1]}`」を追加。
-   `_ZRUSH_EXPECTED_PROTO=3`。
-4. **driver.zsh**: m4-8b(旧: typo クエリで何もしない)を新仕様に書き換え。
+   `_ZRUSH_EXPECTED_PROTO` を追従させる。
+4. **driver.zsh**: tab-2b(旧: typo クエリで何もしない)を新仕様に書き換え。
    環境依存を避けるため gd fixture で判定する:
-   - 伸びるケース: `ls docs/inte` + Tab → `ls docs/internal`(現行 m4-8a のまま)。
+   - 伸びるケース: `ls docs/inte` + Tab → `ls docs/internal`(現行 tab-2a のまま)。
    - 伸びないケース: `ls gd/a1` + Tab → prefix 階層 {a10..a19} の LCP "a1" ==
      クエリ → フォールバックで先頭候補 a10 を確定挿入(`ls gd/a10 `)。
 
@@ -76,7 +76,7 @@ M5 ドッグフーディングで「Tab(`common-prefix`)が体感無反応」を
    `tab = "insert"` と一致する。
 3. 候補 0 件の Tab は何もしない(現行維持)。
 4. cp 挿入パスで入力が縮む・別文字列に置き換わることがない(現行維持)。
-5. プロトコル v3 で契約文書とコードが一致し、Rust・driver・coexist の全テストが通る。
+5. 契約文書とコードが一致し、Rust・driver・coexist の全テストが通る。
 
 ## 未解決事項
 
