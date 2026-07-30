@@ -10,6 +10,7 @@
 //! macOS + Linux only): user input mid-composition need not be UTF-8.
 
 mod config;
+mod insert;
 mod keybind;
 mod layout;
 mod matching;
