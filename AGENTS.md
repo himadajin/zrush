@@ -42,7 +42,7 @@ Details live in `docs/internal/specs/`; these are the invariants:
 - Never act on the user's behalf: don't rewrite input without an explicit action, and don't expand `~`.
 - Never block input; collect candidates asynchronously.
 - Configuration lives solely in `~/.config/zrush/config.toml`; no zstyle-based settings.
-- Responsibilities: Rust = matching, ranking, history search, config interpretation; zsh = zle integration, compsys calls, rendering.
+- Responsibilities: Rust = matching, ranking, history search, layout/render-plan computation, insertion-text construction, config interpretation; zsh = zle integration, compsys capture, applying the plan (rendering).
 - Keep pure Rust logic (matching, ranking, config parsing) separate from the UI and unit-testable.
 
 ## Guardrails
