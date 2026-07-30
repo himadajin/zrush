@@ -429,4 +429,89 @@ mod tests {
             .unwrap();
         assert_eq!(std::str::from_utf8(m).unwrap(), "match 1 1 2");
     }
+
+    #[test]
+    fn common_prefix_includes_matches_dropped_by_the_rows_times_8_cap() {
+        // rows=1 -> cap = rows*8 = 8. 8 "aaaN" candidates plus a 9th
+        // ("ab") all match query "a"'s prefix tier, but only the first 8
+        // (stdin order; all tied) survive ranking's cap -- "ab" never
+        // reaches layout. common-prefix must still reflect it
+        // (cli-protocol.md: computed over the *untruncated* prefix-tier
+        // matches), so the LCP collapses to "a", not "aaa".
+        let stdin = {
+            let mut s = header(&[]);
+            for n in 1..=8 {
+                s.extend(word(&format!("aaa{n}")));
+            }
+            s.extend(word("ab"));
+            s
+        };
+        let out = run(&params("a", Mode::Typo, 1, 40, false), &stdin, &no_dir).unwrap();
+        let p = parse_out(&out);
+        assert_eq!(p.common_prefix, b"a");
+        // Sanity: "ab" really was dropped by the cap, not merely unranked.
+        assert!(p.rows.iter().all(|r| r != b"ab"));
+    }
+
+    #[test]
+    fn stat_runs_only_for_displayed_f_eq_1_positions() {
+        // 10 candidates, all f=1, but a narrow grid (rows=1, width=3)
+        // only displays 1 of them. `is_dir` must be called exactly once
+        // -- not once per matched, ranked, or rows*8-capped candidate --
+        // since the `-f` stat is budgeted by what the grid actually shows.
+        let stdin = {
+            let mut s = header(&[("f", "1"), ("rd", "./")]);
+            for i in 0..10 {
+                s.extend(word(&format!("d{i}")));
+            }
+            s
+        };
+        let calls = std::cell::RefCell::new(0usize);
+        let counting_is_dir = |_: &[u8]| {
+            *calls.borrow_mut() += 1;
+            false
+        };
+        let out = run(
+            &params("", Mode::Typo, 1, 3, false),
+            &stdin,
+            &counting_is_dir,
+        )
+        .unwrap();
+        let p = parse_out(&out);
+        assert_eq!(
+            *calls.borrow(),
+            p.cells.len(),
+            "one stat per displayed position"
+        );
+        assert_eq!(*calls.borrow(), 1);
+    }
+
+    #[test]
+    fn newline_in_candidate_is_normalized_for_display_but_raw_in_insertion_text() {
+        // cli-protocol.md: newline -> space is a *display* normalization
+        // only; insertion text returns the original bytes untouched.
+        let mut stdin = header(&[]);
+        stdin.extend(word("foo\nbar"));
+        let out = run(&params("", Mode::Typo, 10, 40, false), &stdin, &no_dir).unwrap();
+        let p = parse_out(&out);
+        assert_eq!(p.rows, vec![b"foo bar".to_vec()]);
+        assert_eq!(p.inserts, vec![b"foo\nbar".to_vec()]);
+    }
+
+    #[test]
+    fn dir_synthesis_is_skipped_when_real_stat_fails() {
+        // A real fs::metadata-backed is_dir on a path that doesn't exist
+        // must behave exactly like the fake-false case: no `/` synthesis.
+        let mut stdin = header(&[("f", "1"), ("rd", "/nonexistent-zrush-test-path-xyz/")]);
+        stdin.extend(word("child"));
+        let real_is_dir = |path: &[u8]| {
+            use std::os::unix::ffi::OsStrExt;
+            std::fs::metadata(std::ffi::OsStr::from_bytes(path))
+                .map(|m| m.is_dir())
+                .unwrap_or(false)
+        };
+        let out = run(&params("", Mode::Typo, 10, 40, true), &stdin, &real_is_dir).unwrap();
+        let p = parse_out(&out);
+        assert_eq!(p.inserts, vec![b"child ".to_vec()]); // no '/'; trailing space kept
+    }
 }

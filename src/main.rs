@@ -76,13 +76,18 @@ fn cmd_plan(args: &[OsString]) -> ExitCode {
                 Some("false") => smart_case = Some(false),
                 _ => return usage(),
             },
+            // 0 is rejected: cli-protocol.md guarantees zsh clamps both
+            // to >= 1 before invoking; a 0 here indicates misuse, not a
+            // legitimate degenerate budget (layout.rs still handles 0
+            // gracefully as defense in depth, but the CLI contract treats
+            // it as a usage error).
             b"--rows" => match value.to_str().and_then(|s| s.parse::<usize>().ok()) {
-                Some(n) => rows = Some(n),
-                None => return usage(),
+                Some(n) if n > 0 => rows = Some(n),
+                _ => return usage(),
             },
             b"--width" => match value.to_str().and_then(|s| s.parse::<usize>().ok()) {
-                Some(n) => width = Some(n),
-                None => return usage(),
+                Some(n) if n > 0 => width = Some(n),
+                _ => return usage(),
             },
             b"--trailing-space" => match value.to_str() {
                 Some("true") => trailing_space = Some(true),

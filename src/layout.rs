@@ -109,18 +109,24 @@ pub(crate) fn build(
         heading: &'a [u8], // meaningless when key.is_empty()
         members: Vec<usize>,
     }
+    // Ordered groups plus a key -> index lookup, kept in sync: the Vec
+    // preserves first-occurrence display order, the map turns "does this
+    // key already have a group" from an O(groups) scan into O(1)
+    // (audit: linear scan measured 67ms at 30k all-unique-key candidates).
     let mut groups: Vec<Group<'_>> = Vec::new();
+    let mut group_index: std::collections::HashMap<&[u8], usize> = std::collections::HashMap::new();
     for (idx, cand) in candidates.iter().enumerate() {
         let batch = &batches[cand.batch];
         let key = group_key(batch);
-        if let Some(g) = groups.iter_mut().find(|g| g.key == key) {
-            g.members.push(idx);
+        if let Some(&gi) = group_index.get(key) {
+            groups[gi].members.push(idx);
         } else {
             let heading = if key.is_empty() {
                 &b""[..]
             } else {
                 heading_text(batch)
             };
+            group_index.insert(key, groups.len());
             groups.push(Group {
                 key,
                 heading,
@@ -207,6 +213,18 @@ pub(crate) fn build(
 
         let start_pos = positions.len() + 1;
         let members_shown = &group.members[..gcount];
+        // Position numbers are assigned by rank within the group (1..=
+        // gcount), independent of which (row, col) grid cell a position
+        // ends up rendered in -- `members_shown[p_local - 1]` (used below
+        // to resolve each cell's candidate) already *is* that mapping, so
+        // `positions` is exactly `members_shown`, built once here rather
+        // than by pushing inside the render loop below. That loop visits
+        // cells in (row, col) scan order, e.g. p_local = 1, 1+grows,
+        // 1+2*grows, ..., 2, 2+grows, ... whenever grows > 1 and cols > 1
+        // -- not in increasing position order -- so a push there would
+        // (and did) desync `positions` from `cell_ranges`/`nav`, which
+        // are always written or read by position index.
+        positions.extend_from_slice(members_shown);
         for r in 1..=grows {
             let mut row_bytes: Vec<u8> = Vec::new();
             let mut in_row = 0usize;
@@ -234,7 +252,6 @@ pub(crate) fn build(
                     candidate: cand_idx,
                     pos,
                 });
-                positions.push(cand_idx);
             }
             row_lens.push(in_row);
             rows.push(row_bytes);
@@ -366,9 +383,13 @@ fn group_gmaxw(width: usize, max_member_width: usize) -> usize {
 /// here): `members >= 1` and `budget >= 1` -- a zero budget must never
 /// reach this function (it means the group is dropped before grid math).
 fn grid_dims(gmaxw: usize, width: usize, members: usize, budget: usize) -> (usize, usize, usize) {
-    let cols = ((width + 2) / (gmaxw + 2)).clamp(1, MAX_COLS);
+    // Saturating: `width`/`gmaxw` come from caller-controlled CLI args
+    // and candidate byte lengths respectively, so `+2` must not wrap at
+    // usize::MAX (a wrap would corrupt the column count silently instead
+    // of just saturating to a large-but-sane value).
+    let cols = (width.saturating_add(2) / gmaxw.saturating_add(2)).clamp(1, MAX_COLS);
     let grows = members.div_ceil(cols).min(budget);
-    let gcount = (cols * grows).min(members);
+    let gcount = cols.saturating_mul(grows).min(members);
     let cols = gcount.div_ceil(grows);
     (cols, grows, gcount)
 }
@@ -395,44 +416,79 @@ fn normalize_newlines(bytes: &[u8]) -> Cow<'_, [u8]> {
 /// that byte offsets derived from it are valid `String::from_utf8_lossy`
 /// char-boundary cuts. matching.rs's span offsets are indices into this
 /// same standard lossy decoding, so no extra alignment is needed here.
+///
+/// O(n) overall: `str::from_utf8` is called once per maximal valid/
+/// invalid run (not once per character -- a naive per-char
+/// `from_utf8(rest)` call re-validates the whole remainder every step,
+/// which is O(n^2) on long inputs; audit measurement: 383ms at 200KB).
+/// Once a run validates, its chars are popped off the front of the
+/// already-known-good `&str` in O(1) each via `chars().next()`.
 fn lossy_chars(bytes: &[u8]) -> LossyChars<'_> {
     LossyChars {
         rest: bytes,
-        offset: 0,
+        rest_offset: 0,
+        valid: "",
+        valid_offset: 0,
     }
 }
 
 struct LossyChars<'a> {
+    /// Bytes not yet scanned for validity.
     rest: &'a [u8],
-    offset: usize,
+    /// Absolute offset (into the original input) of `rest`'s first byte.
+    rest_offset: usize,
+    /// A validated run not yet fully consumed; chars are popped from its
+    /// front without re-validating.
+    valid: &'a str,
+    /// Absolute offset of `valid`'s first byte.
+    valid_offset: usize,
 }
 
 impl Iterator for LossyChars<'_> {
     type Item = (char, Range<usize>);
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.rest.is_empty() {
-            return None;
-        }
-        let (c, len) = match std::str::from_utf8(self.rest) {
-            Ok(s) => (
-                s.chars().next().unwrap(),
-                s.chars().next().unwrap().len_utf8(),
-            ),
-            Err(e) if e.valid_up_to() > 0 => {
-                let s = std::str::from_utf8(&self.rest[..e.valid_up_to()]).unwrap();
-                let c = s.chars().next().unwrap();
-                (c, c.len_utf8())
+        loop {
+            if let Some(c) = self.valid.chars().next() {
+                let len = c.len_utf8();
+                let start = self.valid_offset;
+                self.valid = &self.valid[len..];
+                self.valid_offset += len;
+                return Some((c, start..start + len));
             }
-            // Invalid subsequence right at the start: `error_len()` bytes
-            // (or the whole remainder, if merely incomplete) become one
-            // U+FFFD, matching from_utf8_lossy's maximal-subpart rule.
-            Err(e) => ('\u{FFFD}', e.error_len().unwrap_or(self.rest.len())),
-        };
-        let start = self.offset;
-        self.rest = &self.rest[len..];
-        self.offset += len;
-        Some((c, start..start + len))
+            if self.rest.is_empty() {
+                return None;
+            }
+            // `valid` exhausted: scan `rest` once for the next maximal
+            // valid run, or -- if it starts with invalid bytes -- consume
+            // one maximal invalid subsequence as a single U+FFFD.
+            match std::str::from_utf8(self.rest) {
+                Ok(s) => {
+                    self.valid = s;
+                    self.valid_offset = self.rest_offset;
+                    self.rest_offset += self.rest.len();
+                    self.rest = &[];
+                }
+                Err(e) if e.valid_up_to() > 0 => {
+                    let (good, bad) = self.rest.split_at(e.valid_up_to());
+                    self.valid = std::str::from_utf8(good).unwrap();
+                    self.valid_offset = self.rest_offset;
+                    self.rest_offset += good.len();
+                    self.rest = bad;
+                }
+                // Invalid subsequence right at the start: `error_len()`
+                // bytes (or the whole remainder, if merely incomplete)
+                // become one U+FFFD, matching from_utf8_lossy's
+                // maximal-subpart rule.
+                Err(e) => {
+                    let bad_len = e.error_len().unwrap_or(self.rest.len());
+                    let start = self.rest_offset;
+                    self.rest = &self.rest[bad_len..];
+                    self.rest_offset += bad_len;
+                    return Some(('\u{FFFD}', start..start + bad_len));
+                }
+            }
+        }
     }
 }
 
@@ -515,6 +571,14 @@ mod tests {
         // gmaxw already clamped to width elsewhere; here gmaxw==width
         // directly forces cols=1 (floor((w+2)/(w+2))=1).
         assert_eq!(grid_dims(20, 20, 1, 100), (1, 1, 1));
+    }
+
+    #[test]
+    fn grid_dims_does_not_overflow_at_usize_max() {
+        // width/gmaxw at usize::MAX must saturate the `+2`, not wrap
+        // around to a tiny (or panicking, in debug builds) value.
+        let (cols, grows, gcount) = grid_dims(usize::MAX, usize::MAX, 5, 100);
+        assert_eq!((cols, grows, gcount), (1, 5, 5));
     }
 
     fn spans_none(n: usize) -> Vec<Vec<(usize, usize)>> {
@@ -642,6 +706,56 @@ mod tests {
     }
 
     #[test]
+    fn heading_plus_multi_column_cjk_offsets() {
+        // 4 single-char CJK candidates (width 2 each), width=6 -> gmaxw=2,
+        // cols=floor(8/4)=2, grows=ceil(4/2)=2: a 2x2 grid with a heading,
+        // combining both offset-tricky dimensions (heading row + CJK
+        // char/width split) in one grid.
+        let batches = [batch(b"g", b"Grp")];
+        let cands = [
+            cand("日".as_bytes(), None, None, 0),
+            cand("本".as_bytes(), None, None, 0),
+            cand("語".as_bytes(), None, None, 0),
+            cand("字".as_bytes(), None, None, 0),
+        ];
+        let plan = build(&cands, &batches, &spans_none(4), 10, 6);
+        // Column-major: col1=[日,本], col2=[語,字].
+        assert_eq!(
+            plan.rows,
+            vec![
+                "Grp".as_bytes().to_vec(),
+                "日  語".as_bytes().to_vec(),
+                "本  字".as_bytes().to_vec()
+            ]
+        );
+        assert_eq!(plan.positions, vec![0, 1, 2, 3]); // 日,本,語,字 in rank order
+        // char offsets: "Grp" (3 chars) + \n -> row2 at 4; row2 "日  語"
+        // is 4 chars + \n -> row3 at 9.
+        assert_eq!(
+            plan.cell_ranges,
+            vec![
+                (4, 1),  // 日: row2, col1
+                (9, 1),  // 本: row3, col1
+                (7, 1),  // 語: row2, col2 (after "日  ")
+                (12, 1), // 字: row3, col2 (after "本  ")
+            ]
+        );
+    }
+
+    #[test]
+    fn duplicate_candidates_are_retained_not_deduplicated() {
+        // cli-protocol.md "重複候補...除去せずそのまま送ってよい...Rust
+        // も重複除去しない": two byte-identical candidates must still
+        // occupy two distinct positions.
+        let batches = [batch(b"", b"")];
+        let cands = [cand(b"git", None, None, 0), cand(b"git", None, None, 0)];
+        let plan = build(&cands, &batches, &spans_none(2), 10, 40);
+        assert_eq!(plan.positions, vec![0, 1]);
+        assert_eq!(plan.cell_ranges.len(), 2);
+        assert_ne!(plan.cell_ranges[0], plan.cell_ranges[1]); // distinct cells, same text
+    }
+
+    #[test]
     fn invalid_utf8_does_not_panic_and_stays_byte_exact() {
         let batches = [batch(b"", b"")];
         let raw: &[u8] = b"ca\xFFt"; // \xFF is not valid UTF-8 continuation
@@ -661,6 +775,23 @@ mod tests {
         let cands = [cand(raw, None, None, 0)];
         let plan = build(&cands, &batches, &spans_none(1), 10, 2);
         assert_eq!(plan.rows[0], b"a\xFF"); // original bytes, not U+FFFD bytes
+    }
+
+    #[test]
+    fn invalid_utf8_multi_byte_incomplete_sequence_is_one_replacement_char() {
+        let batches = [batch(b"", b"")];
+        // \xF0\x9F\x98 is a truncated 4-byte sequence (3 of 4 bytes) at
+        // the end of the buffer: from_utf8_lossy's maximal-subpart rule
+        // collapses all 3 trailing bytes into a single U+FFFD, not three
+        // separate ones (exercising the multi-byte error path, not just
+        // the single stray-byte case above).
+        let raw: &[u8] = b"ab\xF0\x9F\x98";
+        let cands = [cand(raw, None, None, 0)];
+        let plan = build(&cands, &batches, &spans_none(1), 10, 40); // no truncation
+        assert_eq!(plan.rows[0], raw); // bytes preserved verbatim, never re-encoded
+        // "a", "b", one replacement char for all 3 trailing bytes = 3
+        // chars -- not 5 (if each trailing byte were its own U+FFFD).
+        assert_eq!(plan.cell_ranges[0], (0, 3));
     }
 
     // ---- highlight span clipping ----
@@ -804,8 +935,151 @@ mod tests {
     }
 
     #[test]
+    fn positions_follow_column_major_position_order_not_render_scan_order() {
+        // Regression (external audit blocker): `positions` was once
+        // pushed in the render loop's (row, col) *scan* order, which
+        // only matches position order when grows == 1. 5 single-char
+        // candidates a..e at rows=2, width=7 force gmaxw=1, cols=3,
+        // grows=2, gcount=5 -- the exact grid the audit's black-box
+        // repro used, where the scan order (a,c,e,b,d) diverges from
+        // position order (a,b,c,d,e), so confirming a candidate inserted
+        // its neighbor's text.
+        let batches = [batch(b"", b"")];
+        let cands: Vec<Candidate<'_>> = ["a", "b", "c", "d", "e"]
+            .iter()
+            .map(|w| cand(w.as_bytes(), None, None, 0))
+            .collect();
+        let plan = build(&cands, &batches, &spans_none(5), 2, 7);
+        // Column-major placement: col1=[a,b], col2=[c,d], col3=[e] (ragged).
+        assert_eq!(plan.rows, vec![b"a  c  e".to_vec(), b"b  d".to_vec()]);
+        // positions[pos-1] must be the candidate at position `pos` in
+        // rank order (a=0,b=1,c=2,d=3,e=4) -- NOT the render scan order
+        // (a,c,e,b,d) the bug produced.
+        assert_eq!(plan.positions, vec![0, 1, 2, 3, 4]);
+        // Cross-validate every other position-indexed output against the
+        // same grid by hand, per the audit's request to check them together.
+        // char offsets: row0 "a  c  e" is 7 chars + \n -> row1 starts at 8.
+        assert_eq!(
+            plan.cell_ranges,
+            vec![
+                (0, 1),  // a: row0, col1
+                (8, 1),  // b: row1, col1
+                (3, 1),  // c: row0, col2 (after "a  ")
+                (11, 1), // d: row1, col2 (after "b  ")
+                (6, 1),  // e: row0, col3 (after "a  c  ")
+            ]
+        );
+        // nav: next/prev walk positions 1..=5 sequentially; left/right
+        // jump by grows=2 within the single group [1,5].
+        assert_eq!(
+            plan.nav[0],
+            Nav {
+                next: 2,
+                prev: 0,
+                left: 1,
+                right: 3
+            }
+        ); // a
+        assert_eq!(
+            plan.nav[1],
+            Nav {
+                next: 3,
+                prev: 1,
+                left: 1,
+                right: 4
+            }
+        ); // b
+        assert_eq!(
+            plan.nav[2],
+            Nav {
+                next: 4,
+                prev: 2,
+                left: 1,
+                right: 5
+            }
+        ); // c
+        assert_eq!(
+            plan.nav[3],
+            Nav {
+                next: 5,
+                prev: 3,
+                left: 2,
+                right: 5
+            }
+        ); // d
+        assert_eq!(
+            plan.nav[4],
+            Nav {
+                next: 5,
+                prev: 4,
+                left: 3,
+                right: 5
+            }
+        ); // e
+    }
+
+    #[test]
     fn empty_candidates_yield_empty_plan() {
         let plan = build(&[], &[], &[], 10, 40);
         assert_eq!(plan, Plan::default());
+    }
+
+    // ---- external audit: contract boundary cases ----
+
+    #[test]
+    fn non_fitting_headed_group_stops_layout_even_if_a_later_group_would_fit() {
+        // g1 (1 member) fits fully with its heading; g2 (1 member,
+        // headed) then can't fit (budget left is 1, needs 2) and is a
+        // *non-first* group, so the whole layout stops there -- even
+        // though the headingless "" bucket that comes third (by
+        // first-occurrence) would trivially fit in the 1 row left over.
+        let batches = [batch(b"g1", b""), batch(b"g2", b""), batch(b"", b"")];
+        let cands = [
+            cand(b"a", None, None, 0), // group "g1": fits (heading + 1 row = 2)
+            cand(b"b", None, None, 1), // group "g2": needs 2, only 1 left -> drop + stop
+            cand(b"c", None, None, 2), // headingless bucket: would fit alone, never reached
+        ];
+        let plan = build(&cands, &batches, &spans_none(3), 3, 40);
+        assert_eq!(plan.rows, vec![b"g1".to_vec(), b"a".to_vec()]);
+        assert_eq!(plan.positions, vec![0]); // only "a"; "b" and "c" both absent
+    }
+
+    #[test]
+    fn heading_text_is_fixed_by_the_groups_first_occurring_batch() {
+        // Two batches share the group key "grp" but carry different `X`.
+        // The heading must come from whichever batch's candidate
+        // *first* established the group, not from a later member that
+        // happens to join the same key with a different heading text.
+        let batches = [
+            batch(b"grp", b"First Heading"),
+            batch(b"grp", b"Second Heading"),
+        ];
+        let cands = [cand(b"a", None, None, 0), cand(b"b", None, None, 1)];
+        let plan = build(&cands, &batches, &spans_none(2), 10, 40);
+        let headings: Vec<_> = plan
+            .highlights
+            .iter()
+            .filter(|h| h.role == Role::Heading)
+            .collect();
+        assert_eq!(
+            headings.len(),
+            1,
+            "both members share one group -> one heading"
+        );
+        assert_eq!(plan.rows[0], b"First Heading");
+        assert!(plan.rows.iter().all(|r| r != b"Second Heading"));
+    }
+
+    #[test]
+    fn default_group_name_has_no_group_even_with_a_non_empty_heading() {
+        // J == "-default-" reads as no key regardless of X (X is not a
+        // fallback here -- the -default- override short-circuits before
+        // X is ever consulted). Contrast with `heading_prefers_x_falls_
+        // back_to_j`, where an *empty* J does fall back to X.
+        let batches = [batch(b"-default-", b"Some Heading")];
+        let cands = [cand(b"a", None, None, 0)];
+        let plan = build(&cands, &batches, &spans_none(1), 10, 40);
+        assert_eq!(plan.rows, vec![b"a".to_vec()]); // no heading row
+        assert!(plan.highlights.iter().all(|h| h.role != Role::Heading));
     }
 }
