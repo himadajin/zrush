@@ -586,6 +586,9 @@ _zrush_finalize() {
   setopt localoptions no_monitor no_notify
   local payload=$_zrush_buf
   _zrush_buf=
+  # Marks "transport" (fork -> parent pipe) complete, mirroring every other
+  # pipeline stage's own checkpoint; driver-latency.zsh's breakdown reads it.
+  _zlog "finalize: ${#payload} bytes"
   if [[ -z $_zrush_query && -n $payload ]]; then
     _zrush_cc_save "$payload"
   fi
