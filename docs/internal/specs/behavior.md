@@ -1,6 +1,6 @@
 # behavior: zrush の挙動仕様
 
-フェーズ 1(001〜004)で確定した挙動の規範。
+zrush の挙動の規範。
 コンポーネント境界の詳細は `../contracts/cli-protocol.md`(zsh ↔ Rust CLI)と
 `../contracts/config-schema.md`(config.toml)が持ち、この文書はそれ以外の
 観測可能な挙動を定義する。設定キー名は config-schema.md の表記に従う。
@@ -58,7 +58,7 @@
   **prefix > substring > edit(誤字許容)> fuzzy(部分列)** で、`mode` が
   どのティアまで拾うかを決める。`smart-case` はクエリが全小文字のとき大小を無視する。
   意味論の規範は cli-protocol.md。
-- common-prefix は prefix 階層マッチのバイト単位 LCP(cli-protocol v3)。
+- common-prefix は prefix 階層マッチのバイト単位 LCP(cli-protocol.md)。
 
 ## 表示
 

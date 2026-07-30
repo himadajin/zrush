@@ -349,7 +349,7 @@ zpty 内部シェル(現在シェルの fork)で compsys を走らせ、**広げ
 - `zle-line-pre-redraw` でのバッファ変化検知 → fd タイマーで遅延(既定 30ms)→ 広げクエリを構築して M1 の方式で候補収集 → `zle -F -w` ハンドラ内で `zrush match`(設定スナップショットを引数で渡す)→ POSTDISPLAY + region_highlight で一覧描画、を通す。
 - バッファが空(または空白のみ)のときは収集も表示もしないことを確認。
 - min-input・max-lines を config から適用。
-  各行は `$COLUMNS` 未満に切り詰め(折り返しによる行数暴れの防止)、行数は max-lines と `$LINES` の小さい方でクリップ。
+  各行は `$COLUMNS` 未満に切り詰め(折り返しによる行数暴れの防止)、行数は max-lines と `$LINES - 1` の小さい方でクリップ。
 - `zle-line-finish` で POSTDISPLAY と自前の region_highlight エントリを消去する
   (accept-line 後の残骸防止)。
 - 端末リサイズ時の挙動を確認。

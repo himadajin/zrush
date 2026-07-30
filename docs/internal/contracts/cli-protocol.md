@@ -6,8 +6,6 @@ zrush.zsh(zsh 側)と `zrush` バイナリ(Rust 側)の入出力仕様。
 ## プロトコル版
 
 - **PROTOCOL_VERSION = 3**
-  (v2: `zrush match` の出力に候補ごとのマッチ位置フィールドを追加(002)。
-  v3: common-prefix の計算対象を prefix 階層マッチに変更(003))
 - `zrush config` の出力に `ZRUSH_PROTOCOL_VERSION` が含まれる。
   zrush.zsh は自身が期待する版番号と照合し、不一致なら警告を 1 回表示して動作は継続する
   (git pull 後の rebuild し忘れ検知)。
@@ -29,7 +27,7 @@ zrush.zsh(zsh 側)と `zrush` バイナリ(Rust 側)の入出力仕様。
   **NUL はファイル名には出現しないが、zsh の文字列(変数値・履歴語など)には出現し得る**。
   そのため **送信側(zsh)が保証する**: NUL を含む候補はレコードを送出前に除外し、
   `--query` に渡す文字列からは NUL を除去する。Rust 側はフィールド内に NUL が無いことを前提としてよい。
-- **候補語の二形**(M1 の確定事項): 収集で捕獲した候補語は compsys の**挿入用クォート済み形**
+- **候補語の二形**: 収集で捕獲した候補語は compsys の**挿入用クォート済み形**
   (例: `space\ name.txt`)。その `${(Q)}` 復元形(生テキスト)がマッチング・表示用。
   挿入にはクォート済み形をそのまま使う。両形の対応管理は zsh 側の責務で、
   本プロトコルを流れる `match-text` は常に復元形である。
@@ -59,7 +57,7 @@ zrush match --query <fuzzy-query> \
 - `--query`: 広げ規則で削った末尾(ユーザーの as-typed 断片、NUL 除去済み)。空文字列も有効
   (空クエリは全候補が最高同点マッチ = compsys 順のまま上位 N 件を返す)。
 - `--mode` / `--smart-case`: マッチング設定のスナップショット(config-schema.md 参照)。
-- `--max-lines`: 出力する最大候補数。表示行数クリップ(`$LINES` との min)は zsh 側の責務。
+- `--max-lines`: 出力する最大候補数。表示行数クリップ(`$LINES - 1` との min)は zsh 側の責務。
 - 未知の引数・不正値は exit 2(usage エラー)。
 
 ### stdin(候補列)
@@ -105,7 +103,7 @@ zrush match --query <fuzzy-query> \
   max-lines 打ち切り前)の match-text のバイト単位最長共通接頭辞。
   空クエリでは全マッチが prefix 階層。
   マッチ 0 件・prefix 階層 0 件・共通部分なしのときは空フィールド。
-  substring 以下の階層はクエリの接頭辞拡張になり得ないため計算に含めない(v3)。
+  substring 以下の階層はクエリの接頭辞拡張になり得ないため計算に含めない。
   `tab = "common-prefix"` の挙動(config-schema.md)のために返す。zsh 側の規範:
   - クエリが common-prefix の真のバイト接頭辞である場合、削った末尾領域を
     `${(q)}` でクォートした common-prefix で置き換える(as-typed の接頭辞拡張のみ。
@@ -172,7 +170,7 @@ typeset -g  ZRUSH_CFG_DELAY_MS='30'
 typeset -g  ZRUSH_CFG_MIN_INPUT='0'
 typeset -g  ZRUSH_CFG_MODE='typo'
 typeset -g  ZRUSH_CFG_SMART_CASE='true'
-typeset -g  ZRUSH_CFG_TAB='common-prefix'
+typeset -g  ZRUSH_CFG_TAB='menu'
 typeset -g  ZRUSH_CFG_TRAILING_SPACE='true'
 typeset -g  ZRUSH_CFG_HL_SELECTED='standout'
 typeset -g  ZRUSH_CFG_HL_MATCH='underline'
