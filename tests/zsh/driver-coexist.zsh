@@ -1,16 +1,16 @@
 #!/bin/zsh -f
-# zrush の共存・実機系ヘッドレス検証(plan.md M5 チェックリストの事前検証)。
+# Headless coexistence and real-environment checks for zrush.
 #
-# 実行方法:
+# Usage:
 #   zsh -f tests/zsh/driver-coexist.zsh <playground-dir>
-# 前提:
-#   - cargo build --release 済み
+# Prerequisites:
+#   - cargo build --release completed
 #   - /opt/homebrew/share/zsh-abbr, /opt/homebrew/share/zsh-syntax-highlighting
-#   - /opt/homebrew/bin/tmux(専用ソケット -L で起動。実セッションに触れない)
+#   - /opt/homebrew/bin/tmux (started with a dedicated -L socket; no real sessions touched)
 #
-# 検証対象: zsh-abbr 共存 / z-sy-h 共存 / 三者共存 / tmux 内 + リサイズ /
-#           シェル多重起動 / PS2 複数行 / 全角幅(記録のみ)。
-# すべて隔離環境(ZDOTDIR/HOME/XDG/ABBR ファイルを一時領域へ)。
+# Covers zsh-abbr, z-sy-h, all three together, tmux with resizing, concurrent
+# shells, PS2 continuation, and recorded full-width rendering.
+# All tests isolate ZDOTDIR, HOME, XDG, and ABBR files in temporary storage.
 emulate -L zsh
 setopt extended_glob
 zmodload zsh/zpty    || { print -u2 FATAL: zpty; exit 1 }
@@ -35,28 +35,28 @@ ng()  { out "FAIL: $1"; (( ++FAIL )) }
 
 typeset -g WORK=$(mktemp -d ${TMPDIR:-/tmp}/zrush-coex.XXXXXX)
 export TERM=xterm-256color
-# POSTDISPLAY は zle の表示ロジックを通るため、C ロケールだと UTF-8 バイトが
-# 印字不能文字としてエスケープ表示される。実利用環境と同じ UTF-8 を明示する。
+# POSTDISPLAY passes through ZLE rendering, which escapes UTF-8 bytes as unprintable
+# under the C locale. Explicitly match the UTF-8 locale used in practice.
 export LC_ALL=en_US.UTF-8
 export HOME=$PLAYGROUND
 export XDG_CONFIG_HOME=$WORK/xdg
 export ZRUSH_REPO=$REPO
 mkdir -p $WORK/xdg
 
-# 全角幅・リサイズ検証用 fixtures(冪等)
+# Idempotent fixtures for full-width and resize checks
 mkdir -p $PLAYGROUND/wide
 : >| $PLAYGROUND/wide/"longname-${(l:110::x:)}.txt"
 : >| $PLAYGROUND/wide/"jp-日本語の長い名前のファイルで表示崩れを確認する.txt"
 : >| $PLAYGROUND/wide/"jp-これは二つ目の全角ファイル名です.txt"
 
-# ---------------------------------------------------------------- rc 生成
-# ^Xb = BUFFER を ZRUSH_LOG にダンプ(driver.zsh と同じテスト支援)
+# ---------------------------------------------------------------- Generate rc files
+# ^Xb dumps BUFFER to ZRUSH_LOG, matching the driver.zsh test helper.
 typeset -g DUMPW='
 _zrt_dump_buffer() { _zlog "TESTBUF=${(qqqq)BUFFER}" }
 zle -N _zrt-dump-buffer _zrt_dump_buffer
 bindkey "^Xb" _zrt-dump-buffer'
 
-mk_zdot() {  # $1=名前 $2=rc 本文
+mk_zdot() {  # $1=name $2=rc body
   local d=$WORK/zdot-$1
   mkdir -p $d
   print -r -- "$2" > $d/.zshrc
@@ -95,13 +95,13 @@ print MARK-RC-DONE")
 
 typeset -g ZDOT_MIN=$(mk_zdot min "source $REPO/tests/zsh/rc/minimal.zshrc")
 
-# ---------------------------------------------------------------- ホスト操作(複数ホスト対応)
+# ---------------------------------------------------------------- Host operations with multi-host support
 typeset -gA HFD=()
 typeset -g HOST= CURLOG=
 typeset -gi HOSTFD=-1
 typeset -g TRANSCRIPT= EXPECT_BUF=
 
-start_host() {  # $1=ホスト名 $2=ZDOTDIR $3=ログファイル $4=作業tmp
+start_host() {  # $1=host name $2=ZDOTDIR $3=log file $4=working tmp
   export ZDOTDIR=$2
   export ZRUSH_LOG=$3
   export ZRUSH_TEST_TMP=${4:-$WORK}
@@ -133,8 +133,8 @@ expect() {
       EXPECT_BUF+=$chunk
       TRANSCRIPT+=$chunk
       [[ $EXPECT_BUF == ${~pat} ]] && return 0
-      # マッチ箇所ハイライト等の SGR が語の途中に挟まるため、SGR を
-      # 剥がした形でも照合する(生パターン指定のテストは上で先に通る)
+      # Match again after stripping SGR that may split words for highlighting.
+      # Raw escape-sequence patterns already had the first chance to match above.
       [[ ${EXPECT_BUF//$'\e['[0-9;]#m/} == ${~pat} ]] && return 0
     fi
   done
@@ -154,7 +154,7 @@ drain() {
 clear_line()  { send_keys $'\C-u'; drain 0.25 }
 sync_prompt() { expect '*HP>*' ${1:-5} >/dev/null; drain 0.1 }
 
-assert_buffer() {  # $1=期待バッファ $2=ラベル(^Xb ダンプ比較)
+assert_buffer() {  # $1=expected buffer $2=label; compare ^Xb dump
   local want=${(qqqq)1}
   send_keys $'\C-xb'
   local -F dl=$(( SECONDS + 5 ))
@@ -173,12 +173,12 @@ assert_buffer() {  # $1=期待バッファ $2=ラベル(^Xb ダンプ比較)
 typeset -g DOWN=$'\e[B' UP=$'\e[A' ENTER=$'\r' CTRLC=$'\C-c'
 press() { send_keys $1; drain 0.3 }
 
-clog_count() {  # $1=固定文字列 → REPLY: CURLOG 内の出現回数
+clog_count() {  # $1=fixed string -> REPLY: occurrence count in CURLOG
   typeset -g REPLY=0
   [[ -r $CURLOG ]] && REPLY=$(grep -cF -- $1 $CURLOG 2>/dev/null)
   return 0
 }
-wait_clog() {  # $1=固定文字列 $2=基準値 $3=timeout(s) → 増えたら 0
+wait_clog() {  # $1=fixed string $2=baseline $3=timeout(s) -> 0 when count increases
   local -F dl=$(( SECONDS + ${3:-5} ))
   while (( SECONDS < dl )); do
     drain 0.15
@@ -188,8 +188,8 @@ wait_clog() {  # $1=固定文字列 $2=基準値 $3=timeout(s) → 増えたら 
   return 1
 }
 
-# zrush の基本フロー(一覧→選択→確定)を現在のホストで検証する共通手順
-basic_flow() {  # $1=ラベル接頭辞
+# Shared flow that verifies listing, selection, and confirmation on the current host
+basic_flow() {  # $1=label prefix
   send_keys 'ls docs/inte'
   if expect '*internal*' 10; then
     ok "$1: 一覧の自動表示"
@@ -211,13 +211,13 @@ basic_flow() {  # $1=ラベル接頭辞
 }
 
 {
-  # ================ (1) zsh-abbr 共存(abbr → zrush)================
+  # ================ (1) zsh-abbr coexistence (abbr -> zrush) ================
   out "==== (1) zsh-abbr 共存 ===="
   if start_host h_abbr $ZDOT_ABBR $WORK/abbr.log $WORK/t-abbr; then
     ok "(1) abbr+zrush ホスト起動"
     send_keys 'zzz'
     drain 0.5
-    send_keys $ENTER          # press() は drain が出力を先食いするため使わない
+    send_keys $ENTER          # press() would consume output while draining
     if expect '*ABBR-EXPANDED-OK*' 8; then
       ok "(1a) 非選択時 Enter で略語展開が生きる(前任者チェーン経由)"
     else
@@ -230,7 +230,7 @@ basic_flow() {  # $1=ラベル接頭辞
   fi
   stop_host h_abbr
 
-  # ================ (2) zsh-syntax-highlighting 共存(zrush → z-sy-h)================
+  # ================ (2) zsh-syntax-highlighting coexistence (zrush -> z-sy-h) ================
   out "==== (2) z-sy-h 共存 ===="
   if start_host h_zsyh $ZDOT_ZSYH $WORK/zsyh.log $WORK/t-zsyh; then
     ok "(2) zrush+z-sy-h ホスト起動"
@@ -242,13 +242,13 @@ basic_flow() {  # $1=ラベル接頭辞
     fi
     clear_line
     drain 0.5
-    basic_flow "(2c)"   # 一覧+選択+確定 = pre-redraw 共存とラップ後ディスパッチの実証
+    basic_flow "(2c)"   # listing + selection + confirmation exercises pre-redraw and wrapped dispatch
   else
     ng "(2) z-sy-h ホスト起動失敗"
   fi
   stop_host h_zsyh
 
-  # ================ (3) 三者共存(abbr → zrush → z-sy-h)================
+  # ================ (3) Three-way coexistence (abbr -> zrush -> z-sy-h) ================
   out "==== (3) 三者共存 ===="
   if start_host h_all $ZDOT_ALL $WORK/all.log $WORK/t-all; then
     ok "(3) 三者ホスト起動"
@@ -270,7 +270,7 @@ basic_flow() {  # $1=ラベル接頭辞
   fi
   stop_host h_all
 
-  # ================ (5) シェル多重起動(同時収集)================
+  # ================ (5) Concurrent shells and collection ================
   out "==== (5) シェル多重起動 ===="
   if start_host h1 $ZDOT_MIN $WORK/h1.log $WORK/t1 && start_host h2 $ZDOT_MIN $WORK/h2.log $WORK/t2; then
     ok "(5) 2 ホスト同時起動"
@@ -288,11 +288,11 @@ basic_flow() {  # $1=ラベル接頭辞
   fi
   stop_host h2
 
-  # ================ (6) 複数行バッファ(PS2 継続)================
+  # ================ (6) Multiline input through PS2 continuation ================
   out "==== (6) PS2 複数行 ===="
   use_host h1 $WORK/h1.log
   send_keys 'for i in 1 2'
-  press $ENTER            # 未完コマンド → PS2 継続(同一 zle セッション)
+  press $ENTER            # incomplete command -> PS2 continuation in the same ZLE session
   drain 0.5
   send_keys 'ls docs/inte'
   if expect '*internal*' 10; then
@@ -304,14 +304,14 @@ basic_flow() {  # $1=ラベル接頭辞
   send_keys $DOWN
   wait_clog 'selected=1' $c6sel 5 && ok "(6b) PS2 で選択開始(末尾行なので優先順位③)" || ng "(6b) PS2 で選択できない"
   press $ENTER
-  # 注: PS2 継続は行ごとに独立した zle セッションで、BUFFER は継続行のみを持つ
-  # (複数行 BUFFER になるのは ESC-Enter 等の自己挿入改行の場合)。
-  # よって確定後の BUFFER は継続行のみで正しい。
+  # Each PS2 continuation line has its own ZLE session, so BUFFER contains only that
+  # line. A multiline BUFFER instead requires a self-inserted newline such as ESC-Enter.
+  # The confirmed BUFFER should therefore contain only the continuation line.
   assert_buffer 'ls docs/internal/' "(6c) PS2 での確定挿入が継続行内で正常(表示崩れなし)"
-  press $CTRLC            # 行を破棄
+  press $CTRLC            # discard the line
   drain 0.5
 
-  # ================ (7) 全角幅(記録のみ)================
+  # ================ (7) Full-width rendering (record only) ================
   out "==== (7) 全角幅(記録)===="
   sync_prompt 3
   send_keys 'ls wide/jp-'
@@ -326,7 +326,7 @@ basic_flow() {  # $1=ラベル接頭辞
   clear_line
   stop_host h1
 
-  # ================ (4)(8) tmux 内 + リサイズ ================
+  # ================ (4)(8) Inside tmux with resizing ================
   out "==== (4)(8) tmux ===="
   local TSOCK=zrush-m5-$$
   tm() { $TMUX_BIN -L $TSOCK -f /dev/null "$@" }
@@ -347,14 +347,14 @@ basic_flow() {  # $1=ラベル接頭辞
     tm send-keys -t m5 -l ' print -r -- TERM-INSIDE-$TERM'
     tm send-keys -t m5 Enter
     tm_wait '*TERM-INSIDE-*' 5 && out "INFO: $(tm_cap | grep -o 'TERM-INSIDE-[a-z0-9-]*' | tail -1)"
-    # リサイズ前: 長い候補行の幅(width=100 → 99 に切り詰め)
+    # Before resize, truncate a long candidate line from width 100 to 99.
     tm send-keys -t m5 -l 'ls wide/lo'
     if tm_wait '*longname-*' 10; then
       local line1=$(tm_cap | grep -m1 -o 'longname-x*' )
       out "INFO: (8) width=100 での表示長=${#line1}"
       tm resize-window -t m5 -x 60 -y 20 2>/dev/null
       command sleep 0.5
-      tm send-keys -t m5 -l 'n'      # 再描画トリガ('ls wide/lon')
+      tm send-keys -t m5 -l 'n'      # trigger redraw for 'ls wide/lon'
       command sleep 1.5
       local line2=$(tm_cap | grep -m1 -o 'longname-x*')
       out "INFO: (8) width=60 での表示長=${#line2}"
@@ -368,7 +368,7 @@ basic_flow() {  # $1=ラベル接頭辞
     fi
     tm send-keys -t m5 C-u
     command sleep 0.3
-    # tmux 内の基本フロー(terminfo キー解決: Down は tmux が TERM 相当の列を送る)
+    # Basic tmux flow; tmux sends the TERM-equivalent Down sequence resolved by terminfo.
     tm send-keys -t m5 -l 'ls docs/inte'
     if tm_wait '*internal*' 10; then
       ok "(4a) tmux 内で一覧表示"
@@ -387,7 +387,7 @@ basic_flow() {  # $1=ラベル接頭辞
       else
         ng "(4b) tmux 内で選択できない"
       fi
-      # 選択ハイライトの実描画(SGR 7)も観測記録として残す
+      # Also record actual selection-highlight rendering (SGR 7).
       if [[ "$($TMUX_BIN -L $TSOCK -f /dev/null capture-pane -p -e -t m5 2>/dev/null)" == *$'\e[7m'* ]]; then
         out "OBSV: (4b) tmux ペインに standout(SGR 7)を確認"
       else

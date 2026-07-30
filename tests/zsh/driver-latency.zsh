@@ -1,27 +1,27 @@
 #!/bin/zsh -f
-# 遅延計測ドライバ(notes-dogfooding 2026-07-28「一覧なし→初回表示までの間」の切り分け)
+# Latency driver for isolating time from key input to the first candidate paint.
 #
-# 使い方: zsh -f tests/zsh/driver-latency.zsh <playground-dir>
-#   前提: cargo build --release 済み。TERM は実端末相当(xterm-256color)を使う
-#   (vt100 だと zsh-autocomplete が初期化をスキップする — M1 計測の知見)。
+# Usage: zsh -f tests/zsh/driver-latency.zsh <playground-dir>
+#   Prerequisite: cargo build --release completed. Use a real-terminal TERM
+#   (xterm-256color), because zsh-autocomplete skips initialization under vt100.
 #
-# ホスト:
-#   min-zrush     zsh -d -i + minimal.zshrc(隔離)
-#   min-zrush-d0  同上 + delay-ms = 0(デバウンス寄与の分離)
-#   min-zac       zsh -d -i + zsh-autocomplete(min-delay 0.05 = zrush 旧既定 50ms と同条件)
-#   real-zrush    zsh -i + 実 ~/.zshrc(実環境。履歴ガードレール付き)
+# Hosts:
+#   min-zrush     zsh -d -i + isolated minimal.zshrc
+#   min-zrush-d0  same with delay-ms = 0 to isolate debounce contribution
+#   min-zac       zsh -d -i + zsh-autocomplete with min-delay 0.05
+#   real-zrush    zsh -i + real ~/.zshrc with history safeguards
 #
-# 計測:
-#   first-paint: キー列送信 → 期待文字列が pty に現れるまでの実時間
-#                (SGR を剥がして照合。分解能は zselect の ~10ms)
-#   breakdown  : ZRUSH_LOG の区間分解
-#                arm(最終打鍵)→ request → fork → compsys → records → match → render
+# Measurements:
+#   first-paint: elapsed time from key sequence to expected pty text after stripping
+#                SGR, with roughly 10ms zselect resolution
+#   breakdown  : ZRUSH_LOG intervals:
+#                arm (last key) -> request -> fork -> compsys -> records -> match -> render
 #
-# 実環境ホストのガードレール(M1 事故の再発防止):
-#   - 送信コマンドは必ず先頭スペース付き(hist_ignore_space)
-#   - 起動直後に unset HISTFILE / SAVEHIST=0
-#   - 実行前後で ~/.zsh_history のハッシュ不変を検証
-#   - ユーザーファイルへの書き込みは一切しない
+# Safeguards for the real-environment host:
+#   - Prefix every command with a space for hist_ignore_space.
+#   - Immediately unset HISTFILE and set SAVEHIST=0.
+#   - Verify the ~/.zsh_history hash is unchanged before and after.
+#   - Never write user files.
 emulate -L zsh
 setopt extended_glob
 zmodload zsh/zpty    || { print -u2 FATAL: zpty; exit 1 }
@@ -45,7 +45,7 @@ typeset -g HOST= HOSTLOG= CURXDG=
 typeset -gi HOSTFD=-1 SYNCN=0
 out() { print -r -u2 -- "$@" }
 
-send_line() { zpty -w  $HOST " $1" }   # 先頭スペース必須(実環境ホスト対策)
+send_line() { zpty -w  $HOST " $1" }   # leading space is mandatory for the real host
 send_keys() { zpty -wn $HOST $1 }
 
 drain() {
@@ -82,8 +82,8 @@ run_cmd() { send_line $1; sync_host ${2:-30} }
 clear_line() { send_keys $'\C-u'; drain 0.6 }
 
 # ---------------------------------------------------------------- first-paint
-# キー送信 → SGR 除去後の pty ストリームに期待文字列が現れるまでの ms
-paint_once() {  # $1=keys $2=固定文字列 $3=timeout → REPLY=ms(NA=不達)
+# Milliseconds from sending keys until expected text appears in the SGR-stripped pty stream
+paint_once() {  # $1=keys $2=fixed string $3=timeout -> REPLY=ms (NA if not reached)
   typeset -g REPLY=NA
   local pat=$2 buf= chunk
   local -F t0=$EPOCHREALTIME
@@ -130,10 +130,10 @@ paint_case() {  # $1=host-label $2=case-label $3=keys $4=pattern [$5=trials]
 }
 
 # ---------------------------------------------------------------- breakdown
-# ZRUSH_LOG の末尾チェーンから区間 ms を出す(直近 render 起点で遡る)
+# Derive interval milliseconds from the final ZRUSH_LOG chain, walking back from latest render.
 ts_of() { typeset -g REPLY=${${${(z)1}[2]}%\]} }
 
-breakdown_last() {  # $1=logfile $2=先頭スキップ行数 → 表 1 行
+breakdown_last() {  # $1=logfile $2=number of leading lines to skip -> one table row
   local -a L=( ${(f)"$(<$1)"} )
   L=( "${(@)L[$(( $2 + 1 )),-1]}" )
   local -i i ir=0
@@ -176,8 +176,8 @@ paint_break_case() {  # $1=host-label $2=case-label $3=keys $4=pattern
   return 0
 }
 
-# キャッシュヒット経路の区間分解(004): arm → request → cache hit → match → render
-breakdown_hit_last() {  # $1=logfile $2=先頭スキップ行数
+# Cache-hit breakdown: arm -> request -> cache hit -> match -> render
+breakdown_hit_last() {  # $1=logfile $2=number of leading lines to skip
   local -a L=( ${(f)"$(<$1)"} )
   L=( "${(@)L[$(( $2 + 1 )),-1]}" )
   local -i i ir=0
@@ -207,7 +207,7 @@ breakdown_hit_last() {  # $1=logfile $2=先頭スキップ行数
   return 0
 }
 
-paint_break_hit_case() {  # 事前の同種ケースでキャッシュが温まっている前提
+paint_break_hit_case() {  # assumes a preceding equivalent case warmed the cache
   local -i skip=0
   [[ -r $HOSTLOG ]] && skip=$(wc -l < $HOSTLOG)
   paint_once $3 $4 20 || { out "WARN: [$1/$2] 不達"; return 1 }
@@ -217,7 +217,7 @@ paint_break_hit_case() {  # 事前の同種ケースでキャッシュが温ま�
   return 0
 }
 
-# ---------------------------------------------------------------- ホスト
+# ---------------------------------------------------------------- Hosts
 typeset -g MEAS_RC=$WORK/meas.zsh
 cat > $MEAS_RC <<'EOF'
 functions[_zrush_arm_timer_orig]=$functions[_zrush_arm_timer]
@@ -225,7 +225,7 @@ _zrush_arm_timer() { _zlog "MEAS-arm"; _zrush_arm_timer_orig "$@" }
 print MEAS-READY
 EOF
 
-start_min_zrush() {  # $1=host-label $2=XDG dir(config 済み)
+start_min_zrush() {  # $1=host label $2=XDG directory with configuration
   HOST=$1 HOSTLOG=$WORK/$1.log CURXDG=$2
   export ZRUSH_REPO=$REPO ZRUSH_TEST_TMP=$WORK/t-$1 ZDOTDIR=$WORK/zdot-$1
   export XDG_CONFIG_HOME=$2 ZRUSH_LOG=$HOSTLOG
@@ -300,21 +300,21 @@ host_rss() {
 
 stop_host() { zpty -d $HOST 2>/dev/null; HOSTFD=-1 }
 
-# ---------------------------------------------------------------- 実行
+# ---------------------------------------------------------------- Run
 typeset -g HIST_HASH_BEFORE=
 [[ -r ~/.zsh_history ]] && HIST_HASH_BEFORE=$(shasum ~/.zsh_history 2>/dev/null)
 
 {
-  # ============ min-zrush(既定 delay 30ms)============
+  # ============ min-zrush with default 30ms delay ============
   out "==== min-zrush(隔離 + 既定 delay-ms=30)===="
   if start_min_zrush min-zrush $WORK/xdg-default; then
     host_rss; out "INFO: RSS=${REPLY}KB"
-    paint_break_case min-zrush "cmd 1st (whic)"   'whic'         'which'   # 初回 = キャッシュミス
+    paint_break_case min-zrush "cmd 1st (whic)"   'whic'         'which'   # first run is a cache miss
     paint_break_case min-zrush "file (docs/inte)" 'ls docs/inte' 'internal'
     paint_break_case min-zrush "git (git chec)"   'git chec'     'checkout'
-    # キャッシュヒット(004): 上の cmd ケースで温まった 2 回目以降
+    # Cache-hit path after the command case above has warmed it.
     paint_break_hit_case min-zrush "cmd hit (whic)" 'whic'       'which'
-    # 中央値用に追加試行(cmd はヒット、file/git はキャッシュ対象外)
+    # Additional median trials; command hits, while file and git are not cacheable.
     paint_case min-zrush "cmd hit (whic)"   'whic'         'which'
     paint_case min-zrush "file (docs/inte)" 'ls docs/inte' 'internal'
     paint_case min-zrush "git (git chec)"   'git chec'     'checkout'
@@ -352,7 +352,7 @@ typeset -g HIST_HASH_BEFORE=
   out "==== real-zrush(実 ~/.zshrc)===="
   if start_real_zrush; then
     host_rss; out "INFO: RSS=${REPLY}KB"
-    paint_break_case real "cmd 1st (cla)"    'cla'          'clang'   # 初回 = キャッシュミス
+    paint_break_case real "cmd 1st (cla)"    'cla'          'clang'   # first run is a cache miss
     paint_break_case real "file (docs/inte)" 'ls docs/inte' 'internal'
     paint_break_case real "git (git chec)"   'git chec'     'checkout'
     paint_break_hit_case real "cmd hit (cla)" 'cla'         'clang'
@@ -368,7 +368,7 @@ typeset -g HIST_HASH_BEFORE=
   zpty -d min-d0 2>/dev/null
   zpty -d zac 2>/dev/null
   zpty -d real 2>/dev/null
-  # 履歴ガードレール検証
+  # Verify the history safeguard.
   if [[ -n $HIST_HASH_BEFORE ]]; then
     local now=$(shasum ~/.zsh_history 2>/dev/null)
     if [[ $now == $HIST_HASH_BEFORE ]]; then
