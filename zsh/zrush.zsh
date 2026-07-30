@@ -18,6 +18,25 @@
 # Capture the source directory; re-sourcing is allowed and reinitializes state.
 typeset -g _zrush_source_dir=${${(%):-%N}:A:h}
 
+# ---------------------------------------------------------------- Re-source teardown
+# Re-sourcing this file is supported, but the `typeset -g` block right below
+# immediately resets fd/zpty/timer identifiers to -1/empty -- if a previous
+# sourcing already completed _zrush_init (_zrush_enabled=1), its live
+# timer/collection/zpty worker/region_highlight entries must be torn down
+# FIRST, using the still-defined functions and still-live values left over
+# from that previous sourcing, or they would be stranded (leaked fds, an
+# orphaned worker, dangling region_highlight entries). On a first-ever
+# sourcing _zrush_enabled is unset, so this is a no-op.
+# Keybind predecessor chains need no action here: they are embedded in each
+# dispatch widget's own function body at bind time (_zrush_bind_one), not
+# read from these globals, so _zrush_apply_keybinds' normal re-application
+# later in _zrush_init already handles them correctly on re-source.
+if (( ${+_zrush_enabled} )) && (( _zrush_enabled )); then
+  (( $+functions[_zrush_disarm_timer] ))      && _zrush_disarm_timer
+  (( $+functions[_zrush_cancel_collection] )) && _zrush_cancel_collection
+  (( $+functions[_zrush_rh_clear] ))          && _zrush_rh_clear
+fi
+
 # ---------------------------------------------------------------- Global state
 typeset -g  ZRUSH_BIN=${ZRUSH_BIN:-$_zrush_source_dir/../target/release/zrush}
 typeset -gi _zrush_enabled=0
@@ -205,65 +224,74 @@ _zrush_compadd() {
   local -a __hits __dscr
   (( $#dscrs == 1 )) && __dscr=( "${(@P)${(v)dscrs}}" )
   builtin compadd -A __hits -D __dscr "$@"
-  local -i ret=$?
-  (( $#__hits == 0 )) && return ret
 
-  # Drop framing bytes from value fields before encoding; same treatment as NUL.
-  __hits=( "${(@)__hits//(#s)*($'\0'|$'\1'|$'\2')*(#e)/}" )
-  __dscr=( "${(@)__dscr//(#s)*($'\0'|$'\1'|$'\2')*(#e)/}" )
-  local _bad_value="*("$'\0'"|"$'\1'"|"$'\2'")*"
-  local -a __decoded=( "${(@Q)__hits}" )
-  local -i _bad_i
-  while _bad_i=${__decoded[(I)${~_bad_value}]} && (( _bad_i )); do
-    __hits[_bad_i]=
-    __dscr[_bad_i]=
-    __decoded[_bad_i]=
-  done
-  local _rd=
-  if (( $#isfile )); then
-    # Resolve the real directory for insertion-time '/' handling. Tilde expansion
-    # requires the unquoted nested ${}; see notes-zpty.md "置換範囲モデル".
-    _rd=${${(Qe)~${:-$IPREFIX${(v)hpre}}}}
+  # A zero-hit call still needs the tail-call below (compsys internal state,
+  # e.g. compstate bookkeeping, depends on every compadd invocation actually
+  # reaching the real builtin); only the record-emission side is skippable.
+  if (( $#__hits > 0 )); then
+    # Drop framing bytes from value fields before encoding; same treatment as NUL.
+    __hits=( "${(@)__hits//(#s)*($'\0'|$'\1'|$'\2')*(#e)/}" )
+    __dscr=( "${(@)__dscr//(#s)*($'\0'|$'\1'|$'\2')*(#e)/}" )
+    local _bad_value="*("$'\0'"|"$'\1'"|"$'\2'")*"
+    local -a __decoded=( "${(@Q)__hits}" )
+    local -i _bad_i
+    while _bad_i=${__decoded[(I)${~_bad_value}]} && (( _bad_i )); do
+      __hits[_bad_i]=
+      __dscr[_bad_i]=
+      __decoded[_bad_i]=
+    done
+    local _rd=
+    if (( $#isfile )); then
+      # Resolve the real directory for insertion-time '/' handling. Tilde expansion
+      # requires the unquoted nested ${}; see notes-zpty.md "置換範囲モデル".
+      _rd=${${(Qe)~${:-$IPREFIX${(v)hpre}}}}
+    fi
+    local -a _vals=(
+      "${(v)apre}" "${(v)hpre}" "${(v)asuf}" "${(v)hsuf}"
+      "${(v)ipre}" "${(v)isuf}" "$IPREFIX"
+      "$_rd" "${expl[2]:-}" "${(v)grpJ}"
+    )
+    _vals=( "${(@)_vals//(#s)*($'\0'|$'\1'|$'\2')*(#e)/}" )
+
+    # Batch header: shared fields for this compadd call, always emitted even
+    # when every field is empty (cli-protocol.md "バッチヘッダレコード": the
+    # receiver needs it to delimit batch boundaries).
+    local -a _hdr=( "b"$'\1' )
+    [[ -n $_vals[1] ]]  && _hdr+=( "P"$'\1'"$_vals[1]" )
+    [[ -n $_vals[2] ]]  && _hdr+=( "p"$'\1'"$_vals[2]" )
+    [[ -n $_vals[3] ]]  && _hdr+=( "S"$'\1'"$_vals[3]" )
+    [[ -n $_vals[4] ]]  && _hdr+=( "s"$'\1'"$_vals[4]" )
+    [[ -n $_vals[5] ]]  && _hdr+=( "i"$'\1'"$_vals[5]" )
+    [[ -n $_vals[6] ]]  && _hdr+=( "I"$'\1'"$_vals[6]" )
+    [[ -n $_vals[7] ]]  && _hdr+=( "ip"$'\1'"$_vals[7]" )
+    if (( $#isfile )); then
+      _hdr+=( "f"$'\1'"1" )
+      [[ -n $_vals[8] ]] && _hdr+=( "rd"$'\1'"$_vals[8]" )
+    fi
+    [[ -n $_vals[9] ]]  && _hdr+=( "X"$'\1'"$_vals[9]" )
+    [[ -n $_vals[10] ]] && _hdr+=( "J"$'\1'"$_vals[10]" )
+    local _out="${(pj:\2:)_hdr}"$'\0'
+
+    local -a _rec
+    local -i j
+    local _d _m
+    for (( j = 1; j <= $#__hits; ++j )); do
+      # A candidate blanked above for containing framing bytes has nothing
+      # left to send; the contract puts exclusion on the sender (us), so
+      # skip it outright instead of emitting a bare empty-w record (Rust's
+      # own empty-w skip stays as a defensive fallback, not the guarantee).
+      [[ -z $__hits[j] ]] && continue
+      _rec=( "w"$'\1'"$__hits[j]" )
+      _m=$__decoded[j]
+      [[ $_m != "$__hits[j]" ]] && _rec+=( "m"$'\1'"$_m" )
+      _d=${__dscr[j]:-}
+      [[ -n $_d ]] && _rec+=( "d"$'\1'"$_d" )
+      _out+="${(pj:\2:)_rec}"$'\0'
+    done
+    print -rn -u $_zrush_wfd -- "$_out" 2>/dev/null
   fi
-  local -a _vals=(
-    "${(v)apre}" "${(v)hpre}" "${(v)asuf}" "${(v)hsuf}"
-    "${(v)ipre}" "${(v)isuf}" "$IPREFIX"
-    "$_rd" "${expl[2]:-}" "${(v)grpJ}"
-  )
-  _vals=( "${(@)_vals//(#s)*($'\0'|$'\1'|$'\2')*(#e)/}" )
-
-  # Batch header: shared fields for this compadd call, always emitted even
-  # when every field is empty (cli-protocol.md "バッチヘッダレコード": the
-  # receiver needs it to delimit batch boundaries).
-  local -a _hdr=( "b"$'\1' )
-  [[ -n $_vals[1] ]]  && _hdr+=( "P"$'\1'"$_vals[1]" )
-  [[ -n $_vals[2] ]]  && _hdr+=( "p"$'\1'"$_vals[2]" )
-  [[ -n $_vals[3] ]]  && _hdr+=( "S"$'\1'"$_vals[3]" )
-  [[ -n $_vals[4] ]]  && _hdr+=( "s"$'\1'"$_vals[4]" )
-  [[ -n $_vals[5] ]]  && _hdr+=( "i"$'\1'"$_vals[5]" )
-  [[ -n $_vals[6] ]]  && _hdr+=( "I"$'\1'"$_vals[6]" )
-  [[ -n $_vals[7] ]]  && _hdr+=( "ip"$'\1'"$_vals[7]" )
-  if (( $#isfile )); then
-    _hdr+=( "f"$'\1'"1" )
-    [[ -n $_vals[8] ]] && _hdr+=( "rd"$'\1'"$_vals[8]" )
-  fi
-  [[ -n $_vals[9] ]]  && _hdr+=( "X"$'\1'"$_vals[9]" )
-  [[ -n $_vals[10] ]] && _hdr+=( "J"$'\1'"$_vals[10]" )
-  local _out="${(pj:\2:)_hdr}"$'\0'
-
-  local -a _rec
-  local -i j
-  local _d _m
-  for (( j = 1; j <= $#__hits; ++j )); do
-    _rec=( "w"$'\1'"$__hits[j]" )
-    _m=$__decoded[j]
-    [[ $_m != "$__hits[j]" ]] && _rec+=( "m"$'\1'"$_m" )
-    _d=${__dscr[j]:-}
-    [[ -n $_d ]] && _rec+=( "d"$'\1'"$_d" )
-    _out+="${(pj:\2:)_rec}"$'\0'
-  done
-  print -rn -u $_zrush_wfd -- "$_out" 2>/dev/null
-  # Also run the original compadd to keep compsys internal state consistent.
+  # Also run the original compadd to keep compsys internal state consistent,
+  # regardless of whether this call produced any hits.
   builtin compadd "$@"
 }
 
@@ -416,15 +444,25 @@ _zrush_rh_add() {  # $1=start $2=end $3=spec [$4=memo suffix (-sel)]
   return 0
 }
 
+# Reset _zrush_plan_* only, with no display/selection side effects. Shared by
+# _zrush_clear_display (display-gated: no-ops when nothing is showing) and
+# _zrush_settle_plan's failure branch (must reset unconditionally, even when
+# nothing was showing, so stale state from an earlier prompt/query can never
+# survive to be used by a later pending Tab).
+_zrush_reset_plan_state() {
+  _zrush_plan_text= _zrush_plan_nlines=0 _zrush_plan_npos=0
+  _zrush_plan_hl=() _zrush_plan_cells=() _zrush_plan_nav=() _zrush_plan_insert=()
+  _zrush_plan_cp=
+  return 0
+}
+
 _zrush_clear_display() {  # Call only from a ZLE widget context.
   _zrush_selected=0
   (( _zrush_listing )) || return 0
   POSTDISPLAY=
   _zrush_rh_clear
   _zrush_listing=0
-  _zrush_plan_text= _zrush_plan_nlines=0 _zrush_plan_npos=0
-  _zrush_plan_hl=() _zrush_plan_cells=() _zrush_plan_nav=() _zrush_plan_insert=()
-  _zrush_plan_cp=
+  _zrush_reset_plan_state
   return 0
 }
 
@@ -602,19 +640,29 @@ _zrush_finalize() {
 # already populated), nonzero on failure. Shared by both `_zrush_run_plan`
 # call sites (fresh collection and cache hit) so the pending-Tab handling
 # in behavior.md "Tab" ("候補未着時の Tab は...結果到着時に上記の挙動を適用する")
-# cannot be forgotten on one path but not the other. _zrush_tab_with_results'
-# own branches already no-op on zero candidates, so no extra guard is needed
-# here.
+# cannot be forgotten on one path but not the other.
+#
+# On failure, a pending Tab is discarded outright -- it is never resolved
+# against _zrush_plan_* here. _zrush_clear_display no-ops when nothing is
+# currently showing (_zrush_listing == 0), which would otherwise leave a
+# stale, possibly non-empty _zrush_plan_* from an earlier prompt/query in
+# place; teardown here is unconditional so a later pending Tab can never be
+# resolved against it (cli-protocol.md "エラー時の zsh 側挙動").
 _zrush_settle_plan() {
   emulate -L zsh
   if (( $1 == 0 )); then
     _zrush_apply_plan
+    if (( _zrush_tab_pending )); then
+      _zrush_tab_pending=0
+      _zrush_tab_with_results
+    fi
   else
-    _zrush_clear_display
-  fi
-  if (( _zrush_tab_pending )); then
+    _zrush_selected=0
+    POSTDISPLAY=
+    _zrush_rh_clear
+    _zrush_listing=0
+    _zrush_reset_plan_state
     _zrush_tab_pending=0
-    _zrush_tab_with_results
   fi
   return 0
 }
@@ -628,8 +676,11 @@ _zrush_run_plan() {  # $1=raw NUL-terminated capture payload; "" is valid (0 can
   setopt localoptions typesetsilent no_monitor no_notify
   local payload=$1
 
-  local -i rows=$ZRUSH_CFG_MAX_LINES
-  (( LINES > 1 && rows > LINES - 1 )) && rows=$(( LINES - 1 ))
+  # cli-protocol.md "起動": rows = min(max-lines, LINES - 1), clamped to >= 1
+  # unconditionally (not just when LINES > 1 -- LINES <= 1 must still clamp
+  # down to the 1-row floor, not silently keep max-lines).
+  local -i rows=$(( LINES - 1 ))
+  (( rows > ZRUSH_CFG_MAX_LINES )) && rows=$ZRUSH_CFG_MAX_LINES
   (( rows < 1 )) && rows=1
   local -i width=$(( COLUMNS - 1 ))
   (( width < 1 )) && width=1
@@ -851,13 +902,19 @@ _zrush_line_init() {
   emulate -L zsh
   _zrush_last_buffer=
   _zrush_last_cursor=-1
-  # Unlike zle -M, POSTDISPLAY requires explicit cleanup. Remove stale output left by
-  # exits such as send-break that bypass line-finish.
-  if (( _zrush_listing )); then
-    POSTDISPLAY=
-    _zrush_rh_clear
-    _zrush_listing=0
-  fi
+  # A new ZLE session can follow an exit that bypassed _zrush_line_finish
+  # (send-break and similar). Tear down any leftover timer/collection from
+  # the previous session before it can leak a result (and thus a stray
+  # candidate list or a pending-Tab insertion) into this one, and reset
+  # display/plan state unconditionally -- not just when a listing happened
+  # to be visible, since stale _zrush_plan_* must not survive into a new
+  # session either.
+  _zrush_disarm_timer
+  _zrush_cancel_collection
+  POSTDISPLAY=
+  _zrush_rh_clear
+  _zrush_listing=0
+  _zrush_reset_plan_state
   _zrush_selected=0
   _zrush_tab_pending=0
   return 0
@@ -1014,6 +1071,11 @@ _zrush_action_confirm() {
 _zrush_action_dismiss() {
   if (( _zrush_selected > 0 || _zrush_listing )); then
     _zlog "dismiss: closing list"
+    # A still-armed debounce timer or an in-flight collection for a newer
+    # keystroke could otherwise complete after dismiss and silently reopen
+    # the list the user just closed.
+    _zrush_disarm_timer
+    _zrush_cancel_collection
     _zrush_clear_display     # leave the buffer unchanged
     _zrush_tab_pending=0
     return 0
