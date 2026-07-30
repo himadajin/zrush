@@ -1,17 +1,18 @@
 #!/bin/zsh -f
-# zrush.zsh のヘッドレス回帰ドライバ。
+# Headless regression driver for zrush.zsh.
 #
-# 実行方法:
+# Usage:
 #   zsh -f tests/zsh/driver.zsh <playground-dir>
-#     playground には docs/{internal,user} があり、../huge に大量ファイル
-#     ディレクトリがあること(spikes の fixtures と同じレイアウト)。
-#   前提: cargo build --release 済み(zrush バイナリ)。
+#     The playground must contain docs/{internal,user} (a copy of this repo works),
+#     plus a sibling large-file directory ../huge holding tens of thousands of
+#     files named fileNNNNN.txt (e.g. file00000.txt .. file19999.txt).
+#   Prerequisite: the zrush binary has been built with cargo build --release.
 #
-# 方式(spikes/m1-zpty/driver.zsh で実証済みのハーネス知見を踏襲):
-#   - ホスト対話 zsh を zpty -b(非ブロッキング)で起動し、キーを送って
-#     pty 出力と ZRUSH_LOG(ファイル)で判定する
-#   - 待ちループは常に pty を drain する(tcsetattr TCSADRAIN ブロック防止)
-#   - コマンド実行後はプロンプト(HP>)同期をしてから次のキーを送る
+# Harness:
+#   - Start an interactive host zsh with nonblocking zpty -b, send keys, and inspect
+#     both pty output and the ZRUSH_LOG file.
+#   - Always drain the pty in wait loops to prevent tcsetattr TCSADRAIN blocking.
+#   - After executing a command, synchronize on the HP> prompt before sending more keys.
 emulate -L zsh
 setopt extended_glob
 zmodload zsh/zpty    || { print -u2 FATAL: zpty; exit 1 }
@@ -22,8 +23,8 @@ typeset -F SECONDS
 typeset -g HERE=${${(%):-%N}:A:h}
 typeset -g REPO=${HERE:h:h}
 typeset -g PLAYGROUND=${1:?usage: driver.zsh <playground-dir>}
-[[ -d $PLAYGROUND/docs ]] || { print -u2 "FATAL: playground 不備: $PLAYGROUND"; exit 1 }
-[[ -x $REPO/target/release/zrush ]] || { print -u2 "FATAL: zrush バイナリがない(cargo build --release)"; exit 1 }
+[[ -d $PLAYGROUND/docs ]] || { print -u2 "FATAL: invalid playground: $PLAYGROUND"; exit 1 }
+[[ -x $REPO/target/release/zrush ]] || { print -u2 "FATAL: zrush binary not found (cargo build --release)"; exit 1 }
 
 typeset -gi PASS=0 FAIL=0
 out() { print -r -u2 -- "$@" }
@@ -32,9 +33,13 @@ ng()  { out "FAIL: $1"; (( ++FAIL )) }
 
 typeset -g WORK=$(mktemp -d ${TMPDIR:-/tmp}/zrush-test.XXXXXX)
 export TERM=vt100
-export HOME=$PLAYGROUND    # ~ 保持テスト用(実ホームに触れない)
-# 部分パス略記(接頭辞不一致置換)テスト用の固定ツリー
+export LC_ALL=en_US.UTF-8   # match POSTDISPLAY printability checks to real UTF-8 use
+export HOME=$PLAYGROUND    # test '~' preservation without touching the real home
+# Fixed tree for abbreviated partial-path replacement tests
 mkdir -p $PLAYGROUND/pp/usr/local/bin $PLAYGROUND/pp/usr/share/doc
+# Thirty short names for an a01..a30 grid that fits eight columns by four rows
+mkdir -p $PLAYGROUND/gd
+for _gi in {01..30}; do : >| $PLAYGROUND/gd/a$_gi; done
 export ZRUSH_REPO=$REPO
 export ZRUSH_TEST_TMP=$WORK
 export ZDOTDIR=$WORK/zdot
@@ -60,12 +65,15 @@ expect() {  # $1=glob $2=timeout(s)
       EXPECT_BUF+=$chunk
       TRANSCRIPT+=$chunk
       [[ $EXPECT_BUF == ${~pat} ]] && return 0
+      # Match again after stripping SGR that may split words for highlighting.
+      # Raw escape-sequence patterns already had the first chance to match above.
+      [[ ${EXPECT_BUF//$'\e['[0-9;]#m/} == ${~pat} ]] && return 0
     fi
   done
   return 1
 }
 
-drain() {  # $1=秒: pty を読みながら待つ
+drain() {  # $1=seconds to wait while reading the pty
   local -F dl=$(( SECONDS + ${1:-0.2} ))
   local chunk
   while (( SECONDS < dl )); do
@@ -78,54 +86,54 @@ drain() {  # $1=秒: pty を読みながら待つ
 clear_line() { send_keys $'\C-u'; drain 0.2 }
 sync_prompt() { expect '*HP>*' ${1:-5} >/dev/null; drain 0.1 }
 
-log_count() {  # $1=固定文字列 → REPLY: ZRUSH_LOG 内の出現回数
+log_count() {  # $1=fixed string -> REPLY: occurrence count in ZRUSH_LOG
   typeset -g REPLY=0
   [[ -r $ZRUSH_LOG ]] && REPLY=$(grep -cF -- $1 $ZRUSH_LOG 2>/dev/null)
   return 0
 }
 
 {
-  # ---------------- ホスト起動 ----------------
+  # ---------------- Host startup ----------------
   cd $PLAYGROUND || exit 1
   local REPLY=
-  zpty -b host zsh -d -i || { ng "host 起動失敗"; exit 1 }
+  zpty -b host zsh -d -i || { ng "host failed to start"; exit 1 }
   HOSTFD=$REPLY
   if expect '*MARK-RC-DONE*' 20; then
-    ok "host 起動 + compinit + zrush.zsh source(config 読み込み成功)"
+    ok "host started + compinit + zrush.zsh sourced (config loaded successfully)"
   else
-    ng "host 起動を確認できない: ${(qqqq)EXPECT_BUF[-300,-1]}"
+    ng "unable to confirm host startup: ${(qqqq)EXPECT_BUF[-300,-1]}"
     exit 1
   fi
   sync_prompt
 
-  # ---------------- (a) タイプ後 delay-ms 経過で一覧が自動表示される ----------------
+  # ---------------- (a) List appears automatically after delay-ms ----------------
   send_keys 'ls docs/inte'
   if expect '*internal*' 10; then
-    ok "(a) タイプ後に候補一覧が自動表示される(internal を確認)"
+    ok "(a) candidate list displayed automatically after typing (confirmed internal)"
   else
-    ng "(a) 一覧が表示されない"
+    ng "(a) list not displayed"
   fi
   clear_line
 
-  # ---------------- (b) 空バッファで何も出ない ----------------
+  # ---------------- (b) Blank buffer shows nothing ----------------
   drain 0.5
   log_count 'request: widened'; local -i req_before=$REPLY
-  send_keys '   '     # 空白のみ
+  send_keys '   '     # whitespace only
   drain 1.0
   clear_line
   drain 0.5
   log_count 'request: widened'; local -i req_after=$REPLY
   if (( req_after == req_before )); then
-    ok "(b) 空バッファ(空白のみ)では収集リクエストが発生しない ($req_before → $req_after)"
+    ok "(b) no collection request for an empty buffer (whitespace only) ($req_before → $req_after)"
   else
-    ng "(b) 空バッファで収集が走った ($req_before → $req_after)"
+    ng "(b) collection ran for an empty buffer ($req_before → $req_after)"
   fi
 
-  # ---------------- (f) typo クエリで候補が出る(Rust 連携) ----------------
-  # (f1) コマンド位置の gti: 全コマンド収集 → zrush match 往復 → 描画が起きること。
-  #   注意: 契約のティア順(部分列 > 誤字許容)により、g,t,i を部分列に含む
-  #   コマンドが多い環境では 'git' そのものは top-10 に入らない(gtimeout 等が上位)。
-  #   ここでは Rust 連携の実証として「match 成功+描画発生」を判定する。
+  # ---------------- (f) Typo query yields candidates through Rust ----------------
+  # (f1) At command position, gti collects all commands, round-trips through zrush
+  # match, and renders. Because substring outranks typo matching, environments with
+  # many g,t,i subsequences may rank commands such as gtimeout above git.
+  # Assert successful matching and rendering rather than git appearing in the top ten.
   log_count 'finalize: match ok'; local -i mok_before=$REPLY
   log_count 'render:';            local -i ren_before=$REPLY
   send_keys 'gti'
@@ -137,109 +145,111 @@ log_count() {  # $1=固定文字列 → REPLY: ZRUSH_LOG 内の出現回数
     (( mok_after > mok_before && ren_after > ren_before )) && break
   done
   if (( mok_after > mok_before && ren_after > ren_before )); then
-    ok "(f1) gti: 全コマンド収集 → zrush match → 描画の往復が成立"
+    ok "(f1) gti: full command collection → zrush match → render round trip completed"
   else
-    ng "(f1) gti の match/描画が確認できない (match $mok_before→$mok_after render $ren_before→$ren_after)"
+    ng "(f1) unable to confirm gti match/render (match $mok_before→$mok_after render $ren_before→$ren_after)"
   fi
   clear_line
   drain 0.3
-  # (f2) 限定候補での typo 到達: docs/intre(転置)→ internal が表示される
+  # (f2) In a constrained set, transposed docs/intre reaches internal.
   send_keys 'ls docs/intre'
   if expect '*internal*' 10; then
-    ok "(f2) typo クエリ intre → internal が表示される(誤字許容マッチ)"
+    ok "(f2) typo query intre → internal displayed (typo-tolerant match)"
   else
-    ng "(f2) typo 候補 internal が出ない"
+    ng "(f2) typo candidate internal not displayed"
   fi
   clear_line
   drain 0.3
 
-  # ---------------- (d) 大量候補で入力非ブロック ----------------
+  # ---------------- (d) Large candidate sets do not block input ----------------
   send_keys 'ls ../huge/'
-  drain 0.4                     # 収集開始まで待つ(delay 50ms + fork)
+  drain 0.4                     # wait for collection to start (default 30ms delay + fork)
   local -F t0=$SECONDS
-  send_keys 'zzz'               # 収集中の追加タイプ
-  if expect '*zzz*' 2; then
-    ok "(d) huge 収集中も追加タイプが即エコーされる($(( SECONDS - t0 ))s)"
+  send_keys 'zzz'               # additional typing during collection
+  # Decoration updates may insert escape sequences between echoed characters, so do not
+  # require consecutive z characters.
+  if expect '*z*z*z*' 2; then
+    ok "(d) additional typing echoed immediately during huge collection ($(( SECONDS - t0 ))s)"
   else
-    ng "(d) huge 収集中に入力がブロックされた"
+    ng "(d) input blocked during huge collection"
   fi
   clear_line
-  drain 1.0                     # 進行中の収集キャンセルを消化
+  drain 1.0                     # allow in-flight collection cancellation to settle
 
-  # huge の一覧自体も出ること(0 件クエリ zzz を消したので再タイプ)
+  # Also require the huge listing itself after clearing the zero-result zzz query.
   send_keys 'ls ../huge/file0000'
   if expect '*file00000.txt*' 20; then
-    ok "(d') huge ディレクトリの候補一覧が表示される"
+    ok "(d') candidate list for huge directory displayed"
   else
-    ng "(d') huge の一覧が出ない"
+    ng "(d') huge list not displayed"
   fi
   clear_line
   drain 0.5
 
-  # ---------------- (e) accept-line 後に一覧が残らない ----------------
+  # ---------------- (e) No list remains after accept-line ----------------
   log_count 'line-finish: cleared'; local -i fin_before=$REPLY
   send_keys 'ls docs/inte'
   expect '*internal*' 10 >/dev/null
-  send_keys $'\r'               # accept-line(ls docs/ 実行)
+  send_keys $'\r'               # accept-line executes ls docs/
   sync_prompt 10
   log_count 'line-finish: cleared'; local -i fin_after=$REPLY
   if (( fin_after > fin_before )); then
-    ok "(e) accept-line で一覧消去(line-finish cleared: $fin_before → $fin_after)"
+    ok "(e) accept-line clears the list (line-finish cleared: $fin_before → $fin_after)"
   else
-    ng "(e) line-finish の消去が確認できない"
+    ng "(e) unable to confirm line-finish clearing"
   fi
   log_count 'render:'; local -i render_settled=$REPLY
   drain 1.0
   log_count 'render:'; local -i render_after=$REPLY
   if (( render_after == render_settled )); then
-    ok "(e') accept-line 後に一覧の再描画が起きない"
+    ok "(e') list is not redrawn after accept-line"
   else
-    ng "(e') accept-line 後に再描画が発生 ($render_settled → $render_after)"
+    ng "(e') redraw occurred after accept-line ($render_settled → $render_after)"
   fi
 
-  # ---------------- (c) min-input 2 設定時に 1 文字で出ない ----------------
-  command sleep 1.1   # mtime 秒粒度対策
+  # ---------------- (c) min-input=2 suppresses one-character input ----------------
+  command sleep 1.1   # accommodate one-second mtime granularity
   print -r -- $'[display]\nmin-input = 2\ndelay-ms = 10' > $XDG_CONFIG_HOME/zrush/config.toml
-  send_line ': reload'          # プロンプト再表示 → precmd → mtime 検知 → 再読み込み
+  send_line ': reload'          # new prompt -> precmd -> mtime detection -> reload
   sync_prompt
   log_count 'request: widened'; local -i mi_before=$REPLY
-  send_keys 'l'                 # 1 文字(< min-input)
+  send_keys 'l'                 # one character, below min-input
   drain 0.8
   log_count 'request: widened'; local -i mi_one=$REPLY
-  send_keys 's'                 # 2 文字目 → 'ls'(= min-input)
+  send_keys 's'                 # second character makes 'ls', equal to min-input
   drain 0.8
   log_count 'request: widened'; local -i mi_two=$REPLY
   if (( mi_one == mi_before && mi_two > mi_one )); then
-    ok "(c) min-input=2: 1 文字では収集せず、2 文字で収集する ($mi_before/$mi_one/$mi_two)"
+    ok "(c) min-input=2: no collection at 1 character, collection at 2 characters ($mi_before/$mi_one/$mi_two)"
   else
-    ng "(c) min-input が効いていない ($mi_before/$mi_one/$mi_two)"
+    ng "(c) min-input is not effective ($mi_before/$mi_one/$mi_two)"
   fi
   clear_line
   drain 0.3
 
-  # ---------------- (g) config 不正値の警告が表示される ----------------
+  # ---------------- (g) Invalid config value emits a warning ----------------
   command sleep 1.1
   print -r -- $'[display]\nmax-lines = "abc"' > $XDG_CONFIG_HOME/zrush/config.toml
   send_line ': reload2'
   if expect '*max-lines*' 10; then
-    ok "(g) config 不正値の警告が stderr に表示される"
+    ok "(g) warning for invalid config value displayed on stderr"
   else
-    ng "(g) 不正値警告が出ない"
+    ng "(g) invalid-value warning not displayed"
   fi
   sync_prompt
-  # 不正値でも動作継続(既定値フォールバック)の確認
+  # Verify that invalid values fall back to defaults and operation continues.
   send_keys 'ls docs/inte'
   if expect '*internal*' 10; then
-    ok "(g') 不正 config でも既定値で動作継続する"
+    ok "(g') continues with defaults despite invalid config"
   else
-    ng "(g') 不正 config 後に一覧が出ない"
+    ng "(g') list not displayed after invalid config"
   fi
   clear_line
 
-  # ================================================================ M4: 選択・確定・挿入
+  # ================================================================ Selection, confirmation, insertion
   local DOWN=$'\e[B' UP=$'\e[A' ENTER=$'\r' TAB=$'\t' CTRLG=$'\C-g'
   press() { send_keys $1; drain 0.3 }
-  wait_log() {  # $1=固定文字列 $2=基準値 $3=timeout(s) → 増えたら 0
+  wait_log() {  # $1=fixed string $2=baseline $3=timeout(s) -> 0 when count increases
     local -F dl=$(( SECONDS + ${3:-5} ))
     while (( SECONDS < dl )); do
       drain 0.15
@@ -248,7 +258,7 @@ log_count() {  # $1=固定文字列 → REPLY: ZRUSH_LOG 内の出現回数
     done
     return 1
   }
-  assert_buffer() {  # $1=期待するバッファ内容 $2=ラベル(^Xb ダンプで正確比較)
+  assert_buffer() {  # $1=expected buffer $2=label; compare exact ^Xb dump
     local want=${(qqqq)1}
     send_keys $'\C-xb'
     local -F dl=$(( SECONDS + 5 ))
@@ -264,117 +274,168 @@ log_count() {  # $1=固定文字列 → REPLY: ZRUSH_LOG 内の出現回数
     return 1
   }
 
-  # config を既定に戻す(M3 テストが不正 config を残している)
+  # Restore default config after the invalid-config tests.
   command sleep 1.1
   rm -f $XDG_CONFIG_HOME/zrush/config.toml
-  send_line ': m4-reset'
+  send_line ': sel-reset'
   sync_prompt
 
-  # ---------------- (m4-1) 選択開始・マーカー・移動・先頭 ↑ で解除 ----------------
+  # ---------------- (sel-1) Start, highlight, move, and release selection at top ----------------
   send_keys 'ls docs/'
   expect '*user*' 10 >/dev/null
   log_count 'select: start';           local -i c_start=$REPLY
   log_count 'select: pos=2';           local -i c_pos2=$REPLY
   log_count 'select: released-at-top'; local -i c_rel=$REPLY
-  send_keys $DOWN            # press() は drain で描画を先に消費するため使わない
-  if expect '*> internal*' 5; then
-    ok "(m4-1a) ↓ で選択開始・マーカー表示"
+  log_count 'selected=1';              local -i c_sel1=$REPLY
+  TRANSCRIPT=            # isolate pre-selection output for the standout assertion
+  send_keys $DOWN        # press() would consume the render while draining
+  if wait_log 'selected=1' $c_sel1 5; then
+    ok "(sel-1a) Down starts selection (rendered with selected=1)"
   else
-    ng "(m4-1a) マーカーが出ない"
+    ng "(sel-1a) unable to confirm render when selection starts"
+  fi
+  if [[ $TRANSCRIPT == *$'\e[7m'* ]]; then
+    ok "(sel-1a') standout (SGR 7) for selected row appears in pty output"
+  else
+    ng "(sel-1a') standout row not visible in pty output"
   fi
   press $DOWN
-  wait_log 'select: pos=2' $c_pos2 3 && ok "(m4-1b) ↓ で次候補へ移動" || ng "(m4-1b) 候補移動しない"
+  wait_log 'select: pos=2' $c_pos2 3 && ok "(sel-1b) Down moves to the next candidate" || ng "(sel-1b) candidate does not move"
   press $UP
   press $UP
-  wait_log 'select: released-at-top' $c_rel 3 && ok "(m4-1c) 先頭候補で ↑ → 選択解除" || ng "(m4-1c) 先頭 ↑ で解除されない"
+  wait_log 'select: released-at-top' $c_rel 3 && ok "(sel-1c) Up on first candidate → selection released" || ng "(sel-1c) Up on first candidate does not release selection"
   clear_line
   drain 0.3
 
-  # ---------------- (m4-2) 非選択時: Enter=実行・↑=履歴(前任者チェーン) ----------------
-  # ^M を明示送信する(send_line の zpty -w は ^J を付加するため zrush の
-  # Enter ディスパッチ → 前任者フォールバックを経由しない。監査指摘)
+  # ---------------- (sel-2) Unselected Enter executes; Up traverses history ----------------
+  # Send ^M explicitly because send_line's zpty -w appends ^J, bypassing zrush's
+  # Enter dispatch and predecessor fallback.
   send_keys 'print HISTMARK-ALPHA'
   send_keys $'\r'
   if expect '*HISTMARK-ALPHA*' 5; then
-    ok "(m4-2a) 非選択時の Enter は前任者(accept-line)経由でコマンド実行"
+    ok "(sel-2a) Enter without selection executes command via predecessor (accept-line)"
   else
-    ng "(m4-2a) Enter でコマンドが実行されない"
+    ng "(sel-2a) Enter does not execute command"
   fi
   sync_prompt
   send_keys $UP
   if expect '*print HISTMARK-ALPHA*' 5; then
-    ok "(m4-2b) 非選択時の ↑ は前任者経由で履歴移動"
+    ok "(sel-2b) Up without selection navigates history via predecessor"
   else
-    ng "(m4-2b) ↑ で履歴が出ない"
+    ng "(sel-2b) Up does not show history"
   fi
   drain 0.3
 
-  # ---------------- (m4-3) 履歴移動中の ↓ は履歴戻り ----------------
+  # ---------------- (sel-3) Down moves toward newer history while browsing ----------------
   log_count 'next: hist-branch'; local -i c_hist=$REPLY
   press $DOWN
-  wait_log 'next: hist-branch' $c_hist 3 && ok "(m4-3) 履歴移動中の ↓ は履歴戻り(優先順位②)" || ng "(m4-3) hist-branch を通らない"
+  wait_log 'next: hist-branch' $c_hist 3 && ok "(sel-3) Down while navigating history moves forward in history (priority 2)" || ng "(sel-3) hist-branch not taken"
   clear_line
   drain 0.3
 
-  # ---------------- (m4-4/5a/6a) 確定=挿入のみ・末尾置換・dir は space なし ----------------
+  # ---------------- (ins-1/5a/6a) Insert-only confirmation, tail replacement, no space for dirs ----------------
   send_keys 'ls docs/inte'
   expect '*internal*' 10 >/dev/null
   press $DOWN
   press $ENTER
-  assert_buffer 'ls docs/internal/' "(m4-4) 確定は挿入のみ(実行されず編集継続)+末尾置換で 'ls docs/internal/'+dir はスペースなし"
+  assert_buffer 'ls docs/internal/' "(ins-1) confirmation only inserts (no execution, editing continues) + suffix replacement leaves no space between 'ls docs/internal/' and dir"
   clear_line
   drain 0.3
 
-  # ---------------- (m4-6b) trailing-space: 通常ファイル候補に付く ----------------
+  # ---------------- (ins-3b) trailing-space applies to ordinary file candidates ----------------
   send_keys 'ls Cargo.t'
   expect '*Cargo.toml*' 10 >/dev/null
   press $DOWN
   press $ENTER
-  assert_buffer 'ls Cargo.toml ' "(m4-6) trailing-space: ファイル候補の確定で末尾スペースが付く"
+  assert_buffer 'ls Cargo.toml ' "(ins-3) trailing-space: confirming a file candidate adds a trailing space"
   clear_line
   drain 0.3
 
-  # ---------------- (m4-5b) ~ 保持 ----------------
+  # ---------------- (cf-1) Confirmation triggers recollection ----------------
+  # The render may land while press() drains, so match the cumulative TRANSCRIPT
+  # after stripping SGR (as in cc-1b) instead of using expect.
+  # Confirming docs/internal/ synthesizes '/'; recollection lists the directory contents.
+  send_keys 'ls docs/inte'
+  expect '*internal*' 10 >/dev/null
+  press $DOWN
+  log_count 'finalize: match ok'; local -i c_cf1=$REPLY
+  TRANSCRIPT=
+  press $ENTER
+  if wait_log 'finalize: match ok' $c_cf1 10; then
+    ok "(cf-1a) confirming a directory triggers recollection"
+  else
+    ng "(cf-1a) no recollection after directory confirmation"
+  fi
+  drain 0.5
+  if [[ ${TRANSCRIPT//$'\e['[0-9;]#m/} == *specs* ]]; then
+    ok "(cf-1a') directory contents listed after confirming docs/internal/"
+  else
+    ng "(cf-1a') directory contents not displayed after confirmation"
+  fi
+  clear_line
+  drain 0.3
+  # Confirming a file adds a trailing space; recollection lists the next argument position.
+  send_keys 'ls Cargo.t'
+  expect '*Cargo.toml*' 10 >/dev/null
+  press $DOWN
+  log_count 'finalize: match ok'; local -i c_cf2=$REPLY
+  TRANSCRIPT=
+  press $ENTER
+  if wait_log 'finalize: match ok' $c_cf2 10; then
+    ok "(cf-1b) confirming with trailing space triggers recollection"
+  else
+    ng "(cf-1b) no recollection after trailing-space confirmation"
+  fi
+  drain 0.5
+  if [[ ${TRANSCRIPT//$'\e['[0-9;]#m/} == *docs* ]]; then
+    ok "(cf-1b') next-argument candidates listed after confirming 'ls Cargo.toml '"
+  else
+    ng "(cf-1b') next-argument candidates not displayed after confirmation"
+  fi
+  clear_line
+  drain 0.3
+
+  # ---------------- (ins-2b) Preserve '~' ----------------
   send_keys 'ls ~/do'
   expect '*docs*' 10 >/dev/null
   press $DOWN
   press $ENTER
-  assert_buffer 'ls ~/docs/' "(m4-5b) ~ 候補の確定でも ~ が展開されない('ls ~/docs/' のまま)"
+  assert_buffer 'ls ~/docs/' "(ins-2b) ~ remains unexpanded when confirming a ~ candidate (stays 'ls ~/docs/')"
   clear_line
   drain 0.3
 
-  # ---------------- (m4-5c) 接頭辞不一致 → 語全体置換(pp/u/lo) ----------------
+  # ---------------- (ins-2c) Prefix mismatch replaces the whole word (pp/u/lo) ----------------
   log_count 'whole-word-replace'; local -i c_ww=$REPLY
   send_keys 'ls pp/u/lo'
   expect '*local*' 10 >/dev/null
   press $DOWN
   press $ENTER
-  assert_buffer 'ls pp/usr/local/' "(m4-5c) 部分パス略記の確定は語全体置換で 'ls pp/usr/local/'"
-  wait_log 'whole-word-replace' $c_ww 2 && ok "(m4-5c') 語全体置換の分岐を通った" || ng "(m4-5c') whole-word-replace 分岐が記録されない"
+  assert_buffer 'ls pp/usr/local/' "(ins-2c) confirming a partial path abbreviation replaces the whole word with 'ls pp/usr/local/'"
+  wait_log 'whole-word-replace' $c_ww 2 && ok "(ins-2c') whole-word replacement branch taken" || ng "(ins-2c') whole-word-replace branch not logged"
   clear_line
   drain 0.3
 
-  # ---------------- (m4-11) dismiss: 一覧を閉じてバッファ不変 ----------------
+  # ---------------- (dis-1) dismiss closes the list without changing the buffer ----------------
   send_keys 'ls docs/'
   expect '*user*' 10 >/dev/null
   log_count 'dismiss: closing list'; local -i c_dis=$REPLY
   press $CTRLG
-  wait_log 'dismiss: closing list' $c_dis 3 && ok "(m4-11a) dismiss で一覧が閉じる" || ng "(m4-11a) dismiss が効かない"
-  assert_buffer 'ls docs/' "(m4-11b) dismiss 後もバッファは不変"
+  wait_log 'dismiss: closing list' $c_dis 3 && ok "(dis-1a) dismiss closes the list" || ng "(dis-1a) dismiss does not work"
+  assert_buffer 'ls docs/' "(dis-1b) buffer remains unchanged after dismiss"
   clear_line
   drain 0.3
 
-  # ---------------- (m4-7) Tab menu モード: 一覧中 Tab で選択開始 ----------------
+  # ---------------- (tab-1) Tab menu mode starts selection from a visible list ----------------
   send_keys 'ls docs/'
   expect '*user*' 10 >/dev/null
   log_count 'select: start'; local -i c_tstart=$REPLY
   press $TAB
-  wait_log 'select: start' $c_tstart 3 && ok "(m4-7) Tab(menu)で選択開始" || ng "(m4-7) Tab で選択が始まらない"
+  wait_log 'select: start' $c_tstart 3 && ok "(tab-1) Tab (menu) starts selection" || ng "(tab-1) Tab does not start selection"
   press $CTRLG
   clear_line
   drain 0.3
 
-  # ---------------- (m4-8) Tab common-prefix ----------------
+  # ---------------- (tab-2) Tab common-prefix ----------------
   command sleep 1.1
   print -r -- $'[insert]\ntab = "common-prefix"' > $XDG_CONFIG_HOME/zrush/config.toml
   send_line ': cfg-cp'
@@ -382,20 +443,21 @@ log_count() {  # $1=固定文字列 → REPLY: ZRUSH_LOG 内の出現回数
   send_keys 'ls docs/inte'
   expect '*internal*' 10 >/dev/null
   press $TAB
-  assert_buffer 'ls docs/internal' "(m4-8a) Tab(common-prefix): クエリが真の接頭辞のとき共通部を挿入"
+  assert_buffer 'ls docs/internal' "(tab-2a) Tab (common-prefix): inserts common part when query is a true prefix"
   clear_line
   drain 0.3
-  log_count 'finalize: match ok'; local -i c_mok=$REPLY
-  send_keys 'gti'
-  wait_log 'finalize: match ok' $c_mok 10 || ng "(m4-8b 前提) gti の match が来ない"
-  log_count 'condition not met'; local -i c_ncp=$REPLY
+  # Non-extending case: gd/a1 has prefix-tier {a10..a19} with LCP "a1" equal to
+  # the query, so fallback confirms the top candidate a10 including trailing-space.
+  send_keys 'ls gd/a1'
+  expect '*a10*' 10 >/dev/null
+  log_count 'fallback -> insert top'; local -i c_fb=$REPLY
   press $TAB
-  wait_log 'condition not met' $c_ncp 3 && ok "(m4-8b) Tab(common-prefix): typo クエリでは何もしない" || ng "(m4-8b) 条件外で挿入された疑い"
-  assert_buffer 'gti' "(m4-8b') バッファ不変を確認"
+  assert_buffer 'ls gd/a10 ' "(tab-2b) Tab (common-prefix): confirms and inserts top candidate when prefix cannot grow ('ls gd/a10 ')"
+  wait_log 'fallback -> insert top' $c_fb 2 && ok "(tab-2b') fallback path taken" || ng "(tab-2b') fallback path not logged"
   clear_line
   drain 0.3
 
-  # ---------------- (m4-9) Tab insert: 先頭候補即挿入 ----------------
+  # ---------------- (tab-3) Tab insert immediately inserts the top candidate ----------------
   command sleep 1.1
   print -r -- $'[insert]\ntab = "insert"' > $XDG_CONFIG_HOME/zrush/config.toml
   send_line ': cfg-ins'
@@ -403,23 +465,168 @@ log_count() {  # $1=固定文字列 → REPLY: ZRUSH_LOG 内の出現回数
   send_keys 'ls docs/inte'
   expect '*internal*' 10 >/dev/null
   press $TAB
-  assert_buffer 'ls docs/internal/' "(m4-9) Tab(insert)で先頭候補を即挿入"
+  assert_buffer 'ls docs/internal/' "(tab-3) Tab (insert) immediately inserts top candidate"
   clear_line
   drain 0.3
 
-  # ---------------- (m4-10) 候補未着時 Tab → 到着後に適用 ----------------
+  # ---------------- (tab-4) Tab before arrival applies after candidates arrive ----------------
   log_count 'tab: pending'; local -i c_pend=$REPLY
-  send_keys 'ls docs/inte'$'\t'    # デバウンス中に Tab(同一バースト送信)
+  send_keys 'ls docs/inte'$'\t'    # Tab during debounce in the same input burst
   if expect '*ls docs/internal/*' 10; then
-    ok "(m4-10a) 未着時 Tab: 収集前倒し→到着時に insert 適用"
+    ok "(tab-4a) Tab before arrival: collection expedited → insert applied on arrival"
   else
-    ng "(m4-10a) 未着時 Tab が適用されない"
+    ng "(tab-4a) Tab before arrival not applied"
   fi
-  wait_log 'tab: pending' $c_pend 2 && ok "(m4-10b) pending 経路を通った" || ng "(m4-10b) pending 経路が記録されない"
+  wait_log 'tab: pending' $c_pend 2 && ok "(tab-4b) pending path taken" || ng "(tab-4b) pending path not logged"
   clear_line
   drain 0.3
 
-  # ---------------- (m4-12) キーバインド変更・奇数配列 ----------------
+  # ---------------- (d2-1) Multicolumn grid and horizontal movement ----------------
+  local RIGHT=$'\e[C' LEFT=$'\e[D'
+  send_keys 'ls gd/'
+  # a01..a30 use two-character words with width-three cells: eight columns by four
+  # rows, column-major, so row one is a01 a05 a09 ...
+  if expect '*a01  a05*' 10; then
+    ok "(d2-1a) column-major grid places multiple candidates on one row (a01  a05)"
+  else
+    ng "(d2-1a) unable to confirm grid row"
+  fi
+  log_count 'render: 5 lines shown=30'
+  if (( REPLY > 0 )); then
+    ok "(d2-1b) 30 items fit in 1 heading row + 8 columns × 4 rows"
+  else
+    ng "(d2-1b) unexpected grid shape (render: 5 lines shown=30 not found in log)"
+  fi
+  log_count 'select: pos=5'; local -i c_gp5=$REPLY
+  send_keys $DOWN            # start selection at pos=1
+  drain 0.3
+  send_keys $RIGHT           # move right one column = +rows (4)
+  wait_log 'select: pos=5' $c_gp5 3 && ok "(d2-1c) Right moves to the column on the right (pos 1→5)" || ng "(d2-1c) column jump failed"
+  log_count 'select: pos=1'; local -i c_gp1=$REPLY
+  send_keys $LEFT
+  wait_log 'select: pos=1' $c_gp1 3 && ok "(d2-1d) Left returns to the column on the left (pos 5→1)" || ng "(d2-1d) left jump failed"
+  press $CTRLG
+  # When unselected, Left falls back through the predecessor chain to cursor movement.
+  log_count 'dispatch: fallback'; local -i c_gfb=$REPLY
+  send_keys $LEFT
+  wait_log 'dispatch: fallback' $c_gfb 3 && ok "(d2-1e) Left without selection falls back to predecessor" || ng "(d2-1e) Left without selection was intercepted"
+  clear_line
+  drain 0.3
+
+  # ---------------- (kb-1) Default Emacs-family keys (ctrl-n/p/b/f) ----------------
+  send_keys 'ls gd/'
+  expect '*a01  a05*' 10 >/dev/null
+  log_count 'select: start'; local -i c_kbs=$REPLY
+  send_keys $'\C-n'
+  wait_log 'select: start' $c_kbs 3 && ok "(kb-1a) ctrl-n starts selection (same priority rules as Down)" || ng "(kb-1a) ctrl-n does not start selection"
+  log_count 'select: pos=5'; local -i c_kb5=$REPLY
+  send_keys $'\C-f'
+  wait_log 'select: pos=5' $c_kb5 3 && ok "(kb-1b) ctrl-f moves to the column on the right (pos 1→5)" || ng "(kb-1b) ctrl-f does not work"
+  log_count 'select: pos=1'; local -i c_kb1=$REPLY
+  send_keys $'\C-b'
+  wait_log 'select: pos=1' $c_kb1 3 && ok "(kb-1c) ctrl-b moves to the column on the left (pos 5→1)" || ng "(kb-1c) ctrl-b does not work"
+  log_count 'select: released-at-top'; local -i c_kbr=$REPLY
+  send_keys $'\C-p'
+  wait_log 'select: released-at-top' $c_kbr 3 && ok "(kb-1d) ctrl-p at top → selection released (same as Up)" || ng "(kb-1d) ctrl-p does not release selection"
+  # When unselected, ctrl-p falls back to the predecessor history widget.
+  log_count 'dispatch: fallback'; local -i c_kbf=$REPLY
+  send_keys $'\C-p'
+  wait_log 'dispatch: fallback' $c_kbf 3 && ok "(kb-1e) ctrl-p without selection falls back to predecessor" || ng "(kb-1e) ctrl-p without selection was intercepted"
+  clear_line
+  drain 0.3
+
+  # ---------------- (d3-1) Group headings ----------------
+  send_keys 'ls docs/inte'
+  if expect '*file*internal*' 10; then
+    ok "(d3-1a) file candidates have the 'file' group heading"
+  else
+    ng "(d3-1a) 'file' heading not displayed"
+  fi
+  clear_line
+  drain 0.3
+  send_keys 'git chec'
+  if expect '*main porcelain command*checkout*' 15; then
+    ok "(d3-1b) git subcommands have the 'main porcelain command' heading"
+  else
+    ng "(d3-1b) git subcommand heading not displayed"
+  fi
+  drain 0.3
+  # (d3-1c) Rendering multiple groups with spans must not leak variable values.
+  # In zsh, redeclaring a populated local without assignment may print it to stdout.
+  if [[ $TRANSCRIPT != *sp=* && $TRANSCRIPT != *gcount=* ]]; then
+    ok "(d3-1c) render does not leak variable output (sp=/gcount=)"
+  else
+    ng "(d3-1c) render leaked variables to stdout (detected sp=/gcount=)"
+  fi
+  clear_line
+  drain 0.3
+
+  # ---------------- (zp-1) Framing bytes in candidates are dropped before zpty encoding ----------------
+  local framing_dir=$PLAYGROUND/zrush-framing-fixture
+  local bad_soh=$'bad-soh\1tail'
+  local bad_stx=$'bad-stx\2X\1FAKE-FRAMING-HEADING'
+  mkdir -p $framing_dir
+  : >| "$framing_dir/$bad_soh"
+  : >| "$framing_dir/$bad_stx"
+  : >| "$framing_dir/bad-safe"
+  send_line '_zrt_dump_postdisplay() { _zlog "TESTPOST=${(qqqq)POSTDISPLAY}" }; zle -N _zrt-dump-postdisplay _zrt_dump_postdisplay; bindkey "^Xz" _zrt-dump-postdisplay'
+  sync_prompt
+  send_keys 'ls zrush-framing-fixture/bad'
+  expect '*bad-safe*' 10 >/dev/null
+  log_count 'TESTPOST='; local -i c_post=$REPLY
+  send_keys $'\C-xz'
+  if wait_log 'TESTPOST=' $c_post 5; then
+    local -a post_lines=( ${(f)"$(grep -F 'TESTPOST=' $ZRUSH_LOG 2>/dev/null)"} )
+    local post_dump=${post_lines[-1]#*TESTPOST=}
+    if [[ $post_dump == *bad-safe* &&
+          $post_dump != *bad-soh* && $post_dump != *bad-stx* &&
+          $post_dump != *FAKE-FRAMING-HEADING* &&
+          $post_dump != *'\001'* && $post_dump != *'\002'* ]]; then
+      ok "(zp-1) SOH/STX candidates excluded and remaining POSTDISPLAY framing intact"
+    else
+      ng "(zp-1) malformed candidate leaked into POSTDISPLAY: $post_dump"
+    fi
+  else
+    ng "(zp-1) POSTDISPLAY dump widget did not run"
+  fi
+  clear_line
+  drain 0.3
+  send_line 'bindkey -r "^Xz"; zle -D _zrt-dump-postdisplay; unfunction _zrt_dump_postdisplay'
+  sync_prompt
+  rm -f "$framing_dir/$bad_soh" "$framing_dir/$bad_stx" "$framing_dir/bad-safe"
+  rmdir $framing_dir
+
+  # ---------------- (d4-1) Match highlighting and [display.highlight] ----------------
+  TRANSCRIPT=
+  send_keys 'ls docs/inte'
+  expect '*internal*' 10 >/dev/null
+  drain 0.3
+  # With default match="underline", vt100 smul emits \e[4m at match positions.
+  if [[ $TRANSCRIPT == *$'\e[4m'* ]]; then
+    ok "(d4-1a) underline (SGR 4) for matched text appears in pty output"
+  else
+    ng "(d4-1a) underline row not visible in pty output"
+  fi
+  clear_line
+  drain 0.3
+  # Changing match to "" disables decoration; automatic reload removes underline.
+  command sleep 1.1
+  print -r -- $'[display.highlight]\nmatch = ""' > $XDG_CONFIG_HOME/zrush/config.toml
+  send_line ': cfg-hl'
+  sync_prompt
+  TRANSCRIPT=
+  send_keys 'ls docs/inte'
+  expect '*internal*' 10 >/dev/null
+  drain 0.3
+  if [[ $TRANSCRIPT != *$'\e[4m'* ]]; then
+    ok "(d4-1b) automatic application of match=\"\" removes underline"
+  else
+    ng "(d4-1b) underline still displayed after match=\"\""
+  fi
+  clear_line
+  drain 0.3
+
+  # ---------------- (kb-2) Key-binding changes and odd-length arrays ----------------
   command sleep 1.1
   print -r -- $'[insert]\ntab = "menu"\n[keybind]\ndismiss = "ctrl-t"' > $XDG_CONFIG_HOME/zrush/config.toml
   send_line ': cfg-key'
@@ -428,18 +635,164 @@ log_count() {  # $1=固定文字列 → REPLY: ZRUSH_LOG 内の出現回数
   expect '*user*' 10 >/dev/null
   log_count 'dismiss: closing list'; local -i c_dis2=$REPLY
   press $'\C-t'
-  wait_log 'dismiss: closing list' $c_dis2 3 && ok "(m4-12a) config で変更した dismiss キー(^T)が機能" || ng "(m4-12a) ^T dismiss が効かない"
+  wait_log 'dismiss: closing list' $c_dis2 3 && ok "(kb-2a) dismiss key changed in config (^T) works" || ng "(kb-2a) ^T dismiss does not work"
   log_count 'keybinds: restored'
-  (( REPLY > 0 )) && ok "(m4-12b) 外れた旧キー(^G)は前任者へ復元される" || ng "(m4-12b) 旧キーの復元記録がない"
+  (( REPLY > 0 )) && ok "(kb-2b) removed old key (^G) is restored to predecessor" || ng "(kb-2b) old-key restoration not logged"
   clear_line
   drain 0.3
-  # 奇数長 KEYBINDS: 配列全体を無視して既定+警告(ホスト内ユニット)
-  send_line 'ZRUSH_CFG_KEYBINDS=(a b c); _zrush_apply_keybinds'
-  if expect '*odd length*' 5; then
-    ok "(m4-12c) KEYBINDS 奇数長は無視して既定+警告"
+
+  # Explicit [] for every action is a valid request to restore all action predecessors.
+  command sleep 1.1
+  print -r -- $'[insert]\ntab = "menu"\n[keybind]\nselect-next = []\nselect-prev = []\nselect-left = []\nselect-right = []\nconfirm = []\ndismiss = []' > $XDG_CONFIG_HOME/zrush/config.toml
+  send_line ': cfg-key-empty'
+  sync_prompt
+  send_keys 'ls docs/'
+  expect '*user*' 10 >/dev/null
+  log_count 'select: start'; local -i c_empty_start=$REPLY
+  press $DOWN
+  log_count 'select: start'
+  if (( REPLY == c_empty_start )); then
+    ok "(kb-2d) all []: Down falls through to predecessor without starting selection"
   else
-    ng "(m4-12c) 奇数長の警告が出ない"
+    ng "(kb-2d) all []: Down unexpectedly started selection"
   fi
+  clear_line
+  send_line 'bindkey -M main "^T"'
+  if expect '*transpose-chars*' 5; then
+    ok "(kb-2e) all []: previously bound ^T restored to predecessor"
+  else
+    ng "(kb-2e) all []: ^T predecessor was not restored"
+  fi
+  sync_prompt
+  send_keys 'ls docs/'
+  expect '*user*' 10 >/dev/null
+  log_count 'select: start'; local -i c_empty_tab=$REPLY
+  press $TAB
+  wait_log 'select: start' $c_empty_tab 3 && \
+    ok "(kb-2f) all []: fixed Tab hook still applies [insert].tab=menu" || \
+    ng "(kb-2f) all []: Tab hook no longer starts menu selection"
+  clear_line
+  drain 0.3
+
+  # Restore default config before the direct malformed-protocol check and later tests.
+  command sleep 1.1
+  rm -f $XDG_CONFIG_HOME/zrush/config.toml
+  send_line ': cfg-key-reset'
+  sync_prompt
+  # Host-side unit check: odd-length KEYBINDS fails config validation (a failed
+  # load; no fallback to duplicated defaults), and the restored state passes.
+  send_line 'typeset -ga _kb_save=("${(@)ZRUSH_CFG_KEYBINDS}"); ZRUSH_CFG_KEYBINDS=(a b c); _zrush_validate_config; print -r -- "VAL_ODD=$?"; ZRUSH_CFG_KEYBINDS=("${(@)_kb_save}"); _zrush_validate_config; print -r -- "VAL_RESTORED=$?"'
+  if expect '*VAL_ODD=1*' 5 && expect '*VAL_RESTORED=0*' 5; then
+    ok "(kb-2c) odd-length KEYBINDS rejected as a failed load"
+  else
+    ng "(kb-2c) odd-length KEYBINDS not rejected by validation"
+  fi
+  sync_prompt
+
+  # ================================================================ Empty-word collection cache
+  # (cc-1) The second command-position query hits and renders without a fork.
+  clear_line
+  drain 0.5
+  log_count 'cache: saved'; local -i cc_sv=$REPLY
+  send_keys 'whic'
+  expect '*which*' 10 >/dev/null
+  wait_log 'cache: saved' $cc_sv 5 || :   # the first query may hit; either way the cache is warm
+  clear_line
+  drain 0.5
+  log_count 'cache: hit';          local -i cc_hit=$REPLY
+  log_count 'request: collecting'; local -i cc_col=$REPLY
+  TRANSCRIPT=
+  send_keys 'whic'
+  if wait_log 'cache: hit' $cc_hit 5; then
+    ok "(cc-1a) cache hit on second command-position query"
+  else
+    ng "(cc-1a) cache hit not logged"
+  fi
+  drain 0.5
+  # wait_log drains pty output first, so match the cumulative TRANSCRIPT after stripping
+  # SGR instead of using expect, as in d4.
+  if [[ ${TRANSCRIPT//$'\e['[0-9;]#m/} == *which* ]]; then
+    ok "(cc-1b) list rendered on hit path (confirmed which)"
+  else
+    ng "(cc-1b) list not displayed on hit"
+  fi
+  log_count 'request: collecting'; local -i cc_col2=$REPLY
+  if (( cc_col2 == cc_col )); then
+    ok "(cc-1c) no collection fork on hit ($cc_col → $cc_col2)"
+  else
+    ng "(cc-1c) collection ran despite expected hit ($cc_col → $cc_col2)"
+  fi
+  clear_line
+  drain 0.3
+
+  # (cc-2) Adding an alias invalidates the fingerprint, recollects, and lists it.
+  log_count 'cache: miss (fingerprint)'; local -i cc_fp=$REPLY
+  send_line 'alias zrushtestalias=ls'
+  sync_prompt
+  send_keys 'zrushtestali'
+  if expect '*zrushtestalias*' 10; then
+    ok "(cc-2a) added alias reflected in next list"
+  else
+    ng "(cc-2a) added alias not displayed in list"
+  fi
+  wait_log 'cache: miss (fingerprint)' $cc_fp 3 && \
+    ok "(cc-2b) fingerprint miss after adding alias" || \
+    ng "(cc-2b) fingerprint miss not logged"
+  clear_line
+  drain 0.3
+
+  # (cc-3) Adding a PATH directory invalidates the cache and lists its new binary.
+  mkdir -p $WORK/xbin
+  print -r -- '#!/bin/sh' > $WORK/xbin/zrushtestbin1
+  chmod +x $WORK/xbin/zrushtestbin1
+  log_count 'cache: miss (fingerprint)'; cc_fp=$REPLY
+  send_line "path+=($WORK/xbin)"
+  sync_prompt
+  send_keys 'zrushtestbin'
+  if expect '*zrushtestbin1*' 10; then
+    ok "(cc-3a) binary in directory added to PATH reflected in list"
+  else
+    ng "(cc-3a) binary not displayed after adding directory to PATH"
+  fi
+  wait_log 'cache: miss (fingerprint)' $cc_fp 3 && \
+    ok "(cc-3b) fingerprint miss after PATH change" || \
+    ng "(cc-3b) miss after PATH change not logged"
+  clear_line
+  drain 0.3
+
+  # (cc-4) Adding an executable to an existing PATH directory invalidates via dir mtime.
+  command sleep 1.1   # accommodate one-second mtime granularity
+  print -r -- '#!/bin/sh' > $WORK/xbin/zrushtestbin2
+  chmod +x $WORK/xbin/zrushtestbin2
+  log_count 'cache: miss (fingerprint)'; cc_fp=$REPLY
+  send_keys 'zrushtestbin'
+  if expect '*zrushtestbin2*' 10; then
+    ok "(cc-4a) binary added to directory on PATH reflected in list"
+  else
+    ng "(cc-4a) added binary not displayed in list"
+  fi
+  wait_log 'cache: miss (fingerprint)' $cc_fp 3 && \
+    ok "(cc-4b) fingerprint miss after directory mtime change" || \
+    ng "(cc-4b) miss after mtime change not logged"
+  clear_line
+  drain 0.3
+
+  # (cc-5) TTL expiry misses; shorten the TTL to one second inside the host.
+  send_line '_ZRUSH_CC_TTL=1'
+  sync_prompt
+  send_keys 'whic'                 # warm it; either a miss or hit leaves a saved cache
+  expect '*which*' 10 >/dev/null
+  clear_line
+  drain 0.3
+  command sleep 2.5                # exceed TTL=1s despite whole-second rounding
+  log_count 'cache: miss (ttl)'; local -i cc_ttl=$REPLY
+  send_keys 'whic'
+  wait_log 'cache: miss (ttl)' $cc_ttl 5 && \
+    ok "(cc-5) TTL expiration causes miss and recollection" || \
+    ng "(cc-5) TTL miss not logged"
+  clear_line
+  drain 0.3
+  send_line '_ZRUSH_CC_TTL=300'
   sync_prompt
 
   out "SUMMARY: PASS=$PASS FAIL=$FAIL"

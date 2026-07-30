@@ -1,40 +1,21 @@
 //! Fuzzy matching: prefix / substring / typo modes.
 //!
-//! Semantics: docs/internal/contracts/cli-protocol.md (source of truth).
-//! Modes widen cumulatively: typo ⊇ substring ⊇ prefix.
-//! - prefix:    match-text starts with the query.
-//! - substring: match-text contains the query.
-//! - typo:      additionally, order-preserving fuzzy (dcs -> docs) and
-//!   light typos — adjacent transposition or one
-//!   substitution/insertion/deletion (gti -> git).
+//! Semantics and tier ordering: docs/internal/contracts/cli-protocol.md
+//! (source of truth). `dcf` -> `dot-config` is a scattered fuzzy match;
+//! `dcs` -> `docs` is a one-edit match.
 //!
-//! Implementation: hybrid (decided by the M2 nucleo-matcher evaluation).
-//! - prefix/substring tiers: direct byte comparison.
-//! - fuzzy tier: nucleo-matcher `fuzzy_match` (strict subsequence with
-//!   good intra-tier scoring). It cannot catch transposition /
-//!   substitution / insertion (gti->git, verbso->verbose, gir->git all
-//!   score None) — those go to:
-//! - edit tier: our own bounded prefix edit distance (<= 1 edit,
-//!   adjacent transposition counts as one; the candidate may extend
-//!   beyond the aligned prefix, so "gti" matches both "git" and
-//!   "git-lfs").
+//! The matcher is a hybrid: direct bytes for prefix/substring,
+//! nucleo strict-subsequence scoring for fuzzy, and bounded prefix edit
+//! distance for transposition/substitution/insertion, which nucleo
+//! cannot catch and the edit tier handles.
 //!
-//! Tier ordering (prefix > substring > edit > fuzzy) is decided here,
-//! not by nucleo's raw score: nucleo can rank a scattered fuzzy match
-//! above a plain substring match (measured: "doc" scored dot-config 82 >
-//! my-docs 80 > mydocs 56). Intra-tier scores are an implementation
-//! detail per the contract.
+//! Tier precedence cannot use nucleo's raw score: a scattered fuzzy match
+//! can outscore a plain substring match (measured: "doc" scored
+//! dot-config 82 > my-docs 80 > mydocs 56).
 //!
-//! Byte semantics: strings are byte sequences and candidates are never
-//! dropped on invalid UTF-8. Case handling is decided once here and
-//! applied uniformly to every tier: when insensitive, query and
-//! candidate are ASCII-lowercased and nucleo runs with ignore_case=false
-//! and normalize=false on the folded bytes, so all four tiers agree.
-//! Non-ASCII case folding is intentionally not performed (byte-safe;
-//! multi-byte folding can change lengths). The haystack is passed to
-//! nucleo via lossy UTF-8 conversion (invalid bytes become U+FFFD) —
-//! acceptable because match-text is used only to decide match/score and
-//! indices returned to zsh are opaque.
+//! Byte semantics follow cli-protocol.md. Case handling is prepared once,
+//! and all four tiers derive input from the same byte sequence; nucleo
+//! keeps ignore_case=false and normalize=false.
 
 use nucleo_matcher::{Config as NucleoConfig, Matcher, Utf32Str};
 
@@ -104,7 +85,7 @@ impl QueryMatcher {
     pub fn new(query_raw: &[u8], mode: Mode, smart_case: bool) -> Self {
         // smart-case: query all-lowercase => insensitive; any uppercase
         // (Unicode-aware detection) => sensitive. smart_case=false =>
-        // always insensitive (contract: "常に区別しない").
+        // always insensitive (contract: always insensitive).
         let sensitive = smart_case
             && String::from_utf8_lossy(query_raw)
                 .chars()
@@ -217,6 +198,86 @@ impl QueryMatcher {
         }
         None
     }
+
+    /// Matched spans in one candidate's match-text, for the stdout
+    /// match-spans field (cli-protocol.md). Char offsets over the
+    /// lossy UTF-8 reading, 0-based end-exclusive, sorted and merged;
+    /// empty = no position info (empty query or no match).
+    ///
+    /// Second pass by design: callers run this only on the top-ranked
+    /// (at most max-lines) candidates, so the per-candidate re-match is
+    /// cheap and `score()` stays allocation-free for the full set.
+    pub fn spans(&mut self, cand_raw: &[u8]) -> Vec<(usize, usize)> {
+        if self.query.is_empty() {
+            return Vec::new();
+        }
+        let QueryMatcher {
+            mode,
+            fold,
+            query,
+            query_str,
+            nucleo,
+            hay_fold_buf,
+            hay_char_buf,
+            query_char_buf,
+        } = self;
+        let q: &[u8] = query;
+        let cand: &[u8] = if *fold {
+            hay_fold_buf.clear();
+            hay_fold_buf.extend(cand_raw.iter().map(u8::to_ascii_lowercase));
+            hay_fold_buf
+        } else {
+            cand_raw
+        };
+
+        // ASCII folding preserves byte offsets, so byte positions found
+        // on the folded form index the raw form identically.
+        if cand.starts_with(q) {
+            return vec![(0, char_count(&cand[..q.len()]))];
+        }
+        if *mode == Mode::Prefix {
+            return Vec::new();
+        }
+        if q.len() <= cand.len()
+            && let Some(pos) = cand.windows(q.len()).position(|w| w == q)
+        {
+            return vec![(char_count(&cand[..pos]), char_count(&cand[..pos + q.len()]))];
+        }
+        if *mode == Mode::Substring {
+            return Vec::new();
+        }
+        if q.len() >= 2
+            && let Some(em) = prefix_edit_within_one(q, cand)
+        {
+            // The aligned (corrected-query) prefix of the candidate.
+            let consumed = cand.len() - em.suffix_len;
+            return vec![(0, char_count(&cand[..consumed]))];
+        }
+        let cand_lossy = String::from_utf8_lossy(cand);
+        let hay = Utf32Str::new(&cand_lossy, hay_char_buf);
+        let needle = Utf32Str::new(query_str, query_char_buf);
+        let mut indices: Vec<u32> = Vec::new();
+        if nucleo.fuzzy_indices(hay, needle, &mut indices).is_none() {
+            return Vec::new();
+        }
+        indices.sort_unstable();
+        indices.dedup();
+        let mut out: Vec<(usize, usize)> = Vec::new();
+        for i in indices {
+            let i = i as usize;
+            match out.last_mut() {
+                Some(last) if last.1 == i => last.1 = i + 1,
+                _ => out.push((i, i + 1)),
+            }
+        }
+        out
+    }
+}
+
+/// Char count of a byte slice under the lossy UTF-8 reading (the span
+/// offset unit; cli-protocol.md).
+fn char_count(bytes: &[u8]) -> usize {
+    String::from_utf8_lossy(bytes).chars().count()
 }
 
 /// How the single edit reads. Declaration order = intra-tier preference

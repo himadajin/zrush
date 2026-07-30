@@ -5,7 +5,7 @@ edition = "2024"
 rust-version = "1.88"
 
 [dependencies]
-# Fuzzy (subsequence) matching for typo mode. Evaluated in M2:
+# Fuzzy (subsequence) matching for typo mode:
 # - catches subsequence/prefix cases (dcs->docs, inte->internal)
 # - does NOT catch transpositions/substitutions/insertions (gti->git);
 #   those are covered by our own bounded edit-distance logic in matching.rs.

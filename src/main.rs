@@ -1,10 +1,8 @@
 //! zrush CLI entry point.
 //!
-//! Subcommands (docs/internal/contracts/cli-protocol.md is the source of
-//! truth; this code follows it):
-//! - `zrush match`  — read NUL-terminated candidate records from stdin,
-//!   rank against a fuzzy query, write common-prefix + top indices.
-//! - `zrush config` — resolve config.toml, emit zsh-sourceable settings.
+//! Subcommands per docs/internal/contracts/cli-protocol.md (source of truth):
+//! - `zrush match` ranks candidates for a query.
+//! - `zrush config` emits zsh-sourceable settings.
 //!
 //! Argument parsing is hand-written on purpose: zrush is spawned per
 //! keystroke, so we keep dependencies (and startup work) minimal.
@@ -23,7 +21,7 @@ use std::process::ExitCode;
 
 use matching::Mode;
 
-/// Exit codes per cli-protocol.md. 1 = internal error (I/O failure etc.).
+/// Exit codes per cli-protocol.md.
 const EXIT_INTERNAL: u8 = 1;
 const EXIT_USAGE: u8 = 2;
 const EXIT_PROTOCOL: u8 = 3;
@@ -45,11 +43,8 @@ fn usage() -> ExitCode {
     ExitCode::from(EXIT_USAGE)
 }
 
-/// `zrush match`: stdin carries 3 NUL-terminated fields per candidate
-/// (`<index> NUL <match-text> NUL <display-text> NUL`); stdout is
-/// `<common-prefix> NUL <index> NUL ...` (indices rank-ordered, top
-/// max-lines). Unknown/invalid arguments: exit 2. Malformed stream
-/// (field count not a multiple of 3, non-digit index): exit 3.
+/// Per cli-protocol.md "zrush match".
+/// Invalid arguments exit 2; malformed input exits 3.
 fn cmd_match(args: &[OsString]) -> ExitCode {
     let mut query: Option<Vec<u8>> = None;
     let mut mode: Option<Mode> = None;
@@ -101,8 +96,6 @@ fn cmd_match(args: &[OsString]) -> ExitCode {
         return ExitCode::from(EXIT_PROTOCOL);
     }
 
-    // (index, match-text) per candidate; display-text is not used for
-    // ranking (phase 1) and the index is an opaque token echoed back.
     let mut candidates: Vec<(&[u8], &[u8])> = Vec::with_capacity(fields.len() / 3);
     for record in fields.chunks_exact(3) {
         let index = record[0];
@@ -114,23 +107,34 @@ fn cmd_match(args: &[OsString]) -> ExitCode {
 
     let mut qm = matching::QueryMatcher::new(&query, mode, smart_case);
     let mut scored = Vec::new();
-    let mut matched_texts: Vec<&[u8]> = Vec::new();
+    let mut prefix_texts: Vec<&[u8]> = Vec::new();
     for (pos, (_, text)) in candidates.iter().enumerate() {
         if let Some(ms) = qm.score(text) {
             scored.push((pos, ms));
-            matched_texts.push(text);
+            // Prefix-tier only, pre-truncation (cli-protocol.md).
+            if ms.tier == matching::Tier::Prefix {
+                prefix_texts.push(text);
+            }
         }
     }
 
-    // Common prefix spans ALL matches (before max-lines truncation).
-    let lcp = matching::common_prefix(matched_texts.into_iter());
+    let lcp = matching::common_prefix(prefix_texts.into_iter());
     let order = ranking::rank(&scored, max_lines);
 
-    let mut out = Vec::with_capacity(lcp.len() + 1 + order.len() * 8);
+    let mut out = Vec::with_capacity(lcp.len() + 1 + order.len() * 16);
     out.extend_from_slice(lcp);
     out.push(0);
     for pos in order {
         out.extend_from_slice(candidates[pos].0);
+        out.push(0);
+        // Spans are extracted only for the emitted (top max-lines)
+        // candidates — a cheap second pass per candidate.
+        for (i, (s, e)) in qm.spans(candidates[pos].1).into_iter().enumerate() {
+            if i > 0 {
+                out.push(b',');
+            }
+            let _ = write!(out, "{s}-{e}");
+        }
         out.push(0);
     }
     if std::io::stdout().write_all(&out).is_err() {
@@ -139,8 +143,7 @@ fn cmd_match(args: &[OsString]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// `zrush config`: no arguments. Never fails on config problems (exit 0
-/// with defaults + warnings); exit non-0 is reserved for internal errors.
+/// Per cli-protocol.md "zrush config", including config-error fallback.
 fn cmd_config(args: &[OsString]) -> ExitCode {
     if !args.is_empty() {
         return usage();

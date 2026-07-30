@@ -17,25 +17,22 @@ Rust + zsh スクリプトで実装する。
 docs/
 ├── user/            # ユーザー向けドキュメント(インストール・設定・使い方)
 └── internal/        # 開発者向けドキュメント
-    ├── plans/       # 実装計画。連番ディレクトリ(001-prototype/ など)ごとに計画を置く
     ├── specs/       # 確定した仕様(挙動・設定スキーマなど)
     └── contracts/   # コンポーネント間の境界仕様(zsh↔Rust CLI プロトコルなど)
 ```
 
-- `plans/` は作業単位のスナップショット。
-  `specs/` / `contracts/` の文書は内容が確定した時点で随時作成してよい(作業完了を待たない)。
-  作業完了時に、plans に残った確定内容を昇格させる。
+- `specs/` / `contracts/` の文書は内容が確定した時点で随時作成してよい(作業完了を待たない)。
+- 実装計画・タスクの進行管理は GitHub の issue で行う(docs には置かない)。
 - ドキュメントは常に「最新の姿」だけを書く。
   経緯・履歴・レビュー記録の類は残さない(履歴は git が持つ)。
-- 現在進行中の計画: `docs/internal/plans/001-prototype/`
 
 ## コミットメッセージ
 
-[Conventional Commits](https://www.conventionalcommits.org/) に従い、英語で簡潔に書く(例: `docs: add prototype plan`, `feat(match): add typo-tolerant matching`, `fix(zle): clear listing on accept-line`)。
+[Conventional Commits](https://www.conventionalcommits.org/) に従い、英語で簡潔に書く(例: `docs: update config schema`, `feat(match): add typo-tolerant matching`, `fix(zle): clear listing on accept-line`)。
 
 ## 実装の原則(要約)
 
-詳細は各 plan / spec を参照。
+詳細は各 spec を参照。
 
 - 「勝手に何かをしない」: 明示操作なしに入力内容を書き換えない。
   `~` は展開しない。

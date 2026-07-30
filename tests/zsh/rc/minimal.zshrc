@@ -1,12 +1,12 @@
-# ヘッドレス回帰テスト用ホスト rc(tests/zsh/driver.zsh が ZDOTDIR 経由で読み込む)
-# 必要な環境変数: ZRUSH_REPO(リポジトリルート)、ZRUSH_TEST_TMP(隔離 tmp)
+# Host rc for headless regression tests, loaded by tests/zsh/driver.zsh through ZDOTDIR
+# Required environment: ZRUSH_REPO (repository root), ZRUSH_TEST_TMP (isolated tmp)
 PS1='HP> '
 autoload -Uz compinit
 compinit -u -d ${ZRUSH_TEST_TMP:-${TMPDIR:-/tmp}}/zcompdump-zrush-test
 source $ZRUSH_REPO/zsh/zrush.zsh
 
-# テスト支援: 現在の BUFFER を ZRUSH_LOG へダンプするウィジェット(^Xb)。
-# ドライバが確定・置換結果を正確に検証するために使う(本体には含めない)。
+# Test-only ^Xb widget that dumps the current BUFFER to ZRUSH_LOG.
+# Drivers use it to verify confirmation and replacement exactly; it is not production code.
 _zrt_dump_buffer() { _zlog "TESTBUF=${(qqqq)BUFFER}" }
 zle -N _zrt-dump-buffer _zrt_dump_buffer
 bindkey '^Xb' _zrt-dump-buffer
