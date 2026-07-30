@@ -34,6 +34,15 @@ zrush.zsh(zsh 側)と `zrush` バイナリ(Rust 側)の入出力仕様。
   挿入にはクォート済み形をそのまま使う。両形の対応管理は zsh 側の責務で、
   本プロトコルを流れる `match-text` は常に復元形である。
 
+### 終了コード
+
+| コード | 意味 |
+|---|---|
+| 0 | 成功。`zrush config` は設定ファイルの問題があっても既定値と警告を出力して成功する |
+| 1 | 内部エラー(stdin/stdout の I/O 失敗など) |
+| 2 | usage エラー(未知・不足・不正な引数、未知または未指定のサブコマンド) |
+| 3 | `zrush match` のプロトコルエラー(非空ストリームの NUL 終端不備、フィールド数不正、空または数字列でない index) |
+
 ## zrush match
 
 候補列とクエリを受け取り、マッチ・ランキングして上位を返す。
@@ -150,19 +159,20 @@ zrush config
 ```
 
 - config パスの解決: `$XDG_CONFIG_HOME/zrush/config.toml`、
-  `$XDG_CONFIG_HOME` 未設定なら `~/.config/zrush/config.toml`。
+  `$XDG_CONFIG_HOME` が未設定または空文字列なら `~/.config/zrush/config.toml`
+  (XDG 仕様の「空文字列は未設定扱い」に従う)。
   ファイル不在は正常(全既定値で出力、警告なし)。
 
 ### stdout(zsh source 形式)
 
 ```zsh
-typeset -g  ZRUSH_PROTOCOL_VERSION='2'
+typeset -g  ZRUSH_PROTOCOL_VERSION='3'
 typeset -g  ZRUSH_CFG_MAX_LINES='10'
-typeset -g  ZRUSH_CFG_DELAY_MS='50'
+typeset -g  ZRUSH_CFG_DELAY_MS='30'
 typeset -g  ZRUSH_CFG_MIN_INPUT='0'
 typeset -g  ZRUSH_CFG_MODE='typo'
 typeset -g  ZRUSH_CFG_SMART_CASE='true'
-typeset -g  ZRUSH_CFG_TAB='menu'
+typeset -g  ZRUSH_CFG_TAB='common-prefix'
 typeset -g  ZRUSH_CFG_TRAILING_SPACE='true'
 typeset -g  ZRUSH_CFG_HL_SELECTED='standout'
 typeset -g  ZRUSH_CFG_HL_MATCH='underline'
