@@ -33,8 +33,8 @@ typeset -F SECONDS
 typeset -g HERE=${${(%):-%N}:A:h}
 typeset -g REPO=${HERE:h:h}
 typeset -g PLAYGROUND=${1:?usage: driver-latency.zsh <playground-dir>}
-[[ -d $PLAYGROUND/docs ]] || { print -u2 "FATAL: playground 不備: $PLAYGROUND"; exit 1 }
-[[ -x $REPO/target/release/zrush ]] || { print -u2 "FATAL: zrush バイナリがない"; exit 1 }
+[[ -d $PLAYGROUND/docs ]] || { print -u2 "FATAL: invalid playground: $PLAYGROUND"; exit 1 }
+[[ -x $REPO/target/release/zrush ]] || { print -u2 "FATAL: zrush binary not found"; exit 1 }
 typeset -g ZAC_SRC=~/.zsh/zsh-autocomplete/zsh-autocomplete.plugin.zsh
 
 typeset -g WORK=$(mktemp -d ${TMPDIR:-/tmp}/zrush-lat.XXXXXX)
@@ -120,7 +120,7 @@ paint_case() {  # $1=host-label $2=case-label $3=keys $4=pattern [$5=trials]
     if paint_once $3 $4 20; then
       ms+=( $REPLY )
     else
-      out "WARN: [$1/$2] 試行 $i 不達"
+      out "WARN: [$1/$2] attempt $i did not complete"
     fi
     drain 0.6
   done
@@ -140,7 +140,7 @@ breakdown_last() {  # $1=logfile $2=number of leading lines to skip -> one table
   for (( i = $#L; i >= 1; --i )); do
     [[ $L[i] == *" render: "* ]] && { ir=i; break }
   done
-  (( ir )) || { out "WARN: breakdown: render 行が見つからない"; return 1 }
+  (( ir )) || { out "WARN: breakdown: render line not found"; return 1 }
   local -F t_render t_match t_rec t_comp t_fork t_req t_arm
   t_render=0; t_match=0; t_rec=0; t_comp=0; t_fork=0; t_req=0; t_arm=0
   ts_of $L[ir]; t_render=$REPLY
@@ -154,7 +154,7 @@ breakdown_last() {  # $1=logfile $2=number of leading lines to skip -> one table
       *" MEAS-arm"*)                 (( t_req != 0 )) && { ts_of $L[i]; t_arm=$REPLY; break } ;;
     esac
   done
-  (( t_arm && t_req && t_fork && t_comp && t_rec && t_match )) || { out "WARN: breakdown: チェーン不完全"; return 1 }
+  (( t_arm && t_req && t_fork && t_comp && t_rec && t_match )) || { out "WARN: breakdown: incomplete chain"; return 1 }
   printf 'BREAK | debounce=%4.0f | spawn=%4.0f | compsys=%5.0f | transport=%4.0f | match=%4.0f | render=%4.0f | total(arm→render)=%5.0f ms\n' \
     $(( (t_req - t_arm) * 1000 )) \
     $(( (t_fork - t_req) * 1000 )) \
@@ -169,7 +169,7 @@ breakdown_last() {  # $1=logfile $2=number of leading lines to skip -> one table
 paint_break_case() {  # $1=host-label $2=case-label $3=keys $4=pattern
   local -i skip=0
   [[ -r $HOSTLOG ]] && skip=$(wc -l < $HOSTLOG)
-  paint_once $3 $4 20 || { out "WARN: [$1/$2] 不達"; return 1 }
+  paint_once $3 $4 20 || { out "WARN: [$1/$2] did not complete"; return 1 }
   out "CASE  | ${(r:12:)1} | ${(r:18:)2} | first-paint=$(fmt $REPLY)ms"
   breakdown_last $HOSTLOG $skip
   drain 0.6
@@ -184,7 +184,7 @@ breakdown_hit_last() {  # $1=logfile $2=number of leading lines to skip
   for (( i = $#L; i >= 1; --i )); do
     [[ $L[i] == *" render: "* ]] && { ir=i; break }
   done
-  (( ir )) || { out "WARN: breakdown-hit: render 行が見つからない"; return 1 }
+  (( ir )) || { out "WARN: breakdown-hit: render line not found"; return 1 }
   local -F t_render t_match t_hit t_req t_arm
   t_render=0; t_match=0; t_hit=0; t_req=0; t_arm=0
   ts_of $L[ir]; t_render=$REPLY
@@ -197,7 +197,7 @@ breakdown_hit_last() {  # $1=logfile $2=number of leading lines to skip
     esac
   done
   (( t_arm && t_req && t_hit && t_match )) || \
-    { out "WARN: breakdown-hit: チェーン不完全(ヒットしていない?)"; return 1 }
+    { out "WARN: breakdown-hit: incomplete chain (cache miss?)"; return 1 }
   printf 'BREAK | debounce=%4.0f | cache-check=%4.0f | match=%4.0f | render=%4.0f | total(arm→render)=%5.0f ms\n' \
     $(( (t_req - t_arm) * 1000 )) \
     $(( (t_hit - t_req) * 1000 )) \
@@ -210,7 +210,7 @@ breakdown_hit_last() {  # $1=logfile $2=number of leading lines to skip
 paint_break_hit_case() {  # assumes a preceding equivalent case warmed the cache
   local -i skip=0
   [[ -r $HOSTLOG ]] && skip=$(wc -l < $HOSTLOG)
-  paint_once $3 $4 20 || { out "WARN: [$1/$2] 不達"; return 1 }
+  paint_once $3 $4 20 || { out "WARN: [$1/$2] did not complete"; return 1 }
   out "CASE  | ${(r:12:)1} | ${(r:18:)2} | first-paint=$(fmt $REPLY)ms"
   breakdown_hit_last $HOSTLOG $skip
   drain 0.6
@@ -306,7 +306,7 @@ typeset -g HIST_HASH_BEFORE=
 
 {
   # ============ min-zrush with default 30ms delay ============
-  out "==== min-zrush(隔離 + 既定 delay-ms=30)===="
+  out "==== min-zrush (isolated + default delay-ms=30) ===="
   if start_min_zrush min-zrush $WORK/xdg-default; then
     host_rss; out "INFO: RSS=${REPLY}KB"
     paint_break_case min-zrush "cmd 1st (whic)"   'whic'         'which'   # first run is a cache miss
@@ -319,12 +319,12 @@ typeset -g HIST_HASH_BEFORE=
     paint_case min-zrush "file (docs/inte)" 'ls docs/inte' 'internal'
     paint_case min-zrush "git (git chec)"   'git chec'     'checkout'
   else
-    out "FATAL: min-zrush 起動失敗"
+    out "FATAL: min-zrush failed to start"
   fi
   stop_host
 
   # ============ min-zrush delay-ms=0 ============
-  out "==== min-zrush-d0(隔離 + delay-ms=0)===="
+  out "==== min-zrush-d0 (isolated + delay-ms=0) ===="
   mkdir -p $WORK/xdg-d0/zrush
   print -r -- $'[display]\ndelay-ms = 0' > $WORK/xdg-d0/zrush/config.toml
   if start_min_zrush min-d0 $WORK/xdg-d0; then
@@ -332,24 +332,24 @@ typeset -g HIST_HASH_BEFORE=
     paint_case min-d0 "file (docs/inte)" 'ls docs/inte' 'internal'
     paint_case min-d0 "git (git chec)"   'git chec'     'checkout'
   else
-    out "FATAL: min-d0 起動失敗"
+    out "FATAL: min-d0 failed to start"
   fi
   stop_host
 
   # ============ min-zac ============
-  out "==== min-zac(隔離 + zsh-autocomplete, min-delay 0.05)===="
+  out "==== min-zac (isolated + zsh-autocomplete, min-delay 0.05) ===="
   if [[ -r $ZAC_SRC ]] && start_min_zac; then
     host_rss; out "INFO: RSS=${REPLY}KB"
     paint_case zac "cmd (whic)"       'whic'         'which'
     paint_case zac "file (docs/inte)" 'ls docs/inte' 'internal'
     paint_case zac "git (git chec)"   'git chec'     'checkout'
   else
-    out "FATAL: min-zac 起動失敗(ZAC_SRC=$ZAC_SRC)"
+    out "FATAL: min-zac failed to start (ZAC_SRC=$ZAC_SRC)"
   fi
   stop_host
 
   # ============ real-zrush ============
-  out "==== real-zrush(実 ~/.zshrc)===="
+  out "==== real-zrush (actual ~/.zshrc) ===="
   if start_real_zrush; then
     host_rss; out "INFO: RSS=${REPLY}KB"
     paint_break_case real "cmd 1st (cla)"    'cla'          'clang'   # first run is a cache miss
@@ -360,7 +360,7 @@ typeset -g HIST_HASH_BEFORE=
     paint_case real "file (docs/inte)" 'ls docs/inte' 'internal'
     paint_case real "git (git chec)"   'git chec'     'checkout'
   else
-    out "FATAL: real-zrush 起動/セットアップ失敗"
+    out "FATAL: real-zrush failed to start or set up"
   fi
   stop_host
 } always {
@@ -372,9 +372,9 @@ typeset -g HIST_HASH_BEFORE=
   if [[ -n $HIST_HASH_BEFORE ]]; then
     local now=$(shasum ~/.zsh_history 2>/dev/null)
     if [[ $now == $HIST_HASH_BEFORE ]]; then
-      out "GUARD: ~/.zsh_history 不変を確認"
+      out "GUARD: confirmed ~/.zsh_history is unchanged"
     else
-      out "GUARD-FAIL: ~/.zsh_history が変化した!(要確認)"
+      out "GUARD-FAIL: ~/.zsh_history changed! (investigation required)"
     fi
   fi
   [[ -n $WORK && $WORK == */zrush-lat.* ]] && rm -rf $WORK

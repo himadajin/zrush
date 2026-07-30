@@ -22,8 +22,8 @@ typeset -F SECONDS
 typeset -g HERE=${${(%):-%N}:A:h}
 typeset -g REPO=${HERE:h:h}
 typeset -g PLAYGROUND=${1:?usage: driver.zsh <playground-dir>}
-[[ -d $PLAYGROUND/docs ]] || { print -u2 "FATAL: playground 不備: $PLAYGROUND"; exit 1 }
-[[ -x $REPO/target/release/zrush ]] || { print -u2 "FATAL: zrush バイナリがない(cargo build --release)"; exit 1 }
+[[ -d $PLAYGROUND/docs ]] || { print -u2 "FATAL: invalid playground: $PLAYGROUND"; exit 1 }
+[[ -x $REPO/target/release/zrush ]] || { print -u2 "FATAL: zrush binary not found (cargo build --release)"; exit 1 }
 
 typeset -gi PASS=0 FAIL=0
 out() { print -r -u2 -- "$@" }
@@ -95,12 +95,12 @@ log_count() {  # $1=fixed string -> REPLY: occurrence count in ZRUSH_LOG
   # ---------------- Host startup ----------------
   cd $PLAYGROUND || exit 1
   local REPLY=
-  zpty -b host zsh -d -i || { ng "host 起動失敗"; exit 1 }
+  zpty -b host zsh -d -i || { ng "host failed to start"; exit 1 }
   HOSTFD=$REPLY
   if expect '*MARK-RC-DONE*' 20; then
-    ok "host 起動 + compinit + zrush.zsh source(config 読み込み成功)"
+    ok "host started + compinit + zrush.zsh sourced (config loaded successfully)"
   else
-    ng "host 起動を確認できない: ${(qqqq)EXPECT_BUF[-300,-1]}"
+    ng "unable to confirm host startup: ${(qqqq)EXPECT_BUF[-300,-1]}"
     exit 1
   fi
   sync_prompt
@@ -108,9 +108,9 @@ log_count() {  # $1=fixed string -> REPLY: occurrence count in ZRUSH_LOG
   # ---------------- (a) List appears automatically after delay-ms ----------------
   send_keys 'ls docs/inte'
   if expect '*internal*' 10; then
-    ok "(a) タイプ後に候補一覧が自動表示される(internal を確認)"
+    ok "(a) candidate list displayed automatically after typing (confirmed internal)"
   else
-    ng "(a) 一覧が表示されない"
+    ng "(a) list not displayed"
   fi
   clear_line
 
@@ -123,9 +123,9 @@ log_count() {  # $1=fixed string -> REPLY: occurrence count in ZRUSH_LOG
   drain 0.5
   log_count 'request: widened'; local -i req_after=$REPLY
   if (( req_after == req_before )); then
-    ok "(b) 空バッファ(空白のみ)では収集リクエストが発生しない ($req_before → $req_after)"
+    ok "(b) no collection request for an empty buffer (whitespace only) ($req_before → $req_after)"
   else
-    ng "(b) 空バッファで収集が走った ($req_before → $req_after)"
+    ng "(b) collection ran for an empty buffer ($req_before → $req_after)"
   fi
 
   # ---------------- (f) Typo query yields candidates through Rust ----------------
@@ -144,18 +144,18 @@ log_count() {  # $1=fixed string -> REPLY: occurrence count in ZRUSH_LOG
     (( mok_after > mok_before && ren_after > ren_before )) && break
   done
   if (( mok_after > mok_before && ren_after > ren_before )); then
-    ok "(f1) gti: 全コマンド収集 → zrush match → 描画の往復が成立"
+    ok "(f1) gti: full command collection → zrush match → render round trip completed"
   else
-    ng "(f1) gti の match/描画が確認できない (match $mok_before→$mok_after render $ren_before→$ren_after)"
+    ng "(f1) unable to confirm gti match/render (match $mok_before→$mok_after render $ren_before→$ren_after)"
   fi
   clear_line
   drain 0.3
   # (f2) In a constrained set, transposed docs/intre reaches internal.
   send_keys 'ls docs/intre'
   if expect '*internal*' 10; then
-    ok "(f2) typo クエリ intre → internal が表示される(誤字許容マッチ)"
+    ok "(f2) typo query intre → internal displayed (typo-tolerant match)"
   else
-    ng "(f2) typo 候補 internal が出ない"
+    ng "(f2) typo candidate internal not displayed"
   fi
   clear_line
   drain 0.3
@@ -168,9 +168,9 @@ log_count() {  # $1=fixed string -> REPLY: occurrence count in ZRUSH_LOG
   # Decoration updates may insert escape sequences between echoed characters, so do not
   # require consecutive z characters.
   if expect '*z*z*z*' 2; then
-    ok "(d) huge 収集中も追加タイプが即エコーされる($(( SECONDS - t0 ))s)"
+    ok "(d) additional typing echoed immediately during huge collection ($(( SECONDS - t0 ))s)"
   else
-    ng "(d) huge 収集中に入力がブロックされた"
+    ng "(d) input blocked during huge collection"
   fi
   clear_line
   drain 1.0                     # allow in-flight collection cancellation to settle
@@ -178,9 +178,9 @@ log_count() {  # $1=fixed string -> REPLY: occurrence count in ZRUSH_LOG
   # Also require the huge listing itself after clearing the zero-result zzz query.
   send_keys 'ls ../huge/file0000'
   if expect '*file00000.txt*' 20; then
-    ok "(d') huge ディレクトリの候補一覧が表示される"
+    ok "(d') candidate list for huge directory displayed"
   else
-    ng "(d') huge の一覧が出ない"
+    ng "(d') huge list not displayed"
   fi
   clear_line
   drain 0.5
@@ -193,17 +193,17 @@ log_count() {  # $1=fixed string -> REPLY: occurrence count in ZRUSH_LOG
   sync_prompt 10
   log_count 'line-finish: cleared'; local -i fin_after=$REPLY
   if (( fin_after > fin_before )); then
-    ok "(e) accept-line で一覧消去(line-finish cleared: $fin_before → $fin_after)"
+    ok "(e) accept-line clears the list (line-finish cleared: $fin_before → $fin_after)"
   else
-    ng "(e) line-finish の消去が確認できない"
+    ng "(e) unable to confirm line-finish clearing"
   fi
   log_count 'render:'; local -i render_settled=$REPLY
   drain 1.0
   log_count 'render:'; local -i render_after=$REPLY
   if (( render_after == render_settled )); then
-    ok "(e') accept-line 後に一覧の再描画が起きない"
+    ok "(e') list is not redrawn after accept-line"
   else
-    ng "(e') accept-line 後に再描画が発生 ($render_settled → $render_after)"
+    ng "(e') redraw occurred after accept-line ($render_settled → $render_after)"
   fi
 
   # ---------------- (c) min-input=2 suppresses one-character input ----------------
@@ -219,9 +219,9 @@ log_count() {  # $1=fixed string -> REPLY: occurrence count in ZRUSH_LOG
   drain 0.8
   log_count 'request: widened'; local -i mi_two=$REPLY
   if (( mi_one == mi_before && mi_two > mi_one )); then
-    ok "(c) min-input=2: 1 文字では収集せず、2 文字で収集する ($mi_before/$mi_one/$mi_two)"
+    ok "(c) min-input=2: no collection at 1 character, collection at 2 characters ($mi_before/$mi_one/$mi_two)"
   else
-    ng "(c) min-input が効いていない ($mi_before/$mi_one/$mi_two)"
+    ng "(c) min-input is not effective ($mi_before/$mi_one/$mi_two)"
   fi
   clear_line
   drain 0.3
@@ -231,17 +231,17 @@ log_count() {  # $1=fixed string -> REPLY: occurrence count in ZRUSH_LOG
   print -r -- $'[display]\nmax-lines = "abc"' > $XDG_CONFIG_HOME/zrush/config.toml
   send_line ': reload2'
   if expect '*max-lines*' 10; then
-    ok "(g) config 不正値の警告が stderr に表示される"
+    ok "(g) warning for invalid config value displayed on stderr"
   else
-    ng "(g) 不正値警告が出ない"
+    ng "(g) invalid-value warning not displayed"
   fi
   sync_prompt
   # Verify that invalid values fall back to defaults and operation continues.
   send_keys 'ls docs/inte'
   if expect '*internal*' 10; then
-    ok "(g') 不正 config でも既定値で動作継続する"
+    ok "(g') continues with defaults despite invalid config"
   else
-    ng "(g') 不正 config 後に一覧が出ない"
+    ng "(g') list not displayed after invalid config"
   fi
   clear_line
 
@@ -289,20 +289,20 @@ log_count() {  # $1=fixed string -> REPLY: occurrence count in ZRUSH_LOG
   TRANSCRIPT=            # isolate pre-selection output for the standout assertion
   send_keys $DOWN        # press() would consume the render while draining
   if wait_log 'selected=1' $c_sel1 5; then
-    ok "(m4-1a) ↓ で選択開始(selected=1 で描画)"
+    ok "(m4-1a) Down starts selection (rendered with selected=1)"
   else
-    ng "(m4-1a) 選択開始の描画が確認できない"
+    ng "(m4-1a) unable to confirm render when selection starts"
   fi
   if [[ $TRANSCRIPT == *$'\e[7m'* ]]; then
-    ok "(m4-1a') 選択行の standout(SGR 7)が pty 出力に現れる"
+    ok "(m4-1a') standout (SGR 7) for selected row appears in pty output"
   else
-    ng "(m4-1a') standout 列が pty 出力に見えない"
+    ng "(m4-1a') standout row not visible in pty output"
   fi
   press $DOWN
-  wait_log 'select: pos=2' $c_pos2 3 && ok "(m4-1b) ↓ で次候補へ移動" || ng "(m4-1b) 候補移動しない"
+  wait_log 'select: pos=2' $c_pos2 3 && ok "(m4-1b) Down moves to the next candidate" || ng "(m4-1b) candidate does not move"
   press $UP
   press $UP
-  wait_log 'select: released-at-top' $c_rel 3 && ok "(m4-1c) 先頭候補で ↑ → 選択解除" || ng "(m4-1c) 先頭 ↑ で解除されない"
+  wait_log 'select: released-at-top' $c_rel 3 && ok "(m4-1c) Up on first candidate → selection released" || ng "(m4-1c) Up on first candidate does not release selection"
   clear_line
   drain 0.3
 
@@ -312,23 +312,23 @@ log_count() {  # $1=fixed string -> REPLY: occurrence count in ZRUSH_LOG
   send_keys 'print HISTMARK-ALPHA'
   send_keys $'\r'
   if expect '*HISTMARK-ALPHA*' 5; then
-    ok "(m4-2a) 非選択時の Enter は前任者(accept-line)経由でコマンド実行"
+    ok "(m4-2a) Enter without selection executes command via predecessor (accept-line)"
   else
-    ng "(m4-2a) Enter でコマンドが実行されない"
+    ng "(m4-2a) Enter does not execute command"
   fi
   sync_prompt
   send_keys $UP
   if expect '*print HISTMARK-ALPHA*' 5; then
-    ok "(m4-2b) 非選択時の ↑ は前任者経由で履歴移動"
+    ok "(m4-2b) Up without selection navigates history via predecessor"
   else
-    ng "(m4-2b) ↑ で履歴が出ない"
+    ng "(m4-2b) Up does not show history"
   fi
   drain 0.3
 
   # ---------------- (m4-3) Down moves toward newer history while browsing ----------------
   log_count 'next: hist-branch'; local -i c_hist=$REPLY
   press $DOWN
-  wait_log 'next: hist-branch' $c_hist 3 && ok "(m4-3) 履歴移動中の ↓ は履歴戻り(優先順位②)" || ng "(m4-3) hist-branch を通らない"
+  wait_log 'next: hist-branch' $c_hist 3 && ok "(m4-3) Down while navigating history moves forward in history (priority 2)" || ng "(m4-3) hist-branch not taken"
   clear_line
   drain 0.3
 
@@ -337,7 +337,7 @@ log_count() {  # $1=fixed string -> REPLY: occurrence count in ZRUSH_LOG
   expect '*internal*' 10 >/dev/null
   press $DOWN
   press $ENTER
-  assert_buffer 'ls docs/internal/' "(m4-4) 確定は挿入のみ(実行されず編集継続)+末尾置換で 'ls docs/internal/'+dir はスペースなし"
+  assert_buffer 'ls docs/internal/' "(m4-4) confirmation only inserts (no execution, editing continues) + suffix replacement leaves no space between 'ls docs/internal/' and dir"
   clear_line
   drain 0.3
 
@@ -346,7 +346,7 @@ log_count() {  # $1=fixed string -> REPLY: occurrence count in ZRUSH_LOG
   expect '*Cargo.toml*' 10 >/dev/null
   press $DOWN
   press $ENTER
-  assert_buffer 'ls Cargo.toml ' "(m4-6) trailing-space: ファイル候補の確定で末尾スペースが付く"
+  assert_buffer 'ls Cargo.toml ' "(m4-6) trailing-space: confirming a file candidate adds a trailing space"
   clear_line
   drain 0.3
 
@@ -355,7 +355,7 @@ log_count() {  # $1=fixed string -> REPLY: occurrence count in ZRUSH_LOG
   expect '*docs*' 10 >/dev/null
   press $DOWN
   press $ENTER
-  assert_buffer 'ls ~/docs/' "(m4-5b) ~ 候補の確定でも ~ が展開されない('ls ~/docs/' のまま)"
+  assert_buffer 'ls ~/docs/' "(m4-5b) ~ remains unexpanded when confirming a ~ candidate (stays 'ls ~/docs/')"
   clear_line
   drain 0.3
 
@@ -365,8 +365,8 @@ log_count() {  # $1=fixed string -> REPLY: occurrence count in ZRUSH_LOG
   expect '*local*' 10 >/dev/null
   press $DOWN
   press $ENTER
-  assert_buffer 'ls pp/usr/local/' "(m4-5c) 部分パス略記の確定は語全体置換で 'ls pp/usr/local/'"
-  wait_log 'whole-word-replace' $c_ww 2 && ok "(m4-5c') 語全体置換の分岐を通った" || ng "(m4-5c') whole-word-replace 分岐が記録されない"
+  assert_buffer 'ls pp/usr/local/' "(m4-5c) confirming a partial path abbreviation replaces the whole word with 'ls pp/usr/local/'"
+  wait_log 'whole-word-replace' $c_ww 2 && ok "(m4-5c') whole-word replacement branch taken" || ng "(m4-5c') whole-word-replace branch not logged"
   clear_line
   drain 0.3
 
@@ -375,8 +375,8 @@ log_count() {  # $1=fixed string -> REPLY: occurrence count in ZRUSH_LOG
   expect '*user*' 10 >/dev/null
   log_count 'dismiss: closing list'; local -i c_dis=$REPLY
   press $CTRLG
-  wait_log 'dismiss: closing list' $c_dis 3 && ok "(m4-11a) dismiss で一覧が閉じる" || ng "(m4-11a) dismiss が効かない"
-  assert_buffer 'ls docs/' "(m4-11b) dismiss 後もバッファは不変"
+  wait_log 'dismiss: closing list' $c_dis 3 && ok "(m4-11a) dismiss closes the list" || ng "(m4-11a) dismiss does not work"
+  assert_buffer 'ls docs/' "(m4-11b) buffer remains unchanged after dismiss"
   clear_line
   drain 0.3
 
@@ -385,7 +385,7 @@ log_count() {  # $1=fixed string -> REPLY: occurrence count in ZRUSH_LOG
   expect '*user*' 10 >/dev/null
   log_count 'select: start'; local -i c_tstart=$REPLY
   press $TAB
-  wait_log 'select: start' $c_tstart 3 && ok "(m4-7) Tab(menu)で選択開始" || ng "(m4-7) Tab で選択が始まらない"
+  wait_log 'select: start' $c_tstart 3 && ok "(m4-7) Tab (menu) starts selection" || ng "(m4-7) Tab does not start selection"
   press $CTRLG
   clear_line
   drain 0.3
@@ -398,7 +398,7 @@ log_count() {  # $1=fixed string -> REPLY: occurrence count in ZRUSH_LOG
   send_keys 'ls docs/inte'
   expect '*internal*' 10 >/dev/null
   press $TAB
-  assert_buffer 'ls docs/internal' "(m4-8a) Tab(common-prefix): クエリが真の接頭辞のとき共通部を挿入"
+  assert_buffer 'ls docs/internal' "(m4-8a) Tab (common-prefix): inserts common part when query is a true prefix"
   clear_line
   drain 0.3
   # Non-extending case: gd/a1 has prefix-tier {a10..a19} with LCP "a1" equal to
@@ -407,8 +407,8 @@ log_count() {  # $1=fixed string -> REPLY: occurrence count in ZRUSH_LOG
   expect '*a10*' 10 >/dev/null
   log_count 'fallback -> insert top'; local -i c_fb=$REPLY
   press $TAB
-  assert_buffer 'ls gd/a10 ' "(m4-8b) Tab(common-prefix): 伸びないときは先頭候補を確定挿入('ls gd/a10 ')"
-  wait_log 'fallback -> insert top' $c_fb 2 && ok "(m4-8b') フォールバック経路を通った" || ng "(m4-8b') フォールバック経路が記録されない"
+  assert_buffer 'ls gd/a10 ' "(m4-8b) Tab (common-prefix): confirms and inserts top candidate when prefix cannot grow ('ls gd/a10 ')"
+  wait_log 'fallback -> insert top' $c_fb 2 && ok "(m4-8b') fallback path taken" || ng "(m4-8b') fallback path not logged"
   clear_line
   drain 0.3
 
@@ -420,7 +420,7 @@ log_count() {  # $1=fixed string -> REPLY: occurrence count in ZRUSH_LOG
   send_keys 'ls docs/inte'
   expect '*internal*' 10 >/dev/null
   press $TAB
-  assert_buffer 'ls docs/internal/' "(m4-9) Tab(insert)で先頭候補を即挿入"
+  assert_buffer 'ls docs/internal/' "(m4-9) Tab (insert) immediately inserts top candidate"
   clear_line
   drain 0.3
 
@@ -428,11 +428,11 @@ log_count() {  # $1=fixed string -> REPLY: occurrence count in ZRUSH_LOG
   log_count 'tab: pending'; local -i c_pend=$REPLY
   send_keys 'ls docs/inte'$'\t'    # Tab during debounce in the same input burst
   if expect '*ls docs/internal/*' 10; then
-    ok "(m4-10a) 未着時 Tab: 収集前倒し→到着時に insert 適用"
+    ok "(m4-10a) Tab before arrival: collection expedited → insert applied on arrival"
   else
-    ng "(m4-10a) 未着時 Tab が適用されない"
+    ng "(m4-10a) Tab before arrival not applied"
   fi
-  wait_log 'tab: pending' $c_pend 2 && ok "(m4-10b) pending 経路を通った" || ng "(m4-10b) pending 経路が記録されない"
+  wait_log 'tab: pending' $c_pend 2 && ok "(m4-10b) pending path taken" || ng "(m4-10b) pending path not logged"
   clear_line
   drain 0.3
 
@@ -442,29 +442,29 @@ log_count() {  # $1=fixed string -> REPLY: occurrence count in ZRUSH_LOG
   # a01..a30 use two-character words with width-three cells: eight columns by four
   # rows, column-major, so row one is a01 a05 a09 ...
   if expect '*a01  a05*' 10; then
-    ok "(d2-1a) 列優先グリッドで複数候補が 1 行に並ぶ(a01  a05)"
+    ok "(d2-1a) column-major grid places multiple candidates on one row (a01  a05)"
   else
-    ng "(d2-1a) グリッド行が確認できない"
+    ng "(d2-1a) unable to confirm grid row"
   fi
   log_count 'render: 5 lines shown=30'
   if (( REPLY > 0 )); then
-    ok "(d2-1b) 30 件が見出し 1 行 + 8 列 × 4 行に収まる"
+    ok "(d2-1b) 30 items fit in 1 heading row + 8 columns × 4 rows"
   else
-    ng "(d2-1b) グリッド形状が期待と違う(render: 5 lines shown=30 がログにない)"
+    ng "(d2-1b) unexpected grid shape (render: 5 lines shown=30 not found in log)"
   fi
   log_count 'select: pos=5'; local -i c_gp5=$REPLY
   send_keys $DOWN            # start selection at pos=1
   drain 0.3
   send_keys $RIGHT           # move right one column = +rows (4)
-  wait_log 'select: pos=5' $c_gp5 3 && ok "(d2-1c) → で右の列へ(pos 1→5)" || ng "(d2-1c) 列ジャンプしない"
+  wait_log 'select: pos=5' $c_gp5 3 && ok "(d2-1c) Right moves to the column on the right (pos 1→5)" || ng "(d2-1c) column jump failed"
   log_count 'select: pos=1'; local -i c_gp1=$REPLY
   send_keys $LEFT
-  wait_log 'select: pos=1' $c_gp1 3 && ok "(d2-1d) ← で左の列へ戻る(pos 5→1)" || ng "(d2-1d) 左ジャンプしない"
+  wait_log 'select: pos=1' $c_gp1 3 && ok "(d2-1d) Left returns to the column on the left (pos 5→1)" || ng "(d2-1d) left jump failed"
   press $CTRLG
   # When unselected, Left falls back through the predecessor chain to cursor movement.
   log_count 'dispatch: fallback'; local -i c_gfb=$REPLY
   send_keys $LEFT
-  wait_log 'dispatch: fallback' $c_gfb 3 && ok "(d2-1e) 非選択時の ← は前任者へフォールバック" || ng "(d2-1e) 非選択 ← が奪われている"
+  wait_log 'dispatch: fallback' $c_gfb 3 && ok "(d2-1e) Left without selection falls back to predecessor" || ng "(d2-1e) Left without selection was intercepted"
   clear_line
   drain 0.3
 
@@ -473,45 +473,45 @@ log_count() {  # $1=fixed string -> REPLY: occurrence count in ZRUSH_LOG
   expect '*a01  a05*' 10 >/dev/null
   log_count 'select: start'; local -i c_kbs=$REPLY
   send_keys $'\C-n'
-  wait_log 'select: start' $c_kbs 3 && ok "(kb-1a) ctrl-n で選択開始(↓ と同じ優先順位規則)" || ng "(kb-1a) ctrl-n で選択が始まらない"
+  wait_log 'select: start' $c_kbs 3 && ok "(kb-1a) ctrl-n starts selection (same priority rules as Down)" || ng "(kb-1a) ctrl-n does not start selection"
   log_count 'select: pos=5'; local -i c_kb5=$REPLY
   send_keys $'\C-f'
-  wait_log 'select: pos=5' $c_kb5 3 && ok "(kb-1b) ctrl-f で右の列へ(pos 1→5)" || ng "(kb-1b) ctrl-f が効かない"
+  wait_log 'select: pos=5' $c_kb5 3 && ok "(kb-1b) ctrl-f moves to the column on the right (pos 1→5)" || ng "(kb-1b) ctrl-f does not work"
   log_count 'select: pos=1'; local -i c_kb1=$REPLY
   send_keys $'\C-b'
-  wait_log 'select: pos=1' $c_kb1 3 && ok "(kb-1c) ctrl-b で左の列へ(pos 5→1)" || ng "(kb-1c) ctrl-b が効かない"
+  wait_log 'select: pos=1' $c_kb1 3 && ok "(kb-1c) ctrl-b moves to the column on the left (pos 5→1)" || ng "(kb-1c) ctrl-b does not work"
   log_count 'select: released-at-top'; local -i c_kbr=$REPLY
   send_keys $'\C-p'
-  wait_log 'select: released-at-top' $c_kbr 3 && ok "(kb-1d) 先頭で ctrl-p → 選択解除(↑ と同じ)" || ng "(kb-1d) ctrl-p で解除されない"
+  wait_log 'select: released-at-top' $c_kbr 3 && ok "(kb-1d) ctrl-p at top → selection released (same as Up)" || ng "(kb-1d) ctrl-p does not release selection"
   # When unselected, ctrl-p falls back to the predecessor history widget.
   log_count 'dispatch: fallback'; local -i c_kbf=$REPLY
   send_keys $'\C-p'
-  wait_log 'dispatch: fallback' $c_kbf 3 && ok "(kb-1e) 非選択時の ctrl-p は前任者へフォールバック" || ng "(kb-1e) 非選択 ctrl-p が奪われている"
+  wait_log 'dispatch: fallback' $c_kbf 3 && ok "(kb-1e) ctrl-p without selection falls back to predecessor" || ng "(kb-1e) ctrl-p without selection was intercepted"
   clear_line
   drain 0.3
 
   # ---------------- (d3-1) Group headings ----------------
   send_keys 'ls docs/inte'
   if expect '*file*internal*' 10; then
-    ok "(d3-1a) ファイル候補にグループ見出し 'file' が付く"
+    ok "(d3-1a) file candidates have the 'file' group heading"
   else
-    ng "(d3-1a) 見出し 'file' が出ない"
+    ng "(d3-1a) 'file' heading not displayed"
   fi
   clear_line
   drain 0.3
   send_keys 'git chec'
   if expect '*main porcelain command*checkout*' 15; then
-    ok "(d3-1b) git サブコマンドに見出し 'main porcelain command' が付く"
+    ok "(d3-1b) git subcommands have the 'main porcelain command' heading"
   else
-    ng "(d3-1b) git サブコマンドの見出しが出ない"
+    ng "(d3-1b) git subcommand heading not displayed"
   fi
   drain 0.3
   # (d3-1c) Rendering multiple groups with spans must not leak variable values.
   # In zsh, redeclaring a populated local without assignment may print it to stdout.
   if [[ $TRANSCRIPT != *sp=* && $TRANSCRIPT != *gcount=* ]]; then
-    ok "(d3-1c) render の変数表示リーク(sp=/gcount=)がない"
+    ok "(d3-1c) render does not leak variable output (sp=/gcount=)"
   else
-    ng "(d3-1c) render が変数を標準出力へ漏らしている(sp=/gcount= を検出)"
+    ng "(d3-1c) render leaked variables to stdout (detected sp=/gcount=)"
   fi
   clear_line
   drain 0.3
@@ -523,9 +523,9 @@ log_count() {  # $1=fixed string -> REPLY: occurrence count in ZRUSH_LOG
   drain 0.3
   # With default match="underline", vt100 smul emits \e[4m at match positions.
   if [[ $TRANSCRIPT == *$'\e[4m'* ]]; then
-    ok "(d4-1a) マッチ箇所の underline(SGR 4)が pty 出力に現れる"
+    ok "(d4-1a) underline (SGR 4) for matched text appears in pty output"
   else
-    ng "(d4-1a) underline 列が pty 出力に見えない"
+    ng "(d4-1a) underline row not visible in pty output"
   fi
   clear_line
   drain 0.3
@@ -539,9 +539,9 @@ log_count() {  # $1=fixed string -> REPLY: occurrence count in ZRUSH_LOG
   expect '*internal*' 10 >/dev/null
   drain 0.3
   if [[ $TRANSCRIPT != *$'\e[4m'* ]]; then
-    ok "(d4-1b) match=\"\" の自動反映で underline が消える"
+    ok "(d4-1b) automatic application of match=\"\" removes underline"
   else
-    ng "(d4-1b) match=\"\" 後も underline が出ている"
+    ng "(d4-1b) underline still displayed after match=\"\""
   fi
   clear_line
   drain 0.3
@@ -555,17 +555,17 @@ log_count() {  # $1=fixed string -> REPLY: occurrence count in ZRUSH_LOG
   expect '*user*' 10 >/dev/null
   log_count 'dismiss: closing list'; local -i c_dis2=$REPLY
   press $'\C-t'
-  wait_log 'dismiss: closing list' $c_dis2 3 && ok "(m4-12a) config で変更した dismiss キー(^T)が機能" || ng "(m4-12a) ^T dismiss が効かない"
+  wait_log 'dismiss: closing list' $c_dis2 3 && ok "(m4-12a) dismiss key changed in config (^T) works" || ng "(m4-12a) ^T dismiss does not work"
   log_count 'keybinds: restored'
-  (( REPLY > 0 )) && ok "(m4-12b) 外れた旧キー(^G)は前任者へ復元される" || ng "(m4-12b) 旧キーの復元記録がない"
+  (( REPLY > 0 )) && ok "(m4-12b) removed old key (^G) is restored to predecessor" || ng "(m4-12b) old-key restoration not logged"
   clear_line
   drain 0.3
   # Host-side unit check: odd-length KEYBINDS ignores the whole array, defaults, and warns.
   send_line 'ZRUSH_CFG_KEYBINDS=(a b c); _zrush_apply_keybinds'
   if expect '*odd length*' 5; then
-    ok "(m4-12c) KEYBINDS 奇数長は無視して既定+警告"
+    ok "(m4-12c) odd-length KEYBINDS ignored with defaults + warning"
   else
-    ng "(m4-12c) 奇数長の警告が出ない"
+    ng "(m4-12c) odd-length warning not displayed"
   fi
   sync_prompt
 
@@ -584,23 +584,23 @@ log_count() {  # $1=fixed string -> REPLY: occurrence count in ZRUSH_LOG
   TRANSCRIPT=
   send_keys 'whic'
   if wait_log 'cache: hit' $cc_hit 5; then
-    ok "(cc-1a) 2 回目のコマンド位置クエリでキャッシュヒット"
+    ok "(cc-1a) cache hit on second command-position query"
   else
-    ng "(cc-1a) キャッシュヒットが記録されない"
+    ng "(cc-1a) cache hit not logged"
   fi
   drain 0.5
   # wait_log drains pty output first, so match the cumulative TRANSCRIPT after stripping
   # SGR instead of using expect, as in d4.
   if [[ ${TRANSCRIPT//$'\e['[0-9;]#m/} == *which* ]]; then
-    ok "(cc-1b) ヒット経路でも一覧が描画される(which を確認)"
+    ok "(cc-1b) list rendered on hit path (confirmed which)"
   else
-    ng "(cc-1b) ヒット時に一覧が出ない"
+    ng "(cc-1b) list not displayed on hit"
   fi
   log_count 'request: collecting'; local -i cc_col2=$REPLY
   if (( cc_col2 == cc_col )); then
-    ok "(cc-1c) ヒット時は収集 fork が起きない ($cc_col → $cc_col2)"
+    ok "(cc-1c) no collection fork on hit ($cc_col → $cc_col2)"
   else
-    ng "(cc-1c) ヒットのはずが収集が走った ($cc_col → $cc_col2)"
+    ng "(cc-1c) collection ran despite expected hit ($cc_col → $cc_col2)"
   fi
   clear_line
   drain 0.3
@@ -611,13 +611,13 @@ log_count() {  # $1=fixed string -> REPLY: occurrence count in ZRUSH_LOG
   sync_prompt
   send_keys 'zrushtestali'
   if expect '*zrushtestalias*' 10; then
-    ok "(cc-2a) alias 追加が次の一覧に反映される"
+    ok "(cc-2a) added alias reflected in next list"
   else
-    ng "(cc-2a) 追加した alias が一覧に出ない"
+    ng "(cc-2a) added alias not displayed in list"
   fi
   wait_log 'cache: miss (fingerprint)' $cc_fp 3 && \
-    ok "(cc-2b) alias 追加でフィンガープリントミス" || \
-    ng "(cc-2b) fingerprint ミスが記録されない"
+    ok "(cc-2b) fingerprint miss after adding alias" || \
+    ng "(cc-2b) fingerprint miss not logged"
   clear_line
   drain 0.3
 
@@ -630,13 +630,13 @@ log_count() {  # $1=fixed string -> REPLY: occurrence count in ZRUSH_LOG
   sync_prompt
   send_keys 'zrushtestbin'
   if expect '*zrushtestbin1*' 10; then
-    ok "(cc-3a) PATH 追加ディレクトリのバイナリが一覧に反映される"
+    ok "(cc-3a) binary in directory added to PATH reflected in list"
   else
-    ng "(cc-3a) PATH 追加後のバイナリが一覧に出ない"
+    ng "(cc-3a) binary not displayed after adding directory to PATH"
   fi
   wait_log 'cache: miss (fingerprint)' $cc_fp 3 && \
-    ok "(cc-3b) PATH 変更でフィンガープリントミス" || \
-    ng "(cc-3b) PATH 変更のミスが記録されない"
+    ok "(cc-3b) fingerprint miss after PATH change" || \
+    ng "(cc-3b) miss after PATH change not logged"
   clear_line
   drain 0.3
 
@@ -647,13 +647,13 @@ log_count() {  # $1=fixed string -> REPLY: occurrence count in ZRUSH_LOG
   log_count 'cache: miss (fingerprint)'; cc_fp=$REPLY
   send_keys 'zrushtestbin'
   if expect '*zrushtestbin2*' 10; then
-    ok "(cc-4a) PATH 上ディレクトリへのバイナリ追加が一覧に反映される"
+    ok "(cc-4a) binary added to directory on PATH reflected in list"
   else
-    ng "(cc-4a) 追加バイナリが一覧に出ない"
+    ng "(cc-4a) added binary not displayed in list"
   fi
   wait_log 'cache: miss (fingerprint)' $cc_fp 3 && \
-    ok "(cc-4b) ディレクトリ mtime 変化でフィンガープリントミス" || \
-    ng "(cc-4b) mtime 変化のミスが記録されない"
+    ok "(cc-4b) fingerprint miss after directory mtime change" || \
+    ng "(cc-4b) miss after mtime change not logged"
   clear_line
   drain 0.3
 
@@ -668,8 +668,8 @@ log_count() {  # $1=fixed string -> REPLY: occurrence count in ZRUSH_LOG
   log_count 'cache: miss (ttl)'; local -i cc_ttl=$REPLY
   send_keys 'whic'
   wait_log 'cache: miss (ttl)' $cc_ttl 5 && \
-    ok "(cc-5) TTL 失効でミスし再収集する" || \
-    ng "(cc-5) TTL ミスが記録されない"
+    ok "(cc-5) TTL expiration causes miss and recollection" || \
+    ng "(cc-5) TTL miss not logged"
   clear_line
   drain 0.3
   send_line '_ZRUSH_CC_TTL=300'

@@ -17,7 +17,7 @@ local work=$(mktemp -d ${TMPDIR:-/tmp}/zrush-verify.XXXXXX)
 mkdir -p $work/zdot $work/xdg
 
 print -r -- "zrush verify: sandbox=$work"
-print -r -- "  config は $work/xdg/zrush/config.toml に置くと自動反映されます"
+print -r -- "  config changes in $work/xdg/zrush/config.toml are applied automatically"
 
 cat > $work/zdot/.zshrc <<EOF
 autoload -Uz compinit
