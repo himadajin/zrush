@@ -179,6 +179,30 @@ _zrush_compadd() {
   local -i ret=$?
   (( $#__hits == 0 )) && return ret
 
+  # Drop framing bytes from value fields before encoding; same treatment as NUL.
+  __hits=( "${(@)__hits//(#s)*($'\0'|$'\1'|$'\2')*(#e)/}" )
+  __dscr=( "${(@)__dscr//(#s)*($'\0'|$'\1'|$'\2')*(#e)/}" )
+  local _bad_value="*("$'\0'"|"$'\1'"|"$'\2'")*"
+  local -a __decoded=( "${(@Q)__hits}" )
+  local -i _bad_i
+  while _bad_i=${__decoded[(I)${~_bad_value}]} && (( _bad_i )); do
+    __hits[_bad_i]=
+    __dscr[_bad_i]=
+    __decoded[_bad_i]=
+  done
+  local _rd=
+  if (( $#isfile )); then
+    # Resolve the real directory for insertion-time '/' handling. Tilde expansion
+    # requires the unquoted nested ${}; see notes-zpty.md "置換範囲モデル".
+    _rd=${${(Qe)~${:-$IPREFIX${(v)hpre}}}}
+  fi
+  local -a _vals=(
+    "${(v)apre}" "${(v)hpre}" "${(v)asuf}" "${(v)hsuf}"
+    "${(v)ipre}" "${(v)isuf}" "$IPREFIX" "$ISUFFIX" "$PREFIX" "$SUFFIX"
+    "$_rd" "${expl[2]:-}" "${(v)grpJ}" "${(v)grpV}" "${(v)_mesg}"
+  )
+  _vals=( "${(@)_vals//(#s)*($'\0'|$'\1'|$'\2')*(#e)/}" )
+
   local _out=
   local -a _rec
   local -i j
@@ -187,27 +211,25 @@ _zrush_compadd() {
     _rec=( "w"$'\1'"$__hits[j]" )
     _d=${__dscr[j]:-}
     [[ -n $_d ]]           && _rec+=( "d"$'\1'"$_d" )
-    (( $#apre ))           && _rec+=( "P"$'\1'"${(v)apre}" )
-    (( $#hpre ))           && _rec+=( "p"$'\1'"${(v)hpre}" )
-    (( $#asuf ))           && _rec+=( "S"$'\1'"${(v)asuf}" )
-    (( $#hsuf ))           && _rec+=( "s"$'\1'"${(v)hsuf}" )
-    (( $#ipre ))           && _rec+=( "i"$'\1'"${(v)ipre}" )
-    (( $#isuf ))           && _rec+=( "I"$'\1'"${(v)isuf}" )
-    [[ -n $IPREFIX ]]      && _rec+=( "ip"$'\1'"$IPREFIX" )
-    [[ -n $ISUFFIX ]]      && _rec+=( "is"$'\1'"$ISUFFIX" )
-    [[ -n $PREFIX ]]       && _rec+=( "pr"$'\1'"$PREFIX" )
-    [[ -n $SUFFIX ]]       && _rec+=( "su"$'\1'"$SUFFIX" )
+    [[ -n $_vals[1] ]]     && _rec+=( "P"$'\1'"$_vals[1]" )
+    [[ -n $_vals[2] ]]     && _rec+=( "p"$'\1'"$_vals[2]" )
+    [[ -n $_vals[3] ]]     && _rec+=( "S"$'\1'"$_vals[3]" )
+    [[ -n $_vals[4] ]]     && _rec+=( "s"$'\1'"$_vals[4]" )
+    [[ -n $_vals[5] ]]     && _rec+=( "i"$'\1'"$_vals[5]" )
+    [[ -n $_vals[6] ]]     && _rec+=( "I"$'\1'"$_vals[6]" )
+    [[ -n $_vals[7] ]]     && _rec+=( "ip"$'\1'"$_vals[7]" )
+    [[ -n $_vals[8] ]]     && _rec+=( "is"$'\1'"$_vals[8]" )
+    [[ -n $_vals[9] ]]     && _rec+=( "pr"$'\1'"$_vals[9]" )
+    [[ -n $_vals[10] ]]    && _rec+=( "su"$'\1'"$_vals[10]" )
     (( ${_opts[(I)-U]} ))  && _rec+=( "U"$'\1'"1" )
     if (( $#isfile )); then
       _rec+=( "f"$'\1'"1" )
-      # Resolve the real directory for insertion-time '/' handling. Tilde expansion
-      # requires the unquoted nested ${}; see notes-zpty.md "置換範囲モデル".
-      _rec+=( "rd"$'\1'${${(Qe)~${:-$IPREFIX${(v)hpre}}}} )
+      [[ -n $_vals[11] ]] && _rec+=( "rd"$'\1'"$_vals[11]" )
     fi
-    (( $#expl >= 2 ))      && _rec+=( "X"$'\1'"$expl[2]" )
-    (( $#grpJ ))           && _rec+=( "J"$'\1'"${(v)grpJ}" )
-    (( $#grpV ))           && _rec+=( "V"$'\1'"${(v)grpV}" )
-    (( $#_mesg ))          && _rec+=( "x"$'\1'"${(v)_mesg}" )
+    [[ -n $_vals[12] ]]    && _rec+=( "X"$'\1'"$_vals[12]" )
+    [[ -n $_vals[13] ]]    && _rec+=( "J"$'\1'"$_vals[13]" )
+    [[ -n $_vals[14] ]]    && _rec+=( "V"$'\1'"$_vals[14]" )
+    [[ -n $_vals[15] ]]    && _rec+=( "x"$'\1'"$_vals[15]" )
     _out+="${(pj:\2:)_rec}"$'\0'
   done
   print -rn -u $_zrush_wfd -- "$_out" 2>/dev/null
@@ -1299,7 +1321,7 @@ _zrush_apply_keybinds() {
     # The protocol requires an odd-length array to fall back wholesale and warn.
     _zrush_warn "keybinds: malformed ZRUSH_CFG_KEYBINDS (odd length $#kb); using default keybinds"
     kb=( "${(@)kb_default}" )
-  elif (( $#kb == 0 )); then
+  elif (( ! ${+ZRUSH_CFG_KEYBINDS} )); then
     kb=( "${(@)kb_default}" )
   fi
   typeset -gA _zrush_new_bound=()

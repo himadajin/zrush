@@ -516,6 +516,41 @@ log_count() {  # $1=fixed string -> REPLY: occurrence count in ZRUSH_LOG
   clear_line
   drain 0.3
 
+  # ---------------- (zp-1) Framing bytes in candidates are dropped before zpty encoding ----------------
+  local framing_dir=$PLAYGROUND/zrush-framing-fixture
+  local bad_soh=$'bad-soh\1tail'
+  local bad_stx=$'bad-stx\2X\1FAKE-FRAMING-HEADING'
+  mkdir -p $framing_dir
+  : >| "$framing_dir/$bad_soh"
+  : >| "$framing_dir/$bad_stx"
+  : >| "$framing_dir/bad-safe"
+  send_line '_zrt_dump_postdisplay() { _zlog "TESTPOST=${(qqqq)POSTDISPLAY}" }; zle -N _zrt-dump-postdisplay _zrt_dump_postdisplay; bindkey "^Xz" _zrt-dump-postdisplay'
+  sync_prompt
+  send_keys 'ls zrush-framing-fixture/bad'
+  expect '*bad-safe*' 10 >/dev/null
+  log_count 'TESTPOST='; local -i c_post=$REPLY
+  send_keys $'\C-xz'
+  if wait_log 'TESTPOST=' $c_post 5; then
+    local -a post_lines=( ${(f)"$(grep -F 'TESTPOST=' $ZRUSH_LOG 2>/dev/null)"} )
+    local post_dump=${post_lines[-1]#*TESTPOST=}
+    if [[ $post_dump == *bad-safe* &&
+          $post_dump != *bad-soh* && $post_dump != *bad-stx* &&
+          $post_dump != *FAKE-FRAMING-HEADING* &&
+          $post_dump != *'\001'* && $post_dump != *'\002'* ]]; then
+      ok "(zp-1) SOH/STX candidates excluded and remaining POSTDISPLAY framing intact"
+    else
+      ng "(zp-1) malformed candidate leaked into POSTDISPLAY: $post_dump"
+    fi
+  else
+    ng "(zp-1) POSTDISPLAY dump widget did not run"
+  fi
+  clear_line
+  drain 0.3
+  send_line 'bindkey -r "^Xz"; zle -D _zrt-dump-postdisplay; unfunction _zrt_dump_postdisplay'
+  sync_prompt
+  rm -f "$framing_dir/$bad_soh" "$framing_dir/$bad_stx" "$framing_dir/bad-safe"
+  rmdir $framing_dir
+
   # ---------------- (d4-1) Match highlighting and [display.highlight] ----------------
   TRANSCRIPT=
   send_keys 'ls docs/inte'
@@ -560,6 +595,45 @@ log_count() {  # $1=fixed string -> REPLY: occurrence count in ZRUSH_LOG
   (( REPLY > 0 )) && ok "(m4-12b) removed old key (^G) is restored to predecessor" || ng "(m4-12b) old-key restoration not logged"
   clear_line
   drain 0.3
+
+  # Explicit [] for every action is a valid request to restore all action predecessors.
+  command sleep 1.1
+  print -r -- $'[insert]\ntab = "menu"\n[keybind]\nselect-next = []\nselect-prev = []\nselect-left = []\nselect-right = []\nconfirm = []\ndismiss = []' > $XDG_CONFIG_HOME/zrush/config.toml
+  send_line ': cfg-key-empty'
+  sync_prompt
+  send_keys 'ls docs/'
+  expect '*user*' 10 >/dev/null
+  log_count 'select: start'; local -i c_empty_start=$REPLY
+  press $DOWN
+  log_count 'select: start'
+  if (( REPLY == c_empty_start )); then
+    ok "(m4-12d) all []: Down falls through to predecessor without starting selection"
+  else
+    ng "(m4-12d) all []: Down unexpectedly started selection"
+  fi
+  clear_line
+  send_line 'bindkey -M main "^T"'
+  if expect '*transpose-chars*' 5; then
+    ok "(m4-12e) all []: previously bound ^T restored to predecessor"
+  else
+    ng "(m4-12e) all []: ^T predecessor was not restored"
+  fi
+  sync_prompt
+  send_keys 'ls docs/'
+  expect '*user*' 10 >/dev/null
+  log_count 'select: start'; local -i c_empty_tab=$REPLY
+  press $TAB
+  wait_log 'select: start' $c_empty_tab 3 && \
+    ok "(m4-12f) all []: fixed Tab hook still applies [insert].tab=menu" || \
+    ng "(m4-12f) all []: Tab hook no longer starts menu selection"
+  clear_line
+  drain 0.3
+
+  # Restore default config before the direct malformed-protocol check and later tests.
+  command sleep 1.1
+  rm -f $XDG_CONFIG_HOME/zrush/config.toml
+  send_line ': cfg-key-reset'
+  sync_prompt
   # Host-side unit check: odd-length KEYBINDS ignores the whole array, defaults, and warns.
   send_line 'ZRUSH_CFG_KEYBINDS=(a b c); _zrush_apply_keybinds'
   if expect '*odd length*' 5; then
