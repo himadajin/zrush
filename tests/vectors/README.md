@@ -17,6 +17,7 @@ Vector names use kebab case and describe the rule being fixed.
 `reject-plan/` fixes the opposite direction: each `plan.bin` is a byte string that is not a valid plan, and every receiver must reject it.
 One vector breaks exactly one acceptance condition from cli-protocol.md "エラー時の zsh 側挙動", and its name says which one.
 The corpus covers each condition at digit widths both within and beyond a receiver's integer type, because a receiver that evaluates a digit string arithmetically can wrap an out-of-range value back into range.
+Where a condition constrains a sum (`start + len` against the listing text), a vector also fixes the case where each value alone is in range and only the sum escapes.
 No process runs and no golden output is derived, so `UPDATE_GOLDEN` does not apply: write `plan.bin` by hand.
 
 To add a `plan/` or `reject/` vector, create its directory, write `args` and `payload.bin`, and run `UPDATE_GOLDEN=1 cargo test`.

@@ -56,6 +56,12 @@ pub enum Error {
         value: usize,
         max: usize,
     },
+    RangeOutsideListing {
+        field: &'static str,
+        start: usize,
+        len: usize,
+        listing_chars: usize,
+    },
 }
 
 impl fmt::Display for Error {
@@ -76,6 +82,16 @@ impl fmt::Display for Error {
             Self::OutOfRange { field, value, max } => {
                 write!(f, "{field} value {value} is outside 0..={max}")
             }
+            Self::RangeOutsideListing {
+                field,
+                start,
+                len,
+                listing_chars,
+            } => write!(
+                f,
+                "{field} range start {start} + len {len} escapes the \
+                 {listing_chars}-char listing text"
+            ),
         }
     }
 }
@@ -128,22 +144,28 @@ pub fn parse(output: &[u8]) -> Result<Plan, Error> {
     }
 
     let mut index = 3;
-    let rows = fields[index..index + l]
+    let rows: Vec<Vec<u8>> = fields[index..index + l]
         .iter()
         .map(|field| field.to_vec())
         .collect();
     index += l;
     index += 1;
 
+    // cli-protocol.md "オフセット規律": highlight and cell-range offsets are
+    // char counts over the listing text -- the L rows joined by `\n`, no
+    // leading newline. `\n` is a char boundary in every row's lossy reading,
+    // so joining first cannot merge an invalid tail into the next row.
+    let listing_chars = String::from_utf8_lossy(&rows.join(&b'\n')).chars().count();
+
     let mut highlights = Vec::with_capacity(h);
     for field in &fields[index..index + h] {
-        highlights.push(parse_highlight(field, p)?);
+        highlights.push(parse_highlight(field, p, listing_chars)?);
     }
     index += h;
 
     let mut cells = Vec::with_capacity(p);
     for field in &fields[index..index + p] {
-        cells.push(parse_pair(field, "cell")?);
+        cells.push(parse_pair(field, "cell", listing_chars)?);
     }
     index += p;
 
@@ -189,7 +211,30 @@ fn count(value: &[u8], field: &'static str) -> Result<usize, Error> {
     })
 }
 
-fn parse_highlight(value: &[u8], positions: usize) -> Result<Highlight, Error> {
+/// `start + len` must stay inside the listing text (cli-protocol.md
+/// "オフセット規律"). An overflowing sum is out of range by definition.
+fn check_range(
+    field: &'static str,
+    start: usize,
+    len: usize,
+    listing_chars: usize,
+) -> Result<(), Error> {
+    if start.checked_add(len).is_none_or(|end| end > listing_chars) {
+        return Err(Error::RangeOutsideListing {
+            field,
+            start,
+            len,
+            listing_chars,
+        });
+    }
+    Ok(())
+}
+
+fn parse_highlight(
+    value: &[u8],
+    positions: usize,
+    listing_chars: usize,
+) -> Result<Highlight, Error> {
     let parts = tuple_parts(value);
     if parts.len() != 4 {
         return Err(Error::InvalidTuple {
@@ -210,15 +255,22 @@ fn parse_highlight(value: &[u8], positions: usize) -> Result<Highlight, Error> {
             max: positions,
         });
     }
+    let start = count(parts[2], "highlight start")?;
+    let len = count(parts[3], "highlight len")?;
+    check_range("highlight", start, len, listing_chars)?;
     Ok(Highlight {
         role,
         pos,
-        start: count(parts[2], "highlight start")?,
-        len: count(parts[3], "highlight len")?,
+        start,
+        len,
     })
 }
 
-fn parse_pair(value: &[u8], field: &'static str) -> Result<(usize, usize), Error> {
+fn parse_pair(
+    value: &[u8],
+    field: &'static str,
+    listing_chars: usize,
+) -> Result<(usize, usize), Error> {
     let parts = tuple_parts(value);
     if parts.len() != 2 {
         return Err(Error::InvalidTuple {
@@ -226,7 +278,10 @@ fn parse_pair(value: &[u8], field: &'static str) -> Result<(usize, usize), Error
             value: value.to_vec(),
         });
     }
-    Ok((count(parts[0], "cell start")?, count(parts[1], "cell len")?))
+    let start = count(parts[0], "cell start")?;
+    let len = count(parts[1], "cell len")?;
+    check_range(field, start, len, listing_chars)?;
+    Ok((start, len))
 }
 
 fn parse_navigation(value: &[u8], positions: usize) -> Result<Navigation, Error> {
@@ -387,7 +442,7 @@ mod tests {
                 b"1",
                 b"1",
                 b"match 1 0",
-                b"0 1",
+                b"0 0",
                 b"1 0 1 1",
                 b"word",
             ])),
@@ -412,7 +467,7 @@ mod tests {
     fn malformed_navigation_tuple_is_rejected() {
         assert!(matches!(
             parse(&fields(
-                &[b"", b"0", b"1", b"0", b"0 1", b"1 0 1", b"word",]
+                &[b"", b"0", b"1", b"0", b"0 0", b"1 0 1", b"word",]
             )),
             Err(Error::InvalidTuple {
                 field: "navigation",
@@ -430,7 +485,7 @@ mod tests {
                 b"1",
                 b"1",
                 b"match\r1 0 1",
-                b"0 1",
+                b"0 0",
                 b"1 0 1 1",
                 b"word",
             ])),
@@ -450,7 +505,7 @@ mod tests {
                 b"1",
                 b"1",
                 b"other 1 0 1",
-                b"0 1",
+                b"0 0",
                 b"1 0 1 1",
                 b"word",
             ])),
@@ -467,7 +522,7 @@ mod tests {
                 b"1",
                 b"1",
                 b"match 2 0 1",
-                b"0 1",
+                b"0 0",
                 b"1 0 1 1",
                 b"word",
             ])),
@@ -479,9 +534,106 @@ mod tests {
         );
     }
 
+    // ---- ranges against the listing text (contract "オフセット規律") ----
+
+    /// One row `alpha` (5 chars), one position, one highlight.
+    fn ranged_plan(highlight: &[u8], cell: &[u8]) -> Vec<u8> {
+        fields(&[
+            b"", b"1", b"1", b"alpha", b"1", highlight, cell, b"1 0 1 1", b"word",
+        ])
+    }
+
+    #[test]
+    fn range_ending_exactly_at_the_listing_end_is_accepted() {
+        assert!(parse(&ranged_plan(b"match 1 3 2", b"0 5")).is_ok());
+    }
+
+    #[test]
+    fn highlight_range_escaping_the_listing_is_rejected() {
+        // Neither 4 nor 2 exceeds the 5-char listing on its own; the sum does.
+        assert_eq!(
+            parse(&ranged_plan(b"match 1 4 2", b"0 5")),
+            Err(Error::RangeOutsideListing {
+                field: "highlight",
+                start: 4,
+                len: 2,
+                listing_chars: 5,
+            })
+        );
+    }
+
+    #[test]
+    fn cell_range_escaping_the_listing_is_rejected() {
+        assert_eq!(
+            parse(&ranged_plan(b"match 1 0 2", b"3 4")),
+            Err(Error::RangeOutsideListing {
+                field: "cell",
+                start: 3,
+                len: 4,
+                listing_chars: 5,
+            })
+        );
+    }
+
+    #[test]
+    fn range_sum_overflowing_usize_is_rejected() {
+        let huge = usize::MAX.to_string();
+        let cell = format!("1 {huge}");
+        assert!(matches!(
+            parse(&ranged_plan(b"match 1 0 2", cell.as_bytes())),
+            Err(Error::RangeOutsideListing { field: "cell", .. })
+        ));
+    }
+
+    #[test]
+    fn the_bound_spans_the_whole_listing_not_one_row() {
+        // "ab\ncd" is 5 chars, so an offset into row 2 is in range even though
+        // it exceeds row 1's length.
+        let plan = fields(&[
+            b"",
+            b"2",
+            b"1",
+            b"ab",
+            b"cd",
+            b"1",
+            b"match 1 3 2",
+            b"3 2",
+            b"1 0 1 1",
+            b"word",
+        ]);
+        let parsed = parse(&plan).expect("row-2 offsets are inside the listing");
+        assert_eq!(parsed.cells, vec![(3, 2)]);
+    }
+
+    #[test]
+    fn listing_chars_counts_chars_not_bytes() {
+        // "日本語" is 3 chars / 9 bytes: a byte-based bound would wrongly
+        // accept a range reaching char 9.
+        let plan = fields(&[
+            b"",
+            b"1",
+            b"1",
+            "日本語".as_bytes(),
+            b"1",
+            b"match 1 0 9",
+            b"0 3",
+            b"1 0 1 1",
+            b"word",
+        ]);
+        assert_eq!(
+            parse(&plan),
+            Err(Error::RangeOutsideListing {
+                field: "highlight",
+                start: 0,
+                len: 9,
+                listing_chars: 3,
+            })
+        );
+    }
+
     fn assert_navigation_value_is_rejected(tuple: &[u8], expected_field: &'static str) {
         assert!(matches!(
-            parse(&fields(&[b"", b"0", b"1", b"0", b"0 1", tuple, b"word"])),
+            parse(&fields(&[b"", b"0", b"1", b"0", b"0 0", tuple, b"word"])),
             Err(Error::OutOfRange { field, value: 2, max: 1 }) if field == expected_field
         ));
     }
