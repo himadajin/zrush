@@ -145,6 +145,118 @@ fn push_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
 mod tests {
     use super::*;
     use crate::wire;
+    use proptest::prelude::*;
+
+    #[derive(Debug)]
+    struct GeneratedCandidate {
+        w: Vec<u8>,
+        m: Option<Vec<u8>>,
+        d: Option<Vec<u8>>,
+    }
+
+    #[derive(Debug)]
+    struct GeneratedCapture {
+        shared: Vec<Option<Vec<u8>>>,
+        file: bool,
+        candidates: Vec<GeneratedCandidate>,
+    }
+
+    impl GeneratedCapture {
+        fn payload(&self) -> Vec<u8> {
+            const SHARED_TAGS: [&[u8]; 10] =
+                [b"P", b"p", b"S", b"s", b"i", b"I", b"ip", b"rd", b"X", b"J"];
+
+            let mut out = b"b\x01".to_vec();
+            for (tag, value) in SHARED_TAGS.iter().zip(&self.shared) {
+                if let Some(value) = value {
+                    push_capture_field(&mut out, tag, value);
+                }
+            }
+            if self.file {
+                push_capture_field(&mut out, b"f", b"1");
+            }
+            out.push(0);
+
+            for candidate in &self.candidates {
+                out.extend_from_slice(b"w\x01");
+                out.extend_from_slice(&candidate.w);
+                if let Some(m) = candidate.m.as_ref().filter(|m| *m != &candidate.w) {
+                    push_capture_field(&mut out, b"m", m);
+                }
+                if let Some(d) = &candidate.d {
+                    push_capture_field(&mut out, b"d", d);
+                }
+                out.push(0);
+            }
+            out
+        }
+    }
+
+    fn push_capture_field(out: &mut Vec<u8>, tag: &[u8], value: &[u8]) {
+        out.push(2);
+        out.extend_from_slice(tag);
+        out.push(1);
+        out.extend_from_slice(value);
+    }
+
+    fn capture_value(max_len: usize) -> impl Strategy<Value = Vec<u8>> {
+        prop::collection::vec(3u8..=u8::MAX, 1..=max_len)
+    }
+
+    fn generated_candidate() -> impl Strategy<Value = GeneratedCandidate> {
+        (
+            capture_value(16),
+            prop::option::of(capture_value(16)),
+            prop::option::of(capture_value(16)),
+        )
+            .prop_map(|(w, m, d)| GeneratedCandidate { w, m, d })
+    }
+
+    fn generated_capture() -> impl Strategy<Value = GeneratedCapture> {
+        (
+            prop::collection::vec(prop::option::of(capture_value(8)), 10..=10),
+            any::<bool>(),
+            prop::collection::vec(generated_candidate(), 0..=16),
+        )
+            .prop_map(|(shared, file, candidates)| GeneratedCapture {
+                shared,
+                file,
+                candidates,
+            })
+    }
+
+    fn generated_mode() -> impl Strategy<Value = Mode> {
+        prop_oneof![Just(Mode::Prefix), Just(Mode::Substring), Just(Mode::Typo),]
+    }
+
+    proptest! {
+        #[test]
+        fn serialized_pipeline_output_satisfies_wire_shape(
+            capture in generated_capture(),
+            query in prop::collection::vec(1u8..=u8::MAX, 0..=16),
+            mode in generated_mode(),
+            smart_case in any::<bool>(),
+            rows in 1usize..=8,
+            width in 1usize..=64,
+            trailing_space in any::<bool>(),
+        ) {
+            let params = Params {
+                query,
+                mode,
+                smart_case,
+                rows,
+                width,
+                trailing_space,
+            };
+            let stdin = capture.payload();
+            let output = run(&params, &stdin, &no_dir).expect("generated payload is framed");
+            let parsed = wire::parse(&output);
+            prop_assert!(
+                parsed.is_ok(),
+                "reference parser rejected output {output:?}: {parsed:?}"
+            );
+        }
+    }
 
     fn params(query: &str, mode: Mode, rows: usize, width: usize, trailing_space: bool) -> Params {
         Params {
