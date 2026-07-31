@@ -5,6 +5,7 @@ This corpus turns the prose rules in `docs/internal/contracts/cli-protocol.md` i
 Each `plan/<name>/` directory contains `args`, `payload.bin`, and `expected.bin`.
 Each `reject/<name>/` directory contains `args`, `payload.bin`, and `exit`.
 Each `reject-plan/<name>/` directory contains only `plan.bin`.
+Each `encode/<name>/` directory contains `argv.bin`, `hits.bin`, `dscr.bin`, `expected.bin`, and an optional `env`.
 The runner implicitly prepends the `plan` subcommand, so `args` contains flags and their values only.
 The `args` file stores one argument per line, with an empty line representing an empty argument.
 Shell quoting is not interpreted, and argument values containing newlines cannot be represented.
@@ -25,10 +26,43 @@ After reviewing the diff, rerun the same command; it passes when no files change
 
 For a readable raw-byte dump, run `od -An -tx1c tests/vectors/plan/<name>/payload.bin`.
 
-Vectors omit `f = 1` candidates because directory slash synthesis depends on filesystem state.
-That behavior remains covered by the injected-stat Rust unit tests.
-Vectors also omit candidate values containing `\0`, `\1`, or `\2`, and omit redundant `m` fields equal to `w`.
-Those are sender-side zsh guarantees and cannot be observed in Rust output.
+## `encode/`
 
-`cargo test` checks this corpus against the Rust serializer and the `wire` reference parser.
-`zsh -f tests/zsh/vectors.zsh` checks the same corpus against the independent zsh decoder `_zrush_parse_plan`, so both sides are held to one set of bytes.
+`encode/` fixes the sender side of the capture stream: one `compadd` call in, the bytes `zsh/zrush.zsh` writes to the collection pipe out.
+`argv.bin` is the argument list the `compadd` call was made with, `hits.bin` the candidates `compadd -A` returned, and `dscr.bin` the display strings `compadd -D` returned.
+These three are NUL-*terminated* lists, not the line-per-argument form `plan/args` uses, because candidates and option values are arbitrary byte strings and may contain newlines; an empty file means an empty list.
+The optional `env` file holds one `KEY=VALUE` per line and is applied to the calling scope only, so a vector can pin values (`IPREFIX`, `HOME`, parameters the `-f` real-directory expansion reads) that would otherwise depend on the machine.
+
+These vectors exist because the guarantees below are the sender's, never appear in Rust output, and so cannot be fixed by a `plan/` vector:
+
+| vector | rule it fixes |
+|---|---|
+| `shared-tags-all` | `-P -p -S -s -i -I -X -J` and `IPREFIX` map to the `P p S s i I X J ip` header fields |
+| `shared-tags-none` | the header record is emitted even when every shared field is empty |
+| `no-candidates` | a `compadd` call producing no candidate emits nothing at all, header included |
+| `all-candidates-dropped` | when every candidate is dropped the header is still emitted (the contract permits either) |
+| `match-equals-word` | `m` is omitted when it would equal `w` |
+| `match-differs-quoted` | `m` carries `${(Q)w}` when the quoted and unquoted forms differ |
+| `display-text` | `d` is emitted only when non-empty, whether the `-D` entry is empty or absent |
+| `control-byte-candidate` | a candidate containing a framing byte is dropped whole, with its description |
+| `control-byte-decoded` | so is a candidate whose quoted form is clean but whose `${(Q)}` form is not |
+| `control-byte-shared-field` | a shared field whose value contains a framing byte is dropped, the others stay |
+| `newline-in-candidate` | a newline is not a framing byte and passes through `w` and `d` unchanged |
+| `file-real-dir-tilde` | `-f` adds `f` and `rd`; `rd` is `IPREFIX` + `-p` with tilde expansion applied |
+| `file-real-dir-param` | `rd` also resolves parameter expansion, while `p` keeps the raw form |
+
+`plan/encoder-chain/payload.bin` is byte-identical to `encode/shared-tags-all/expected.bin`, so one byte string runs the whole chain: encoder out, decoder in.
+`zsh -f tests/zsh/vectors.zsh` fails if the two files ever diverge.
+
+To add an `encode/` vector, create its directory, write `argv.bin` / `hits.bin` / `dscr.bin` (and `env` if it needs one), then run `UPDATE_GOLDEN=1 zsh -f tests/zsh/vectors.zsh`.
+It follows the same discipline as the Rust runner: it writes the golden, then fails listing every file it changed.
+A generated `expected.bin` is a proposal, not an answer -- read it against cli-protocol.md before rerunning.
+
+## Who checks what
+
+`cargo test` checks `plan/`, `reject/`, and `reject-plan/` against the Rust serializer and the `wire` reference parser.
+`zsh -f tests/zsh/vectors.zsh` checks `encode/` against the zsh encoder `_zrush_encode_batch`, and the same `plan/` and `reject-plan/` corpus against the independent zsh decoder `_zrush_parse_plan`, so both sides are held to one set of bytes.
+
+`plan/` vectors omit `f = 1` candidates because directory slash synthesis depends on filesystem state.
+That behavior remains covered by the injected-stat Rust unit tests.
+`plan/` vectors also omit candidate values containing `\0`, `\1`, or `\2`, and omit redundant `m` fields equal to `w`, because a conforming sender never produces them; `encode/` is where those exclusions are fixed.

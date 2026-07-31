@@ -1,25 +1,34 @@
 #!/bin/zsh -f
-# Golden-vector runner for the zsh-side plan decoder (_zrush_parse_plan).
+# Golden-vector runner for the two zsh-side halves of the wire protocol:
+# the capture encoder (_zrush_encode_batch) and the plan decoder
+# (_zrush_parse_plan).
 #
 # Usage:
 #   zsh -f tests/zsh/vectors.zsh
 #     No arguments, no pty, no terminal. The zrush binary is NOT needed: this
 #     runner never starts a process, it only sources zsh/zrush.zsh with
-#     ZRUSH_NO_INIT=1 (the test seam at the end of that file) and calls
-#     _zrush_parse_plan directly on bytes read from tests/vectors/.
+#     ZRUSH_NO_INIT=1 (the test seam at the end of that file) and calls those
+#     two functions directly on bytes read from tests/vectors/.
 #     $HOME and $XDG_CONFIG_HOME are redirected to a fresh mktemp directory,
 #     so the real ~/.zshrc, shell history and ~/.config/zrush are untouched.
+#   UPDATE_GOLDEN=1 zsh -f tests/zsh/vectors.zsh
+#     Regenerate encode/<name>/expected.bin from the current implementation.
+#     Like the Rust runner, this deliberately fails and lists every file it
+#     changed, so a regenerated golden cannot land unreviewed.
 #
-# Scope: tests/vectors/ fixes the `zrush plan` wire format (see its README and
-# docs/internal/contracts/cli-protocol.md). `cargo test` checks it against the
-# Rust serializer and the Rust reference parser; this runner checks the same
-# corpus against the independent hand-written zsh decoder:
+# Scope: tests/vectors/ fixes the `zrush plan` wire format in both directions
+# (see its README and docs/internal/contracts/cli-protocol.md).
+#   - encode/<name>/: compadd argv plus captured candidate arrays in,
+#     expected.bin out. Fixes the sender-side guarantees that never appear in
+#     Rust output and so cannot be covered by plan/ vectors.
 #   - plan/<name>/expected.bin must parse, and the _zrush_plan_* state must
 #     re-serialize to exactly those bytes (a decode/encode round trip).
+#     `cargo test` checks the same corpus against the Rust serializer and the
+#     Rust reference parser, so both sides are held to one set of bytes.
 #   - reject-plan/<name>/plan.bin must be rejected (return 1).
 #
 # Unlike driver.zsh (a zle/compsys end-to-end smoke test over zpty), nothing
-# here touches zle, so a failure points at the decoder itself.
+# here touches zle, so a failure points at the encoder or decoder itself.
 emulate -L zsh
 setopt extended_glob
 
@@ -71,6 +80,50 @@ dump_file() {  # $1=path -> REPLY
   dump_bytes "$(<$1)"
 }
 
+# ---------------- encode/ ----------------
+# Read one NUL-terminated list file (encode/ inputs are arbitrary byte strings,
+# so they cannot use the line-per-argument form plan/args uses).
+read_nul() {  # $1=path -> reply=(elements), or return 1 with REPLY=reason
+  emulate -L zsh
+  typeset -ga reply=()
+  [[ -e $1 ]] || { typeset -g REPLY="missing ${1:t}"; return 1 }
+  local s=$(<$1)
+  [[ -z $s ]] && return 0
+  [[ $s == *$'\0' ]] || { typeset -g REPLY="${1:t} is not NUL-terminated"; return 1 }
+  reply=( "${(@0)${s%$'\0'}}" )
+  return 0
+}
+
+# Apply the vector's environment to this scope only -- IPREFIX, HOME and any
+# parameter the -f real-directory expansion reads are restored on return -- and
+# call the encoder.
+encode_call() {  # $1=env file (may be absent), $2.. = compadd argv -> REPLY
+  emulate -L zsh
+  local envfile=$1; shift
+  local IPREFIX=
+  local line
+  if [[ -e $envfile ]]; then
+    for line in "${(@f)$(<$envfile)}"; do
+      [[ -z $line ]] && continue
+      [[ $line == *=* ]] || { typeset -g REPLY="env line without '=': $line"; return 1 }
+      typeset -- "$line"
+    done
+  fi
+  _zrush_encode_batch "$@"
+}
+
+encode_vector() {  # $1=vector directory -> REPLY=wire bytes, or return 1 with REPLY=reason
+  emulate -L zsh
+  local dir=$1
+  read_nul $dir/argv.bin || return 1
+  local -a vargv=( "${(@)reply}" )
+  read_nul $dir/hits.bin || return 1
+  typeset -ga _zrush_enc_hits=( "${(@)reply}" )
+  read_nul $dir/dscr.bin || return 1
+  typeset -ga _zrush_enc_dscr=( "${(@)reply}" )
+  encode_call $dir/env "${(@)vargv}"
+}
+
 # Re-serialize the parsed _zrush_plan_* state back into plan bytes, following
 # the field order of cli-protocol.md "stdout(描画プラン)".
 # Fails (return 1, reason in REPLY) when _zrush_plan_text does not split back
@@ -108,13 +161,67 @@ reserialize_plan() {  # -> REPLY=bytes, or return 1 with REPLY=reason
   source $REPO/zsh/zrush.zsh || { out "FATAL: cannot source zrush.zsh"; exit 1 }
   unset ZRUSH_NO_INIT
   (( $+functions[_zrush_parse_plan] )) || { out "FATAL: _zrush_parse_plan undefined after source"; exit 1 }
+  (( $+functions[_zrush_encode_batch] )) || { out "FATAL: _zrush_encode_batch undefined after source"; exit 1 }
   (( _zrush_enabled )) && { out "FATAL: ZRUSH_NO_INIT did not suppress initialization"; exit 1 }
+
+  # ---------------- Encode ----------------
+  typeset -a inputs=( $VECTORS/encode/*/argv.bin(N) )
+  (( $#inputs )) || { out "FATAL: no encode vectors under $VECTORS/encode"; exit 1 }
+  typeset -a updated=()
+
+  local g v dir goldenfile name expected actual REPLY
+  for v in "${(@)inputs}"; do
+    dir=${v:h}
+    name=${dir:t}
+    if ! encode_vector $dir; then
+      ng "encode/$name: $REPLY"
+      continue
+    fi
+    actual=$REPLY
+    goldenfile=$dir/expected.bin
+    print -rn -- "$actual" >| $WORK/actual.bin
+    if [[ $UPDATE_GOLDEN == 1 ]]; then
+      if cmp -s $WORK/actual.bin $goldenfile 2>/dev/null; then
+        ok "encode/$name: golden unchanged"
+      else
+        cp $WORK/actual.bin $goldenfile
+        updated+=( "encode/$name/expected.bin" )
+      fi
+      continue
+    fi
+    if [[ ! -e $goldenfile ]]; then
+      ng "encode/$name: expected.bin missing (run UPDATE_GOLDEN=1 and review the result)"
+      continue
+    fi
+    if cmp -s $goldenfile $WORK/actual.bin; then
+      ok "encode/$name: encodes to the golden bytes"
+    else
+      dump_file $goldenfile; local want=$REPLY
+      dump_bytes "$actual"; local got=$REPLY
+      ng "encode/$name: encoded bytes differ
+      expected: $want
+      actual:   $got"
+    fi
+  done
+
+  if (( $#updated )); then
+    ng "updated golden files (review these diffs against cli-protocol.md, then rerun):
+      ${(pj:\n      :)updated}"
+  fi
+
+  # ---------------- Encoder output reused as a decoder input ----------------
+  # One byte string spans both directions: what the encoder emits for
+  # encode/shared-tags-all is exactly what plan/encoder-chain feeds `zrush plan`.
+  if cmp -s $VECTORS/encode/shared-tags-all/expected.bin $VECTORS/plan/encoder-chain/payload.bin; then
+    ok "chain: plan/encoder-chain/payload.bin is encode/shared-tags-all/expected.bin"
+  else
+    ng "chain: plan/encoder-chain/payload.bin no longer matches encode/shared-tags-all/expected.bin"
+  fi
 
   # ---------------- Accept + round trip ----------------
   typeset -a golden=( $VECTORS/plan/*/expected.bin(N) )
   (( $#golden )) || { out "FATAL: no plan vectors under $VECTORS/plan"; exit 1 }
 
-  local g name expected actual REPLY
   for g in "${(@)golden}"; do
     name=${${g:h}:t}
     expected=$(<$g)
