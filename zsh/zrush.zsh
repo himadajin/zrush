@@ -1326,4 +1326,6 @@ _zrush_init() {
   return 0
 }
 
-_zrush_init
+# Test seam: tests/zsh/vectors.zsh sources this file with ZRUSH_NO_INIT=1 to
+# exercise _zrush_parse_plan alone, without zle/compsys/binary side effects.
+[[ -n $ZRUSH_NO_INIT ]] || _zrush_init

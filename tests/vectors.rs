@@ -210,6 +210,34 @@ fn plan_vectors_match_golden_outputs() {
 }
 
 #[test]
+fn reject_plan_vectors_are_rejected() {
+    let mut failures = Vec::new();
+
+    for path in vector_dirs("reject-plan") {
+        let name = vector_name(&path);
+        let plan = match std::fs::read(path.join("plan.bin")) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                failures.push(format!("{name}: read plan.bin: {error}"));
+                continue;
+            }
+        };
+        if let Ok(parsed) = wire::parse(&plan) {
+            failures.push(format!(
+                "{name}: expected rejection, parsed as {parsed:?}; bytes: {}",
+                dump(&plan)
+            ));
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "vector failures:\n{}",
+        failures.join("\n")
+    );
+}
+
+#[test]
 fn reject_vectors_match_expected_exit_codes() {
     let update = std::env::var_os("UPDATE_GOLDEN").as_deref() == Some("1".as_ref());
     let mut failures = Vec::new();
