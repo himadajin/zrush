@@ -707,6 +707,26 @@ _zrush_run_plan() {  # $1=raw NUL-terminated capture payload; "" is valid (0 can
   return 1
 }
 
+# Upper-bound check for every non-negative decimal in a plan, without
+# arithmetic evaluation. A plan is untrusted input and zsh integers are
+# 64-bit: evaluating a wider digit string truncates it after 19 digits, wraps
+# it negative -- so an out-of-range value would pass -- and prints a message
+# on stderr that would corrupt the zle display. Comparing the canonical digit
+# strings instead -- leading zeros dropped, then length, then ASCII order --
+# is exact at any width.
+_zrush_dec_le_all() {  # $1=bound, $2.. = values, all matched by <->
+  emulate -L zsh
+  setopt localoptions extendedglob
+  local b=${1##0##} v c   # canonical zero is the empty string
+  for v in "${@[2,-1]}"; do
+    c=${v##0##}
+    (( $#c < $#b )) && continue
+    (( $#c > $#b )) && return 1
+    [[ $c > $b ]] && return 1
+  done
+  return 0
+}
+
 # Validate and split one `zrush plan` stdout buffer into _zrush_plan_*.
 # Field layout is fixed (cli-protocol.md "stdout(描画プラン)"):
 #   common-prefix, L, P, L rows, H, H "role pos start len", P "start len",
@@ -719,6 +739,9 @@ _zrush_parse_plan() {  # $1=raw `zrush plan` stdout
   local -i n=$#f
   (( n >= 4 )) || return 1
   [[ $f[2] == <-> && $f[3] == <-> ]] || return 1
+  # n = 4 + L + H + 3P bounds each count by n; checking that before any
+  # arithmetic keeps the counts inside the integer range from here on.
+  _zrush_dec_le_all $n $f[2] $f[3] || return 1
   local -i L=$f[2] P=$f[3]
 
   local -i idx=4
@@ -727,6 +750,7 @@ _zrush_parse_plan() {  # $1=raw `zrush plan` stdout
   (( idx += L ))
   (( idx <= n )) || return 1
   [[ $f[idx] == <-> ]] || return 1
+  _zrush_dec_le_all $n $f[idx] || return 1
   local -i H=$f[idx]
   (( idx += 1 ))
   (( idx + H - 1 <= n )) || return 1
@@ -743,16 +767,16 @@ _zrush_parse_plan() {  # $1=raw `zrush plan` stdout
   (( idx += P ))
   (( idx - 1 == n )) || return 1   # exact field count: 4 + L + H + 3P
 
-  # Tuple shapes and value ranges.
+  # Tuple shapes, then every 0..P value in one pass.
   local e role pos start len
-  local -a tok
+  local -a tok ranged=()
   for e in "${(@)hls}"; do
     tok=( ${=e} )
     (( $#tok == 4 )) || return 1
     role=$tok[1] pos=$tok[2] start=$tok[3] len=$tok[4]
     [[ $role == match || $role == heading ]] || return 1
     [[ $pos == <-> && $start == <-> && $len == <-> ]] || return 1
-    (( pos <= P )) || return 1
+    ranged+=( $pos )
   done
   for e in "${(@)cells}"; do
     tok=( ${=e} )
@@ -763,8 +787,9 @@ _zrush_parse_plan() {  # $1=raw `zrush plan` stdout
     tok=( ${=e} )
     (( $#tok == 4 )) || return 1
     [[ $tok[1] == <-> && $tok[2] == <-> && $tok[3] == <-> && $tok[4] == <-> ]] || return 1
-    (( tok[1] <= P && tok[2] <= P && tok[3] <= P && tok[4] <= P )) || return 1
+    ranged+=( "${(@)tok}" )
   done
+  _zrush_dec_le_all $P "${(@)ranged}" || return 1
 
   _zrush_plan_cp=$f[1]
   _zrush_plan_nlines=$L
