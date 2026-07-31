@@ -6,11 +6,15 @@ Development is dogfooding-driven: the author's daily use comes first.
 
 ## Docs are the single source of truth
 
-The `docs/` directory is authoritative for design and behavior:
+The `docs/` directory records intended behavior — a commitment, not a description of the code:
 
 - Resolve design/spec questions by reading `docs/` first.
 - When changing design or behavior, update the relevant doc before (or together with) the code.
-- If code and docs disagree, treat the docs as correct; verify which side is wrong and fix it.
+- Code that disagrees with docs is a bug in the code.
+  If the intent itself has changed, that is a spec change: update the doc deliberately, never merely to match what the code happens to do.
+  When unsure which case it is, ask instead of picking a side.
+- Behavior the docs don't cover is not guaranteed and may change freely; to rely on it, spec it first.
+- Code comments never restate the docs; at most they point to the relevant doc.
 
 Layout: `docs/user/` (install, configuration, usage), `docs/internal/specs/` (settled behavior specs), `docs/internal/contracts/` (component boundaries such as the zsh ↔ Rust CLI protocol and config schema).
 
