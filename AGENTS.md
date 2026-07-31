@@ -6,11 +6,15 @@ Development is dogfooding-driven: the author's daily use comes first.
 
 ## Docs are the single source of truth
 
-The `docs/` directory is authoritative for design and behavior:
+The `docs/` directory records intended behavior — a commitment, not a description of the code:
 
 - Resolve design/spec questions by reading `docs/` first.
 - When changing design or behavior, update the relevant doc before (or together with) the code.
-- If code and docs disagree, treat the docs as correct; verify which side is wrong and fix it.
+- Code that disagrees with docs is a bug in the code.
+  If the intent itself has changed, that is a spec change: update the doc deliberately, never merely to match what the code happens to do.
+  When unsure which case it is, ask instead of picking a side.
+- Behavior the docs don't cover is not guaranteed and may change freely; to rely on it, spec it first.
+- Code comments never restate the docs; at most they point to the relevant doc.
 
 Layout: `docs/user/` (install, configuration, usage), `docs/internal/specs/` (settled behavior specs), `docs/internal/contracts/` (component boundaries such as the zsh ↔ Rust CLI protocol and config schema).
 
@@ -19,7 +23,7 @@ Docs describe only the current state — no history or review notes (git keeps t
 
 ## Build and test
 
-Run all four before considering a change done (CI enforces the same):
+Run all of the following before considering a change done (CI enforces the same):
 
 ```sh
 cargo fmt --check
@@ -28,12 +32,15 @@ cargo build --release
 cargo test
 ```
 
-zle-integration regression tests live in `tests/zsh/driver*.zsh`, and `zsh/verify.zsh` launches an isolated shell for manual verification; each file's header documents prerequisites and usage.
+For changes touching `zsh/`, the zle-integration drivers `tests/zsh/driver.zsh` and `tests/zsh/driver-coexist.zsh` must also pass — run them locally; CI runs only the headless `driver.zsh`.
+`zsh/verify.zsh` launches an isolated shell for manual verification, and `tests/zsh/driver-latency.zsh` measures first-paint latency; each file's header documents prerequisites and usage.
 
-## Commits
+## Commits, issues, and pull requests
 
-Follow [Conventional Commits](https://www.conventionalcommits.org/), concise and in English
+One-line titles — commit messages, issue titles, PR titles — are concise English, because they flow through tooling.
+Commit messages additionally follow [Conventional Commits](https://www.conventionalcommits.org/)
 (e.g. `docs: update config schema`, `feat(match): add typo-tolerant matching`, `fix(zle): clear listing on accept-line`).
+Bodies may be English or Japanese.
 
 ## Core principles
 
@@ -44,6 +51,17 @@ Details live in `docs/internal/specs/`; these are the invariants:
 - Configuration lives solely in `~/.config/zrush/config.toml`; no zstyle-based settings.
 - Responsibilities: Rust = matching, ranking, history search, layout/render-plan computation, insertion-text construction, config interpretation; zsh = zle integration, compsys capture, applying the plan (rendering).
 - Keep pure Rust logic (matching, ranking, config parsing) separate from the UI and unit-testable.
+
+## Design discipline
+
+zrush is alpha software developed by dogfooding; simplicity outranks continuity.
+
+- No backward compatibility.
+  When behavior, config, protocol, or data formats change, replace the old form and delete the old code path in the same change — no deprecation shims, migration code, legacy aliases, or versioned fallbacks.
+  (The protocol version check stays: it detects a stale build, it is not a compat layer.)
+- Prefer a few principled rules over many ad-hoc ones.
+  Growing special cases, conditionals, or implementation size relative to the goal is a sign of a wrong approach: step back and restructure so a general rule covers the cases, instead of patching case by case.
+  If a requested change would require such growth, propose the simpler restructuring first.
 
 ## Guardrails
 
