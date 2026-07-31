@@ -45,6 +45,17 @@ Details live in `docs/internal/specs/`; these are the invariants:
 - Responsibilities: Rust = matching, ranking, history search, layout/render-plan computation, insertion-text construction, config interpretation; zsh = zle integration, compsys capture, applying the plan (rendering).
 - Keep pure Rust logic (matching, ranking, config parsing) separate from the UI and unit-testable.
 
+## Design discipline
+
+zrush is alpha software developed by dogfooding; simplicity outranks continuity.
+
+- No backward compatibility.
+  When behavior, config, protocol, or data formats change, replace the old form and delete the old code path in the same change — no deprecation shims, migration code, legacy aliases, or versioned fallbacks.
+  (The protocol version check stays: it detects a stale build, it is not a compat layer.)
+- Prefer a few principled rules over many ad-hoc ones.
+  Growing special cases, conditionals, or implementation size relative to the goal is a sign of a wrong approach: step back and restructure so a general rule covers the cases, instead of patching case by case.
+  If a requested change would require such growth, propose the simpler restructuring first.
+
 ## Guardrails
 
 - Never run tests or verification against the real `~/.zshrc` or shell history; use the isolated sandbox (`zsh/verify.zsh`).
