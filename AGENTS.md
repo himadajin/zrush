@@ -23,7 +23,7 @@ Docs describe only the current state — no history or review notes (git keeps t
 
 ## Build and test
 
-Run all four before considering a change done (CI enforces the same):
+Run all of the following before considering a change done (CI enforces the same):
 
 ```sh
 cargo fmt --check
