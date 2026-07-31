@@ -144,6 +144,7 @@ fn push_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wire;
 
     fn params(query: &str, mode: Mode, rows: usize, width: usize, trailing_space: bool) -> Params {
         Params {
@@ -160,47 +161,8 @@ mod tests {
         false
     }
 
-    /// Split a `run()` result into its fixed-position and repeated-block
-    /// fields, verifying the `4 + L + H + 3P` field-count invariant.
-    struct Parsed {
-        common_prefix: Vec<u8>,
-        rows: Vec<Vec<u8>>,
-        highlights: Vec<Vec<u8>>,
-        cells: Vec<Vec<u8>>,
-        nav: Vec<Vec<u8>>,
-        inserts: Vec<Vec<u8>>,
-    }
-
-    fn parse_out(out: &[u8]) -> Parsed {
-        assert_eq!(out.last(), Some(&0u8), "output must be NUL-terminated");
-        let f: Vec<Vec<u8>> = out[..out.len() - 1]
-            .split(|&b| b == 0)
-            .map(<[u8]>::to_vec)
-            .collect();
-        let l: usize = std::str::from_utf8(&f[1]).unwrap().parse().unwrap();
-        let p: usize = std::str::from_utf8(&f[2]).unwrap().parse().unwrap();
-        let mut i = 3;
-        let rows = f[i..i + l].to_vec();
-        i += l;
-        let h: usize = std::str::from_utf8(&f[i]).unwrap().parse().unwrap();
-        i += 1;
-        let highlights = f[i..i + h].to_vec();
-        i += h;
-        let cells = f[i..i + p].to_vec();
-        i += p;
-        let nav = f[i..i + p].to_vec();
-        i += p;
-        let inserts = f[i..i + p].to_vec();
-        i += p;
-        assert_eq!(i, f.len(), "field count must be exactly 4 + L + H + 3P");
-        Parsed {
-            common_prefix: f[0].clone(),
-            rows,
-            highlights,
-            cells,
-            nav,
-            inserts,
-        }
+    fn parse_wire(out: &[u8]) -> wire::Plan {
+        wire::parse(out).expect("valid plan")
     }
 
     fn header(fields: &[(&str, &str)]) -> Vec<u8> {
@@ -246,7 +208,7 @@ mod tests {
         // width=9: gmaxw=max(3,4)=4 -> cols=floor(11/6)=1 (single column),
         // and the width budget still fits "Commands" (8 chars) untruncated.
         let out = run(&params("g", Mode::Prefix, 10, 9, true), &stdin, &no_dir).unwrap();
-        let p = parse_out(&out);
+        let p = parse_wire(&out);
         assert_eq!(p.common_prefix, b"g");
         // heading + "git" padded to gmaxw=4 + "grep" (already width 4).
         assert_eq!(
@@ -254,22 +216,29 @@ mod tests {
             vec![b"Commands".to_vec(), b"git ".to_vec(), b"grep".to_vec()]
         );
         assert_eq!(p.cells.len(), 2);
-        assert_eq!(p.nav.len(), 2);
+        assert_eq!(p.navigation.len(), 2);
         assert_eq!(p.inserts, vec![b"git ".to_vec(), b"grep ".to_vec()]);
         // Offsets run over the whole listing text ("Commands\ngit \ngrep"):
         // heading spans [0,8); row 2 starts at char 9 (8 + 1 newline);
         // row 3 starts at char 14 (9 + 4 + 1 newline).
-        assert_eq!(p.cells[0], b"9 3".to_vec()); // "git" real text, 3 chars
-        assert_eq!(p.cells[1], b"14 4".to_vec()); // "grep", 4 chars
-        let hl: Vec<&str> = p
-            .highlights
-            .iter()
-            .map(|h| std::str::from_utf8(h).unwrap())
-            .collect();
-        assert!(hl.contains(&"heading 0 0 8"));
+        assert_eq!(p.cells[0], (9, 3)); // "git" real text, 3 chars
+        assert_eq!(p.cells[1], (14, 4)); // "grep", 4 chars
+        assert!(
+            p.highlights
+                .iter()
+                .any(|h| { (h.role, h.pos, h.start, h.len) == (wire::Role::Heading, 0, 0, 8) })
+        );
         // query "g" is a 1-char prefix match: span [0,1) on each match-text.
-        assert!(hl.contains(&"match 1 9 1"));
-        assert!(hl.contains(&"match 2 14 1"));
+        assert!(
+            p.highlights
+                .iter()
+                .any(|h| { (h.role, h.pos, h.start, h.len) == (wire::Role::Match, 1, 9, 1) })
+        );
+        assert!(
+            p.highlights
+                .iter()
+                .any(|h| { (h.role, h.pos, h.start, h.len) == (wire::Role::Match, 2, 14, 1) })
+        );
     }
 
     #[test]
@@ -293,7 +262,7 @@ mod tests {
             &no_dir,
         )
         .unwrap();
-        let p = parse_out(&out);
+        let p = parse_wire(&out);
         assert_eq!(p.rows, vec![b"space name.txt".to_vec()]);
         assert_eq!(p.inserts, vec![b"space\\ name.txt".to_vec()]);
     }
@@ -312,7 +281,7 @@ mod tests {
         stdin.extend(rec);
 
         let out = run(&params("", Mode::Typo, 10, 40, false), &stdin, &no_dir).unwrap();
-        let p = parse_out(&out);
+        let p = parse_wire(&out);
         assert_eq!(p.rows, vec![b"Pretty Display".to_vec()]);
         assert_eq!(p.inserts, vec![b"raw".to_vec()]);
     }
@@ -323,14 +292,14 @@ mod tests {
         stdin.extend(word("日本語")); // 3 chars, width 6
         stdin.extend(word("ab"));
         let out = run(&params("", Mode::Typo, 10, 8, false), &stdin, &no_dir).unwrap();
-        let p = parse_out(&out);
+        let p = parse_wire(&out);
         // single column (gmaxw=6, width=8 -> cols=floor(10/8)=1)
         assert_eq!(
             p.rows,
             vec!["日本語".as_bytes().to_vec(), b"ab    ".to_vec()]
         );
-        assert_eq!(std::str::from_utf8(&p.cells[0]).unwrap(), "0 3");
-        assert_eq!(std::str::from_utf8(&p.cells[1]).unwrap(), "4 2");
+        assert_eq!(p.cells[0], (0, 3));
+        assert_eq!(p.cells[1], (4, 2));
     }
 
     #[test]
@@ -349,7 +318,7 @@ mod tests {
                 .unwrap_or(false)
         };
         let out = run(&params("", Mode::Typo, 10, 40, true), &stdin, &real_is_dir).unwrap();
-        let p = parse_out(&out);
+        let p = parse_wire(&out);
         assert_eq!(p.inserts, vec![b"child/".to_vec()]); // no trailing space: nospace on `/`
 
         std::fs::remove_dir_all(&dir).unwrap();
@@ -364,8 +333,8 @@ mod tests {
         };
         let on = run(&params("", Mode::Typo, 10, 40, true), &stdin, &no_dir).unwrap();
         let off = run(&params("", Mode::Typo, 10, 40, false), &stdin, &no_dir).unwrap();
-        assert_eq!(parse_out(&on).inserts, vec![b"git ".to_vec()]);
-        assert_eq!(parse_out(&off).inserts, vec![b"git".to_vec()]);
+        assert_eq!(parse_wire(&on).inserts, vec![b"git ".to_vec()]);
+        assert_eq!(parse_wire(&off).inserts, vec![b"git".to_vec()]);
     }
 
     #[test]
@@ -393,7 +362,7 @@ mod tests {
         // cols=floor(12/12)=1, forcing a single column so rows appear
         // in rank order top-to-bottom (each padded to width 10).
         let out = run(&params("doc", Mode::Typo, 10, 10, false), &stdin, &no_dir).unwrap();
-        let p = parse_out(&out);
+        let p = parse_wire(&out);
         assert_eq!(p.common_prefix, b"doc");
         // prefix-exact(doc) > prefix(docs) > substring(mydocs) > edit(dot-config); xxx excluded.
         let pad = |w: &str| format!("{w:<10}").into_bytes();
@@ -420,14 +389,13 @@ mod tests {
             &no_dir,
         )
         .unwrap();
-        let p = parse_out(&out);
+        let p = parse_wire(&out);
         assert_eq!(p.rows, vec![b"cargo".to_vec()]);
-        let m = p
-            .highlights
-            .iter()
-            .find(|h| std::str::from_utf8(h).unwrap().starts_with("match "))
-            .unwrap();
-        assert_eq!(std::str::from_utf8(m).unwrap(), "match 1 1 2");
+        assert!(
+            p.highlights
+                .iter()
+                .any(|h| { (h.role, h.pos, h.start, h.len) == (wire::Role::Match, 1, 1, 2) })
+        );
     }
 
     #[test]
@@ -447,7 +415,7 @@ mod tests {
             s
         };
         let out = run(&params("a", Mode::Typo, 1, 40, false), &stdin, &no_dir).unwrap();
-        let p = parse_out(&out);
+        let p = parse_wire(&out);
         assert_eq!(p.common_prefix, b"a");
         // Sanity: "ab" really was dropped by the cap, not merely unranked.
         assert!(p.rows.iter().all(|r| r != b"ab"));
@@ -477,7 +445,7 @@ mod tests {
             &counting_is_dir,
         )
         .unwrap();
-        let p = parse_out(&out);
+        let p = parse_wire(&out);
         assert_eq!(
             *calls.borrow(),
             p.cells.len(),
@@ -493,7 +461,7 @@ mod tests {
         let mut stdin = header(&[]);
         stdin.extend(word("foo\nbar"));
         let out = run(&params("", Mode::Typo, 10, 40, false), &stdin, &no_dir).unwrap();
-        let p = parse_out(&out);
+        let p = parse_wire(&out);
         assert_eq!(p.rows, vec![b"foo bar".to_vec()]);
         assert_eq!(p.inserts, vec![b"foo\nbar".to_vec()]);
     }
@@ -511,7 +479,7 @@ mod tests {
                 .unwrap_or(false)
         };
         let out = run(&params("", Mode::Typo, 10, 40, true), &stdin, &real_is_dir).unwrap();
-        let p = parse_out(&out);
+        let p = parse_wire(&out);
         assert_eq!(p.inserts, vec![b"child ".to_vec()]); // no '/'; trailing space kept
     }
 }

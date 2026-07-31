@@ -1,0 +1,12 @@
+--query
+g
+--mode
+prefix
+--smart-case
+true
+--rows
+1
+--width
+40
+--trailing-space
+false

@@ -5,6 +5,8 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
+use zrush::wire;
+
 fn zrush() -> Command {
     Command::new(env!("CARGO_BIN_EXE_zrush"))
 }
@@ -95,167 +97,26 @@ fn word(w: &str) -> Vec<u8> {
     field_record(&[("w", w)])
 }
 
-/// Parsed `zrush plan` stdout: fixed-position fields plus the four
-/// repeated blocks. Asserts the `4 + L + H + 3P` field-count invariant
-/// (cli-protocol.md "stdout(描画プラン)") while parsing, plus the
-/// well-formedness checks a zsh consumer would need before trusting the
-/// plan (cli-protocol.md "エラー時の zsh 側挙動": non-digit numerics,
-/// wrong tuple arity, an unknown `role`, or an out-of-range position all
-/// mean "discard the plan").
-struct Plan {
-    common_prefix: Vec<u8>,
-    rows: Vec<Vec<u8>>,
-    highlights: Vec<String>,
-    cells: Vec<String>,
-    nav: Vec<String>,
-    inserts: Vec<Vec<u8>>,
+fn parse_wire(out: &[u8]) -> wire::Plan {
+    wire::parse(out).expect("valid plan")
 }
 
-/// Parse a field as a non-negative decimal integer (cli-protocol.md:
-/// "数値は ASCII 10 進表記"), panicking with context on anything else
-/// (empty, a sign, non-digits, or out of `usize` range).
-fn parse_count(bytes: &[u8], field: &str) -> usize {
-    let s = std::str::from_utf8(bytes)
-        .unwrap_or_else(|_| panic!("{field} is not valid UTF-8: {bytes:?}"));
-    assert!(
-        !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()),
-        "{field} must be an ASCII decimal digit string, got {s:?}"
-    );
-    s.parse()
-        .unwrap_or_else(|_| panic!("{field} out of usize range: {s:?}"))
-}
-
-fn parse_plan(out: &[u8]) -> Plan {
-    assert_eq!(out.last(), Some(&0u8), "output must be NUL-terminated");
-    let f: Vec<Vec<u8>> = out[..out.len() - 1]
-        .split(|&b| b == 0)
-        .map(<[u8]>::to_vec)
-        .collect();
-    assert!(
-        f.len() >= 3,
-        "must have at least common-prefix, L, P: {f:?}"
-    );
-    let l = parse_count(&f[1], "L");
-    let p = parse_count(&f[2], "P");
-    let mut i = 3;
-    let rows = f[i..i + l].to_vec();
-    i += l;
-    let h = parse_count(&f[i], "H");
-    i += 1;
-    let highlights: Vec<String> = f[i..i + h]
+fn has_highlight(
+    plan: &wire::Plan,
+    role: wire::Role,
+    pos: usize,
+    start: usize,
+    len: usize,
+) -> bool {
+    plan.highlights
         .iter()
-        .map(|b| String::from_utf8(b.clone()).unwrap())
-        .collect();
-    i += h;
-    let cells: Vec<String> = f[i..i + p]
-        .iter()
-        .map(|b| String::from_utf8(b.clone()).unwrap())
-        .collect();
-    i += p;
-    let nav: Vec<String> = f[i..i + p]
-        .iter()
-        .map(|b| String::from_utf8(b.clone()).unwrap())
-        .collect();
-    i += p;
-    let inserts = f[i..i + p].to_vec();
-    i += p;
-    assert_eq!(i, f.len(), "field count must equal 4 + L + H + 3P");
-
-    for hl in &highlights {
-        let parts: Vec<&str> = hl.split(' ').collect();
-        assert_eq!(
-            parts.len(),
-            4,
-            "highlight entry must be \"role pos start len\": {hl:?}"
-        );
-        assert!(
-            parts[0] == "match" || parts[0] == "heading",
-            "role must be match|heading: {hl:?}"
-        );
-        let pos = parse_count(parts[1].as_bytes(), "highlight pos");
-        assert!(pos <= p, "highlight pos {pos} out of range 0..={p}: {hl:?}");
-        parse_count(parts[2].as_bytes(), "highlight start");
-        parse_count(parts[3].as_bytes(), "highlight len");
-    }
-    for c in &cells {
-        let parts: Vec<&str> = c.split(' ').collect();
-        assert_eq!(parts.len(), 2, "cell entry must be \"start len\": {c:?}");
-        parse_count(parts[0].as_bytes(), "cell start");
-        parse_count(parts[1].as_bytes(), "cell len");
-    }
-    for n in &nav {
-        let parts: Vec<&str> = n.split(' ').collect();
-        assert_eq!(
-            parts.len(),
-            4,
-            "nav entry must be \"next prev left right\": {n:?}"
-        );
-        let next = parse_count(parts[0].as_bytes(), "nav next");
-        let prev = parse_count(parts[1].as_bytes(), "nav prev");
-        let left = parse_count(parts[2].as_bytes(), "nav left");
-        let right = parse_count(parts[3].as_bytes(), "nav right");
-        for (name, v) in [
-            ("next", next),
-            ("prev", prev),
-            ("left", left),
-            ("right", right),
-        ] {
-            assert!(v <= p, "nav {name} {v} out of range 0..={p}: {n:?}");
-        }
-    }
-
-    Plan {
-        common_prefix: f[0].clone(),
-        rows,
-        highlights,
-        cells,
-        nav,
-        inserts,
-    }
+        .any(|h| (h.role, h.pos, h.start, h.len) == (role, pos, start, len))
 }
 
 #[test]
-fn plan_rejects_unknown_or_missing_args_with_exit_2() {
-    let (code, _) = run_plan(&["--bogus", "x"], b"");
-    assert_eq!(code, 2);
-    let (code, _) = run_plan(&["--query", "a"], b""); // missing the rest
-    assert_eq!(code, 2);
-}
-
-#[test]
-fn plan_rejects_invalid_enum_and_bool_values_with_exit_2() {
-    let (code, _) = run_plan(&plan_args("a", "fuzzy", "10", "40", "true"), b""); // bad --mode
-    assert_eq!(code, 2);
-    let (code, _) = run_plan(&plan_args("a", "typo", "10", "40", "yes"), b""); // bad --trailing-space
-    assert_eq!(code, 2);
-}
-
-#[test]
-fn plan_rejects_non_numeric_rows_or_width_with_exit_2() {
-    let (code, _) = run_plan(&plan_args("a", "typo", "abc", "40", "true"), b"");
-    assert_eq!(code, 2);
+fn plan_rejects_negative_width_with_exit_2() {
     let (code, _) = run_plan(&plan_args("a", "typo", "10", "-1", "true"), b"");
     assert_eq!(code, 2);
-}
-
-#[test]
-fn plan_rejects_zero_rows_or_width_with_exit_2() {
-    // cli-protocol.md guarantees zsh clamps both to >= 1 before invoking;
-    // 0 is a usage error, not a legitimate degenerate budget.
-    let (code, _) = run_plan(&plan_args("a", "typo", "0", "40", "true"), b"");
-    assert_eq!(code, 2);
-    let (code, _) = run_plan(&plan_args("a", "typo", "10", "0", "true"), b"");
-    assert_eq!(code, 2);
-}
-
-#[test]
-fn plan_rejects_non_terminated_stream_with_exit_3() {
-    let args = plan_args("a", "typo", "10", "40", "true");
-    let mut stdin = header(&[]);
-    stdin.extend(word("git"));
-    stdin.pop(); // drop the final NUL: framing violation
-    let (code, _) = run_plan(&args, &stdin);
-    assert_eq!(code, 3);
 }
 
 #[test]
@@ -270,91 +131,6 @@ fn removed_match_subcommand_now_exits_2() {
 }
 
 #[test]
-fn plan_empty_stdin_is_the_four_field_zero_match_form() {
-    let (code, out) = run_plan(&plan_args("abc", "typo", "10", "40", "true"), b"");
-    assert_eq!(code, 0);
-    assert_eq!(out, b"\x000\x000\x000\x00");
-}
-
-#[test]
-fn plan_zero_matches_is_the_four_field_form() {
-    let mut stdin = header(&[]);
-    stdin.extend(word("alpha"));
-    stdin.extend(word("beta"));
-    let (code, out) = run_plan(&plan_args("zzz", "typo", "10", "40", "true"), &stdin);
-    assert_eq!(code, 0);
-    assert_eq!(out, b"\x000\x000\x000\x00");
-}
-
-#[test]
-fn plan_end_to_end_grouped_payload() {
-    let mut stdin = header(&[("J", "cmds"), ("X", "Commands")]);
-    stdin.extend(word("git"));
-    stdin.extend(word("grep"));
-    // width=9: gmaxw=max(3,4)=4 -> cols=floor(11/6)=1 (single column),
-    // and "Commands" (8 chars) still fits the width budget untruncated.
-    let (code, out) = run_plan(&plan_args("g", "prefix", "10", "9", "true"), &stdin);
-    assert_eq!(code, 0);
-    let p = parse_plan(&out);
-    assert_eq!(p.common_prefix, b"g");
-    assert_eq!(
-        p.rows,
-        vec![b"Commands".to_vec(), b"git ".to_vec(), b"grep".to_vec()]
-    );
-    assert_eq!(p.inserts, vec![b"git ".to_vec(), b"grep ".to_vec()]);
-    // Offsets run over the whole listing text ("Commands\ngit \ngrep"):
-    // heading spans [0,8); row 2 starts at char 9; row 3 at char 14.
-    assert_eq!(p.cells, vec!["9 3", "14 4"]);
-    assert!(p.highlights.iter().any(|h| h == "heading 0 0 8"));
-    assert!(p.highlights.iter().any(|h| h == "match 1 9 1"));
-    assert!(p.highlights.iter().any(|h| h == "match 2 14 1"));
-    assert_eq!(p.nav, vec!["2 0 1 2", "2 1 1 2"]);
-}
-
-#[test]
-fn plan_match_text_uses_m_tag_over_w() {
-    let mut stdin = header(&[]);
-    stdin.extend(field_record(&[
-        ("w", "space\\ name.txt"),
-        ("m", "space name.txt"),
-    ]));
-    let (code, out) = run_plan(&plan_args("space", "prefix", "10", "40", "false"), &stdin);
-    assert_eq!(code, 0);
-    let p = parse_plan(&out);
-    assert_eq!(p.rows, vec![b"space name.txt".to_vec()]);
-    // Insertion text still uses the quoted `w`, not `m`.
-    assert_eq!(p.inserts, vec![b"space\\ name.txt".to_vec()]);
-}
-
-#[test]
-fn plan_d_tag_is_displayed_instead_of_match_text() {
-    let mut stdin = header(&[]);
-    stdin.extend(field_record(&[("w", "raw"), ("d", "Pretty Display")]));
-    let (code, out) = run_plan(&plan_args("", "typo", "10", "40", "false"), &stdin);
-    assert_eq!(code, 0);
-    let p = parse_plan(&out);
-    assert_eq!(p.rows, vec![b"Pretty Display".to_vec()]);
-    assert_eq!(p.inserts, vec![b"raw".to_vec()]);
-}
-
-#[test]
-fn plan_cjk_cell_alignment_pads_by_width_offsets_by_chars() {
-    let mut stdin = header(&[]);
-    stdin.extend(word("日本語")); // 3 chars, display width 6
-    stdin.extend(word("ab"));
-    // width=8: gmaxw=max(6,2)=6 -> cols=floor(10/8)=1 (single column).
-    let (code, out) = run_plan(&plan_args("", "typo", "10", "8", "false"), &stdin);
-    assert_eq!(code, 0);
-    let p = parse_plan(&out);
-    assert_eq!(
-        p.rows,
-        vec!["日本語".as_bytes().to_vec(), b"ab    ".to_vec()]
-    );
-    // Cell range length is char count (3, 2), not display width (6, 2).
-    assert_eq!(p.cells, vec!["0 3", "4 2"]);
-}
-
-#[test]
 fn plan_dir_synthesis_uses_real_filesystem_stat() {
     let dir = std::env::temp_dir().join(format!("zrush-cli-it-{}", std::process::id()));
     std::fs::create_dir_all(dir.join("child")).expect("mkdir");
@@ -363,7 +139,7 @@ fn plan_dir_synthesis_uses_real_filesystem_stat() {
     stdin.extend(word("child"));
     let (code, out) = run_plan(&plan_args("", "typo", "10", "40", "true"), &stdin);
     assert_eq!(code, 0);
-    let p = parse_plan(&out);
+    let p = parse_wire(&out);
     // `/` synthesized (real directory), which also suppresses the
     // trailing space despite --trailing-space true.
     assert_eq!(p.inserts, vec![b"child/".to_vec()]);
@@ -371,15 +147,12 @@ fn plan_dir_synthesis_uses_real_filesystem_stat() {
 }
 
 #[test]
-fn plan_trailing_space_toggle() {
+fn plan_trailing_space_true_appends_space() {
     let mut stdin = header(&[]);
     stdin.extend(word("git"));
     let (code, on) = run_plan(&plan_args("", "typo", "10", "40", "true"), &stdin);
     assert_eq!(code, 0);
-    let (code, off) = run_plan(&plan_args("", "typo", "10", "40", "false"), &stdin);
-    assert_eq!(code, 0);
-    assert_eq!(parse_plan(&on).inserts, vec![b"git ".to_vec()]);
-    assert_eq!(parse_plan(&off).inserts, vec![b"git".to_vec()]);
+    assert_eq!(parse_wire(&on).inserts, vec![b"git ".to_vec()]);
 }
 
 #[test]
@@ -392,7 +165,7 @@ fn plan_ranking_tiers_and_common_prefix() {
     // forcing a single column so rows appear in rank order top-to-bottom.
     let (code, out) = run_plan(&plan_args("doc", "typo", "10", "10", "false"), &stdin);
     assert_eq!(code, 0);
-    let p = parse_plan(&out);
+    let p = parse_wire(&out);
     // prefix-exact(doc) > prefix(docs) > substring(mydocs) > edit(dot-config); xxx excluded.
     assert_eq!(p.common_prefix, b"doc");
     let pad = |w: &str| format!("{w:<10}").into_bytes();
@@ -412,7 +185,7 @@ fn plan_typo_transposition_gti() {
     // forcing a single column so each match gets its own row.
     let (code, out) = run_plan(&plan_args("gti", "typo", "10", "8", "false"), &stdin);
     assert_eq!(code, 0);
-    let p = parse_plan(&out);
+    let p = parse_wire(&out);
     // No prefix-tier match under "gti" -> empty common prefix.
     assert_eq!(p.common_prefix, b"");
     assert_eq!(p.rows.len(), 2); // "git" and "git-lfs" via the edit tier; "grep" excluded
@@ -430,44 +203,9 @@ fn plan_match_highlight_offset_is_non_trivial_for_a_mid_string_match() {
     stdin.extend(word("cargo"));
     let (code, out) = run_plan(&plan_args("ar", "substring", "10", "40", "false"), &stdin);
     assert_eq!(code, 0);
-    let p = parse_plan(&out);
+    let p = parse_wire(&out);
     assert_eq!(p.rows, vec![b"cargo".to_vec()]);
-    assert!(p.highlights.iter().any(|h| h == "match 1 1 2"));
-}
-
-#[test]
-fn plan_positions_follow_column_major_position_order_not_render_scan_order() {
-    // Regression (external audit blocker): grid position numbering must
-    // match rank order (a,b,c,d,e), not the render loop's (row, col)
-    // scan order, which for this exact grid (5 single-char candidates,
-    // rows=2, width=7 -> gmaxw=1, cols=3, grows=2) visits a,c,e,b,d.
-    // `positions` drove insertion-text lookup, so the bug meant
-    // confirming a candidate inserted a *different* candidate's text.
-    let mut stdin = header(&[]);
-    for w in ["a", "b", "c", "d", "e"] {
-        stdin.extend(word(w));
-    }
-    let (code, out) = run_plan(&plan_args("", "typo", "2", "7", "false"), &stdin);
-    assert_eq!(code, 0);
-    let p = parse_plan(&out);
-    assert_eq!(p.rows, vec![b"a  c  e".to_vec(), b"b  d".to_vec()]);
-    // Position p's insertion text must be candidate p's own text, in
-    // rank order (a,b,c,d,e) -- not the render-scan order (a,c,e,b,d).
-    assert_eq!(
-        p.inserts,
-        vec![
-            b"a".to_vec(),
-            b"b".to_vec(),
-            b"c".to_vec(),
-            b"d".to_vec(),
-            b"e".to_vec()
-        ]
-    );
-    assert_eq!(p.cells, vec!["0 1", "8 1", "3 1", "11 1", "6 1"]);
-    assert_eq!(
-        p.nav,
-        vec!["2 0 1 3", "3 1 1 4", "4 2 1 5", "5 3 2 5", "5 4 3 5"]
-    );
+    assert!(has_highlight(&p, wire::Role::Match, 1, 1, 2));
 }
 
 // ---- zrush config ----

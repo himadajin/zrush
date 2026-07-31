@@ -343,10 +343,10 @@ mod tests {
 
     #[test]
     fn worker_pid_record_is_skipped() {
-        let pid = record(&[field("pid", "12345")]);
         let header = record(&[field("b", "")]);
+        let pid = record(&[field("pid", "12345")]);
         let ok = record(&[field("w", "cand")]);
-        let refs: [&[u8]; 3] = [&pid, &header, &ok];
+        let refs: [&[u8]; 3] = [&header, &pid, &ok];
         let input = payload(&refs);
         let parsed = parse(&input).unwrap();
         assert_eq!(parsed.batches.len(), 1);
