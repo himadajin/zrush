@@ -30,10 +30,12 @@ cargo test
 
 zle-integration regression tests live in `tests/zsh/driver*.zsh`, and `zsh/verify.zsh` launches an isolated shell for manual verification; each file's header documents prerequisites and usage.
 
-## Commits
+## Commits, issues, and pull requests
 
-Follow [Conventional Commits](https://www.conventionalcommits.org/), concise and in English
+One-line titles — commit messages, issue titles, PR titles — are concise English, because they flow through tooling.
+Commit messages additionally follow [Conventional Commits](https://www.conventionalcommits.org/)
 (e.g. `docs: update config schema`, `feat(match): add typo-tolerant matching`, `fix(zle): clear listing on accept-line`).
+Bodies may be English or Japanese.
 
 ## Core principles
 
