@@ -29,3 +29,8 @@ jobs:
         run: cargo build --release
       - name: cargo test
         run: cargo test
+      - name: Install zsh (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y zsh
+      - name: zle driver
+        run: zsh -f tests/zsh/driver.zsh "$(mktemp -d)"

@@ -28,7 +28,8 @@ cargo build --release
 cargo test
 ```
 
-zle-integration regression tests live in `tests/zsh/driver*.zsh`, and `zsh/verify.zsh` launches an isolated shell for manual verification; each file's header documents prerequisites and usage.
+For changes touching `zsh/`, the zle-integration drivers `tests/zsh/driver.zsh` and `tests/zsh/driver-coexist.zsh` must also pass — run them locally; CI runs only the headless `driver.zsh`.
+`zsh/verify.zsh` launches an isolated shell for manual verification, and `tests/zsh/driver-latency.zsh` measures first-paint latency; each file's header documents prerequisites and usage.
 
 ## Commits, issues, and pull requests
 
