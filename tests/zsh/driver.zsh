@@ -627,6 +627,19 @@ start_hist_host() {  # $1=zdotdir $2=xdg-config-home $3=logfile
   else
     ng "(h1a) kind dump did not run"
   fi
+  if dump_get $'\C-xp' TESTPOST; then
+    local post_h1=${(Q)REPLY}
+    local listing_h1=${post_h1#$'\n'}
+    local first_h1=${listing_h1%%$'\n'*}
+    local last_h1=${listing_h1##*$'\n'}
+    if [[ $first_h1 == 'echo oldest'* && $last_h1 == 'echo newest'* ]]; then
+      ok "(h1a') history is one column growing upward: oldest shown at top, position 1/newest at bottom"
+    else
+      ng "(h1a') unexpected history row order: ${(qqqq)post_h1}"
+    fi
+  else
+    ng "(h1a') POSTDISPLAY dump did not run"
+  fi
   press $'\e[A'
   dump_get $'\C-xk' TESTKIND
   [[ $REPLY == 'kind=history sel=2 listing=1 npos=6' ]] && ok "(h1b) Up moves to the next-older entry (position 2)" || ng "(h1b) $REPLY"
@@ -648,18 +661,14 @@ start_hist_host() {  # $1=zdotdir $2=xdg-config-home $3=logfile
   clear_line
   drain 0.3
 
-  # ---- (h2) empty buffer + Up: the full (unfiltered) history menu, newest
-  # first, position 1 = the single newest entry. The fixture has 13 unique,
-  # non-excluded entries, but this driver's headless terminal is narrow
-  # enough that some long fixture lines force a single-column grid, and
-  # [display].max-lines=10 (the default) then legitimately caps how many of
-  # them get a display position (cli-protocol.md "表示行の中身" row-budget
-  # truncation) -- so this only checks that the menu opens with *a* position
-  # 1 selected; (h2c) below is what actually pins down which entry that is.
+  # ---- (h2) empty buffer + Up: the full (unfiltered) history menu, one
+  # candidate per row with position 1 = the single newest entry at the bottom.
+  # The fixture has 13 unique, non-excluded entries, so [display].max-lines=10
+  # (the default) caps the single-column list at exactly 10 positions.
   press $'\e[A'
   if dump_get $'\C-xk' TESTKIND; then
-    [[ $REPLY == 'kind=history sel=1 listing=1'* ]] \
-      && ok "(h2a) empty-buffer Up opens the full history menu, position 1 selected" \
+    [[ $REPLY == 'kind=history sel=1 listing=1 npos=10' ]] \
+      && ok "(h2a) empty-buffer Up opens a max-lines-bounded single-column history menu at position 1" \
       || ng "(h2a) $REPLY"
   else
     ng "(h2a) kind dump did not run"

@@ -34,7 +34,6 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand, ValueEnum};
 
 use matching::Mode;
-use ranking::Order;
 
 /// Exit codes per cli-protocol.md. Usage errors (invalid/missing/unknown
 /// arguments or subcommand) are exit 2, handled by clap's default error
@@ -117,21 +116,18 @@ impl From<CliMode> for Mode {
     }
 }
 
-/// Producer profiles (cli-protocol.md "起動"). The profile reaches the
-/// pipeline only as the result ordering it selects, so it converts here
-/// rather than travelling through plan.rs as a second name for the same
-/// choice.
+/// Producer profiles (cli-protocol.md "起動").
 #[derive(Copy, Clone, ValueEnum)]
 enum CliProducer {
     Compsys,
     History,
 }
 
-impl From<CliProducer> for Order {
-    fn from(producer: CliProducer) -> Order {
+impl From<CliProducer> for plan::Producer {
+    fn from(producer: CliProducer) -> plan::Producer {
         match producer {
-            CliProducer::Compsys => Order::Quality,
-            CliProducer::History => Order::Stdin,
+            CliProducer::Compsys => plan::Producer::Compsys,
+            CliProducer::History => plan::Producer::History,
         }
     }
 }
@@ -154,7 +150,7 @@ fn cmd_plan(args: PlanArgs) -> ExitCode {
     }
 
     let params = plan::Params {
-        order: args.producer.into(),
+        producer: args.producer.into(),
         query: args.query.as_bytes().to_vec(),
         mode: args.mode.into(),
         smart_case: args.smart_case,
