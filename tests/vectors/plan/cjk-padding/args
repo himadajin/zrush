@@ -1,0 +1,12 @@
+--query
+
+--mode
+typo
+--smart-case
+true
+--rows
+10
+--width
+8
+--trailing-space
+false

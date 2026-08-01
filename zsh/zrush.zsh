@@ -201,95 +201,131 @@ _zrush_precmd() {
 }
 
 # ---------------------------------------------------------------- Capture inside the fork
-# compadd hook installed in functions[compadd] only inside the fork.
-# Emits the v2 wire format (cli-protocol.md "stdin(捕獲レコード)"): one batch
-# header record (tag `b`, then whichever of P/p/S/s/i/I/ip/f/rd/X/J are
-# non-empty) followed by one thin record per candidate (`w`, optional `m`
-# only when it differs from `w`, optional `d`). Batch NUL-terminated records
-# once per compadd call because per-record writes caused one read per record
-# and measurably degraded large candidate sets.
+# compadd's option grammar, shared verbatim by the two zparseopts calls below
+# (the capture hook needs -O/-A/-D and -d, the encoder needs the rest) so the
+# two cannot drift; an incomplete grammar would make zparseopts stop early and
+# miss a later option. Each spec is quoted because ':=' inside an array
+# assignment would otherwise trigger '=' filename expansion.
+typeset -ga _ZRUSH_COMPADD_SPEC=(
+  'P:=apre' 'p:=hpre' 'S:=asuf' 's:=hsuf' 'i:=ipre' 'I:=isuf'
+  'd:=dscrs' 'X+:=expl' 'O:=_oad' 'A:=_oad' 'D:=_oad' 'f=isfile' 'x:=__'
+  'r:' 'R:' 'W:' 'F:' 'M+:' 'E:' 'q' 'e' 'Q' 'n' 'U' 'C'
+  'J:=grpJ' 'V:=__' 'a=__' 'l=__' 'k=__' 'o::=__' '1=__' '2=__'
+)
+
+# Pure encoder for one compadd call: argv plus the captured candidate arrays in,
+# wire bytes out. Emits the v2 wire format (cli-protocol.md "stdin(捕獲レコード)"):
+# one batch header record (tag `b`, then whichever of P/p/S/s/i/I/ip/f/rd/X/J are
+# non-empty) followed by one thin record per candidate (`w`, optional `m` only
+# when it differs from `w`, optional `d`). Batch NUL-terminated records once per
+# compadd call because per-record writes caused one read per record and
+# measurably degraded large candidate sets.
+#
+# No I/O and no completion context, so tests/zsh/vectors.zsh can call it
+# directly over tests/vectors/encode/. Inputs, all read from the caller's scope:
+#   $@                = the argv the compadd call was made with
+#   _zrush_enc_hits   = candidates as captured by `compadd -A`
+#   _zrush_enc_dscr   = display strings as captured by `compadd -D`
+#   $IPREFIX          = the `ip` field, and the base of the `-f` real directory
+# Output: REPLY = the bytes to send; empty means send nothing for this call.
+# The two arrays are consumed: sanitization rewrites them in place rather than
+# copying, because a copy per compadd call is measurable on large candidate sets.
+_zrush_encode_batch() {
+  builtin setopt localoptions extendedglob norcexpandparam noshglob
+  typeset -g REPLY=
+  (( $#_zrush_enc_hits > 0 )) || return 0
+
+  local -A apre hpre asuf hsuf ipre isuf dscrs _oad grpJ
+  local -a isfile _opts __ expl
+  zparseopts -a _opts "${(@)_ZRUSH_COMPADD_SPEC}"
+
+  # Drop framing bytes from value fields before encoding; same treatment as NUL.
+  _zrush_enc_hits=( "${(@)_zrush_enc_hits//(#s)*($'\0'|$'\1'|$'\2')*(#e)/}" )
+  _zrush_enc_dscr=( "${(@)_zrush_enc_dscr//(#s)*($'\0'|$'\1'|$'\2')*(#e)/}" )
+  local _bad_value="*("$'\0'"|"$'\1'"|"$'\2'")*"
+  local -a __decoded=( "${(@Q)_zrush_enc_hits}" )
+  local -i _bad_i
+  while _bad_i=${__decoded[(I)${~_bad_value}]} && (( _bad_i )); do
+    _zrush_enc_hits[_bad_i]=
+    _zrush_enc_dscr[_bad_i]=
+    __decoded[_bad_i]=
+  done
+  local _rd=
+  if (( $#isfile )); then
+    # Resolve the real directory for insertion-time '/' handling. Tilde expansion
+    # requires the unquoted nested ${}; see notes-zpty.md "置換範囲モデル".
+    _rd=${${(Qe)~${:-$IPREFIX${(v)hpre}}}}
+  fi
+  local -a _vals=(
+    "${(v)apre}" "${(v)hpre}" "${(v)asuf}" "${(v)hsuf}"
+    "${(v)ipre}" "${(v)isuf}" "$IPREFIX"
+    "$_rd" "${expl[2]:-}" "${(v)grpJ}"
+  )
+  _vals=( "${(@)_vals//(#s)*($'\0'|$'\1'|$'\2')*(#e)/}" )
+
+  # Batch header: shared fields for this compadd call, always emitted even
+  # when every field is empty (cli-protocol.md "バッチヘッダレコード": the
+  # receiver needs it to delimit batch boundaries).
+  local -a _hdr=( "b"$'\1' )
+  [[ -n $_vals[1] ]]  && _hdr+=( "P"$'\1'"$_vals[1]" )
+  [[ -n $_vals[2] ]]  && _hdr+=( "p"$'\1'"$_vals[2]" )
+  [[ -n $_vals[3] ]]  && _hdr+=( "S"$'\1'"$_vals[3]" )
+  [[ -n $_vals[4] ]]  && _hdr+=( "s"$'\1'"$_vals[4]" )
+  [[ -n $_vals[5] ]]  && _hdr+=( "i"$'\1'"$_vals[5]" )
+  [[ -n $_vals[6] ]]  && _hdr+=( "I"$'\1'"$_vals[6]" )
+  [[ -n $_vals[7] ]]  && _hdr+=( "ip"$'\1'"$_vals[7]" )
+  if (( $#isfile )); then
+    _hdr+=( "f"$'\1'"1" )
+    [[ -n $_vals[8] ]] && _hdr+=( "rd"$'\1'"$_vals[8]" )
+  fi
+  [[ -n $_vals[9] ]]  && _hdr+=( "X"$'\1'"$_vals[9]" )
+  [[ -n $_vals[10] ]] && _hdr+=( "J"$'\1'"$_vals[10]" )
+  local _out="${(pj:\2:)_hdr}"$'\0'
+
+  local -a _rec
+  local -i j
+  local _d _m
+  for (( j = 1; j <= $#_zrush_enc_hits; ++j )); do
+    # A candidate blanked above for containing framing bytes has nothing
+    # left to send; the contract puts exclusion on the sender (us), so
+    # skip it outright instead of emitting a bare empty-w record (Rust's
+    # own empty-w skip stays as a defensive fallback, not the guarantee).
+    [[ -z $_zrush_enc_hits[j] ]] && continue
+    _rec=( "w"$'\1'"$_zrush_enc_hits[j]" )
+    _m=$__decoded[j]
+    [[ $_m != "$_zrush_enc_hits[j]" ]] && _rec+=( "m"$'\1'"$_m" )
+    _d=${_zrush_enc_dscr[j]:-}
+    [[ -n $_d ]] && _rec+=( "d"$'\1'"$_d" )
+    _out+="${(pj:\2:)_rec}"$'\0'
+  done
+  typeset -g REPLY=$_out
+  return 0
+}
+
+# compadd hook installed in functions[compadd] only inside the fork. Captures
+# the candidates -- the only part that needs the completion context -- and
+# writes what _zrush_encode_batch makes of them.
 _zrush_compadd() {
   builtin setopt localoptions extendedglob norcexpandparam noshglob
   local -A apre hpre asuf hsuf ipre isuf dscrs _oad grpJ
   local -a isfile _opts __ expl
-  zparseopts -a _opts P:=apre p:=hpre S:=asuf s:=hsuf i:=ipre I:=isuf \
-             d:=dscrs X+:=expl O:=_oad A:=_oad D:=_oad f=isfile x:=__ \
-             r: R: W: F: M+: E: q e Q n U C \
-             J:=grpJ V:=__ a=__ l=__ k=__ o::=__ 1=__ 2=__
+  zparseopts -a _opts "${(@)_ZRUSH_COMPADD_SPEC}"
   # -O/-A/-D are internal matching/array calls; delegate without counting candidates.
   if (( $#_oad != 0 )); then
     builtin compadd "$@"
     return
   fi
-  local -a __hits __dscr
-  (( $#dscrs == 1 )) && __dscr=( "${(@P)${(v)dscrs}}" )
-  builtin compadd -A __hits -D __dscr "$@"
+  local -a _zrush_enc_hits _zrush_enc_dscr
+  (( $#dscrs == 1 )) && _zrush_enc_dscr=( "${(@P)${(v)dscrs}}" )
+  builtin compadd -A _zrush_enc_hits -D _zrush_enc_dscr "$@"
 
   # A zero-hit call still needs the tail-call below (compsys internal state,
   # e.g. compstate bookkeeping, depends on every compadd invocation actually
-  # reaching the real builtin); only the record-emission side is skippable.
-  if (( $#__hits > 0 )); then
-    # Drop framing bytes from value fields before encoding; same treatment as NUL.
-    __hits=( "${(@)__hits//(#s)*($'\0'|$'\1'|$'\2')*(#e)/}" )
-    __dscr=( "${(@)__dscr//(#s)*($'\0'|$'\1'|$'\2')*(#e)/}" )
-    local _bad_value="*("$'\0'"|"$'\1'"|"$'\2'")*"
-    local -a __decoded=( "${(@Q)__hits}" )
-    local -i _bad_i
-    while _bad_i=${__decoded[(I)${~_bad_value}]} && (( _bad_i )); do
-      __hits[_bad_i]=
-      __dscr[_bad_i]=
-      __decoded[_bad_i]=
-    done
-    local _rd=
-    if (( $#isfile )); then
-      # Resolve the real directory for insertion-time '/' handling. Tilde expansion
-      # requires the unquoted nested ${}; see notes-zpty.md "置換範囲モデル".
-      _rd=${${(Qe)~${:-$IPREFIX${(v)hpre}}}}
-    fi
-    local -a _vals=(
-      "${(v)apre}" "${(v)hpre}" "${(v)asuf}" "${(v)hsuf}"
-      "${(v)ipre}" "${(v)isuf}" "$IPREFIX"
-      "$_rd" "${expl[2]:-}" "${(v)grpJ}"
-    )
-    _vals=( "${(@)_vals//(#s)*($'\0'|$'\1'|$'\2')*(#e)/}" )
-
-    # Batch header: shared fields for this compadd call, always emitted even
-    # when every field is empty (cli-protocol.md "バッチヘッダレコード": the
-    # receiver needs it to delimit batch boundaries).
-    local -a _hdr=( "b"$'\1' )
-    [[ -n $_vals[1] ]]  && _hdr+=( "P"$'\1'"$_vals[1]" )
-    [[ -n $_vals[2] ]]  && _hdr+=( "p"$'\1'"$_vals[2]" )
-    [[ -n $_vals[3] ]]  && _hdr+=( "S"$'\1'"$_vals[3]" )
-    [[ -n $_vals[4] ]]  && _hdr+=( "s"$'\1'"$_vals[4]" )
-    [[ -n $_vals[5] ]]  && _hdr+=( "i"$'\1'"$_vals[5]" )
-    [[ -n $_vals[6] ]]  && _hdr+=( "I"$'\1'"$_vals[6]" )
-    [[ -n $_vals[7] ]]  && _hdr+=( "ip"$'\1'"$_vals[7]" )
-    if (( $#isfile )); then
-      _hdr+=( "f"$'\1'"1" )
-      [[ -n $_vals[8] ]] && _hdr+=( "rd"$'\1'"$_vals[8]" )
-    fi
-    [[ -n $_vals[9] ]]  && _hdr+=( "X"$'\1'"$_vals[9]" )
-    [[ -n $_vals[10] ]] && _hdr+=( "J"$'\1'"$_vals[10]" )
-    local _out="${(pj:\2:)_hdr}"$'\0'
-
-    local -a _rec
-    local -i j
-    local _d _m
-    for (( j = 1; j <= $#__hits; ++j )); do
-      # A candidate blanked above for containing framing bytes has nothing
-      # left to send; the contract puts exclusion on the sender (us), so
-      # skip it outright instead of emitting a bare empty-w record (Rust's
-      # own empty-w skip stays as a defensive fallback, not the guarantee).
-      [[ -z $__hits[j] ]] && continue
-      _rec=( "w"$'\1'"$__hits[j]" )
-      _m=$__decoded[j]
-      [[ $_m != "$__hits[j]" ]] && _rec+=( "m"$'\1'"$_m" )
-      _d=${__dscr[j]:-}
-      [[ -n $_d ]] && _rec+=( "d"$'\1'"$_d" )
-      _out+="${(pj:\2:)_rec}"$'\0'
-    done
-    print -rn -u $_zrush_wfd -- "$_out" 2>/dev/null
-  fi
+  # reaching the real builtin); only the record-emission side is skippable,
+  # which is what an empty REPLY from the encoder means.
+  local REPLY=   # keep the encoder's output out of compsys's own REPLY
+  _zrush_encode_batch "$@"
+  [[ -n $REPLY ]] && print -rn -u $_zrush_wfd -- "$REPLY" 2>/dev/null
   # Also run the original compadd to keep compsys internal state consistent,
   # regardless of whether this call produced any hits.
   builtin compadd "$@"
@@ -707,6 +743,26 @@ _zrush_run_plan() {  # $1=raw NUL-terminated capture payload; "" is valid (0 can
   return 1
 }
 
+# Upper-bound check for every non-negative decimal in a plan, without
+# arithmetic evaluation. A plan is untrusted input and zsh integers are
+# 64-bit: evaluating a wider digit string truncates it after 19 digits, wraps
+# it negative -- so an out-of-range value would pass -- and prints a message
+# on stderr that would corrupt the zle display. Comparing the canonical digit
+# strings instead -- leading zeros dropped, then length, then ASCII order --
+# is exact at any width.
+_zrush_dec_le_all() {  # $1=bound, $2.. = values, all matched by <->
+  emulate -L zsh
+  setopt localoptions extendedglob
+  local b=${1##0##} v c   # canonical zero is the empty string
+  for v in "${@[2,-1]}"; do
+    c=${v##0##}
+    (( $#c < $#b )) && continue
+    (( $#c > $#b )) && return 1
+    [[ $c > $b ]] && return 1
+  done
+  return 0
+}
+
 # Validate and split one `zrush plan` stdout buffer into _zrush_plan_*.
 # Field layout is fixed (cli-protocol.md "stdout(描画プラン)"):
 #   common-prefix, L, P, L rows, H, H "role pos start len", P "start len",
@@ -719,6 +775,9 @@ _zrush_parse_plan() {  # $1=raw `zrush plan` stdout
   local -i n=$#f
   (( n >= 4 )) || return 1
   [[ $f[2] == <-> && $f[3] == <-> ]] || return 1
+  # n = 4 + L + H + 3P bounds each count by n; checking that before any
+  # arithmetic keeps the counts inside the integer range from here on.
+  _zrush_dec_le_all $n $f[2] $f[3] || return 1
   local -i L=$f[2] P=$f[3]
 
   local -i idx=4
@@ -727,6 +786,7 @@ _zrush_parse_plan() {  # $1=raw `zrush plan` stdout
   (( idx += L ))
   (( idx <= n )) || return 1
   [[ $f[idx] == <-> ]] || return 1
+  _zrush_dec_le_all $n $f[idx] || return 1
   local -i H=$f[idx]
   (( idx += 1 ))
   (( idx + H - 1 <= n )) || return 1
@@ -743,16 +803,16 @@ _zrush_parse_plan() {  # $1=raw `zrush plan` stdout
   (( idx += P ))
   (( idx - 1 == n )) || return 1   # exact field count: 4 + L + H + 3P
 
-  # Tuple shapes and value ranges.
+  # Tuple shapes, then every 0..P value in one pass.
   local e role pos start len
-  local -a tok
+  local -a tok ranged=()
   for e in "${(@)hls}"; do
     tok=( ${=e} )
     (( $#tok == 4 )) || return 1
     role=$tok[1] pos=$tok[2] start=$tok[3] len=$tok[4]
     [[ $role == match || $role == heading ]] || return 1
     [[ $pos == <-> && $start == <-> && $len == <-> ]] || return 1
-    (( pos <= P )) || return 1
+    ranged+=( $pos )
   done
   for e in "${(@)cells}"; do
     tok=( ${=e} )
@@ -763,8 +823,9 @@ _zrush_parse_plan() {  # $1=raw `zrush plan` stdout
     tok=( ${=e} )
     (( $#tok == 4 )) || return 1
     [[ $tok[1] == <-> && $tok[2] == <-> && $tok[3] == <-> && $tok[4] == <-> ]] || return 1
-    (( tok[1] <= P && tok[2] <= P && tok[3] <= P && tok[4] <= P )) || return 1
+    ranged+=( "${(@)tok}" )
   done
+  _zrush_dec_le_all $P "${(@)ranged}" || return 1
 
   _zrush_plan_cp=$f[1]
   _zrush_plan_nlines=$L
@@ -1326,4 +1387,7 @@ _zrush_init() {
   return 0
 }
 
-_zrush_init
+# Test seam: tests/zsh/vectors.zsh sources this file with ZRUSH_NO_INIT=1 to
+# exercise _zrush_parse_plan and _zrush_encode_batch alone, without
+# zle/compsys/binary side effects.
+[[ -n $ZRUSH_NO_INIT ]] || _zrush_init

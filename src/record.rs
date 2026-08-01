@@ -207,6 +207,43 @@ fn parse_candidate_fields<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+
+    fn parser_byte() -> impl Strategy<Value = u8> {
+        prop_oneof![
+            6 => prop::sample::select(vec![REC_SEP, TAG_SEP, FIELD_SEP]),
+            6 => prop::sample::select(b"bwPpSsiIfrdXJm".to_vec()),
+            1 => any::<u8>(),
+        ]
+    }
+
+    fn arbitrary_parser_input() -> impl Strategy<Value = Vec<u8>> {
+        let arbitrary = prop::collection::vec(any::<u8>(), 0..=256);
+        let framing_heavy = prop::collection::vec(parser_byte(), 0..=256);
+        let terminated = prop::collection::vec(parser_byte(), 0..256).prop_map(|mut bytes| {
+            bytes.push(REC_SEP);
+            bytes
+        });
+        prop_oneof![2 => arbitrary, 3 => framing_heavy, 5 => terminated]
+    }
+
+    // The signature already rules out any outcome but Ok / FramingError, so
+    // asserting that alone would hold by typing. What is worth pinning over
+    // arbitrary bytes is that no input panics, plus the two postconditions
+    // plan.rs relies on when it indexes the result.
+    proptest! {
+        #[test]
+        fn parse_is_total(input in arbitrary_parser_input()) {
+            let Ok(parsed) = parse(&input) else { return Ok(()) };
+            for cand in &parsed.candidates {
+                prop_assert!(!cand.w.is_empty(), "candidate with empty w: {cand:?}");
+                prop_assert!(
+                    cand.batch < parsed.batches.len(),
+                    "candidate batch index out of range: {cand:?}"
+                );
+            }
+        }
+    }
 
     /// Build a record from `\1`-joined tag/value pairs already `\2`-joined
     /// by the caller; this helper just appends the NUL terminator.
@@ -343,10 +380,10 @@ mod tests {
 
     #[test]
     fn worker_pid_record_is_skipped() {
-        let pid = record(&[field("pid", "12345")]);
         let header = record(&[field("b", "")]);
+        let pid = record(&[field("pid", "12345")]);
         let ok = record(&[field("w", "cand")]);
-        let refs: [&[u8]; 3] = [&pid, &header, &ok];
+        let refs: [&[u8]; 3] = [&header, &pid, &ok];
         let input = payload(&refs);
         let parsed = parse(&input).unwrap();
         assert_eq!(parsed.batches.len(), 1);

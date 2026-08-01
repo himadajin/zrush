@@ -650,36 +650,107 @@ mod tests {
         assert!(out.contains("ty'\\''po"), "{out}");
     }
 
+    // Reads a repo file by path relative to the crate root, for tests that
+    // read the contract doc or cross-check hand-written copies of
+    // PROTOCOL_VERSION elsewhere in the repo.
+    fn read_repo_file(relative_path: &str) -> String {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(relative_path);
+        std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()))
+    }
+
+    const CONTRACT: &str = "docs/internal/contracts/cli-protocol.md";
+
+    /// PROTOCOL_VERSION is hand-written in four places: this const, two
+    /// lines in the cli-protocol.md contract doc, and zsh/zrush.zsh. This
+    /// cross-checks the other three against this const so a bump here can't
+    /// silently drift from docs or the zsh side. (The remaining copy, in
+    /// tests/cli.rs's golden, is covered by the test that owns it.)
+    #[test]
+    fn protocol_version_matches_docs_and_zsh() {
+        let expected: [(&str, String); 3] = [
+            (
+                CONTRACT,
+                format!("- **PROTOCOL_VERSION = {PROTOCOL_VERSION}**"),
+            ),
+            (
+                CONTRACT,
+                format!("typeset -g  ZRUSH_PROTOCOL_VERSION='{PROTOCOL_VERSION}'"),
+            ),
+            (
+                "zsh/zrush.zsh",
+                format!("typeset -gi _ZRUSH_EXPECTED_PROTO={PROTOCOL_VERSION}"),
+            ),
+        ];
+
+        let mismatches: Vec<String> = expected
+            .iter()
+            .filter(|(relative_path, expected_line)| {
+                !read_repo_file(relative_path)
+                    .lines()
+                    .any(|line| line.trim() == expected_line)
+            })
+            .map(|(relative_path, expected_line)| {
+                format!("{relative_path}: expected a line \"{expected_line}\"")
+            })
+            .collect();
+
+        assert!(
+            mismatches.is_empty(),
+            "PROTOCOL_VERSION mismatch: src/config.rs::PROTOCOL_VERSION is \
+             {PROTOCOL_VERSION:?}, but the following locations disagree (or are \
+             missing the anchor line) and need to be updated to match:\n{}",
+            mismatches.join("\n")
+        );
+    }
+
+    /// The default `zrush config` output as the contract specifies it: the
+    /// fenced zsh block that opens the "stdout" section of "zrush config".
+    /// Reading it keeps the doc the only copy on this side; every failure
+    /// mode of the extraction panics with the anchor it could not find, so
+    /// restructuring the doc breaks this loudly instead of quietly turning
+    /// the check into a no-op.
+    fn contract_default_output() -> String {
+        const HEADING: &str = "### stdout(zsh source 形式)";
+        const OPEN: &str = "```zsh\n";
+        const CLOSE: &str = "```";
+
+        let doc = read_repo_file(CONTRACT);
+        let after_heading = doc
+            .split_once(&format!("\n{HEADING}\n"))
+            .unwrap_or_else(|| {
+                panic!("{CONTRACT}: heading \"{HEADING}\" not found; this test reads the example under it")
+            })
+            .1;
+        // Stop at the next heading: the example must stay the first block of
+        // its section, or a later fence would be silently picked up instead.
+        let section = after_heading
+            .split_once("\n#")
+            .map_or(after_heading, |(section, _)| section);
+        let body = section
+            .split_once(OPEN)
+            .unwrap_or_else(|| {
+                panic!("{CONTRACT}: no {OPEN:?} block between \"{HEADING}\" and the next heading")
+            })
+            .1;
+        body.split_once(CLOSE)
+            .unwrap_or_else(|| {
+                panic!(
+                    "{CONTRACT}: the example block under \"{HEADING}\" is not closed by {CLOSE:?}"
+                )
+            })
+            .0
+            .to_string()
+    }
+
     #[test]
     fn default_output_matches_contract_example() {
-        let out = to_zsh(&LoadResult::default());
-        let expected = "\
-typeset -g  ZRUSH_PROTOCOL_VERSION='2'
-typeset -g  ZRUSH_CFG_MAX_LINES='10'
-typeset -g  ZRUSH_CFG_DELAY_MS='30'
-typeset -g  ZRUSH_CFG_MIN_INPUT='0'
-typeset -g  ZRUSH_CFG_MODE='typo'
-typeset -g  ZRUSH_CFG_SMART_CASE='true'
-typeset -g  ZRUSH_CFG_TAB='menu'
-typeset -g  ZRUSH_CFG_TRAILING_SPACE='true'
-typeset -g  ZRUSH_CFG_HL_SELECTED='standout'
-typeset -g  ZRUSH_CFG_HL_MATCH='underline'
-typeset -g  ZRUSH_CFG_HL_HEADING='bold'
-typeset -ga ZRUSH_CFG_KEYBINDS=(
-  'select-next'  'key:down'
-  'select-next'  'seq:^N'
-  'select-prev'  'key:up'
-  'select-prev'  'seq:^P'
-  'select-left'  'key:left'
-  'select-left'  'seq:^B'
-  'select-right' 'key:right'
-  'select-right' 'seq:^F'
-  'confirm'      'seq:^M'
-  'dismiss'      'seq:^G'
-)
-typeset -ga ZRUSH_CFG_WARNINGS=()
-";
-        assert_eq!(out, expected);
+        assert_eq!(
+            to_zsh(&LoadResult::default()),
+            contract_default_output(),
+            "default `zrush config` output disagrees with the example in {CONTRACT}, \
+             which is the source of truth"
+        );
     }
 
     #[test]

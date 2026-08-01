@@ -3,7 +3,20 @@
 zrush.zsh(zsh 側)と `zrush` バイナリ(Rust 側)の入出力仕様。
 この文書が真実であり、コードはこれに追従する。
 
+## この文書の読み方
+
+節の冒頭に「検証:」行がある節は、そこに挙げたテストがその節の規範を機械検証している。
+挙げられた規範を破れば、そのテストが落ちる。
+検証行の無い節、および検証行が挙げていない規範は、散文だけが規範の在処であり、破ってもテストは落ちない
+(自由に変えてよいという意味ではない。この文書が真実であることは変わらない)。
+
+節の一部だけが機械検証されている場合は、検証行がその範囲を明示する。
+検証行が挙げるのはテストの所在(ディレクトリまたはファイル)までで、個々のベクタ名は挙げない。
+ゴールデンベクタ群の構成・追加手順・カバー範囲は `tests/vectors/README.md`。
+
 ## プロトコル版
+
+> 検証: 版番号のコピーの一致 — `src/config.rs` のテスト `protocol_version_matches_docs_and_zsh`。
 
 - **PROTOCOL_VERSION = 2**
 - `zrush config` の出力に `ZRUSH_PROTOCOL_VERSION` が含まれる。
@@ -15,7 +28,36 @@ zrush.zsh(zsh 側)と `zrush` バイナリ(Rust 側)の入出力仕様。
 - 未知の引数を渡された `zrush` は exit 2 で拒否する(前方互換より誤用の早期検出を優先する意図的選択。
   版不整合は上記の警告で検知される)。
 
+### 版番号を上げる手順
+
+1. `src/config.rs` の `PROTOCOL_VERSION` を上げる。
+2. `cargo test --no-fail-fast` を実行する。追従が必要な残りの箇所は、落ちたテストがすべて指す
+   (`--no-fail-fast` を付けないと最初に落ちたテストターゲットで止まり、`tests/cli.rs` の分は次の実行まで出てこない):
+   - `protocol_version_matches_docs_and_zsh`(`src/config.rs`)が、この文書の 2 行
+     (この節の `- **PROTOCOL_VERSION = N**` と「zrush config」節の出力例の
+     `typeset -g  ZRUSH_PROTOCOL_VERSION='N'`)と `zsh/zrush.zsh` の
+     `typeset -gi _ZRUSH_EXPECTED_PROTO=N` のうち、追従できていないものを列挙する。
+   - `default_output_matches_contract_example`(`src/config.rs`)は「zrush config」節の出力例を読むので、
+     その例の版番号を直すまで落ちる(テスト側にコピーは無い。この文書を直せば追従する)。
+   - `config_without_file_prints_contract_default_output`(`tests/cli.rs`)は実プロセスの出力を
+     テスト内の独立したコピーと突き合わせるので、そのコピーも直す。
+   直して `cargo test` が green になることを確認する。
+3. ワイヤ形式も変えた場合はゴールデンを再生成する:
+   `UPDATE_GOLDEN=1 cargo test`(`tests/vectors/plan/` の `expected.bin` と `tests/vectors/reject/` の `exit`)、
+   `UPDATE_GOLDEN=1 zsh -f tests/zsh/vectors.zsh`(`tests/vectors/encode/` の `expected.bin`)。
+   どちらも更新が生じると更新一覧を添えて**わざと失敗する**ので、差分をレビューしてから同じコマンドを再実行し、
+   何も更新されない(= green になる)ことを確認する。
+   `tests/vectors/reject-plan/` は生成物ではないので手で書く。
+4. zsh 側のランナーと E2E ドライバを通す:
+   `zsh -f tests/zsh/vectors.zsh` と、`cargo build --release` の後に
+   `zsh -f tests/zsh/driver.zsh <playground-dir>`
+   (`zsh/` に触れる変更なので `tests/zsh/driver-coexist.zsh` も。AGENTS.md「Build and test」)。
+5. 版番号を名指ししているコード中のコメント(`grep -rn 'v2' src zsh tests`)を確認する。
+   どのテストも検出しないので、ここだけは手で追従させる。
+
 ## 共通事項
+
+> 検証: 制御バイトを含む候補・値の除外(送信側の保証)— `tests/vectors/encode/`(`zsh -f tests/zsh/vectors.zsh`)。
 
 - `zrush` はキー入力・プロンプト表示のたびに都度起動される。常駐しない。
 - 文字列はバイト列として扱い、エンコーディング変換をしない(ファイル名は任意バイト列であり得る)。
@@ -29,6 +71,10 @@ zrush.zsh(zsh 側)と `zrush` バイナリ(Rust 側)の入出力仕様。
   詳細は「`zrush plan`」節。
 
 ### 終了コード
+
+> 検証: `zrush plan` が exit 2 / 3 を返す条件 — `tests/vectors/reject/`(ランナーは `tests/vectors.rs`)。
+> `--help` の exit 0、未知サブコマンドと `zrush config` への余計な引数の exit 2 — `tests/cli.rs`。
+> exit 1 と、`-h` / `help` サブコマンドを固定するテストは無い。
 
 | コード | 意味 |
 |---|---|
@@ -47,6 +93,8 @@ zrush.zsh(zsh 側)と `zrush` バイナリ(Rust 側)の入出力仕様。
 zsh がそのまま適用できる描画プランを返す。
 
 ### 起動
+
+> 検証: 引数の受理と拒否(未知の引数・不足・不正値は exit 2)— `tests/vectors/reject/`。
 
 ```
 zrush plan --query <bytes> --mode <prefix|substring|typo> --smart-case <true|false> \
@@ -73,6 +121,10 @@ zrush plan --query <bytes> --mode <prefix|substring|typo> --smart-case <true|fal
   `zrush plan` は対話シェルのカレントディレクトリで起動される前提を置く。
 
 ### stdin(捕獲レコード)
+
+> 検証(この節と以下の小節): 送信側(zsh のエンコーダ)の発行規範 — `tests/vectors/encode/`(`zsh -f tests/zsh/vectors.zsh`)。
+> 受信側(Rust のパーサ)の解釈規範 — `tests/vectors/plan/`(`tests/vectors.rs`)と `src/record.rs` の proptest(パーサの全域性)。
+> 非空ストリームの NUL 終端欠落 — `tests/vectors/reject/`。
 
 フレーミングは NUL(`\0`)終端のレコードが連続する形式。
 レコード内は `\2` で連結した `<tag>\1<value>` 形式のフィールドの並び。
@@ -144,6 +196,12 @@ Rust も重複除去しない(compsys の出力順の情報を保つ。
     Rust 側でのスキップは保険であり、通常の入力では発生しない。
 
 ### stdout(描画プラン)
+
+> 検証(この節と以下の小節。ただし「適用(zsh 側の規範)」を除く):
+> ワイヤ形式とプランの中身 — `tests/vectors/plan/` を、Rust のシリアライザと参照パーサ `src/wire.rs`(`tests/vectors.rs`)、
+> および zsh のデコーダ `_zrush_parse_plan`(`zsh -f tests/zsh/vectors.zsh`。パース後に再直列化して往復させる)の双方で検査する。
+> 任意の入力に対して出力がワイヤ形状の不変条件を満たすことは `src/plan.rs` の proptest。
+> ゴールデンは `f = 1` の候補を含まないため、`/` 合成だけはこの検証の対象外(`tests/vectors/README.md`)。その検証手段は「挿入テキスト」節の検証行。
 
 NUL(`\0`)終端フィールドの平坦列。数値は ASCII 10 進表記。順序は固定:
 
@@ -242,6 +300,11 @@ NUL(`\0`)終端フィールドの平坦列。数値は ASCII 10 進表記。順�
 
 #### 挿入テキスト
 
+> 検証(この節のうち、上の節のゴールデンが届かない `/` 合成の判定):
+> 連結順・stat パス(`rd` + match-text)の構築・`f` が `1` でない候補を stat しないこと・nospace 条件 — `src/insert.rs` の単体テスト(`is_dir` を注入する)。
+> stat するのは表示位置として採用された `f = 1` の候補だけであること、および stat 失敗・非ディレクトリ時の扱い — `src/plan.rs`。
+> 実ファイルシステムに対する `/` 合成 — `tests/cli.rs`。
+
 - 位置ごとに、確定時にそのまま使える完成済みの挿入テキストを 1 個ずつ返す。
 - 構築規則: `ip + i + P + p + w + s + S + I` の連結
   (バッチヘッダの共有フィールド + その候補固有の `w`)。
@@ -256,6 +319,9 @@ NUL(`\0`)終端フィールドの平坦列。数値は ASCII 10 進表記。順�
   この時点で付与済みとして返す。
 
 #### 適用(zsh 側の規範)
+
+> 検証: 実際の zle 配線に対するスモークテスト — `tests/zsh/driver.zsh`
+> (`POSTDISPLAY` の組み立て、確定時の `LBUFFER` 置換と `RBUFFER` 保持)。
 
 - **表示**: `L > 0` なら `POSTDISPLAY` を「改行 1 個 + L 個の表示行テキストを改行で連結したもの」に
   置き換える(オフセット規律の `$#BUFFER + 1` 加算は、この先頭の改行 1 個に対応する)。
@@ -289,6 +355,11 @@ zsh は一覧を消す。
 
 ### マッチング・ランキングの意味論
 
+> 検証: モードの累積性・ティアの序列・smart-case の真偽両方・誤字許容の範囲(候補の接頭辞に対する 1 編集、1 文字クエリでは不適用)・非 UTF-8 バイト列でもマッチすること —
+> `src/matching.rs` の単体テスト(小さなアルファベット上での DP 参照実装との網羅照合を含む)。
+> ティア順のソートと同点時の stdin 順保存 — `src/ranking.rs`。プロセス越しのティア順と common-prefix — `tests/cli.rs`。
+> 大文字小文字の畳み込みを ASCII に限る規範は、どのテストも固定していない。
+
 - モードは累積的に広がる: `typo` ⊇ `substring` ⊇ `prefix`。
   - `prefix`: match-text がクエリで始まる。
   - `substring`: match-text がクエリを部分文字列として含む。
@@ -313,6 +384,10 @@ zsh は一覧を消す。
 
 ### エラー時の zsh 側挙動(規範)
 
+> 検証: プランの受理条件(下記の拒否条件)— `tests/vectors/reject-plan/` を、
+> Rust の参照パーサ `src/wire.rs`(`tests/vectors.rs`)と zsh の `_zrush_parse_plan`(`zsh -f tests/zsh/vectors.zsh`)の双方が拒否することを検査する。
+> 破棄と「セッション内 1 回警告」の実挙動 — `tests/zsh/driver.zsh` のスモークテスト。
+
 - `zrush plan` の exit が非 0(2/3 に限らず、パニック・シグナル死・実行失敗 127 を含む)の場合、
   zsh 側は出力を破棄して一覧を出さず(既存の一覧は消し)、動作を継続する。
   警告表示はセッション内で初回のみ(キー入力毎のスパム防止)。
@@ -325,6 +400,12 @@ zsh は一覧を消す。
 - `zrush plan` の stderr は端末に流さない(zle 表示を壊さないため。`/dev/null` へ)。
 
 ## zrush config
+
+> 検証: 既定出力 — `src/config.rs` の `default_output_matches_contract_example` が**下の出力例そのものを読んで** `zrush config` の出力と突き合わせる(この文書が唯一のコピー)。
+> 同じ出力を実プロセスで — `tests/cli.rs`(独立したコピーを持つ)。
+> クォート規律・設定値の反映・不正値の既定値フォールバックと警告・キーバインド配列(正規化後の重複解決を含む)— `src/config.rs` と `tests/cli.rs` の設定テスト。
+> config パス解決は `$XDG_CONFIG_HOME` が設定されている経路(ファイル不在を含む)のみ検査される。未設定・空文字列で `~/.config` に落ちる規範を固定するテストは無い。
+> zsh 側の規範(`emulate -L zsh` での source、`key:` の `$terminfo` 解決、`main` キーマップへの bindkey)は、既定キーバインドの範囲で `tests/zsh/driver.zsh` がスモークテストする。
 
 config.toml を解決・検証し、zsh が `source` できる形で設定値とキーバインド定義を出力する。
 
