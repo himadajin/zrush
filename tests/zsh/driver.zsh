@@ -1034,12 +1034,16 @@ start_hist_host() {  # $1=zdotdir $2=xdg-config-home $3=logfile
   fi
   sync_prompt
 
-  # ---- (h26) audit A2: send-break while the history menu is open must not
-  # leak state into the next line -- kind/listing (^Xk) and the debounce
-  # timer/collection fds (^Xt) must all be clear after the following
-  # line-init. The existing (sb-1) regression elsewhere in this driver only
-  # checks _zrush_plan_npos/_zrush_listing for a completion listing, not the
-  # history-menu path nor the timer/collection fds.
+  # ---- (h26a/h26b) audit A2: send-break while the history menu is open must
+  # not leak kind/listing state into the next line. The existing (sb-1)
+  # regression elsewhere in this driver only checks _zrush_plan_npos/
+  # _zrush_listing for a completion listing, not the history-menu path.
+  # (No fd check here: opening the history menu already disarms the timer
+  # and cancels any collection *before* it displays, so the fds are already
+  # clear before ^C is even sent -- a check here would pass vacuously even
+  # if _zrush_line_init's own disarm/cancel were broken. (h26c)/(h26d) below
+  # cover the fd cleanup from states where the fds are provably non-empty
+  # right before send-break.)
   send_keys 'echo'
   drain 0.5
   press $'\e[A'
@@ -1051,11 +1055,38 @@ start_hist_host() {  # $1=zdotdir $2=xdg-config-home $3=logfile
     if dump_get $'\C-xk' TESTKIND; then
       [[ $REPLY == 'kind=none sel=0 listing=0 npos=0' ]] && ok "(h26b) no kind/listing state leaks into the new prompt" || ng "(h26b) $REPLY"
     fi
+  else
+    ng "(h26a) send-break did not produce a new prompt in this environment"
+  fi
+  clear_line
+  drain 0.3
+
+  # ---- (h26d) audit A2: send-break while a real collection is in flight
+  # (rfd/pty alive, not merely debounce-armed) must clear those fds too.
+  # Reuses the same slow fixture as (h17), but ends with ^C instead of Up.
+  send_keys 'zrushtestslow '
+  drain 0.2   # let debounce elapse and the fork start; it is still asleep (0.5s)
+  if dump_get $'\C-xt' TESTFDS; then
+    # Guard against a vacuous check: fail loudly here rather than silently
+    # passing (h26d) below for the wrong reason if no collection is actually
+    # in flight yet.
+    [[ $REPLY != 'timer=-1 rfd=-1 wfd=-1 pty=<none>' ]] \
+      && ok "(h26d-pre) a real collection is in flight (rfd/pty non -1) before send-break" \
+      || ng "(h26d-pre) no in-flight collection detected before send-break: $REPLY"
+  fi
+  send_keys $'\C-c'
+  if sync_prompt 5; then
+    ok "(h26d-a) a new prompt appears after send-break during an in-flight collection"
     if dump_get $'\C-xt' TESTFDS; then
-      [[ $REPLY == 'timer=-1 rfd=-1 wfd=-1 pty=<none>' ]] && ok "(h26c) no timer/collection fd leaks into the new prompt" || ng "(h26c) $REPLY"
+      [[ $REPLY == 'timer=-1 rfd=-1 wfd=-1 pty=<none>' ]] \
+        && ok "(h26d) the cancelled collection's fds/pty are cleared after the following line-init" \
+        || ng "(h26d) $REPLY"
+    fi
+    if dump_get $'\C-xk' TESTKIND; then
+      [[ $REPLY == 'kind=none sel=0 listing=0 npos=0' ]] && ok "(h26d-kind) kind/listing is also clean" || ng "(h26d-kind) $REPLY"
     fi
   else
-    out "SKIP: (h26) send-break did not produce a new prompt in this environment; skipping the leak check"
+    ng "(h26d-a) send-break did not produce a new prompt in this environment"
   fi
   clear_line
   drain 0.3
@@ -1121,6 +1152,43 @@ start_hist_host() {  # $1=zdotdir $2=xdg-config-home $3=logfile
     && ok "(h14c) the cursor actually moved onto the first line (was $cur_before, now $cur_after; line 1 spans 0..6)" \
     || ng "(h14c) cursor did not move onto the first line (before=$cur_before after=$cur_after)"
   reset_line
+
+  # ---- (h26c) audit A2: send-break while merely debounce-armed (timer fd
+  # alive, no collection started yet) must clear the timer too. A dedicated
+  # host with a generous delay-ms is used so the round trip to dump and
+  # assert the armed timer via ^Xt comfortably fits before the debounce
+  # would otherwise fire ((h25) already covers disarming via the history-menu
+  # open path itself; this covers disarming via send-break/line-init instead).
+  mkdir -p $WORK/xdg-hist-slowdebounce/zrush
+  print -r -- $'[display]\ndelay-ms = 2000' > $WORK/xdg-hist-slowdebounce/zrush/config.toml
+  if start_hist_host $WORK/zdot-hist $WORK/xdg-hist-slowdebounce $WORK/host-hist-slowdebounce.log; then
+    ok "(h26c-0) delay-ms=2000 host started"
+    send_keys 'x'
+    drain 0.3   # comfortably within the 2s debounce window
+    if dump_get $'\C-xt' TESTFDS; then
+      # Guard against a vacuous check: fail loudly here rather than silently
+      # passing (h26c) below for the wrong reason if the timer never armed.
+      [[ $REPLY != 'timer=-1'* ]] \
+        && ok "(h26c-pre) the debounce timer is armed (non -1) before send-break" \
+        || ng "(h26c-pre) timer was not armed as expected before send-break: $REPLY"
+    fi
+    send_keys $'\C-c'
+    if sync_prompt 5; then
+      ok "(h26c-a) a new prompt appears after send-break during the debounce wait"
+      if dump_get $'\C-xt' TESTFDS; then
+        [[ $REPLY == 'timer=-1 rfd=-1 wfd=-1 pty=<none>' ]] \
+          && ok "(h26c) the disarmed debounce timer's fd is cleared after the following line-init" \
+          || ng "(h26c) $REPLY"
+      fi
+      if dump_get $'\C-xk' TESTKIND; then
+        [[ $REPLY == 'kind=none sel=0 listing=0 npos=0' ]] && ok "(h26c-kind) kind/listing is also clean" || ng "(h26c-kind) $REPLY"
+      fi
+    else
+      ng "(h26c-a) send-break did not produce a new prompt in this environment"
+    fi
+  else
+    ng "(h26c-0) delay-ms=2000 host failed to start"
+  fi
 
   # ---- (h8) [history].limit bounds the RAW scan window; entries that don't
   # survive the in-window dedup/exclusion are never backfilled from outside
