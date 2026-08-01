@@ -40,7 +40,7 @@ fi
 # ---------------------------------------------------------------- Global state
 typeset -g  ZRUSH_BIN=${ZRUSH_BIN:-$_zrush_source_dir/../target/release/zrush}
 typeset -gi _zrush_enabled=0
-typeset -gi _ZRUSH_EXPECTED_PROTO=2
+typeset -gi _ZRUSH_EXPECTED_PROTO=3
 typeset -g  _zrush_cfg_path= _zrush_cfg_mtime=
 typeset -gi _zrush_plan_warned=0 _zrush_proto_warned=0
 # Variables this script consumes from `zrush config` output (validation and rollback)
@@ -214,7 +214,8 @@ typeset -ga _ZRUSH_COMPADD_SPEC=(
 )
 
 # Pure encoder for one compadd call: argv plus the captured candidate arrays in,
-# wire bytes out. Emits the v2 wire format (cli-protocol.md "stdin(捕獲レコード)"):
+# wire bytes out. Emits the compsys 捕獲 profile wire format (cli-protocol.md
+# "compsys 捕獲 profile"):
 # one batch header record (tag `b`, then whichever of P/p/S/s/i/I/ip/f/rd/X/J are
 # non-empty) followed by one thin record per candidate (`w`, optional `m` only
 # when it differs from `w`, optional `d`). Batch NUL-terminated records once per

@@ -39,7 +39,7 @@ pub(crate) enum Error {
     Framing,
 }
 
-/// Run the full v2 pipeline and return the serialized render plan.
+/// Run the full pipeline and return the serialized render plan.
 pub(crate) fn run(
     params: &Params,
     stdin: &[u8],
@@ -462,7 +462,7 @@ mod tests {
     }
 
     #[test]
-    fn ranking_tiers_and_common_prefix_v2() {
+    fn ranking_tiers_and_common_prefix() {
         let stdin = {
             let mut s = header(&[]);
             for w in ["mydocs", "docs", "dot-config", "doc", "xxx"] {

@@ -2,8 +2,9 @@
 //!
 //! Semantics: docs/internal/contracts/cli-protocol.md "挿入テキスト"
 //! (source of truth). Byte concatenation only, in the contract's fixed
-//! tag order; no zsh quoting semantics are reproduced here (`w` already
-//! arrives pre-quoted from record.rs, per cli-protocol.md "共通事項").
+//! tag order; no zsh quoting semantics are reproduced here (whether `w`
+//! is pre-quoted is a producer-profile concern, per cli-protocol.md
+//! "compsys 捕獲 profile" / "history profile").
 //!
 //! The `-f` directory-synthesis stat is injected as a predicate rather
 //! than performed here: plan.rs owns the "stat only the P displayed `f=1`

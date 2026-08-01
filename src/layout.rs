@@ -9,12 +9,13 @@
 //! match-text, from matching::QueryMatcher::spans) are supplied by the
 //! caller and only get clipped/repositioned here.
 //!
-//! v1's offset bug (mixing char counts and display widths) is why the
-//! contract now spells out the split explicitly: highlight/cell-range
-//! `start`/`len` are always char counts over the lossy-UTF-8 reading of
-//! the listing text, while cell padding/truncation is always display
-//! width (unicode-width). The two are computed from the same lossy
-//! decoding pass (`lossy_chars`) so they can never drift apart here.
+//! Mixing char counts and display widths is a recurring source of offset
+//! bugs, which is why the contract spells out the split explicitly:
+//! highlight/cell-range `start`/`len` are always char counts over the
+//! lossy-UTF-8 reading of the listing text, while cell padding/truncation
+//! is always display width (unicode-width). The two are computed from the
+//! same lossy decoding pass (`lossy_chars`) so they can never drift apart
+//! here.
 
 use std::borrow::Cow;
 use std::ops::Range;
@@ -681,7 +682,7 @@ mod tests {
         assert_eq!(plan.positions.len(), 2); // dropped the other 3
     }
 
-    // ---- offsets: char count vs display width (v1 regression) ----
+    // ---- offsets: char count vs display width ----
 
     #[test]
     fn cjk_cell_padding_uses_width_offsets_use_chars() {

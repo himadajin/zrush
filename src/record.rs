@@ -1,7 +1,7 @@
-//! v2 stdin capture-payload parser for `zrush plan`.
+//! stdin record parser for `zrush plan`.
 //!
 //! Format and semantics: docs/internal/contracts/cli-protocol.md
-//! ("`zrush plan`" -> "stdin(捕獲レコード)", source of truth). NUL-terminated
+//! ("`zrush plan`" -> "stdin(レコードストリーム)", source of truth). NUL-terminated
 //! records; fields within a record are `\2`-joined `<tag>\1<value>` pairs.
 //! Batch header records (first field tag `b`) carry shared fields that
 //! apply to every candidate record up to the next header; candidate
@@ -20,17 +20,19 @@ const TAG_SEP: u8 = 1; // \1: separates a field's tag from its value
 /// The sender only emits a shared field when it is non-empty, and per the
 /// contract's general rule "absent field" and "empty value" are
 /// equivalent -- so every field here reads as the empty slice when the
-/// header omitted it (or, defensively, sent it empty). Field names spell
-/// out the compadd option and its visible (uppercase tag) / hidden
-/// (lowercase tag) form; `ip`/`f`/`rd`/`x`/`j` mirror their tags directly.
+/// header omitted it (or, defensively, sent it empty). Field names mirror
+/// their wire tags directly (cli-protocol.md "バッチヘッダレコード"); the
+/// compadd option each visible/hidden prefix/suffix tag corresponds to is
+/// a compsys 捕獲 profile convention (cli-protocol.md "compsys 捕獲
+/// profile"), not a fact of this producer-independent record layer.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct Batch<'a> {
-    pub p_vis: &'a [u8],    // P: compadd -P
-    pub p_hidden: &'a [u8], // p: compadd -p
-    pub s_vis: &'a [u8],    // S: compadd -S
-    pub s_hidden: &'a [u8], // s: compadd -s
-    pub i_vis: &'a [u8],    // i: compadd -i
-    pub i_hidden: &'a [u8], // I: compadd -I
+    pub p_vis: &'a [u8],    // P
+    pub p_hidden: &'a [u8], // p
+    pub s_vis: &'a [u8],    // S
+    pub s_hidden: &'a [u8], // s
+    pub i_vis: &'a [u8],    // i
+    pub i_hidden: &'a [u8], // I
     pub ip: &'a [u8],       // ip: IPREFIX
     pub f: &'a [u8],        // f: "1" if a file candidate
     pub rd: &'a [u8],       // rd: real directory (for `-f` "/" synthesis)
@@ -42,13 +44,15 @@ pub(crate) struct Batch<'a> {
 /// the `batches` vec returned alongside it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Candidate<'a> {
-    /// Quoted-for-insertion candidate word (cli-protocol.md `w`). Never
-    /// empty -- the parser skips records that would produce one.
+    /// Candidate body used to build the insertion text (cli-protocol.md
+    /// `w`, "候補レコード"). Never empty -- the parser skips records that
+    /// would produce one. Producer-profile-specific: see cli-protocol.md
+    /// "compsys 捕獲 profile" / "history profile".
     pub w: &'a [u8],
-    /// Unquoted raw text (cli-protocol.md `m`), present only when it
-    /// differs from `w`.
+    /// match-text (cli-protocol.md `m`), present only when it differs
+    /// from `w`.
     pub m: Option<&'a [u8]>,
-    /// Display text (compadd `-d`).
+    /// Display text (cli-protocol.md `d`, "候補レコード").
     pub d: Option<&'a [u8]>,
     /// Index into the sibling `batches` vec.
     pub batch: usize,
@@ -77,9 +81,7 @@ pub(crate) struct FramingError;
 /// `FramingError` is plan.rs's job, not this module's.
 pub(crate) fn parse(input: &[u8]) -> Result<Parsed<'_>, FramingError> {
     // NUL-terminated records: a non-empty stream must end with NUL, and
-    // stripping it yields exactly the record list (mirrors the v1
-    // field-framing check this replaces in `zrush match`'s cmd_match,
-    // now removed).
+    // stripping it yields exactly the record list.
     let body = match input.last() {
         None => return Ok(Parsed::default()),
         Some(&REC_SEP) => &input[..input.len() - 1],

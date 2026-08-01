@@ -2,9 +2,9 @@
 //!
 //! Semantics (cli-protocol.md): sort by match quality descending —
 //! stricter tier ranks higher (prefix > substring > typo tolerance >
-//! order-preserving fuzzy). Ties keep stdin order (= compsys output
-//! order). Intra-tier ordering is an implementation detail
-//! (matching.rs assigns the scores).
+//! order-preserving fuzzy). Ties keep stdin order (the order the sender
+//! emitted candidates in). Intra-tier ordering is an implementation
+//! detail (matching.rs assigns the scores).
 
 use crate::matching::MatchScore;
 

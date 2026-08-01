@@ -1,5 +1,5 @@
 #!/bin/zsh -f
-# Headless coexistence and real-environment checks for zrush (protocol v2).
+# Headless coexistence and real-environment checks for zrush.
 #
 # Usage:
 #   zsh -f tests/zsh/driver-coexist.zsh <playground-dir>
@@ -22,9 +22,8 @@
 # clobbering the other.
 # All tests isolate ZDOTDIR, HOME, XDG, and ABBR files in temporary storage.
 #
-# Internal-state assertions read the v2 zsh state (_zrush_plan_*, the
-# "select: start"/"select: dir=..." log lines from _zrush_select_start/_dir)
-# rather than v1's _zrush_recs/_zrush_render (removed).
+# Internal-state assertions read the current zsh state (_zrush_plan_*, the
+# "select: start"/"select: dir=..." log lines from _zrush_select_start/_dir).
 emulate -L zsh
 setopt extended_glob
 zmodload zsh/zpty    || { print -u2 FATAL: zpty; exit 1 }
@@ -277,7 +276,7 @@ basic_flow() {  # $1=label prefix
     ng "$1: list not displayed"
     return 1
   fi
-  # v2: selection-only updates go through _zrush_apply_highlights (no plan
+  # Selection-only updates go through _zrush_apply_highlights (no plan
   # re-fetch/log), so "select: start" -- not a re-logged "selected=1" render --
   # is the event that marks Down actually starting selection.
   clog_count 'select: start'; local -i c_sel=$REPLY

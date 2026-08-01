@@ -121,7 +121,7 @@ fn plan_rejects_negative_width_with_exit_2() {
 
 #[test]
 fn removed_match_subcommand_now_exits_2() {
-    // `zrush match` (v1) no longer exists; it's just an unknown subcommand.
+    // `zrush match` does not exist; it's just an unknown subcommand.
     let out = zrush()
         .args(["match", "--query", "a"])
         .stderr(Stdio::null())
@@ -259,7 +259,7 @@ fn config_without_file_prints_contract_default_output() {
     let (code, out) = run_config(&dir);
     assert_eq!(code, 0);
     let expected = "\
-typeset -g  ZRUSH_PROTOCOL_VERSION='2'
+typeset -g  ZRUSH_PROTOCOL_VERSION='3'
 typeset -g  ZRUSH_CFG_MAX_LINES='10'
 typeset -g  ZRUSH_CFG_DELAY_MS='30'
 typeset -g  ZRUSH_CFG_MIN_INPUT='0'
@@ -270,6 +270,7 @@ typeset -g  ZRUSH_CFG_TRAILING_SPACE='true'
 typeset -g  ZRUSH_CFG_HL_SELECTED='standout'
 typeset -g  ZRUSH_CFG_HL_MATCH='underline'
 typeset -g  ZRUSH_CFG_HL_HEADING='bold'
+typeset -g  ZRUSH_CFG_HISTORY_LIMIT='5000'
 typeset -ga ZRUSH_CFG_KEYBINDS=(
   'select-next'  'key:down'
   'select-next'  'seq:^N'
@@ -291,11 +292,14 @@ typeset -ga ZRUSH_CFG_WARNINGS=()
 fn config_applies_file_values() {
     let dir = xdg_dir(
         "values",
-        Some("[display]\nmax-lines = 5\n[keybind]\nselect-next = \"ctrl-n\"\n"),
+        Some(
+            "[display]\nmax-lines = 5\n[history]\nlimit = 1234\n[keybind]\nselect-next = \"ctrl-n\"\n",
+        ),
     );
     let (code, out) = run_config(&dir);
     assert_eq!(code, 0);
     assert!(out.contains("ZRUSH_CFG_MAX_LINES='5'"), "{out}");
+    assert!(out.contains("ZRUSH_CFG_HISTORY_LIMIT='1234'"), "{out}");
     assert!(out.contains("'select-next'  'seq:^N'"), "{out}");
     assert!(out.contains("ZRUSH_CFG_WARNINGS=()"), "{out}");
 }
