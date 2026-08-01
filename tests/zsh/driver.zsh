@@ -1,5 +1,5 @@
 #!/bin/zsh -f
-# Headless zle-integration smoke driver for zrush.zsh (protocol v2).
+# Headless zle-integration smoke driver for zrush.zsh.
 #
 # Usage:
 #   zsh -f tests/zsh/driver.zsh <playground-dir>
@@ -190,16 +190,16 @@ dump_get() {
   zpty -b host zsh -d -i || { ng "host failed to start"; exit 1 }
   HOSTFD=$REPLY
   if expect '*MARK-RC-DONE*' 20; then
-    ok "host started + compinit + zrush.zsh sourced (protocol v2, config loaded)"
+    ok "host started + compinit + zrush.zsh sourced (config loaded)"
   else
     ng "unable to confirm host startup: ${(qqqq)EXPECT_BUF[-300,-1]}"
     exit 1
   fi
   sync_prompt
 
-  # ================================================================ (1) Capture fork -> v2 records
-  # (cap-1a) A real compsys fork collects candidates, ships v2 records (b header +
-  # w/d), and the round trip through `zrush plan` renders a list.
+  # ================================================================ (1) Capture fork -> candidate records
+  # (cap-1a) A real compsys fork collects candidates, ships candidate records
+  # (b header + w/d), and the round trip through `zrush plan` renders a list.
   send_keys 'ls fx/basic/al'
   if expect '*alpha.txt*' 10; then
     ok "(cap-1a) fork capture -> zrush plan -> apply round trip renders a list"

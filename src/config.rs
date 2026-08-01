@@ -11,7 +11,7 @@ use crate::keybind;
 use crate::matching::Mode;
 
 /// Protocol version emitted as ZRUSH_PROTOCOL_VERSION (cli-protocol.md).
-pub const PROTOCOL_VERSION: &str = "2";
+pub const PROTOCOL_VERSION: &str = "3";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TabBehavior {
@@ -57,6 +57,8 @@ pub struct Config {
     // [insert]
     pub tab: TabBehavior,
     pub trailing_space: bool,
+    // [history]
+    pub history_limit: u32,
     // [keybind] — normalized seq:/key: spec lists (one action may bind
     // several keys), index-aligned with keybind::ACTIONS.
     pub keybinds: [Vec<String>; keybind::N],
@@ -75,6 +77,7 @@ impl Default for Config {
             smart_case: true,
             tab: TabBehavior::Menu,
             trailing_space: true,
+            history_limit: 5000,
             keybinds: keybind::default_specs(),
         }
     }
@@ -138,7 +141,7 @@ pub fn parse(source: &str) -> LoadResult {
 
     for (tname, tval) in &table {
         match tname.as_str() {
-            "display" | "matching" | "insert" | "keybind" => {
+            "display" | "matching" | "insert" | "history" | "keybind" => {
                 let Some(sub) = tval.as_table() else {
                     warnings.push(format!(
                         "config: {tname}: expected a table, got {}; using defaults",
@@ -235,6 +238,9 @@ fn apply_key(
         }
         ("insert", "trailing-space") => {
             cfg.trailing_space = bool_val(val, table, key, true, warnings);
+        }
+        ("history", "limit") => {
+            cfg.history_limit = int_val(val, table, key, 1, 100000, 5000, warnings);
         }
         ("keybind", _) => {
             if let Some(i) = keybind::ACTIONS.iter().position(|a| *a == key) {
@@ -343,7 +349,7 @@ pub fn to_zsh(result: &LoadResult) -> String {
     use std::fmt::Write as _;
     let c = &result.config;
     let mut o = String::new();
-    let scalars: [(&str, String); 11] = [
+    let scalars: [(&str, String); 12] = [
         ("ZRUSH_PROTOCOL_VERSION", PROTOCOL_VERSION.to_string()),
         ("ZRUSH_CFG_MAX_LINES", c.max_lines.to_string()),
         ("ZRUSH_CFG_DELAY_MS", c.delay_ms.to_string()),
@@ -355,6 +361,7 @@ pub fn to_zsh(result: &LoadResult) -> String {
         ("ZRUSH_CFG_HL_SELECTED", c.hl_selected.clone()),
         ("ZRUSH_CFG_HL_MATCH", c.hl_match.clone()),
         ("ZRUSH_CFG_HL_HEADING", c.hl_heading.clone()),
+        ("ZRUSH_CFG_HISTORY_LIMIT", c.history_limit.to_string()),
     ];
     for (name, value) in &scalars {
         let _ = writeln!(o, "typeset -g  {name}={}", sq(value));
@@ -395,6 +402,7 @@ mod tests {
         assert!(c.smart_case);
         assert_eq!(c.tab, TabBehavior::Menu);
         assert!(c.trailing_space);
+        assert_eq!(c.history_limit, 5000);
         assert_eq!(c.keybinds, keybind::default_specs());
     }
 
@@ -427,6 +435,9 @@ mod tests {
             tab = "insert"
             trailing-space = false
 
+            [history]
+            limit = 200
+
             [keybind]
             select-next = ["ctrl-j", "j"]
             select-prev = "ctrl-k"
@@ -444,6 +455,7 @@ mod tests {
         assert!(!c.smart_case);
         assert_eq!(c.tab, TabBehavior::Insert);
         assert!(!c.trailing_space);
+        assert_eq!(c.history_limit, 200);
         assert_eq!(c.hl_selected, "fg=blue,standout");
         assert_eq!(c.hl_match, "", "empty string means no decoration");
         assert_eq!(c.hl_heading, "fg=green");
@@ -545,6 +557,19 @@ mod tests {
                 .any(|w| w.contains("expected integer 0..10000, got 20000")),
             "{:?}",
             r.warnings
+        );
+    }
+
+    #[test]
+    fn history_limit_out_of_range_falls_back() {
+        let r = parse("[history]\nlimit = 0\n");
+        assert_eq!(r.config.history_limit, 5000);
+        assert_eq!(r.warnings.len(), 1);
+        assert!(
+            r.warnings[0]
+                .contains("[history] limit: expected integer 1..100000, got 0; using default 5000"),
+            "{}",
+            r.warnings[0]
         );
     }
 

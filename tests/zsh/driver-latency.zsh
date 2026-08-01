@@ -1,6 +1,5 @@
 #!/bin/zsh -f
-# Latency driver for isolating time from key input to the first candidate paint
-# (protocol v2).
+# Latency driver for isolating time from key input to the first candidate paint.
 #
 # Usage: zsh -f tests/zsh/driver-latency.zsh <playground-dir>
 #   Prerequisite: cargo build --release completed. Use a real-terminal TERM
@@ -20,14 +19,12 @@
 #   first-paint: elapsed time from key sequence to expected pty text after stripping
 #                SGR, with roughly 10ms zselect resolution
 #   breakdown  : ZRUSH_LOG intervals, keyed off zsh's own _zlog checkpoints
-#                (cli-protocol.md / zsh/zrush.zsh -- v2 moved matching, ranking,
-#                grid layout, and highlight/nav-table construction out of zsh
-#                and into the single `zrush plan` external call, so what v1
-#                split into a "match" (Rust) bucket + a "render" (zsh grid/
-#                highlight computation) bucket is now one "plan" bucket (the
-#                whole `zrush plan` round trip) followed by a thin "apply"
-#                bucket (zsh copying the already-built plan into POSTDISPLAY/
-#                region_highlight)):
+#                (cli-protocol.md / zsh/zrush.zsh -- matching, ranking, grid
+#                layout, and highlight/nav-table construction all happen in
+#                Rust inside the single `zrush plan` external call, so the
+#                breakdown has one "plan" bucket (the whole `zrush plan`
+#                round trip) followed by a thin "apply" bucket (zsh copying
+#                the already-built plan into POSTDISPLAY/region_highlight)):
 #                arm (last key) -> request -> fork -> compsys -> transport -> plan -> apply
 emulate -L zsh
 setopt extended_glob
@@ -153,9 +150,8 @@ breakdown_last() {  # $1=logfile $2=number of leading lines to skip -> one table
   ts_of $L[ir]; t_apply=$REPLY
   for (( i = ir - 1; i >= 1; --i )); do
     case $L[i] in
-      # v2: `zrush plan` does matching/ranking/layout/highlights/nav/insert in
-      # one external call, replacing v1's separate "finalize: match ok" (Rust
-      # match) + the zsh-side render/layout leg now folded into "plan: ok".
+      # `zrush plan` does matching/ranking/layout/highlights/nav/insert in one
+      # external call, so all of that shows up as a single "plan: ok" line.
       *" plan: ok "*)                (( t_plan == 0 ))  && { ts_of $L[i]; t_plan=$REPLY } ;;
       *" finalize: "*" bytes"*)      (( t_xfer == 0 ))  && { ts_of $L[i]; t_xfer=$REPLY } ;;
       *" fork: _main_complete "*)    (( t_comp == 0 ))  && { ts_of $L[i]; t_comp=$REPLY } ;;

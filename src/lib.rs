@@ -62,7 +62,7 @@ enum Command {
 /// Flags for `zrush plan` (cli-protocol.md "zrush plan" > "起動").
 #[derive(clap::Args)]
 struct PlanArgs {
-    /// As-typed query fragment, raw bytes (not necessarily UTF-8).
+    /// As-typed text used for matching, raw bytes (not necessarily UTF-8).
     #[arg(long)]
     query: OsString,
     /// Matching mode (cli-protocol.md "マッチング・ランキングの意味論").

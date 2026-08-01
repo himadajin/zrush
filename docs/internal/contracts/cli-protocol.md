@@ -18,7 +18,7 @@ zrush.zsh(zsh 側)と `zrush` バイナリ(Rust 側)の入出力仕様。
 
 > 検証: 版番号のコピーの一致 — `src/config.rs` のテスト `protocol_version_matches_docs_and_zsh`。
 
-- **PROTOCOL_VERSION = 2**
+- **PROTOCOL_VERSION = 3**
 - `zrush config` の出力に `ZRUSH_PROTOCOL_VERSION` が含まれる。
   zrush.zsh は自身が期待する版番号と照合し、不一致なら警告を 1 回表示して動作は継続する
   (git pull 後の rebuild し忘れ検知)。
@@ -52,12 +52,13 @@ zrush.zsh(zsh 側)と `zrush` バイナリ(Rust 側)の入出力仕様。
    `zsh -f tests/zsh/vectors.zsh` と、`cargo build --release` の後に
    `zsh -f tests/zsh/driver.zsh <playground-dir>`
    (`zsh/` に触れる変更なので `tests/zsh/driver-coexist.zsh` も。AGENTS.md「Build and test」)。
-5. 版番号を名指ししているコード中のコメント(`grep -rn 'v2' src zsh tests`)を確認する。
+5. 版番号を名指ししている記述(`grep -rnE '\bv[0-9]+\b' src zsh tests docs`)を確認する。
    どのテストも検出しないので、ここだけは手で追従させる。
 
 ## 共通事項
 
-> 検証: 制御バイトを含む候補・値の除外(送信側の保証)— `tests/vectors/encode/`(`zsh -f tests/zsh/vectors.zsh`)。
+> 検証: 制御バイトを含む候補・値の除外(送信側の保証)のうち「compsys 捕獲 profile」の分 —
+> `tests/vectors/encode/`(`zsh -f tests/zsh/vectors.zsh`)。他の profile の分を固定するテストは無い。
 
 - `zrush` はキー入力・プロンプト表示のたびに都度起動される。常駐しない。
 - 文字列はバイト列として扱い、エンコーディング変換をしない(ファイル名は任意バイト列であり得る)。
@@ -66,9 +67,9 @@ zrush.zsh(zsh 側)と `zrush` バイナリ(Rust 側)の入出力仕様。
   表示行テキスト・挿入テキストなど実際に返すバイト列は、
   由来となった候補語の原バイト列をそのまま保持する(Rust 側は再エンコードしない)。
 - フレーミングに制御バイト(`\0` `\1` `\2`)を使う箇所(`zrush plan` の stdin)がある。
-  これらのバイトを含む候補・値の除外は送信側(zsh、fork 内の compadd フック)が保証し、
+  これらのバイトを含む候補・値の除外は送信側(zsh)が保証し、
   Rust 側はフィールド内にこれらのバイトが出現しないことを前提としてよい。
-  詳細は「`zrush plan`」節。
+  どの機構が除外を担うかは producer profile が定める。詳細は「`zrush plan`」節。
 
 ### 終了コード
 
@@ -101,15 +102,17 @@ zrush plan --query <bytes> --mode <prefix|substring|typo> --smart-case <true|fal
            --rows <N> --width <N> --trailing-space <true|false>
 ```
 
-- `--query`: 広げ規則で削った末尾(ユーザーの as-typed 断片、NUL 除去済み)。空文字列も有効
-  (空クエリは全候補が最高同点マッチ = compsys 順のまま扱われる)。
+- `--query`: マッチングに用いるユーザーの as-typed テキスト(NUL 除去済み)。空文字列も有効
+  (空クエリは全候補が最高同点マッチ = stdin の出現順のまま扱われる)。
+  渡す値は producer profile(「compsys 捕獲 profile」「history profile」)が定める。
 - `--mode` / `--smart-case`: マッチング設定のスナップショット(config-schema.md 参照)。
   意味論は後述「マッチング・ランキングの意味論」節。
 - `--rows`: 表示行の最終予算。zsh が `min(max-lines, $LINES - 1)` を計算し、
   1 以上にクランプして渡す(Rust は端末サイズを知らない)。
 - `--width`: 使用可能桁数。zsh が `$COLUMNS - 1` を 1 以上にクランプして渡す。
-- `--trailing-space`: 挿入テキストへ末尾スペースを焼き込むための設定スナップショット
-  (config-schema.md `[insert].trailing-space`)。
+- `--trailing-space`: 挿入テキストへ末尾スペースを焼き込むかどうかの指定
+  (対応する設定は config-schema.md `[insert].trailing-space`)。
+  渡す値は producer profile(「compsys 捕獲 profile」「history profile」)が定める。
 - 未知の引数・不正値は exit 2(usage エラー)。
 - `zrush plan` は **config.toml を読まない純関数**として設計する。
   設定はすべて引数で渡す(設定スナップショットの取得・mtime 監視は zsh 側の責務)。
@@ -120,55 +123,60 @@ zrush plan --query <bytes> --mode <prefix|substring|typo> --smart-case <true|fal
   この stat は起動時のカレントディレクトリを基準に解決するため、
   `zrush plan` は対話シェルのカレントディレクトリで起動される前提を置く。
 
-### stdin(捕獲レコード)
+### stdin(レコードストリーム)
 
 > 検証(この節と以下の小節): 送信側(zsh のエンコーダ)の発行規範 — `tests/vectors/encode/`(`zsh -f tests/zsh/vectors.zsh`)。
 > 受信側(Rust のパーサ)の解釈規範 — `tests/vectors/plan/`(`tests/vectors.rs`)と `src/record.rs` の proptest(パーサの全域性)。
 > 非空ストリームの NUL 終端欠落 — `tests/vectors/reject/`。
+> 「history profile」の送信側規範は上記の検証の範囲外(受信側の解釈は上記のベクタが覆う)。
+> 「compsys 捕獲 profile」の transport 側の規範(pid レコードの除去、
+> 空語収集キャッシュに保存する payload の形)も上記の検証の範囲外。
 
 フレーミングは NUL(`\0`)終端のレコードが連続する形式。
 レコード内は `\2` で連結した `<tag>\1<value>` 形式のフィールドの並び。
-制御バイト(`\0` `\1` `\2`)を含む候補語・付随テキストの除外は
-送信側(fork 内の compadd フック)が保証する(「共通事項」参照)。
+制御バイト(`\0` `\1` `\2`)を含む候補語・付随テキストの除外は送信側が保証する(「共通事項」参照)。
+
+レコードモデルは payload の由来(producer)に依らない。
+「レコード解釈の規律」「バッチヘッダレコード」「候補レコード」「スキップ規律」の各小節は
+すべての payload に適用され、Rust 側は payload の由来を知らない。
+由来ごとの追加規約は「compsys 捕獲 profile」「history profile」が定める。
 
 #### レコード解釈の規律(規範)
 
 - レコード内に未知のタグが含まれる場合、そのフィールドは無視する
   (将来のタグ追加に対する前方許容)。
-- 同一レコード内で同じタグが複数回現れた場合、最初の出現を採用する
-  (v1 の抽出規則と同じ)。
+- 同一レコード内で同じタグが複数回現れた場合、最初の出現を採用する。
 - `b` ヘッダとそれに続く候補レコード群は 1 つの連続した論理バッチを成す。
-  送信側(fork 内フック)は compadd 呼び出しを直列に処理するため、
-  複数バッチのレコードが交錯することはない(規範: 送信側が直列化を保証する)。
+  送信側はバッチを直列に発行するため、複数バッチのレコードが交錯することはない
+  (規範: 送信側が直列化を保証する)。
   ヘッダの効力(共有フィールド)は次の `b` ヘッダが現れるまで持続する。
 
 #### バッチヘッダレコード
 
-compadd 呼び出しごとに、そのバッチの先頭へヘッダレコードを 1 つ発行する。
+バッチごとに、その先頭へヘッダレコードを 1 つ発行する。
 
 - 第 1 フィールドはタグ `b`(値は空)。
 - 続けて、そのバッチに属する候補が共有するフィールドのうち非空のものを載せる:
   `P` `p` `S` `s` `i` `I` `ip` `f` `rd` `X` `J`。
-  - `P` / `p` / `S` / `s` / `i` / `I`: compadd の可視・隠し接頭辞/接尾辞
-    (`-P` `-p` `-S` `-s` `-i` `-I` に対応)。
-  - `ip`: `IPREFIX`。
+  - `P` / `p` / `S` / `s` / `i` / `I`: 可視・隠しの接頭辞/接尾辞。
+  - `ip`: 挿入テキストの最も外側に置く接頭辞。
   - `f`(値 `1`): ファイル候補であることを示す。
   - `rd`: チルダ・パラメータ展開済みの実ディレクトリ(ファイル候補の合成 `/` 判定に使う)。
   - `X`: グループ見出し文字列。`J`: グループ名。
     グループキーの決定規則は stdout「表示行の中身」節。
 - 共有フィールドが全て空でも、ヘッダレコードは必ず発行する
   (バッチ境界を一意に識別するため)。
-- 候補レコードを 1 件も発行しない compadd 呼び出しについては、
-  バッチヘッダごと発行を省略してよい(受信側はヘッダの無いバッチを観測しない)。
+- 候補レコードを 1 件も発行しないバッチについては、
+  ヘッダごと発行を省略してよい(受信側はヘッダの無いバッチを観測しない)。
 
 #### 候補レコード
 
 ヘッダに続けて、そのバッチの候補ごとに 1 レコードを発行する。
 フィールドは以下の 3 種のみ:
 
-- `w`(必須・先頭・非空): compsys の挿入用にクォート済みの候補語(例: `space\ name.txt`)。
-- `m`(任意): `${(Q)w}`(クォート復元形・生テキスト)。**`w` と異なる場合のみ**発行する。
-- `d`(任意): 表示文字列(compadd `-d`)。
+- `w`(必須・先頭・非空): 挿入テキスト構築に使う候補本体。
+- `m`(任意): match-text。**`w` と異なる場合のみ**発行する。
+- `d`(任意): 表示文字列。
 
 `m` / `d` は値が非空のときのみ発行する。
 フィールドが無いことと値が空文字列であることは同義に扱う(いずれも「不在」)。
@@ -180,20 +188,56 @@ match-text(マッチング・ハイライト計算・表示の対象テキスト
 Rust は zsh のクォート規則を一切実装しない
 (`${(Q)}` 復元・`${(q)}` クォートは zsh 側の責務)。
 
-重複候補(同一の match-text/display-text 組)は除去せずそのまま送ってよい。
-Rust も重複除去しない(compsys の出力順の情報を保つ。
-除去を導入する場合は版番号を上げる)。
+Rust は重複候補(同一の match-text/display-text 組)を除去しない
+(送信側の発行順の情報を保つ。除去を導入する場合は版番号を上げる)。
+重複を送出してよいかは producer profile が定める。
 
 #### スキップ規律(規範)
 
 - 候補レコードの第 1 フィールドが非空の値を持つ `w` タグでない場合、
   そのレコードはスキップする(空の `w` は候補として無効)。
 - ヘッダレコードより前に現れた候補レコードは黙ってスキップする。
-- 先頭タグが `b` / `w` のいずれでもないレコード(ワーカーの `pid` レコードなど)は黙ってスキップする。
-  - ワーカーの pid レコード(`pid\1<pid>\0` としてストリーム先頭に流れる)は、
-    zsh が受信中に取り除いてから `zrush plan` の stdin へ渡す。
-    空語収集キャッシュ(behavior.md)に保存する payload も pid を取り除いた形が契約である。
-    Rust 側でのスキップは保険であり、通常の入力では発生しない。
+- 先頭タグが `b` / `w` のいずれでもないレコードは黙ってスキップする
+  (compsys 捕獲のワーカー `pid` レコードなど)。
+
+#### compsys 捕獲 profile
+
+zpty 内で compsys を駆動して得る payload(behavior.md「候補収集」節)。
+
+- `w` は compsys の挿入用にクォート済みの候補語(例: `space\ name.txt`)。
+  `m` はそのクォート復元形 `${(Q)w}`、`d` は compadd `-d` の表示文字列。
+- compadd 呼び出し 1 回が 1 バッチに対応する。
+- 共有フィールドの写像: `P` `p` `S` `s` `i` `I` `X` `J` は compadd の
+  `-P` `-p` `-S` `-s` `-i` `-I` `-X` `-J`、`ip` は `IPREFIX`。
+- 重複候補(同一の match-text/display-text 組)は除去せずそのまま送ってよい。
+- 制御バイト(`\0` `\1` `\2`)を含む候補・値の除外は fork 内の compadd フックが保証する。
+- ワーカーの pid レコード(`pid\1<pid>\0` としてストリーム先頭に流れる)は、
+  zsh が受信中に取り除いてから `zrush plan` の stdin へ渡す。
+  空語収集キャッシュ(behavior.md)に保存する payload も pid を取り除いた形が契約である。
+  Rust 側でのスキップは保険であり、通常の入力では発生しない。
+- `zrush plan` へ渡す引数値: `--query` は広げ規則で削った末尾(behavior.md「候補収集」節)、
+  `--trailing-space` は `[insert].trailing-space` の設定値。
+
+#### history profile
+
+zsh が履歴から合成する payload。
+この payload から作られた一覧を履歴一覧、その候補を履歴候補と呼ぶ。
+
+- 共有フィールドが全て空のバッチヘッダを 1 個だけ発行し、以降は候補レコードのみが続く
+  (見出し `X` を含め、共有フィールドは 1 つも載せない)。
+- `w` は履歴行の生バイト列(compsys のクォートは施さない)。
+  `m` / `d` は発行しない(match-text も表示テキストも `w` そのもの)。
+- 候補レコードは新しい順(最新の履歴行が先頭)。
+  ランキングはマッチ品質が先で、同点のみ stdin の出現順を保つ(「マッチング・ランキングの意味論」節)。
+  したがってこの順序は、同じマッチ品質の候補の中で新しいものに小さい位置番号を与える効果を持つ
+  (空クエリでは全候補が最高同点マッチのため、payload の順序がそのまま位置番号順になり、
+  位置 1 が最新の履歴行になる。位置番号と画面上の配置の対応は「表示行の中身」節の列優先規則による)。
+- 同一の履歴行は最新の 1 件だけを残す。この重複除去は送信側が合成時に行う。
+- 制御バイト(`\0` `\1` `\2`)を含む履歴行は、zsh が payload を合成する時点で除外する。
+- 対象は `[history].limit` 件を新しい方から走査した範囲(config-schema.md)。
+  重複除去はこの範囲の中で行うため、発行するレコード数は `limit` 以下になる。
+- `zrush plan` へ渡す引数値: `--query` はバッファ全体(as-typed)、
+  `--trailing-space` は常に `false`(挿入テキストを履歴行の原文と一致させるため)。
 
 ### stdout(描画プラン)
 
@@ -333,14 +377,18 @@ NUL(`\0`)終端フィールドの平坦列。数値は ASCII 10 進表記。順�
 #### 適用(zsh 側の規範)
 
 > 検証: 実際の zle 配線に対するスモークテスト — `tests/zsh/driver.zsh`
-> (`POSTDISPLAY` の組み立て、確定時の `LBUFFER` 置換と `RBUFFER` 保持)。
+> (`POSTDISPLAY` の組み立て、補完一覧の確定時の `LBUFFER` 置換と `RBUFFER` 保持)。
 
 - **表示**: `L > 0` なら `POSTDISPLAY` を「改行 1 個 + L 個の表示行テキストを改行で連結したもの」に
   置き換える(オフセット規律の `$#BUFFER + 1` 加算は、この先頭の改行 1 個に対応する)。
   `L = 0` なら `POSTDISPLAY` を消去する。
-- **確定**: `pre` を「`LBUFFER` から現在語(広げ規則が対象にした語。behavior.md「候補収集」節)を
-  除いた前半部分」とし、確定時に `LBUFFER = pre + 挿入テキスト` で置き換える
-  (`RBUFFER` は変更しない)。
+- **確定**: 置換の規則は一覧の種類ごとに 2 つある。
+  プランの出力形式はどちらでも同じであり、どちらを適用するかは
+  zsh が自身の状態(どちらの一覧を表示しているか)で決める。
+  - 補完一覧: `pre` を「`LBUFFER` から現在語(広げ規則が対象にした語。behavior.md「候補収集」節)を
+    除いた前半部分」とし、`LBUFFER = pre + 挿入テキスト` で置き換える
+    (`RBUFFER` は変更しない)。
+  - 履歴一覧: `BUFFER = 挿入テキスト` で行全体を置き換え、`CURSOR` を末尾に置く。
 
 #### 0 マッチ
 
@@ -385,7 +433,7 @@ zsh は一覧を消す。
   大文字を含むなら区別する。`false`: 常に区別しない。
   大文字小文字の畳み込みは **ASCII の範囲のみ**(非 ASCII はバイト安全のため区別される。
   バイト列意味論を保つための意図的制限)。
-- ランキング: マッチ品質スコアの降順。同点は stdin での出現順(= compsys の出力順)を保つ。
+- ランキング: マッチ品質スコアの降順。同点は stdin での出現順(送信側が発行した順)を保つ。
   スコアの序列は「より厳密なマッチのティアほど上位」
   (prefix 一致 > 部分一致 > 誤字許容 > 文字順保存のあいまい一致)。
   誤字許容をあいまい一致より上位に置くのは、前者が高精度・少数
@@ -437,7 +485,7 @@ zrush config
 ### stdout(zsh source 形式)
 
 ```zsh
-typeset -g  ZRUSH_PROTOCOL_VERSION='2'
+typeset -g  ZRUSH_PROTOCOL_VERSION='3'
 typeset -g  ZRUSH_CFG_MAX_LINES='10'
 typeset -g  ZRUSH_CFG_DELAY_MS='30'
 typeset -g  ZRUSH_CFG_MIN_INPUT='0'
@@ -448,6 +496,7 @@ typeset -g  ZRUSH_CFG_TRAILING_SPACE='true'
 typeset -g  ZRUSH_CFG_HL_SELECTED='standout'
 typeset -g  ZRUSH_CFG_HL_MATCH='underline'
 typeset -g  ZRUSH_CFG_HL_HEADING='bold'
+typeset -g  ZRUSH_CFG_HISTORY_LIMIT='5000'
 typeset -ga ZRUSH_CFG_KEYBINDS=(
   'select-next'  'key:down'
   'select-next'  'seq:^N'
