@@ -72,6 +72,7 @@ mod tests {
             w,
             m,
             d: None,
+            n: None,
             batch: 0,
         }
     }

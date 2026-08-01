@@ -312,7 +312,7 @@ fn config_without_file_prints_contract_default_output() {
     let (code, out) = run_config(&dir);
     assert_eq!(code, 0);
     let expected = "\
-typeset -g  ZRUSH_PROTOCOL_VERSION='4'
+typeset -g  ZRUSH_PROTOCOL_VERSION='5'
 typeset -g  ZRUSH_CFG_MAX_LINES='10'
 typeset -g  ZRUSH_CFG_DELAY_MS='30'
 typeset -g  ZRUSH_CFG_MIN_INPUT='0'
@@ -323,6 +323,7 @@ typeset -g  ZRUSH_CFG_TRAILING_SPACE='true'
 typeset -g  ZRUSH_CFG_HL_SELECTED='standout'
 typeset -g  ZRUSH_CFG_HL_MATCH='underline'
 typeset -g  ZRUSH_CFG_HL_HEADING='bold'
+typeset -g  ZRUSH_CFG_HL_HISTORY_NUMBER='faint'
 typeset -g  ZRUSH_CFG_HISTORY_LIMIT='5000'
 typeset -ga ZRUSH_CFG_KEYBINDS=(
   'select-next'  'key:down'

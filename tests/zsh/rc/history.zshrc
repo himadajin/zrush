@@ -56,6 +56,18 @@ _zrt_dump_fds() { _zlog "TESTFDS=timer=$_zrush_timer_fd rfd=$_zrush_rfd wfd=$_zr
 zle -N _zrt-dump-fds _zrt_dump_fds
 bindkey '^Xt' _zrt-dump-fds
 
+# ^Xe: the real event number for the newest fixture line. Resolve it lazily
+# in the widget so every `print -s` fixture below has entered `$history`.
+_zrt_dump_newest_event() {
+  local event
+  for event in "${(@k)history}"; do
+    [[ $history[$event] == 'echo newest' ]] && { _zlog "TESTEVENT=$event"; return 0 }
+  done
+  _zlog 'TESTEVENT=<missing>'
+}
+zle -N _zrt-dump-newest-event _zrt_dump_newest_event
+bindkey '^Xe' _zrt-dump-newest-event
+
 # Slow fake completion (behavior.md "候補収集" cancellation semantics,
 # exercised by driver.zsh's (h17)). Defined here as plain script rather than
 # a typed command, so this definition and its compdef registration never

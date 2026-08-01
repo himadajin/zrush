@@ -27,6 +27,7 @@
 | `selected` | 文字列 | `"standout"` | 選択中セルの装飾 |
 | `match` | 文字列 | `"underline"` | マッチ箇所の装飾(match-text 表示時のみ。選択中セルには適用しない) |
 | `heading` | 文字列 | `"bold"` | グループ見出し行の装飾 |
+| `history-number` | 文字列 | `"faint"` | 履歴イベント番号の装飾(選択中セルには適用しない) |
 
 - 検証は「文字列であること」まで。spec の解釈は zle に委ねる(不正な spec は zle が無視する)。
 - **空文字列は「装飾なし」**(region_highlight エントリを追加しない)。

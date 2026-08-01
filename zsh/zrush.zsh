@@ -40,7 +40,7 @@ fi
 # ---------------------------------------------------------------- Global state
 typeset -g  ZRUSH_BIN=${ZRUSH_BIN:-$_zrush_source_dir/../target/release/zrush}
 typeset -gi _zrush_enabled=0
-typeset -gi _ZRUSH_EXPECTED_PROTO=4
+typeset -gi _ZRUSH_EXPECTED_PROTO=5
 typeset -g  _zrush_cfg_path= _zrush_cfg_mtime=
 typeset -gi _zrush_plan_warned=0 _zrush_proto_warned=0
 # Variables this script consumes from `zrush config` output (validation and rollback)
@@ -48,6 +48,7 @@ typeset -ga _ZRUSH_CFG_VARS=(
   ZRUSH_CFG_MAX_LINES ZRUSH_CFG_DELAY_MS ZRUSH_CFG_MIN_INPUT
   ZRUSH_CFG_MODE ZRUSH_CFG_SMART_CASE ZRUSH_CFG_TAB ZRUSH_CFG_TRAILING_SPACE
   ZRUSH_CFG_HL_SELECTED ZRUSH_CFG_HL_MATCH ZRUSH_CFG_HL_HEADING
+  ZRUSH_CFG_HL_HISTORY_NUMBER
   ZRUSH_CFG_HISTORY_LIMIT ZRUSH_CFG_KEYBINDS ZRUSH_CFG_WARNINGS
 )
 
@@ -459,7 +460,7 @@ _zrush_rh_clear() {
 }
 
 # Remove only the selection highlight after input or cursor movement; retain list text
-# and match/heading decoration until the next result.
+# and match/heading/history-number decoration until the next result.
 _zrush_rh_clear_sel() {
   [[ -n $_zrush_rh_sel ]] || return 0
   if [[ -n $_zrush_hl_memo ]]; then
@@ -813,7 +814,7 @@ _zrush_parse_plan() {  # $1=raw `zrush plan` stdout
     tok=( ${=e} )
     (( $#tok == 4 )) || return 1
     role=$tok[1] pos=$tok[2] start=$tok[3] len=$tok[4]
-    [[ $role == match || $role == heading ]] || return 1
+    [[ $role == match || $role == heading || $role == history-number ]] || return 1
     [[ $pos == <-> && $start == <-> && $len == <-> ]] || return 1
     ranged+=( $pos )
     offs+=( $start $len )
@@ -882,18 +883,24 @@ _zrush_apply_highlights() {
   local hl_sel=${ZRUSH_CFG_HL_SELECTED-standout}
   local hl_mat=${ZRUSH_CFG_HL_MATCH-underline}
   local hl_head=${ZRUSH_CFG_HL_HEADING-bold}
+  local hl_histnum=${ZRUSH_CFG_HL_HISTORY_NUMBER-faint}
   local -i off=$(( $#BUFFER + 1 ))   # account for the leading newline
   local -i sel=$_zrush_selected
   local e role spec
   local -a f
   for e in "${(@)_zrush_plan_hl}"; do
     f=( ${=e} )   # role pos start len
-    if [[ $f[1] == match ]]; then
-      (( f[2] == sel )) && continue   # the selected cell's own decoration wins
-      spec=$hl_mat
-    else
-      spec=$hl_head
-    fi
+    case $f[1] in
+      match)
+        (( f[2] == sel )) && continue   # the selected cell's own decoration wins
+        spec=$hl_mat
+        ;;
+      history-number)
+        (( f[2] == sel )) && continue
+        spec=$hl_histnum
+        ;;
+      heading) spec=$hl_head ;;
+    esac
     [[ -n $spec ]] || continue
     _zrush_rh_add $(( off + f[3] )) $(( off + f[3] + f[4] )) "$spec"
   done
@@ -915,19 +922,24 @@ _zrush_apply_highlights() {
 _zrush_history_payload() {  # -> REPLY = payload bytes for `zrush plan` stdin
   emulate -L zsh
   local -i limit=$ZRUSH_CFG_HISTORY_LIMIT
-  local -a lines=()
+  local -a events=()
   if (( limit > 0 )); then
-    lines=( "${(@)history}" )
-    (( $#lines > limit )) && lines=( "${(@)lines[1,limit]}" )
-    # Within that range (nothing is pulled in from outside it to make up for a
-    # drop): empty lines cannot be candidates, and a line carrying a framing
-    # byte is dropped whole rather than stripped. Every other control byte is
-    # sent as-is; normalizing it for display is `zrush plan`'s job.
-    lines=( "${(@)lines:#(|*($'\0'|$'\1'|$'\2')*)}" )
-    lines=( "${(@u)lines}" )   # identical lines: (u) keeps the newest occurrence
+    events=( "${(@k)history}" )
+    (( $#events > limit )) && events=( "${(@)events[1,limit]}" )
   fi
-  local w=w$'\1'
-  local -a recs=( b$'\1' "${(@)lines/#/$w}" )
+  local -A seen=()
+  local event line
+  local -a recs=( b$'\1' )
+  for event in "${(@)events}"; do
+    line=$history[$event]
+    # Within the raw scan window (nothing is pulled in from outside it to make
+    # up for a drop), reject empty/framing-byte lines and retain only the
+    # newest event number for each distinct line.
+    [[ -n $line && $line != *$'\0'* && $line != *$'\1'* && $line != *$'\2'* ]] || continue
+    (( ${+seen[$line]} )) && continue
+    seen[$line]=1
+    recs+=( w$'\1'$line$'\2'n$'\1'$event )
+  done
   typeset -g REPLY=${(pj:\0:)recs}$'\0'
   return 0
 }

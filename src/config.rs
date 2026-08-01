@@ -11,7 +11,7 @@ use crate::keybind;
 use crate::matching::Mode;
 
 /// Protocol version emitted as ZRUSH_PROTOCOL_VERSION (cli-protocol.md).
-pub const PROTOCOL_VERSION: &str = "4";
+pub const PROTOCOL_VERSION: &str = "5";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TabBehavior {
@@ -51,6 +51,7 @@ pub struct Config {
     pub hl_selected: String,
     pub hl_match: String,
     pub hl_heading: String,
+    pub hl_history_number: String,
     // [matching]
     pub mode: Mode,
     pub smart_case: bool,
@@ -73,6 +74,7 @@ impl Default for Config {
             hl_selected: "standout".into(),
             hl_match: "underline".into(),
             hl_heading: "bold".into(),
+            hl_history_number: "faint".into(),
             mode: Mode::Typo,
             smart_case: true,
             tab: TabBehavior::Menu,
@@ -193,6 +195,7 @@ fn apply_key(
                     "selected" => &mut cfg.hl_selected,
                     "match" => &mut cfg.hl_match,
                     "heading" => &mut cfg.hl_heading,
+                    "history-number" => &mut cfg.hl_history_number,
                     _ => {
                         warnings.push(format!(
                             "config: [display.highlight] unknown key \"{k}\"; ignoring"
@@ -349,7 +352,7 @@ pub fn to_zsh(result: &LoadResult) -> String {
     use std::fmt::Write as _;
     let c = &result.config;
     let mut o = String::new();
-    let scalars: [(&str, String); 12] = [
+    let scalars: [(&str, String); 13] = [
         ("ZRUSH_PROTOCOL_VERSION", PROTOCOL_VERSION.to_string()),
         ("ZRUSH_CFG_MAX_LINES", c.max_lines.to_string()),
         ("ZRUSH_CFG_DELAY_MS", c.delay_ms.to_string()),
@@ -361,6 +364,7 @@ pub fn to_zsh(result: &LoadResult) -> String {
         ("ZRUSH_CFG_HL_SELECTED", c.hl_selected.clone()),
         ("ZRUSH_CFG_HL_MATCH", c.hl_match.clone()),
         ("ZRUSH_CFG_HL_HEADING", c.hl_heading.clone()),
+        ("ZRUSH_CFG_HL_HISTORY_NUMBER", c.hl_history_number.clone()),
         ("ZRUSH_CFG_HISTORY_LIMIT", c.history_limit.to_string()),
     ];
     for (name, value) in &scalars {
@@ -398,6 +402,7 @@ mod tests {
         assert_eq!(c.hl_selected, "standout");
         assert_eq!(c.hl_match, "underline");
         assert_eq!(c.hl_heading, "bold");
+        assert_eq!(c.hl_history_number, "faint");
         assert_eq!(c.mode, Mode::Typo);
         assert!(c.smart_case);
         assert_eq!(c.tab, TabBehavior::Menu);
@@ -426,6 +431,7 @@ mod tests {
             selected = "fg=blue,standout"
             match = ""
             heading = "fg=green"
+            history-number = "fg=yellow,faint"
 
             [matching]
             mode = "substring"
@@ -459,6 +465,7 @@ mod tests {
         assert_eq!(c.hl_selected, "fg=blue,standout");
         assert_eq!(c.hl_match, "", "empty string means no decoration");
         assert_eq!(c.hl_heading, "fg=green");
+        assert_eq!(c.hl_history_number, "fg=yellow,faint");
         // array, bare string (= one-element list), explicit empty list,
         // and an untouched action keeping its multi-key default
         assert_eq!(c.keybinds[0], vec!["seq:^J", "seq:j"]);

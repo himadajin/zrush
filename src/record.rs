@@ -5,7 +5,7 @@
 //! records; fields within a record are `\2`-joined `<tag>\1<value>` pairs.
 //! Batch header records (first field tag `b`) carry shared fields that
 //! apply to every candidate record up to the next header; candidate
-//! records (first field tag `w`) carry per-candidate `w`/`m`/`d`.
+//! records (first field tag `w`) carry per-candidate `w`/`m`/`d`/`n`.
 //!
 //! Zero-copy: every value here borrows from the caller's stdin buffer.
 //! plan.rs is the consumer.
@@ -54,6 +54,9 @@ pub(crate) struct Candidate<'a> {
     pub m: Option<&'a [u8]>,
     /// Display text (cli-protocol.md `d`, "候補レコード").
     pub d: Option<&'a [u8]>,
+    /// History event number (cli-protocol.md `n`), emitted only by the
+    /// history profile as non-empty ASCII decimal digits.
+    pub n: Option<&'a [u8]>,
     /// Index into the sibling `batches` vec.
     pub batch: usize,
 }
@@ -181,8 +184,8 @@ fn parse_batch_fields<'a>(fields: impl Iterator<Item = (&'a [u8], &'a [u8])>) ->
     }
 }
 
-/// Fold a candidate record's remaining fields (after `w`) into `m`/`d`:
-/// unknown tags (including a duplicate `w`) ignored, duplicate `m`/`d`
+/// Fold a candidate record's remaining fields (after `w`) into `m`/`d`/`n`:
+/// unknown tags (including a duplicate `w`) ignored, duplicate `m`/`d`/`n`
 /// first-wins, empty value == absent.
 fn parse_candidate_fields<'a>(
     w: &'a [u8],
@@ -191,17 +194,20 @@ fn parse_candidate_fields<'a>(
 ) -> Candidate<'a> {
     let mut m_raw = None;
     let mut d_raw = None;
+    let mut n_raw = None;
     for (tag, val) in fields {
         match tag {
             b"m" if m_raw.is_none() => m_raw = Some(val),
             b"d" if d_raw.is_none() => d_raw = Some(val),
-            _ => {} // unknown tag, or a later duplicate `w`/`m`/`d`
+            b"n" if n_raw.is_none() => n_raw = Some(val),
+            _ => {} // unknown tag, or a later duplicate `w`/`m`/`d`/`n`
         }
     }
     Candidate {
         w,
         m: m_raw.filter(|v| !v.is_empty()),
         d: d_raw.filter(|v| !v.is_empty()),
+        n: n_raw.filter(|v| !v.is_empty()),
         batch,
     }
 }
@@ -214,7 +220,7 @@ mod tests {
     fn parser_byte() -> impl Strategy<Value = u8> {
         prop_oneof![
             6 => prop::sample::select(vec![REC_SEP, TAG_SEP, FIELD_SEP]),
-            6 => prop::sample::select(b"bwPpSsiIfrdXJm".to_vec()),
+            6 => prop::sample::select(b"bwPpSsiIfrdXJmdn".to_vec()),
             1 => any::<u8>(),
         ]
     }
@@ -428,26 +434,49 @@ mod tests {
     }
 
     #[test]
-    fn empty_m_and_d_are_absent() {
+    fn history_number_field_is_captured() {
         let header = record(&[field("b", "")]);
-        let c = record(&[field("w", "word"), field("m", ""), field("d", "")]);
+        let c = record(&[field("w", "echo hi"), field("n", "12345")]);
+        let refs: [&[u8]; 2] = [&header, &c];
+        let input = payload(&refs);
+        let parsed = parse(&input).unwrap();
+        assert_eq!(parsed.candidates[0].n, Some(&b"12345"[..]));
+    }
+
+    #[test]
+    fn empty_m_d_and_n_are_absent() {
+        let header = record(&[field("b", "")]);
+        let c = record(&[
+            field("w", "word"),
+            field("m", ""),
+            field("d", ""),
+            field("n", ""),
+        ]);
         let refs: [&[u8]; 2] = [&header, &c];
         let input = payload(&refs);
         let parsed = parse(&input).unwrap();
         assert_eq!(parsed.candidates[0].m, None);
         assert_eq!(parsed.candidates[0].d, None);
+        assert_eq!(parsed.candidates[0].n, None);
         assert_eq!(parsed.candidates[0].match_text(), b"word");
     }
 
     #[test]
     fn duplicate_tag_first_wins() {
         let header = record(&[field("b", ""), field("J", "first"), field("J", "second")]);
-        let c = record(&[field("w", "word"), field("m", "m1"), field("m", "m2")]);
+        let c = record(&[
+            field("w", "word"),
+            field("m", "m1"),
+            field("m", "m2"),
+            field("n", "10"),
+            field("n", "11"),
+        ]);
         let refs: [&[u8]; 2] = [&header, &c];
         let input = payload(&refs);
         let parsed = parse(&input).unwrap();
         assert_eq!(parsed.batches[0].j, b"first");
         assert_eq!(parsed.candidates[0].m, Some(&b"m1"[..]));
+        assert_eq!(parsed.candidates[0].n, Some(&b"10"[..]));
     }
 
     #[test]

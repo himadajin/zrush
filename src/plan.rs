@@ -179,6 +179,7 @@ mod tests {
         w: Vec<u8>,
         m: Option<Vec<u8>>,
         d: Option<Vec<u8>>,
+        n: Option<Vec<u8>>,
     }
 
     #[derive(Debug)]
@@ -213,6 +214,9 @@ mod tests {
                 if let Some(d) = &candidate.d {
                     push_capture_field(&mut out, b"d", d);
                 }
+                if let Some(n) = &candidate.n {
+                    push_capture_field(&mut out, b"n", n);
+                }
                 out.push(0);
             }
             out
@@ -235,8 +239,9 @@ mod tests {
             capture_value(16),
             prop::option::of(capture_value(16)),
             prop::option::of(capture_value(16)),
+            prop::option::of(prop::collection::vec(b'0'..=b'9', 1..=8)),
         )
-            .prop_map(|(w, m, d)| GeneratedCandidate { w, m, d })
+            .prop_map(|(w, m, d, n)| GeneratedCandidate { w, m, d, n })
     }
 
     fn generated_capture() -> impl Strategy<Value = GeneratedCapture> {
@@ -337,6 +342,15 @@ mod tests {
 
     fn word(w: &str) -> Vec<u8> {
         raw_word(w.as_bytes())
+    }
+
+    fn history_word(w: &str, n: &str) -> Vec<u8> {
+        let mut r = b"w\x01".to_vec();
+        r.extend_from_slice(w.as_bytes());
+        r.extend_from_slice(b"\x02n\x01");
+        r.extend_from_slice(n.as_bytes());
+        r.push(0);
+        r
     }
 
     fn has_match(plan: &wire::Plan, pos: usize, start: usize, len: usize) -> bool {
@@ -700,6 +714,23 @@ mod tests {
         let p = parse_wire(&out);
         assert_eq!(p.rows, vec![b"newer ".to_vec(), b"newest".to_vec()]);
         assert_eq!(p.inserts, vec![b"newest".to_vec(), b"newer".to_vec()]);
+    }
+
+    #[test]
+    fn history_event_number_is_display_only_and_shifts_match_highlight() {
+        let mut stdin = header(&[]);
+        stdin.extend(history_word("echo foo", "42"));
+        let out = run(&history_params("foo", Mode::Typo, 10, 40), &stdin, &no_dir).unwrap();
+        let p = parse_wire(&out);
+        assert_eq!(p.rows, vec![b"   42  echo foo".to_vec()]);
+        assert_eq!(p.cells, vec![(0, 15)]);
+        assert_eq!(p.inserts, vec![b"echo foo".to_vec()]);
+        assert!(
+            p.highlights.iter().any(|h| {
+                (h.role, h.pos, h.start, h.len) == (wire::Role::HistoryNumber, 1, 3, 2)
+            })
+        );
+        assert!(has_match(&p, 1, 12, 3));
     }
 
     #[test]

@@ -62,7 +62,10 @@ A generated `expected.bin` is a proposal, not an answer -- read it against cli-p
 ## Who checks what
 
 `cargo test` checks `plan/`, `reject/`, and `reject-plan/` against the Rust serializer and the `wire` reference parser.
-`zsh -f tests/zsh/vectors.zsh` checks `encode/` against the zsh encoder `_zrush_encode_batch`, and the same `plan/` and `reject-plan/` corpus against the independent zsh decoder `_zrush_parse_plan`, so both sides are held to one set of bytes.
+`zsh -f tests/zsh/vectors.zsh` checks `encode/` against the zsh encoder `_zrush_encode_batch`,
+the history sender's line/event-number pairing and filtering against `_zrush_history_payload`,
+and the same `plan/` and `reject-plan/` corpus against the independent zsh decoder
+`_zrush_parse_plan`, so both sides are held to one set of bytes.
 
 `plan/` vectors omit `f = 1` candidates because directory slash synthesis depends on filesystem state.
 That behavior remains covered by the injected-stat Rust unit tests.
