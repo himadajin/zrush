@@ -96,7 +96,8 @@ zsh がそのまま適用できる描画プランを返す。
 
 ### 起動
 
-> 検証: 引数の受理と拒否(未知の引数・不足・不正値は exit 2)— `tests/vectors/reject/`。
+> 検証: 引数の受理(`--producer` は両方の値を通す)— `tests/vectors/plan/`。
+> 引数の拒否(未知の引数・不足・不正値は exit 2)— `tests/vectors/reject/`。
 
 ```
 zrush plan --producer <compsys|history> --query <bytes> --mode <prefix|substring|typo> \
@@ -261,6 +262,7 @@ zsh が履歴から合成する payload。
 > 「オフセット規律」の範囲の上界は、この proptest が生成した任意の入力について参照パーサ側で検査される
 > (レイアウトが listing text の外を指すオフセットを出力しないこと)。上界を破るプランの拒否は「エラー時の zsh 側挙動」節の検証行。
 > ただし、受信側が用いる文字数が Rust 側の文字数以上であるべき規範は、どのテストも固定していない。
+> 制御バイト→スペース正規化(表示テキスト・表示幅・パディング・切り詰め・オフセットへの反映と、挿入テキストが原文のままであること)— `src/plan.rs` の単体テスト。
 
 NUL(`\0`)終端フィールドの平坦列。数値は ASCII 10 進表記。順序は固定:
 
@@ -442,7 +444,8 @@ zsh は一覧を消す。
 
 > 検証: モードの累積性・ティアの序列・smart-case の真偽両方・誤字許容の範囲(候補の接頭辞に対する 1 編集、1 文字クエリでは不適用)・非 UTF-8 バイト列でもマッチすること —
 > `src/matching.rs` の単体テスト(小さなアルファベット上での DP 参照実装との網羅照合を含む)。
-> ティア順のソートと同点時の stdin 順保存 — `src/ranking.rs`。プロセス越しのティア順と common-prefix — `tests/cli.rs`。
+> ティア順のソートと同点時の stdin 順保存、および `--producer history` がマッチ品質で並べ替えないこと — `src/ranking.rs` と `src/plan.rs`。
+> プロセス越しの producer ごとの結果順と common-prefix — `tests/cli.rs`。`--producer history` のプラン全体 — `tests/vectors/plan/`。
 > 大文字小文字の畳み込みを ASCII に限る規範は、どのテストも固定していない。
 
 - モードは累積的に広がる: `typo` ⊇ `substring` ⊇ `prefix`。

@@ -1,9 +1,7 @@
---producer
-compsys
 --query
-space
+a
 --mode
-prefix
+typo
 --smart-case
 true
 --rows
@@ -11,4 +9,4 @@ true
 --width
 40
 --trailing-space
-false
+true

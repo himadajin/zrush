@@ -137,12 +137,13 @@ pub(crate) fn build(
     }
 
     // Per-candidate cell source text (contract "セルの表示テキストの決定
-    // 規則": `d` if present, else match-text), newline-normalized. Built
-    // for every candidate up front because gmaxw is defined over a
-    // group's *full* membership, not just what ends up displayed.
+    // 規則": `d` if present, else match-text), control-byte-normalized.
+    // Built for every candidate up front because gmaxw is defined over a
+    // group's *full* membership, not just what ends up displayed, and
+    // because width/padding/truncation all measure the normalized text.
     let sources: Vec<Cow<'_, [u8]>> = candidates
         .iter()
-        .map(|c| normalize_newlines(c.d.unwrap_or(c.match_text())))
+        .map(|c| normalize_control_bytes(c.d.unwrap_or(c.match_text())))
         .collect();
 
     let mut rows: Vec<Vec<u8>> = Vec::new();
@@ -201,7 +202,7 @@ pub(crate) fn build(
         let (cols, grows, gcount) = grid_dims(gmaxw, width, group.members.len(), candidate_budget);
 
         if show_heading {
-            let heading = normalize_newlines(group.heading);
+            let heading = normalize_control_bytes(group.heading);
             // Same truncation rule as cells (cli-protocol.md "見出し
             // テキストが width を超える場合"): max original-byte prefix
             // whose lossy display width fits `width`.
@@ -395,20 +396,26 @@ fn grid_dims(gmaxw: usize, width: usize, members: usize, budget: usize) -> (usiz
     (cols, grows, gcount)
 }
 
-/// Replace `\n` with a space (cli-protocol.md: newline -> space, applied
-/// to both candidate cell text and heading text). Zero-copy when there is
-/// nothing to replace.
-fn normalize_newlines(bytes: &[u8]) -> Cow<'_, [u8]> {
-    if bytes.contains(&b'\n') {
+/// Replace every C0 control byte and DEL with a space (cli-protocol.md
+/// "制御バイト→スペース正規化"), applied to both candidate cell text and
+/// heading text. One byte maps to one byte, so char offsets computed on
+/// the original text stay valid. Zero-copy when there is nothing to
+/// replace.
+fn normalize_control_bytes(bytes: &[u8]) -> Cow<'_, [u8]> {
+    if bytes.iter().any(|&b| is_control_byte(b)) {
         Cow::Owned(
             bytes
                 .iter()
-                .map(|&b| if b == b'\n' { b' ' } else { b })
+                .map(|&b| if is_control_byte(b) { b' ' } else { b })
                 .collect(),
         )
     } else {
         Cow::Borrowed(bytes)
     }
+}
+
+fn is_control_byte(byte: u8) -> bool {
+    byte < 0x20 || byte == 0x7f
 }
 
 /// Lossy-UTF-8 reading of `bytes` as `(char, source byte range)` pairs,
@@ -493,8 +500,10 @@ impl Iterator for LossyChars<'_> {
     }
 }
 
-/// Full lossy display width of `bytes` (no truncation). Control chars
-/// (including a stray `\r`) have no assigned width and count as 0.
+/// Full lossy display width of `bytes` (no truncation). Callers pass
+/// control-byte-normalized text, so the width-less control chars that
+/// `UnicodeWidthChar::width` reports as `None` (counted 0 here) are only
+/// reachable through non-ASCII sequences.
 fn display_width(bytes: &[u8]) -> usize {
     lossy_chars(bytes)
         .map(|(c, _)| UnicodeWidthChar::width(c).unwrap_or(0))

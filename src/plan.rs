@@ -3,7 +3,8 @@
 //!
 //! Pipeline: record::parse -> matching::QueryMatcher (score every parsed
 //! candidate + common-prefix over the *untruncated* prefix-tier matches)
-//! -> ranking::rank (truncate to the grid's absolute capacity, rows*8)
+//! -> ranking::rank (the pipeline's only producer-dependent stage;
+//! truncates to the grid's absolute capacity, rows*8)
 //! -> matching::QueryMatcher::spans (only for the ranked subset) ->
 //! layout::build (grouping/grid/highlights/nav, further truncated to the
 //! real per-group row budget) -> insert::build per displayed position
@@ -21,9 +22,10 @@ use std::io::Write;
 use crate::matching::{Mode, QueryMatcher, Tier};
 use crate::{insert, layout, ranking, record};
 
-/// Snapshot of the `--query`/`--mode`/`--smart-case`/`--rows`/`--width`/
-/// `--trailing-space` arguments (cli-protocol.md "起動").
+/// Snapshot of the `zrush plan` arguments (cli-protocol.md "起動");
+/// `--producer` arrives as the result ordering it selects (ranking.rs).
 pub(crate) struct Params {
+    pub order: ranking::Order,
     pub query: Vec<u8>,
     pub mode: Mode,
     pub smart_case: bool,
@@ -69,9 +71,9 @@ pub(crate) fn run(
     // layout::build applies the real, per-group row budget on top of
     // this coarse cap.
     let cap = params.rows.saturating_mul(8);
-    let order = ranking::rank(&scored, cap);
+    let ranked = ranking::rank(&scored, cap, params.order);
     let candidates: Vec<record::Candidate<'_>> =
-        order.iter().map(|&i| parsed.candidates[i]).collect();
+        ranked.iter().map(|&i| parsed.candidates[i]).collect();
     // spans() is a second pass by design (matching.rs docs): only run it
     // on the ranked subset that actually reaches layout.
     let spans: Vec<Vec<(usize, usize)>> = candidates
@@ -241,6 +243,7 @@ mod tests {
             trailing_space in any::<bool>(),
         ) {
             let params = Params {
+                order: ranking::Order::Quality,
                 query,
                 mode,
                 smart_case,
@@ -258,14 +261,24 @@ mod tests {
         }
     }
 
+    /// Params with the `--producer compsys` ordering (quality-ranked).
     fn params(query: &str, mode: Mode, rows: usize, width: usize, trailing_space: bool) -> Params {
         Params {
+            order: ranking::Order::Quality,
             query: query.as_bytes().to_vec(),
             mode,
             smart_case: true,
             rows,
             width,
             trailing_space,
+        }
+    }
+
+    /// Params with the `--producer history` ordering (stdin order kept).
+    fn history_params(query: &str, mode: Mode, rows: usize, width: usize) -> Params {
+        Params {
+            order: ranking::Order::Stdin,
+            ..params(query, mode, rows, width, false)
         }
     }
 
@@ -289,12 +302,22 @@ mod tests {
         r
     }
 
-    fn word(w: &str) -> Vec<u8> {
+    fn raw_word(w: &[u8]) -> Vec<u8> {
         let mut r = b"w".to_vec();
         r.push(1);
-        r.extend_from_slice(w.as_bytes());
+        r.extend_from_slice(w);
         r.push(0);
         r
+    }
+
+    fn word(w: &str) -> Vec<u8> {
+        raw_word(w.as_bytes())
+    }
+
+    fn has_match(plan: &wire::Plan, pos: usize, start: usize, len: usize) -> bool {
+        plan.highlights
+            .iter()
+            .any(|h| (h.role, h.pos, h.start, h.len) == (wire::Role::Match, pos, start, len))
     }
 
     #[test]
@@ -567,15 +590,77 @@ mod tests {
     }
 
     #[test]
-    fn newline_in_candidate_is_normalized_for_display_but_raw_in_insertion_text() {
-        // cli-protocol.md: newline -> space is a *display* normalization
-        // only; insertion text returns the original bytes untouched.
+    fn control_bytes_are_normalized_for_display_but_raw_in_insertion_text() {
+        // cli-protocol.md "制御バイト→スペース正規化": every C0 byte and
+        // DEL becomes one space in the *display* text, and display width,
+        // padding, truncation and cell/highlight offsets are all measured
+        // on that normalized text; insertion text keeps the raw bytes.
+        // One payload, two widths, so the untruncated and truncated
+        // readings are pinned against the same candidates.
+        const ESC_DEL_TAB: &[u8] = b"ab\x1bcd\x7fef\tgh"; // 11 bytes -> "ab cd ef gh"
+        const LF: &[u8] = b"zz\ncd"; // 5 bytes -> "zz cd"
         let mut stdin = header(&[]);
-        stdin.extend(word("foo\nbar"));
-        let out = run(&params("", Mode::Typo, 10, 40, false), &stdin, &no_dir).unwrap();
+        stdin.extend(raw_word(ESC_DEL_TAB));
+        stdin.extend(raw_word(LF));
+
+        // width 40: nothing truncated. gmaxw is 11 -- the *normalized*
+        // width of the first candidate (raw, its 3 control bytes would
+        // have width 0 and give 8), which is what pads "zz cd" out to 11.
+        let out = run(
+            &params("cd", Mode::Substring, 10, 40, false),
+            &stdin,
+            &no_dir,
+        )
+        .unwrap();
         let p = parse_wire(&out);
-        assert_eq!(p.rows, vec![b"foo bar".to_vec()]);
-        assert_eq!(p.inserts, vec![b"foo\nbar".to_vec()]);
+        assert_eq!(p.rows, vec![b"ab cd ef gh  zz cd      ".to_vec()]);
+        assert_eq!(p.cells, vec![(0, 11), (13, 5)]);
+        // Spans are computed on the raw match-text; the 1-byte-for-1-byte
+        // normalization keeps them aligned with the displayed cell.
+        assert!(has_match(&p, 1, 3, 2));
+        assert!(has_match(&p, 2, 16, 2));
+        assert_eq!(p.inserts, vec![ESC_DEL_TAB.to_vec(), LF.to_vec()]);
+
+        // width 5: truncation counts the normalized text, so the retained
+        // prefix is 5 chars ("ab cd"), not the 7 a control-byte-as-width-0
+        // reading would keep.
+        let out = run(
+            &params("cd", Mode::Substring, 10, 5, false),
+            &stdin,
+            &no_dir,
+        )
+        .unwrap();
+        let p = parse_wire(&out);
+        assert_eq!(p.rows, vec![b"ab cd".to_vec(), b"zz cd".to_vec()]);
+        assert_eq!(p.cells, vec![(0, 5), (6, 5)]);
+        assert!(has_match(&p, 1, 3, 2));
+        assert!(has_match(&p, 2, 9, 2));
+        assert_eq!(p.inserts, vec![ESC_DEL_TAB.to_vec(), LF.to_vec()]);
+    }
+
+    #[test]
+    fn history_order_keeps_stdin_order_regardless_of_match_quality() {
+        // cli-protocol.md "--producer history": the payload is newest
+        // first and that order survives verbatim, so position 1 is the
+        // newest *matching* history line even though the older candidate
+        // is the better (prefix-tier) match.
+        let mut stdin = header(&[]);
+        for w in ["echo xfoo", "unrelated", "foo"] {
+            stdin.extend(word(w));
+        }
+        // width 9 == the widest candidate, forcing a single column so the
+        // rows read top-to-bottom in position order.
+        let out = run(&history_params("foo", Mode::Typo, 10, 9), &stdin, &no_dir).unwrap();
+        let p = parse_wire(&out);
+        // "unrelated" matches no tier and is the only candidate dropped.
+        assert_eq!(p.rows, vec![b"echo xfoo".to_vec(), b"foo      ".to_vec()]);
+        assert_eq!(p.inserts, vec![b"echo xfoo".to_vec(), b"foo".to_vec()]);
+
+        // Same payload under the compsys ordering ranks by quality
+        // instead, so the two orderings really are distinguishable here.
+        let out = run(&params("foo", Mode::Typo, 10, 9, false), &stdin, &no_dir).unwrap();
+        let p = parse_wire(&out);
+        assert_eq!(p.inserts, vec![b"foo".to_vec(), b"echo xfoo".to_vec()]);
     }
 
     #[test]

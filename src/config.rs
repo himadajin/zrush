@@ -11,7 +11,7 @@ use crate::keybind;
 use crate::matching::Mode;
 
 /// Protocol version emitted as ZRUSH_PROTOCOL_VERSION (cli-protocol.md).
-pub const PROTOCOL_VERSION: &str = "3";
+pub const PROTOCOL_VERSION: &str = "4";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TabBehavior {
@@ -240,7 +240,7 @@ fn apply_key(
             cfg.trailing_space = bool_val(val, table, key, true, warnings);
         }
         ("history", "limit") => {
-            cfg.history_limit = int_val(val, table, key, 1, 100000, 5000, warnings);
+            cfg.history_limit = int_val(val, table, key, 1, 20000, 5000, warnings);
         }
         ("keybind", _) => {
             if let Some(i) = keybind::ACTIONS.iter().position(|a| *a == key) {
@@ -567,9 +567,27 @@ mod tests {
         assert_eq!(r.warnings.len(), 1);
         assert!(
             r.warnings[0]
-                .contains("[history] limit: expected integer 1..100000, got 0; using default 5000"),
+                .contains("[history] limit: expected integer 1..20000, got 0; using default 5000"),
             "{}",
             r.warnings[0]
+        );
+    }
+
+    #[test]
+    fn history_limit_above_the_maximum_falls_back() {
+        // config-schema.md [history] limit: 1..20000. The upper bound is
+        // the one this test pins (the lower bound is above).
+        let r = parse("[history]\nlimit = 20001\n");
+        assert_eq!(r.config.history_limit, 5000);
+        assert_eq!(r.warnings.len(), 1);
+        assert!(
+            r.warnings[0].contains("expected integer 1..20000, got 20001"),
+            "{}",
+            r.warnings[0]
+        );
+        assert_eq!(
+            parse("[history]\nlimit = 20000\n").config.history_limit,
+            20000
         );
     }
 
