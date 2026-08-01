@@ -803,9 +803,12 @@ _zrush_parse_plan() {  # $1=raw `zrush plan` stdout
   (( idx += P ))
   (( idx - 1 == n )) || return 1   # exact field count: 4 + L + H + 3P
 
-  # Tuple shapes, then every 0..P value in one pass.
+  # Tuple shapes, then every 0..P value in one pass; `ranged` collects those,
+  # `offs` collects the (start, len) pairs bounded by the listing text.
+  local text=${(pj:\n:)rows}
+  local -i N=$#text   # $# is this receiver's own character reading (contract)
   local e role pos start len
-  local -a tok ranged=()
+  local -a tok ranged=() offs=()
   for e in "${(@)hls}"; do
     tok=( ${=e} )
     (( $#tok == 4 )) || return 1
@@ -813,11 +816,13 @@ _zrush_parse_plan() {  # $1=raw `zrush plan` stdout
     [[ $role == match || $role == heading ]] || return 1
     [[ $pos == <-> && $start == <-> && $len == <-> ]] || return 1
     ranged+=( $pos )
+    offs+=( $start $len )
   done
   for e in "${(@)cells}"; do
     tok=( ${=e} )
     (( $#tok == 2 )) || return 1
     [[ $tok[1] == <-> && $tok[2] == <-> ]] || return 1
+    offs+=( "${(@)tok}" )
   done
   for e in "${(@)navs}"; do
     tok=( ${=e} )
@@ -826,11 +831,19 @@ _zrush_parse_plan() {  # $1=raw `zrush plan` stdout
     ranged+=( "${(@)tok}" )
   done
   _zrush_dec_le_all $P "${(@)ranged}" || return 1
+  # cli-protocol.md "オフセット規律": ranges stay inside the listing text.
+  # Bound each value on its own first -- string compare, no arithmetic -- so
+  # the sum below cannot truncate a wide digit string or overflow.
+  _zrush_dec_le_all $N "${(@)offs}" || return 1
+  local -i i
+  for (( i = 1; i <= $#offs; i += 2 )); do
+    (( offs[i] + offs[i+1] <= N )) || return 1
+  done
 
   _zrush_plan_cp=$f[1]
   _zrush_plan_nlines=$L
   _zrush_plan_npos=$P
-  _zrush_plan_text=${(pj:\n:)rows}
+  _zrush_plan_text=$text
   _zrush_plan_hl=( "${(@)hls}" )
   _zrush_plan_cells=( "${(@)cells}" )
   _zrush_plan_nav=( "${(@)navs}" )
