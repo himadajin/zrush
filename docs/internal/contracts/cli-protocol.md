@@ -247,7 +247,8 @@ zsh が履歴から合成する payload。
 - 対象は `[history].limit` 件を新しい方から走査した範囲(config-schema.md)。
   重複除去と除外はこの範囲の中で行い、除外した分を範囲の外から補充しないため、
   発行するレコード数は `limit` 以下になる。
-- payload の合成コストは走査する履歴の行数と行長に線形である
+- payload の合成は、全履歴の値の一括展開 1 回(履歴の総件数に線形)と、
+  走査範囲の処理(その範囲の行数と行長に線形)からなる
   (この payload は同期経路で合成される。behavior.md「履歴メニュー」節)。
 - `zrush plan` へ渡す引数値: `--producer` は `history`、`--query` はバッファ全体(as-typed)、
   `--trailing-space` は常に `false`(挿入テキストを履歴行の原文と一致させるため)。
