@@ -36,6 +36,26 @@ bindkey '^Xk' _zrt-dump-kind
 # (behavior.md "選択・キーバインド").
 bindkey '^Xu' up-line-or-history
 
+# ^Xl: a plain cursor-movement widget zrush never binds (not one of the six
+# configurable actions), used to exercise a CURSOR-only external change while
+# a history menu is open (driver.zsh's (h23); h4 only covers a BUFFER-text change).
+bindkey '^Xl' backward-char
+
+# ^Xz: CURSOR position, for scenarios that need to confirm a delegated widget
+# actually moved the cursor (driver.zsh's (h14c)), not just that BUFFER text
+# was left alone.
+_zrt_dump_cursor() { _zlog "TESTCUR=$CURSOR" }
+zle -N _zrt-dump-cursor _zrt_dump_cursor
+bindkey '^Xz' _zrt-dump-cursor
+
+# ^Xt: debounce timer / in-flight collection fd state, for confirming nothing
+# is leaked across a send-break (driver.zsh's (h26); the existing (sb-1)
+# regression in this driver only checks _zrush_plan_npos/_zrush_listing, not
+# the timer/collection fds).
+_zrt_dump_fds() { _zlog "TESTFDS=timer=$_zrush_timer_fd rfd=$_zrush_rfd wfd=$_zrush_wfd pty=${_zrush_pty:-<none>}" }
+zle -N _zrt-dump-fds _zrt_dump_fds
+bindkey '^Xt' _zrt-dump-fds
+
 # Slow fake completion (behavior.md "候補収集" cancellation semantics,
 # exercised by driver.zsh's (h17)). Defined here as plain script rather than
 # a typed command, so this definition and its compdef registration never

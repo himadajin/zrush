@@ -706,6 +706,31 @@ start_hist_host() {  # $1=zdotdir $2=xdg-config-home $3=logfile
   clear_line
   drain 0.3
 
+  # ---- (h23) audit A2: a CURSOR-only external change (no BUFFER text edit)
+  # must also erase the whole history menu; (h4) above only exercises a
+  # BUFFER-changing edit. Uses the log line _zrush_line_pre_redraw always
+  # emits on this exact transition, so the check is independent of whatever
+  # a same-buffer recollection settles to afterward (same rationale as the
+  # relaxed kind checks elsewhere in this file).
+  send_keys 'echo'
+  drain 0.5
+  press $'\e[A'
+  dump_get $'\C-xk' TESTKIND
+  [[ $REPLY == 'kind=history'* ]] || ng "(h23-setup) history menu did not open: $REPLY"
+  log_count 'history: menu erased by an external buffer/cursor change'; local -i hc0=$REPLY
+  press $'\C-xl'   # backward-char: moves CURSOR only, BUFFER text unchanged
+  if wait_log 'history: menu erased by an external buffer/cursor change' $hc0 3; then
+    ok "(h23a) a cursor-only external change (no BUFFER edit) erases the history menu"
+  else
+    ng "(h23a) cursor-only change did not erase the menu"
+  fi
+  if dump_get $'\C-xk' TESTKIND; then
+    [[ $REPLY != 'kind=history'* ]] && ok "(h23b) kind is no longer 'history' after the cursor-only change" || ng "(h23b) $REPLY"
+  fi
+  assert_buffer 'echo' "(h23c) buffer text itself is unchanged (only the cursor moved)"
+  clear_line
+  drain 0.3
+
   # ---- (h5) Tab while a history entry is selected confirms it exactly like Enter.
   send_keys 'echo'
   drain 0.5
@@ -849,6 +874,28 @@ start_hist_host() {  # $1=zdotdir $2=xdg-config-home $3=logfile
   clear_line
   drain 0.3
 
+  # ---- (h25) audit A2: opening the history menu while only debounce-armed
+  # (no collection started yet) disarms the pending timer; (h17) above only
+  # covers cancelling a collection that has already started. The Up here is
+  # sent in the same burst as the typed query, well inside the default 30ms
+  # debounce, so the timer must still be pending when select-prev disarms it.
+  log_count 'request: collecting'; local -i rc0=$REPLY
+  send_keys 'echo'
+  send_keys $'\e[A'
+  drain 0.5
+  if dump_get $'\C-xk' TESTKIND; then
+    [[ $REPLY == 'kind=history sel=1 listing=1 npos=6' ]] \
+      && ok "(h25a) Up sent within the debounce window still opens the history menu" \
+      || ng "(h25a) $REPLY"
+  fi
+  drain 1.0   # comfortably longer than the original 30ms debounce + a real fork/collection round trip
+  log_count 'request: collecting'; local -i rc1=$REPLY
+  (( rc1 == rc0 )) \
+    && ok "(h25b) the disarmed debounce timer never fires a compsys collection ($rc0 -> $rc1)" \
+    || ng "(h25b) a compsys collection started despite the timer being disarmed ($rc0 -> $rc1)"
+  clear_line
+  drain 0.3
+
   # ---- (h17) opening the history menu cancels an in-flight completion
   # collection; the collection's late-arriving result must not overwrite the
   # menu once it (eventually) completes (behavior.md "候補収集": a cancelled
@@ -898,6 +945,43 @@ start_hist_host() {  # $1=zdotdir $2=xdg-config-home $3=logfile
   clear_line
   drain 0.3
 
+  # ---- (h22) regression (f6fcf2e, audit A2): confirming a history candidate
+  # that is byte-identical to the current BUFFER must still trigger normal
+  # recollection afterward. Opening the menu snapshots BUFFER/CURSOR as the
+  # pre-redraw baseline (behavior.md "履歴メニュー"); if confirm left that
+  # baseline untouched, an insertion identical to the pre-open buffer would
+  # read as "no change" on the next pre-redraw and silently stall
+  # recollection (behavior.md "確定(挿入)"). Checked via both confirm keys.
+  send_keys 'echo newest'
+  drain 0.5
+  press $'\e[A'
+  dump_get $'\C-xk' TESTKIND
+  [[ $REPLY == 'kind=history sel=1 listing=1 npos=1' ]] || ng "(h22-setup-enter) exact-match menu did not open as expected: $REPLY"
+  log_count 'plan: ok producer=compsys'; local -i cc0=$REPLY
+  press $'\r'
+  if wait_log 'plan: ok producer=compsys' $cc0 3; then
+    ok "(h22a) confirming a history entry byte-identical to BUFFER (via Enter) still triggers a fresh compsys recollection"
+  else
+    ng "(h22a) no fresh compsys recollection observed after Enter confirmed an exact-BUFFER-match entry"
+  fi
+  clear_line
+  drain 0.3
+
+  send_keys 'echo newest'
+  drain 0.5
+  press $'\e[A'
+  dump_get $'\C-xk' TESTKIND
+  [[ $REPLY == 'kind=history sel=1 listing=1 npos=1' ]] || ng "(h22-setup-tab) exact-match menu did not open as expected: $REPLY"
+  log_count 'plan: ok producer=compsys'; local -i cc1=$REPLY
+  press $'\t'
+  if wait_log 'plan: ok producer=compsys' $cc1 3; then
+    ok "(h22b) confirming a history entry byte-identical to BUFFER (via Tab) still triggers a fresh compsys recollection"
+  else
+    ng "(h22b) no fresh compsys recollection observed after Tab confirmed an exact-BUFFER-match entry"
+  fi
+  clear_line
+  drain 0.3
+
   # ---- (h21) the fixture-injection mechanism itself (print -s, run from
   # this host's rc file) never becomes a history candidate: a query matching
   # its own invocation text finds nothing.
@@ -908,6 +992,70 @@ start_hist_host() {  # $1=zdotdir $2=xdg-config-home $3=logfile
     [[ $REPLY == 'kind=none sel=0 listing=0 npos=0' ]] \
       && ok "(h21) the fixture's own 'print -s ...' injection commands never appear as history candidates" \
       || ng "(h21) $REPLY"
+  fi
+  clear_line
+  drain 0.3
+
+  # ---- (h24) audit A2: a synchronous history-producer plan failure (same
+  # broken-binary technique as err-1/err-2, which only exercise the async
+  # compsys path) must leave no menu, no residual kind/listing, the buffer
+  # untouched, and the shell responsive (cli-protocol.md "エラー時の zsh 側
+  # 挙動" applies to `zrush plan --producer history`'s synchronous invocation
+  # exactly as it does to the async compsys one).
+  # An empty buffer (rather than a typed query) avoids a confound: typing
+  # anything here would also arm its own compsys collection, which (via the
+  # already-warm empty-word cache from earlier scenarios on this host) would
+  # hit the broken binary synchronously and consume the session's one-time
+  # warning before the history-menu attempt below even runs.
+  print -r -- $'#!/bin/sh\nexit 7' > $WORK/bin/zrush
+  chmod +x $WORK/bin/zrush
+  TRANSCRIPT=
+  send_keys $'\e[A'   # raw send, not press: press's own drain would already
+                       # consume the one-shot warning before expect looks for it
+  if expect '*zrush: zrush plan failed*' 10; then
+    ok "(h24a) a broken zrush binary triggers a warning when opening the history menu"
+  else
+    ng "(h24a) no warning shown for a broken binary on the history-menu path"
+  fi
+  if dump_get $'\C-xk' TESTKIND; then
+    [[ $REPLY == 'kind=none sel=0 listing=0 npos=0' ]] && ok "(h24b) no menu/kind/listing survives the failed sync plan" || ng "(h24b) $REPLY"
+  fi
+  assert_buffer '' "(h24c) buffer is unchanged after the failed sync plan"
+  cp $REPO/target/release/zrush $WORK/bin/zrush
+  chmod +x $WORK/bin/zrush
+  clear_line
+  drain 0.3
+  send_keys 'print HISTMARK-AFTER-HIST-PLAN-ERROR'
+  send_keys $'\r'
+  if expect '*HISTMARK-AFTER-HIST-PLAN-ERROR*' 5; then
+    ok "(h24d) the shell keeps responding normally after a failed history-menu plan"
+  else
+    ng "(h24d) shell did not respond after the failed history-menu plan"
+  fi
+  sync_prompt
+
+  # ---- (h26) audit A2: send-break while the history menu is open must not
+  # leak state into the next line -- kind/listing (^Xk) and the debounce
+  # timer/collection fds (^Xt) must all be clear after the following
+  # line-init. The existing (sb-1) regression elsewhere in this driver only
+  # checks _zrush_plan_npos/_zrush_listing for a completion listing, not the
+  # history-menu path nor the timer/collection fds.
+  send_keys 'echo'
+  drain 0.5
+  press $'\e[A'
+  dump_get $'\C-xk' TESTKIND
+  [[ $REPLY == 'kind=history'* ]] || ng "(h26-setup) history menu did not open: $REPLY"
+  send_keys $'\C-c'   # send-break: abandon the line, bypassing confirm/dismiss/line-finish
+  if sync_prompt 5; then
+    ok "(h26a) a new prompt appears after send-break with the history menu open"
+    if dump_get $'\C-xk' TESTKIND; then
+      [[ $REPLY == 'kind=none sel=0 listing=0 npos=0' ]] && ok "(h26b) no kind/listing state leaks into the new prompt" || ng "(h26b) $REPLY"
+    fi
+    if dump_get $'\C-xt' TESTFDS; then
+      [[ $REPLY == 'timer=-1 rfd=-1 wfd=-1 pty=<none>' ]] && ok "(h26c) no timer/collection fd leaks into the new prompt" || ng "(h26c) $REPLY"
+    fi
+  else
+    out "SKIP: (h26) send-break did not produce a new prompt in this environment; skipping the leak check"
   fi
   clear_line
   drain 0.3
@@ -923,14 +1071,29 @@ start_hist_host() {  # $1=zdotdir $2=xdg-config-home $3=logfile
   press $'\C-xu'   # two raw history-back steps, so there is room for a further Down below
   dump_get $'\C-xk' TESTKIND
   [[ $REPLY != 'kind=history'* ]] || ng "(h13-setup) unexpected history-menu kind after raw history browsing: $REPLY"
+  # audit A2: "kind != history" alone would also pass if the key were simply
+  # swallowed as a no-op instead of actually delegated, so additionally pin
+  # down the real transition via BUFFER content: Up must move one further
+  # step back in plain history (a different line), and Down must land back
+  # on exactly the line seen right before Up (a round trip), proving both
+  # keys actually reached up-line-or-history/down-line-or-history.
+  dump_get $'\C-xb' TESTBUF; local buf_base=${(Q)REPLY}
   press $'\e[A'
   if dump_get $'\C-xk' TESTKIND; then
     [[ $REPLY != 'kind=history'* ]] && ok "(h13a) Up while browsing plain history delegates (no history menu opens)" || ng "(h13a) $REPLY"
   fi
+  dump_get $'\C-xb' TESTBUF; local buf_after_up=${(Q)REPLY}
+  [[ $buf_after_up != "$buf_base" ]] \
+    && ok "(h13a') the delegated Up actually moved one step further back in plain history (buffer changed: ${(qqqq)buf_base} -> ${(qqqq)buf_after_up})" \
+    || ng "(h13a') buffer did not change; Up may have been silently swallowed instead of delegated"
   press $'\e[B'
   if dump_get $'\C-xk' TESTKIND; then
     [[ $REPLY != 'kind=history'* ]] && ok "(h13b) Down while browsing plain history delegates (no history menu opens)" || ng "(h13b) $REPLY"
   fi
+  dump_get $'\C-xb' TESTBUF; local buf_after_down=${(Q)REPLY}
+  [[ $buf_after_down == "$buf_base" ]] \
+    && ok "(h13b') the delegated Down actually moved one step forward, back to the same plain-history line as before Up" \
+    || ng "(h13b') buffer=${(qqqq)buf_after_down} want=${(qqqq)buf_base}"
   reset_line
 
   # ---- (h14) a multiline buffer with the cursor off the first line: Up is
@@ -940,6 +1103,7 @@ start_hist_host() {  # $1=zdotdir $2=xdg-config-home $3=logfile
   send_keys $'\C-v\C-j'
   send_keys 'b'
   drain 0.5
+  dump_get $'\C-xz' TESTCUR; local -i cur_before=$REPLY   # end of buffer: 8 ('echo a'=6 + \n + 'b')
   press $'\e[A'
   if dump_get $'\C-xk' TESTKIND; then
     # A same-buffer recollection for the "b" argument word may have already
@@ -948,6 +1112,14 @@ start_hist_host() {  # $1=zdotdir $2=xdg-config-home $3=logfile
     [[ $REPLY != 'kind=history'* ]] && ok "(h14a) Up with a newline in LBUFFER delegates (no history menu opens)" || ng "(h14a) $REPLY"
   fi
   assert_buffer $'echo a\nb' "(h14b) buffer content is unchanged (only the cursor moved)"
+  # audit A2: "buffer unchanged" alone would also pass if Up were a pure
+  # no-op, so additionally pin down that the cursor actually left line 2:
+  # 'echo a' occupies positions 0..6 (the newline sits at 6), so landing
+  # anywhere in 0..6 means "on line 1".
+  dump_get $'\C-xz' TESTCUR; local -i cur_after=$REPLY
+  [[ $cur_after -lt 7 && $cur_after -ne $cur_before ]] \
+    && ok "(h14c) the cursor actually moved onto the first line (was $cur_before, now $cur_after; line 1 spans 0..6)" \
+    || ng "(h14c) cursor did not move onto the first line (before=$cur_before after=$cur_after)"
   reset_line
 
   # ---- (h8) [history].limit bounds the RAW scan window; entries that don't
@@ -1015,6 +1187,7 @@ start_hist_host() {  # $1=zdotdir $2=xdg-config-home $3=logfile
         || ng "(h20b) $REPLY"
     fi
     press $'\C-g'   # dismiss: back to an empty buffer, HISTNO still untouched
+    dump_get $'\C-xb' TESTBUF; local buf_before_ctrlp=${(Q)REPLY}
     press $'\C-p'
     if dump_get $'\C-xk' TESTKIND; then
       # ctrl-p's predecessor may move BUFFER to a real history line, which
@@ -1023,6 +1196,13 @@ start_hist_host() {  # $1=zdotdir $2=xdg-config-home $3=logfile
       # wrongly opened.
       [[ $REPLY != 'kind=history'* ]] && ok "(h20a) ctrl-p (excluded from select-prev) does not open the history menu" || ng "(h20a) $REPLY"
     fi
+    # audit A2: "kind != history" alone would also pass if ctrl-p were
+    # silently swallowed as a no-op; pin down that its predecessor actually
+    # ran plain history movement by requiring a real, nonempty buffer change.
+    dump_get $'\C-xb' TESTBUF; local buf_after_ctrlp=${(Q)REPLY}
+    [[ -n $buf_after_ctrlp && $buf_after_ctrlp != "$buf_before_ctrlp" ]] \
+      && ok "(h20a') ctrl-p's predecessor actually performed native history movement (buffer: ${(qqqq)buf_before_ctrlp} -> ${(qqqq)buf_after_ctrlp})" \
+      || ng "(h20a') ctrl-p did not change the buffer; it may have been silently swallowed instead of delegated"
   else
     ng "(h20-0) select-prev=[\"up\"] host failed to start"
   fi
