@@ -288,6 +288,59 @@ host_rss() {
 
 stop_host() { zpty -d $HOST 2>/dev/null; HOSTFD=-1 }
 
+# ---------------------------------------------------------------- History-menu first paint
+# Same isolation discipline as start_min_zrush, but sourcing
+# tests/zsh/rc/history-latency.zshrc (bulk-generated fixture history) instead
+# of minimal.zshrc, and optionally writing a [history].limit override so the
+# large-history case can exercise a scan window bigger than the 5000 default
+# (config-schema.md "[history]", max 20000).
+start_hist_latency() {  # $1=host label $2=N fixture entries $3=long(0/1) [$4=history.limit override]
+  HOST=$1 HOSTLOG=$WORK/$1.log CURXDG=$WORK/xdg-$1
+  export ZRUSH_REPO=$REPO ZRUSH_TEST_TMP=$WORK/t-$1 ZDOTDIR=$WORK/zdot-$1
+  export XDG_CONFIG_HOME=$CURXDG ZRUSH_LOG=$HOSTLOG
+  export ZRUSH_HIST_N=$2 ZRUSH_HIST_LONG=$3
+  mkdir -p $ZDOTDIR $ZRUSH_TEST_TMP $CURXDG/zrush
+  if [[ -n ${4:-} ]]; then
+    print -r -- $'[history]\nlimit = '$4 > $CURXDG/zrush/config.toml
+  fi
+  print "source $REPO/tests/zsh/rc/history-latency.zshrc" > $ZDOTDIR/.zshrc
+  cd $PLAYGROUND || return 1
+  local REPLY=
+  zpty -b $HOST zsh -d -i || return 1
+  HOSTFD=$REPLY
+  expect '*MARK-RC-DONE*' 60 || return 1   # generating thousands of history entries can take a moment
+  drain 0.5
+  unset ZRUSH_HIST_N ZRUSH_HIST_LONG
+  return 0
+}
+
+# The history menu is opened by a bare select-prev (Up) on an empty buffer,
+# not by typing a pattern, so this cannot reuse paint_case/paint_once as-is:
+# once open, a second Up would navigate the still-open menu (select-prev on
+# an already-selected position 1) instead of re-opening it, so each trial
+# must explicitly dismiss first to guarantee it measures the same open
+# transition every time.
+paint_history_once() {  # $1=pattern $2=timeout -> REPLY=ms (NA if not reached)
+  send_keys $'\C-g'; drain 0.2   # ensure the menu starts closed (a no-op if it already is)
+  paint_once $'\e[A' $1 ${2:-20}
+}
+
+paint_history_case() {  # $1=host-label $2=case-label $3=pattern [$4=trials]
+  local -i trials=${4:-4}
+  local -a ms=()
+  local -i i
+  for (( i = 1; i <= trials; ++i )); do
+    if paint_history_once $3 20; then
+      ms+=( $REPLY )
+    else
+      out "WARN: [$1/$2] attempt $i did not complete"
+    fi
+  done
+  median $ms
+  out "PAINT | ${(r:12:)1} | ${(r:18:)2} | med=$(fmt $REPLY)ms | trials=[${(j:, :)${(@)ms/(#m)*/$(fmt $MATCH)}}]"
+  return 0
+}
+
 # ---------------------------------------------------------------- Run
 {
   # ============ min-zrush with default 30ms delay ============
@@ -332,9 +385,31 @@ stop_host() { zpty -d $HOST 2>/dev/null; HOSTFD=-1 }
     out "FATAL: min-zac failed to start (ZAC_SRC=$ZAC_SRC)"
   fi
   stop_host
+
+  # ============ history-menu first paint (issue #9 latency addendum) ============
+  # behavior.md "履歴メニュー" targets ~50ms at the default limit and normal
+  # history sizes as a goal, not a contract (line length is unbounded), so
+  # this reports measurements only -- same convention as the cases above.
+  out "==== hist-5000 (history menu, default [history].limit=5000, ~5000-entry history) ===="
+  if start_hist_latency hist5000 5000 0; then
+    paint_history_case hist5000 "empty-buf Up (5000)" 'needle-latency-target'
+  else
+    out "FATAL: hist5000 failed to start"
+  fi
+  stop_host
+
+  out "==== hist-20000-long (limit=20000, 20000-entry history, long single lines) ===="
+  if start_hist_latency hist20000 20000 1 20000; then
+    paint_history_case hist20000 "empty-buf Up (20000, long lines)" 'needle-latency-target'
+  else
+    out "FATAL: hist20000 failed to start"
+  fi
+  stop_host
 } always {
   zpty -d min-zrush 2>/dev/null
   zpty -d min-d0 2>/dev/null
   zpty -d zac 2>/dev/null
+  zpty -d hist5000 2>/dev/null
+  zpty -d hist20000 2>/dev/null
   [[ -n $WORK && $WORK == */zrush-lat.* ]] && rm -rf $WORK
 }

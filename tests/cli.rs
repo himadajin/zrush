@@ -36,6 +36,7 @@ fn run_plan(extra: &[&str], stdin: &[u8]) -> (i32, Vec<u8>) {
 /// The full required flag set (cli-protocol.md "起動"); tests override
 /// individual values as needed.
 fn plan_args<'a>(
+    producer: &'a str,
     query: &'a str,
     mode: &'a str,
     rows: &'a str,
@@ -43,6 +44,8 @@ fn plan_args<'a>(
     trailing_space: &'a str,
 ) -> Vec<&'a str> {
     vec![
+        "--producer",
+        producer,
         "--query",
         query,
         "--mode",
@@ -115,7 +118,7 @@ fn has_highlight(
 
 #[test]
 fn plan_rejects_negative_width_with_exit_2() {
-    let (code, _) = run_plan(&plan_args("a", "typo", "10", "-1", "true"), b"");
+    let (code, _) = run_plan(&plan_args("compsys", "a", "typo", "10", "-1", "true"), b"");
     assert_eq!(code, 2);
 }
 
@@ -137,7 +140,10 @@ fn plan_dir_synthesis_uses_real_filesystem_stat() {
     let rd = format!("{}/", dir.display());
     let mut stdin = header(&[("f", "1"), ("rd", &rd)]);
     stdin.extend(word("child"));
-    let (code, out) = run_plan(&plan_args("", "typo", "10", "40", "true"), &stdin);
+    let (code, out) = run_plan(
+        &plan_args("compsys", "", "typo", "10", "40", "true"),
+        &stdin,
+    );
     assert_eq!(code, 0);
     let p = parse_wire(&out);
     // `/` synthesized (real directory), which also suppresses the
@@ -150,7 +156,10 @@ fn plan_dir_synthesis_uses_real_filesystem_stat() {
 fn plan_trailing_space_true_appends_space() {
     let mut stdin = header(&[]);
     stdin.extend(word("git"));
-    let (code, on) = run_plan(&plan_args("", "typo", "10", "40", "true"), &stdin);
+    let (code, on) = run_plan(
+        &plan_args("compsys", "", "typo", "10", "40", "true"),
+        &stdin,
+    );
     assert_eq!(code, 0);
     assert_eq!(parse_wire(&on).inserts, vec![b"git ".to_vec()]);
 }
@@ -163,7 +172,10 @@ fn plan_ranking_tiers_and_common_prefix() {
     }
     // width=10 == the widest match: gmaxw=10, cols=floor(12/12)=1,
     // forcing a single column so rows appear in rank order top-to-bottom.
-    let (code, out) = run_plan(&plan_args("doc", "typo", "10", "10", "false"), &stdin);
+    let (code, out) = run_plan(
+        &plan_args("compsys", "doc", "typo", "10", "10", "false"),
+        &stdin,
+    );
     assert_eq!(code, 0);
     let p = parse_wire(&out);
     // prefix-exact(doc) > prefix(docs) > substring(mydocs) > edit(dot-config); xxx excluded.
@@ -176,6 +188,38 @@ fn plan_ranking_tiers_and_common_prefix() {
 }
 
 #[test]
+fn plan_history_producer_keeps_stdin_order() {
+    // cli-protocol.md "マッチング・ランキングの意味論": --producer history
+    // keeps the payload's (newest-first) order whatever the match
+    // quality, while --producer compsys ranks the same payload by tier.
+    let mut stdin = header(&[]);
+    for w in ["echo xfoo", "unrelated", "foo"] {
+        stdin.extend(word(w));
+    }
+    // width=9 == the widest candidate: single column, one row each.
+    let (code, out) = run_plan(
+        &plan_args("history", "foo", "typo", "10", "9", "false"),
+        &stdin,
+    );
+    assert_eq!(code, 0);
+    // "unrelated" matches no tier and is dropped; the rest keep their order.
+    assert_eq!(
+        parse_wire(&out).inserts,
+        vec![b"echo xfoo".to_vec(), b"foo".to_vec()]
+    );
+
+    let (code, out) = run_plan(
+        &plan_args("compsys", "foo", "typo", "10", "9", "false"),
+        &stdin,
+    );
+    assert_eq!(code, 0);
+    assert_eq!(
+        parse_wire(&out).inserts,
+        vec![b"foo".to_vec(), b"echo xfoo".to_vec()]
+    );
+}
+
+#[test]
 fn plan_typo_transposition_gti() {
     let mut stdin = header(&[]);
     for w in ["git", "grep", "git-lfs"] {
@@ -183,7 +227,10 @@ fn plan_typo_transposition_gti() {
     }
     // width=8: gmaxw=max(3,7)=7 (over the 2 matches) -> cols=floor(10/9)=1,
     // forcing a single column so each match gets its own row.
-    let (code, out) = run_plan(&plan_args("gti", "typo", "10", "8", "false"), &stdin);
+    let (code, out) = run_plan(
+        &plan_args("compsys", "gti", "typo", "10", "8", "false"),
+        &stdin,
+    );
     assert_eq!(code, 0);
     let p = parse_wire(&out);
     // No prefix-tier match under "gti" -> empty common prefix.
@@ -201,7 +248,10 @@ fn plan_match_highlight_offset_is_non_trivial_for_a_mid_string_match() {
     // misreading of end=3 as a length, extending the highlight to "arg").
     let mut stdin = header(&[]);
     stdin.extend(word("cargo"));
-    let (code, out) = run_plan(&plan_args("ar", "substring", "10", "40", "false"), &stdin);
+    let (code, out) = run_plan(
+        &plan_args("compsys", "ar", "substring", "10", "40", "false"),
+        &stdin,
+    );
     assert_eq!(code, 0);
     let p = parse_wire(&out);
     assert_eq!(p.rows, vec![b"cargo".to_vec()]);
@@ -259,7 +309,7 @@ fn config_without_file_prints_contract_default_output() {
     let (code, out) = run_config(&dir);
     assert_eq!(code, 0);
     let expected = "\
-typeset -g  ZRUSH_PROTOCOL_VERSION='3'
+typeset -g  ZRUSH_PROTOCOL_VERSION='4'
 typeset -g  ZRUSH_CFG_MAX_LINES='10'
 typeset -g  ZRUSH_CFG_DELAY_MS='30'
 typeset -g  ZRUSH_CFG_MIN_INPUT='0'

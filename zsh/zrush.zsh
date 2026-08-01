@@ -40,7 +40,7 @@ fi
 # ---------------------------------------------------------------- Global state
 typeset -g  ZRUSH_BIN=${ZRUSH_BIN:-$_zrush_source_dir/../target/release/zrush}
 typeset -gi _zrush_enabled=0
-typeset -gi _ZRUSH_EXPECTED_PROTO=3
+typeset -gi _ZRUSH_EXPECTED_PROTO=4
 typeset -g  _zrush_cfg_path= _zrush_cfg_mtime=
 typeset -gi _zrush_plan_warned=0 _zrush_proto_warned=0
 # Variables this script consumes from `zrush config` output (validation and rollback)
@@ -48,7 +48,7 @@ typeset -ga _ZRUSH_CFG_VARS=(
   ZRUSH_CFG_MAX_LINES ZRUSH_CFG_DELAY_MS ZRUSH_CFG_MIN_INPUT
   ZRUSH_CFG_MODE ZRUSH_CFG_SMART_CASE ZRUSH_CFG_TAB ZRUSH_CFG_TRAILING_SPACE
   ZRUSH_CFG_HL_SELECTED ZRUSH_CFG_HL_MATCH ZRUSH_CFG_HL_HEADING
-  ZRUSH_CFG_KEYBINDS ZRUSH_CFG_WARNINGS
+  ZRUSH_CFG_HISTORY_LIMIT ZRUSH_CFG_KEYBINDS ZRUSH_CFG_WARNINGS
 )
 
 # Collection request state
@@ -69,6 +69,10 @@ typeset -ga _zrush_plan_nav=()         # P entries, each "next prev left right"
 typeset -ga _zrush_plan_insert=()      # P entries, completed insertion text
 typeset -g  _zrush_plan_cp=            # common-prefix
 typeset -gi _zrush_listing=0
+# Which producer the current plan came from: none (no plan) | compsys | history.
+# Single source for the listing kind (behavior.md "履歴メニュー"): confirmation
+# rule and key mapping branch on this and on nothing else.
+typeset -g  _zrush_plan_kind=none
 
 # Rendering (POSTDISPLAY + region_highlight)
 typeset -ga _zrush_rh=()      # ledger of entries added to region_highlight
@@ -481,25 +485,24 @@ _zrush_rh_add() {  # $1=start $2=end $3=spec [$4=memo suffix (-sel)]
   return 0
 }
 
-# Reset _zrush_plan_* only, with no display/selection side effects. Shared by
-# _zrush_clear_display (display-gated: no-ops when nothing is showing) and
-# _zrush_settle_plan's failure branch (must reset unconditionally, even when
-# nothing was showing, so stale state from an earlier prompt/query can never
-# survive to be used by a later pending Tab).
-_zrush_reset_plan_state() {
-  _zrush_plan_text= _zrush_plan_nlines=0 _zrush_plan_npos=0
-  _zrush_plan_hl=() _zrush_plan_cells=() _zrush_plan_nav=() _zrush_plan_insert=()
-  _zrush_plan_cp=
-  return 0
-}
-
-_zrush_clear_display() {  # Call only from a ZLE widget context.
-  _zrush_selected=0
-  (( _zrush_listing )) || return 0
+# Drop the listing and everything that describes it: display, selection, plan
+# (kind included), and any pending Tab. Unconditional -- it never inspects
+# _zrush_listing -- so no caller has to reason about whether something is
+# currently showing, and stale plan state from an earlier prompt or query can
+# never survive to be used by a later pending Tab or confirmation.
+# Call only from a ZLE widget context. In-flight work (debounce timer,
+# collection) is not part of the listing; callers that must also stop it call
+# _zrush_disarm_timer / _zrush_cancel_collection first.
+_zrush_teardown() {
   POSTDISPLAY=
   _zrush_rh_clear
   _zrush_listing=0
-  _zrush_reset_plan_state
+  _zrush_selected=0
+  _zrush_tab_pending=0
+  _zrush_plan_text= _zrush_plan_nlines=0 _zrush_plan_npos=0
+  _zrush_plan_hl=() _zrush_plan_cells=() _zrush_plan_nav=() _zrush_plan_insert=()
+  _zrush_plan_cp=
+  _zrush_plan_kind=none
   return 0
 }
 
@@ -583,7 +586,7 @@ _zrush_start_request() {
 
   # See behavior.md "空語収集キャッシュ". zle -F -w callers require explicit redraw.
   if [[ -z $_zrush_query ]] && _zrush_cc_check; then
-    _zrush_run_plan "$_zrush_cc_payload"
+    _zrush_run_plan "$_zrush_cc_payload" compsys "$_zrush_fuzzy" "$ZRUSH_CFG_TRAILING_SPACE"
     _zrush_settle_plan $?
     zle -R
     return 0
@@ -667,7 +670,7 @@ _zrush_finalize() {
   if [[ -z $_zrush_query && -n $payload ]]; then
     _zrush_cc_save "$payload"
   fi
-  _zrush_run_plan "$payload"
+  _zrush_run_plan "$payload" compsys "$_zrush_fuzzy" "$ZRUSH_CFG_TRAILING_SPACE"
   _zrush_settle_plan $?
   return 0
 }
@@ -680,11 +683,7 @@ _zrush_finalize() {
 # cannot be forgotten on one path but not the other.
 #
 # On failure, a pending Tab is discarded outright -- it is never resolved
-# against _zrush_plan_* here. _zrush_clear_display no-ops when nothing is
-# currently showing (_zrush_listing == 0), which would otherwise leave a
-# stale, possibly non-empty _zrush_plan_* from an earlier prompt/query in
-# place; teardown here is unconditional so a later pending Tab can never be
-# resolved against it (cli-protocol.md "エラー時の zsh 側挙動").
+# against _zrush_plan_* here (cli-protocol.md "エラー時の zsh 側挙動").
 _zrush_settle_plan() {
   emulate -L zsh
   if (( $1 == 0 )); then
@@ -694,24 +693,22 @@ _zrush_settle_plan() {
       _zrush_tab_with_results
     fi
   else
-    _zrush_selected=0
-    POSTDISPLAY=
-    _zrush_rh_clear
-    _zrush_listing=0
-    _zrush_reset_plan_state
-    _zrush_tab_pending=0
+    _zrush_teardown
   fi
   return 0
 }
 
 # ---------------------------------------------------------------- Plan retrieval
 # See docs/internal/contracts/cli-protocol.md "`zrush plan`" and "stdout(描画プラン)".
-# Runs the pure `zrush plan` pipeline over a raw capture payload (fresh
-# collection or a cache hit) and populates _zrush_plan_* on success.
-_zrush_run_plan() {  # $1=raw NUL-terminated capture payload; "" is valid (0 candidates)
+# Runs the pure `zrush plan` pipeline over a payload and populates
+# _zrush_plan_* on success. The argument values that differ per producer
+# (query, trailing-space) belong to the producer profile, so the caller that
+# owns the payload passes them in rather than this function guessing.
+_zrush_run_plan() {  # $1=NUL-terminated payload ("" is valid: 0 candidates)
+                     # $2=producer  $3=--query value  $4=--trailing-space value
   emulate -L zsh
   setopt localoptions typesetsilent no_monitor no_notify
-  local payload=$1
+  local payload=$1 producer=$2 query=$3 tspace=$4
 
   # cli-protocol.md "起動": rows = min(max-lines, LINES - 1), clamped to >= 1
   # unconditionally (not just when LINES > 1 -- LINES <= 1 must still clamp
@@ -725,13 +722,15 @@ _zrush_run_plan() {  # $1=raw NUL-terminated capture payload; "" is valid (0 can
   # `zrush plan` is pure over its arguments and stdin; suppress stderr to protect ZLE.
   local out
   out=$(print -rn -- "$payload" | \
-        "$ZRUSH_BIN" plan --query "$_zrush_fuzzy" --mode "$ZRUSH_CFG_MODE" \
+        "$ZRUSH_BIN" plan --producer "$producer" \
+                          --query "$query" --mode "$ZRUSH_CFG_MODE" \
                           --smart-case "$ZRUSH_CFG_SMART_CASE" \
                           --rows $rows --width $width \
-                          --trailing-space "$ZRUSH_CFG_TRAILING_SPACE" 2>/dev/null)
+                          --trailing-space "$tspace" 2>/dev/null)
   local -i rc=$?
   if (( rc == 0 )) && _zrush_parse_plan "$out"; then
-    _zlog "plan: ok L=$_zrush_plan_nlines P=$_zrush_plan_npos"
+    _zrush_plan_kind=$producer
+    _zlog "plan: ok producer=$producer L=$_zrush_plan_nlines P=$_zrush_plan_npos"
     return 0
   fi
   # cli-protocol.md "エラー時の zsh 側挙動": discard, warn once per session; the
@@ -905,6 +904,63 @@ _zrush_apply_highlights() {
   return 0
 }
 
+# ---------------------------------------------------------------- History menu
+# See docs/internal/specs/behavior.md "履歴メニュー" and cli-protocol.md
+# "history profile".
+#
+# $history maps event numbers to lines and its values come out newest first.
+# Event numbers have gaps, so the newest `limit` entries are the first `limit`
+# values -- never a decrement from HISTCMD, and never `fc` output (multi-line
+# entries break its line-oriented format).
+_zrush_history_payload() {  # -> REPLY = payload bytes for `zrush plan` stdin
+  emulate -L zsh
+  local -i limit=$ZRUSH_CFG_HISTORY_LIMIT
+  local -a lines=()
+  if (( limit > 0 )); then
+    lines=( "${(@)history}" )
+    (( $#lines > limit )) && lines=( "${(@)lines[1,limit]}" )
+    # Within that range (nothing is pulled in from outside it to make up for a
+    # drop): empty lines cannot be candidates, and a line carrying a framing
+    # byte is dropped whole rather than stripped. Every other control byte is
+    # sent as-is; normalizing it for display is `zrush plan`'s job.
+    lines=( "${(@)lines:#(|*($'\0'|$'\1'|$'\2')*)}" )
+    lines=( "${(@u)lines}" )   # identical lines: (u) keeps the newest occurrence
+  fi
+  local w=w$'\1'
+  local -a recs=( b$'\1' "${(@)lines/#/$w}" )
+  typeset -g REPLY=${(pj:\0:)recs}$'\0'
+  return 0
+}
+
+# The one indivisible transition that opens the history menu: stop everything
+# in flight, drop the current listing, then synthesize, plan, show and select
+# position 1 in one go. Zero matches and a failed plan both leave the buffer
+# alone and consume the key.
+_zrush_open_history_menu() {  # ZLE widget context
+  emulate -L zsh
+  _zrush_disarm_timer
+  _zrush_cancel_collection
+  _zrush_teardown
+  # This action leaves BUFFER/CURSOR alone, so bring the pre-redraw baseline up
+  # to date: without it the redraw that follows this very keystroke can be the
+  # first one of the line and would read as an external change, erasing the
+  # menu the moment it appears.
+  _zrush_last_buffer=$BUFFER
+  _zrush_last_cursor=$CURSOR
+  _zrush_history_payload
+  # cli-protocol.md "history profile": the whole buffer is the query (the
+  # sender strips NUL from --query) and trailing-space is always false.
+  if _zrush_run_plan "$REPLY" history "${BUFFER//$'\0'/}" false && (( _zrush_plan_npos > 0 )); then
+    _zrush_selected=1
+    _zrush_apply_plan
+    _zlog "history: menu opened P=$_zrush_plan_npos"
+    return 0
+  fi
+  _zrush_teardown
+  _zlog "history: no menu (no match or plan failure)"
+  return 0
+}
+
 # ---------------------------------------------------------------- Debounce timer
 _zrush_arm_timer() {  # ZLE widget context
   emulate -L zsh
@@ -945,6 +1001,14 @@ _zrush_line_pre_redraw() {
   [[ $BUFFER == "$_zrush_last_buffer" ]] && (( CURSOR == _zrush_last_cursor )) && return 0
   _zrush_last_buffer=$BUFFER
   _zrush_last_cursor=$CURSOR
+  # Reaching here means the change came from something other than a zrush
+  # action (every zrush action tears the listing down itself, leaving kind
+  # `none`), so a history menu goes away whole -- listing text included --
+  # before the ordinary debounce flow resumes (behavior.md "履歴メニュー").
+  if [[ $_zrush_plan_kind == history ]]; then
+    _zlog "history: menu erased by an external buffer/cursor change"
+    _zrush_teardown
+  fi
   # A buffer change clears selection and pending Tab state. Remove only the selection
   # highlight immediately; retain list text and other decoration until the next result
   # to avoid flashing. ZLE adjusts their offsets with buffer edits.
@@ -956,7 +1020,7 @@ _zrush_line_pre_redraw() {
   if [[ -z ${BUFFER//[[:space:]]/} ]]; then
     _zrush_disarm_timer
     _zrush_cancel_collection
-    _zrush_clear_display
+    _zrush_teardown
     return 0
   fi
 
@@ -965,7 +1029,7 @@ _zrush_line_pre_redraw() {
   if (( ${#REPLY_WORD} < ZRUSH_CFG_MIN_INPUT )); then
     _zrush_disarm_timer
     _zrush_cancel_collection
-    _zrush_clear_display
+    _zrush_teardown
     return 0
   fi
 
@@ -980,18 +1044,10 @@ _zrush_line_init() {
   # A new ZLE session can follow an exit that bypassed _zrush_line_finish
   # (send-break and similar). Tear down any leftover timer/collection from
   # the previous session before it can leak a result (and thus a stray
-  # candidate list or a pending-Tab insertion) into this one, and reset
-  # display/plan state unconditionally -- not just when a listing happened
-  # to be visible, since stale _zrush_plan_* must not survive into a new
-  # session either.
+  # candidate list or a pending-Tab insertion) into this one.
   _zrush_disarm_timer
   _zrush_cancel_collection
-  POSTDISPLAY=
-  _zrush_rh_clear
-  _zrush_listing=0
-  _zrush_reset_plan_state
-  _zrush_selected=0
-  _zrush_tab_pending=0
+  _zrush_teardown
   return 0
 }
 
@@ -1000,8 +1056,7 @@ _zrush_line_finish() {
   (( _zrush_enabled )) || return 0
   _zrush_disarm_timer
   _zrush_cancel_collection
-  _zrush_clear_display
-  _zrush_tab_pending=0
+  _zrush_teardown
   _zlog "line-finish: cleared"
   return 0
 }
@@ -1017,19 +1072,30 @@ _zrush_confirm_pos() {  # $1=one-based position into _zrush_plan_insert
   (( pos >= 1 && pos <= $#_zrush_plan_insert )) || return 1
   local text=$_zrush_plan_insert[pos]
 
-  _zrush_widen "$LBUFFER"
-  local word=$REPLY_WORD
-  local pre=${LBUFFER[1,$#LBUFFER-$#word]}
-  LBUFFER=$pre$text        # leave text after the cursor (RBUFFER) unchanged
-  _zlog "confirm: pos=$pos insert=${(qqqq)text}"
+  # cli-protocol.md "適用": the listing kind picks the replacement rule.
+  if [[ $_zrush_plan_kind == history ]]; then
+    BUFFER=$text
+    CURSOR=$#BUFFER
+  else
+    _zrush_widen "$LBUFFER"
+    local word=$REPLY_WORD
+    local pre=${LBUFFER[1,$#LBUFFER-$#word]}
+    LBUFFER=$pre$text      # leave text after the cursor (RBUFFER) unchanged
+  fi
+  _zlog "confirm: kind=$_zrush_plan_kind pos=$pos insert=${(qqqq)text}"
 
-  # After confirmation, clear selection/list. last_buffer stays stale so the next
-  # pre-redraw treats the insertion as a buffer change and triggers recollection,
-  # matching the common-prefix insertion path.
+  # After confirmation, clear selection/list and invalidate the pre-redraw
+  # baseline, so the next pre-redraw always treats the insertion as a buffer
+  # change and triggers recollection (behavior.md "確定(挿入)"), matching the
+  # common-prefix insertion path. Leaving the baseline alone would not do: an
+  # insertion identical to what the baseline already records -- confirming the
+  # history candidate that equals the current line, say -- would read as "no
+  # change" and stall the recollection.
+  _zrush_last_buffer=
+  _zrush_last_cursor=-1
   _zrush_disarm_timer
   _zrush_cancel_collection
-  _zrush_clear_display
-  _zrush_tab_pending=0
+  _zrush_teardown
   return 0
 }
 
@@ -1046,9 +1112,8 @@ _zrush_select_start() {
 # Move the current selection using the last plan's navigation table
 # (cli-protocol.md "ナビ"); no re-fetch or re-layout involved. A
 # self-referencing transition (next/left/right clamped at the boundary) is a
-# no-op per the contract; select-prev's transition to 0 at position 1
-# deselects and returns to normal state.
-_zrush_select_dir() {  # $1=next|prev|left|right
+# no-op per the contract; a transition to 0 is what the listing kind decides.
+_zrush_select_dir() {  # $1=next|prev|left|right (navigation-table transition)
   emulate -L zsh
   local -i p=$_zrush_selected
   (( p >= 1 && p <= $#_zrush_plan_nav )) || return 0
@@ -1062,9 +1127,31 @@ _zrush_select_dir() {  # $1=next|prev|left|right
     *) return 0 ;;
   esac
   (( new == p )) && return 0
+  if (( new == 0 )) && [[ $_zrush_plan_kind == history ]]; then
+    # No unselected history menu exists, so losing the selection erases it.
+    _zlog "history: menu closed at position 1"
+    _zrush_teardown
+    return 0
+  fi
   _zrush_selected=$new
   _zrush_apply_highlights
   _zlog "select: dir=$1 pos=$_zrush_selected"
+  return 0
+}
+
+# The one place the select-prev/select-next keys are mapped onto navigation-table
+# transitions. A completion listing maps them straight through; a history listing
+# inverts them, because there ↑ moves away from the prompt into older history and
+# ↓ moves back toward it (behavior.md "履歴メニュー").
+_zrush_select_move() {  # $1=select-prev|select-next
+  emulate -L zsh
+  local t
+  if [[ $_zrush_plan_kind == history ]]; then
+    [[ $1 == select-prev ]] && t=next || t=prev
+  else
+    [[ $1 == select-prev ]] && t=prev || t=next
+  fi
+  _zrush_select_dir $t
   return 0
 }
 
@@ -1086,7 +1173,7 @@ _zrush_call_prev() {  # Fall back through the predecessor chain, never directly 
 
 _zrush_action_next() {
   if (( _zrush_selected > 0 )); then
-    _zrush_select_dir next
+    _zrush_select_move select-next
     return 0
   fi
   # See docs/internal/specs/behavior.md "選択・キーバインド" for this priority order.
@@ -1107,10 +1194,19 @@ _zrush_action_next() {
 
 _zrush_action_prev() {
   if (( _zrush_selected > 0 )); then
-    _zrush_select_dir prev
+    _zrush_select_move select-prev
     return 0
   fi
-  _zrush_call_prev
+  # See docs/internal/specs/behavior.md "選択・キーバインド" for this priority order.
+  if [[ $LBUFFER == *$'\n'* ]]; then
+    _zlog "prev: multiline-branch"
+    _zrush_call_prev; return 0            # 1. not on the first line -> cursor movement
+  fi
+  if (( HISTNO != HISTCMD )); then
+    _zlog "prev: hist-branch"
+    _zrush_call_prev; return 0            # 2. browsing history -> keep plain history movement
+  fi
+  _zrush_open_history_menu                # 3. otherwise -> open the history menu
   return 0
 }
 
@@ -1151,8 +1247,7 @@ _zrush_action_dismiss() {
     # the list the user just closed.
     _zrush_disarm_timer
     _zrush_cancel_collection
-    _zrush_clear_display     # leave the buffer unchanged
-    _zrush_tab_pending=0
+    _zrush_teardown          # leave the buffer unchanged
     return 0
   fi
   _zrush_call_prev
