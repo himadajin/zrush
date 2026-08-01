@@ -162,7 +162,75 @@ reserialize_plan() {  # -> REPLY=bytes, or return 1 with REPLY=reason
   unset ZRUSH_NO_INIT
   (( $+functions[_zrush_parse_plan] )) || { out "FATAL: _zrush_parse_plan undefined after source"; exit 1 }
   (( $+functions[_zrush_encode_batch] )) || { out "FATAL: _zrush_encode_batch undefined after source"; exit 1 }
+  (( $+functions[_zrush_history_payload] )) || { out "FATAL: _zrush_history_payload undefined after source"; exit 1 }
   (( _zrush_enabled )) && { out "FATAL: ZRUSH_NO_INIT did not suppress initialization"; exit 1 }
+
+  # ---------------- History payload sender ----------------
+  # `print -s` leaves its newest entry as the current event until another
+  # entry is pushed, so the final sentinel makes "newest" visible without
+  # itself entering the `$history` view used by the payload function.
+  print -sr -- 'oldest'
+  print -sr -- 'dup'
+  print -sr -- 'dup'
+  print -sr -- $'bad\1line'
+  print -sr -- 'newest'
+  print -sr -- 'sentinel-not-visible'
+  ZRUSH_CFG_HISTORY_LIMIT=100
+  _zrush_history_payload
+  local history_payload=$REPLY
+  local -a history_records=( "${(@0)${history_payload%$'\0'}}" )
+  local -i history_ok=1 dup_count=0 newest_count=0 oldest_count=0
+  local record line event
+  [[ $history_records[1] == b$'\1' ]] || history_ok=0
+  for record in "${(@)history_records[2,-1]}"; do
+    line=${record%%$'\2'*}
+    event=${record#*$'\2'}
+    [[ $line == w$'\1'* && $event == n$'\1'<-> ]] \
+      || { history_ok=0; continue }
+    line=${line#w$'\1'}
+    event=${event#n$'\1'}
+    [[ $history[$event] == "$line" ]] || history_ok=0
+    [[ $line == dup ]] && (( ++dup_count ))
+    [[ $line == newest ]] && (( ++newest_count ))
+    [[ $line == oldest ]] && (( ++oldest_count ))
+    [[ $line == *bad* ]] && history_ok=0
+  done
+  if (( history_ok && dup_count == 1 && newest_count == 1 && oldest_count == 1 )); then
+    ok "history payload: pairs each distinct line with its real newest event number"
+  else
+    dump_bytes "$history_payload"
+    ng "history payload: unexpected records: $REPLY"
+  fi
+
+  # ---------------- Highlight role application ----------------
+  BUFFER=
+  region_highlight=()
+  _zrush_rh=()
+  _zrush_rh_sel=
+  _zrush_hl_memo=
+  _zrush_plan_nlines=1
+  _zrush_plan_hl=( 'history-number 1 4 1' 'history-number 2 13 2' )
+  _zrush_plan_cells=( '0 10' '11 10' )
+  _zrush_selected=1
+  ZRUSH_CFG_HL_SELECTED=standout
+  ZRUSH_CFG_HL_HISTORY_NUMBER=faint
+  _zrush_apply_highlights
+  if [[ "${(j:|:)_zrush_rh}" == '14 16 faint|1 11 standout' \
+        && $_zrush_rh_sel == '1 11 standout' ]]; then
+    ok "history-number highlight: selected cell wins and other numbers use faint"
+  else
+    ng "history-number highlight: ledger=${(qqqq)_zrush_rh} selected=${(qqqq)_zrush_rh_sel}"
+  fi
+  _zrush_rh_clear
+  _zrush_selected=0
+  ZRUSH_CFG_HL_HISTORY_NUMBER=
+  _zrush_apply_highlights
+  if (( $#_zrush_rh == 0 )); then
+    ok "history-number highlight: an empty spec emits no region_highlight entry"
+  else
+    ng "history-number highlight: empty spec left ledger=${(qqqq)_zrush_rh}"
+  fi
+  unset REPLY
 
   # ---------------- Encode ----------------
   typeset -a inputs=( $VECTORS/encode/*/argv.bin(N) )

@@ -16,6 +16,7 @@ pub struct Plan {
 pub enum Role {
     Match,
     Heading,
+    HistoryNumber,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -245,6 +246,7 @@ fn parse_highlight(
     let role = match parts[0] {
         b"match" => Role::Match,
         b"heading" => Role::Heading,
+        b"history-number" => Role::HistoryNumber,
         other => return Err(Error::InvalidRole(other.to_vec())),
     };
     let pos = count(parts[1], "highlight pos")?;
@@ -511,6 +513,23 @@ mod tests {
             ])),
             Err(Error::InvalidRole(b"other".to_vec()))
         );
+    }
+
+    #[test]
+    fn history_number_highlight_role_is_accepted() {
+        let plan = parse(&fields(&[
+            b"",
+            b"1",
+            b"1",
+            b"    9  word",
+            b"1",
+            b"history-number 1 4 1",
+            b"0 11",
+            b"1 0 1 1",
+            b"word",
+        ]))
+        .unwrap();
+        assert_eq!(plan.highlights[0].role, Role::HistoryNumber);
     }
 
     #[test]

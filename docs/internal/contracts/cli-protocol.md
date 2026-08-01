@@ -18,7 +18,7 @@ zrush.zsh(zsh 側)と `zrush` バイナリ(Rust 側)の入出力仕様。
 
 > 検証: 版番号のコピーの一致 — `src/config.rs` のテスト `protocol_version_matches_docs_and_zsh`。
 
-- **PROTOCOL_VERSION = 4**
+- **PROTOCOL_VERSION = 5**
 - `zrush config` の出力に `ZRUSH_PROTOCOL_VERSION` が含まれる。
   zrush.zsh は自身が期待する版番号と照合し、不一致なら警告を 1 回表示して動作は継続する
   (git pull 後の rebuild し忘れ検知)。
@@ -134,7 +134,8 @@ zrush plan --producer <compsys|history> --query <bytes> --mode <prefix|substring
 > 検証(この節と以下の小節): 送信側(zsh のエンコーダ)の発行規範 — `tests/vectors/encode/`(`zsh -f tests/zsh/vectors.zsh`)。
 > 受信側(Rust のパーサ)の解釈規範 — `tests/vectors/plan/`(`tests/vectors.rs`)と `src/record.rs` の proptest(パーサの全域性)。
 > 非空ストリームの NUL 終端欠落 — `tests/vectors/reject/`。
-> 「history profile」の送信側規範は上記の検証の範囲外(受信側の解釈は上記のベクタが覆う)。
+> 「history profile」の送信側規範(イベント番号との対応、重複・制御バイト除外) —
+> `tests/zsh/vectors.zsh`。受信側の解釈は上記のベクタが覆う。
 > 「compsys 捕獲 profile」の transport 側の規範(pid レコードの除去、
 > 空語収集キャッシュに保存する payload の形)も上記の検証の範囲外。
 
@@ -178,13 +179,14 @@ zrush plan --producer <compsys|history> --query <bytes> --mode <prefix|substring
 #### 候補レコード
 
 ヘッダに続けて、そのバッチの候補ごとに 1 レコードを発行する。
-フィールドは以下の 3 種のみ:
+フィールドは以下の 4 種のみ:
 
 - `w`(必須・先頭・非空): 挿入テキスト構築に使う候補本体。
 - `m`(任意): match-text。**`w` と異なる場合のみ**発行する。
 - `d`(任意): 表示文字列。
+- `n`(任意): 履歴イベント番号。history profile の候補だけが発行する。
 
-`m` / `d` は値が非空のときのみ発行する。
+`m` / `d` / `n` は値が非空のときのみ発行する。
 フィールドが無いことと値が空文字列であることは同義に扱う(いずれも「不在」)。
 送信側は空の `w` を持つレコードを送出しない
 (受信側の空 `w` スキップ規律は保険として維持する。「スキップ規律」節)。
@@ -233,7 +235,9 @@ zsh が履歴から合成する payload。
 - 共有フィールドが全て空のバッチヘッダを 1 個だけ発行し、以降は候補レコードのみが続く
   (見出し `X` を含め、共有フィールドは 1 つも載せない)。
 - `w` は履歴行の生バイト列(compsys のクォートは施さない)。
-  `m` / `d` は発行しない(match-text も表示テキストも `w` そのもの)。
+  `n` はその履歴行に対応する `$history` のキーを、非空の ASCII 10 進数で発行する。
+  欠番を詰めず、キーをそのまま使う。`m` / `d` は発行しない
+  (match-text も番号接頭辞を付ける前のセル表示テキストも `w` そのもの)。
 - 候補レコードは新しい順(最新の履歴行が先頭)。
   `--producer history` は stdin の出現順を保つため(「マッチング・ランキングの意味論」節)、
   この順序がそのまま位置番号順になり、位置 1 は**マッチした候補のうち最も新しい履歴行**になる
@@ -318,12 +322,13 @@ NUL(`\0`)終端フィールドの平坦列。数値は ASCII 10 進表記。順�
 
 #### ハイライト
 
-- `role` ∈ `match` | `heading`。zsh が `role` を `[display.highlight]` の該当スペックへ写像する
+- `role` ∈ `match` | `heading` | `history-number`。zsh が `role` を
+  `[display.highlight]` の該当スペックへ写像する
   (空スペック = 装飾なし)。
 - `pos` はそのエントリが属する選択可能位置。見出しエントリは `pos = 0`(いずれの位置にも属さない)。
-- **選択中セルには match 装飾を適用しない**規則は、zsh が選択変更のたびに
+- **選択中セルには match / history-number 装飾を適用しない**規則は、zsh が選択変更のたびに
   受け取ったプランからエントリを再構築することで実現する:
-  `pos == 選択位置` の match エントリをスキップし、
+  `pos == 選択位置` の match / history-number エントリをスキップし、
   代わりに選択エントリ(その位置のセル実テキスト範囲 + `selected` スペック)を追加する。
   プランの再取得・`zrush plan` の再実行は伴わない。
 - match 装飾は match-text をそのまま表示しているセルにのみ発行される
@@ -334,6 +339,14 @@ NUL(`\0`)終端フィールドの平坦列。数値は ASCII 10 進表記。順�
 
 - **セルの表示テキストの決定規則**: `d` があれば `d`、なければ match-text
   (候補データの解釈規則。描画層の実装に依らない)。
+- `n` を持つ候補では、上記で決めたテキストの前に履歴イベント番号欄を付ける。
+  番号欄幅は `max(5, n を持つ全レイアウト対象候補の n の最大バイト長)` とし、
+  `n` を ASCII スペースで右寄せした後に区切りの ASCII スペース 2 個を置く。
+  `history-number` ハイライトは数字そのものだけを指し、左パディングと区切り空白は含めない。
+  match ハイライトのオフセットは番号欄と区切りの分だけ移動する。
+  セル実テキスト範囲には番号欄・区切り・従来の表示テキストをすべて含める。
+  この合成後のセル全体に、他のセルと同じパディング・右端切り詰め規則を適用し、
+  横幅不足時の特例は設けない。挿入テキストには `n` と表示用の空白を含めない。
 - **グループ分割**: グループキーは `J` を優先し、無ければ `X`。
   `J` の値が `-default-` の場合は空(グループなし)として扱う。
   キーが空のグループはグループなし・見出しなしとして扱う。
@@ -492,7 +505,7 @@ zsh は一覧を消す。
 - exit 0 であっても出力が仕様を満たさない場合
   (最終フィールドの NUL 終端欠落、`L` / `P` / `H` が非負の数字列でない、
   総フィールド数が `4 + L + H + 3P` と一致しない、ハイライト・セル範囲・ナビゲーションの
-  各タプルの要素数が不正、`role` が `match` / `heading` 以外、
+  各タプルの要素数が不正、`role` が `match` / `heading` / `history-number` 以外、
   位置・ナビゲーション値が `0..P` の範囲外、
   ハイライト範囲・セル実テキスト範囲の `start + len` が listing text の文字数を超える)は、
   プラン全体を破棄して一覧を消し、
@@ -523,7 +536,7 @@ zrush config
 ### stdout(zsh source 形式)
 
 ```zsh
-typeset -g  ZRUSH_PROTOCOL_VERSION='4'
+typeset -g  ZRUSH_PROTOCOL_VERSION='5'
 typeset -g  ZRUSH_CFG_MAX_LINES='10'
 typeset -g  ZRUSH_CFG_DELAY_MS='30'
 typeset -g  ZRUSH_CFG_MIN_INPUT='0'
@@ -534,6 +547,7 @@ typeset -g  ZRUSH_CFG_TRAILING_SPACE='true'
 typeset -g  ZRUSH_CFG_HL_SELECTED='standout'
 typeset -g  ZRUSH_CFG_HL_MATCH='underline'
 typeset -g  ZRUSH_CFG_HL_HEADING='bold'
+typeset -g  ZRUSH_CFG_HL_HISTORY_NUMBER='faint'
 typeset -g  ZRUSH_CFG_HISTORY_LIMIT='5000'
 typeset -ga ZRUSH_CFG_KEYBINDS=(
   'select-next'  'key:down'

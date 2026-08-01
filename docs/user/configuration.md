@@ -19,6 +19,7 @@ min-input = 0         # 一覧を出し始める現在語の最小文字数
 selected = "standout" # 選択中セル
 match    = "underline"# マッチ箇所
 heading  = "bold"     # グループ見出し
+history-number = "faint" # 履歴イベント番号
 
 [matching]
 mode = "typo"         # "prefix" / "substring" / "typo"(後ほど広く拾う)

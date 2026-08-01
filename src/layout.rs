@@ -51,19 +51,21 @@ impl Style {
 }
 
 /// Highlight role (cli-protocol.md "ハイライト"). `heading` entries carry
-/// `pos == 0`; `match` entries carry the position they belong to.
+/// `pos == 0`; `match` and `history-number` entries carry their position.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Role {
     Match,
     Heading,
+    HistoryNumber,
 }
 
 impl Role {
-    /// The stdout wire token (cli-protocol.md "role ∈ match | heading").
+    /// The stdout wire token (cli-protocol.md "ハイライト").
     pub fn as_str(self) -> &'static str {
         match self {
             Role::Match => "match",
             Role::Heading => "heading",
+            Role::HistoryNumber => "history-number",
         }
     }
 }
@@ -160,13 +162,42 @@ pub(crate) fn build(
     }
 
     // Per-candidate cell source text (contract "セルの表示テキストの決定
-    // 規則": `d` if present, else match-text), control-byte-normalized.
+    // 規則": `d` if present, else match-text), control-byte-normalized and,
+    // for history candidates, prefixed by a shared-width event-number field.
     // Built for every candidate up front because gmaxw is defined over a
     // group's *full* membership, not just what ends up displayed, and
     // because width/padding/truncation all measure the normalized text.
-    let sources: Vec<Cow<'_, [u8]>> = candidates
+    let number_width = candidates
         .iter()
-        .map(|c| normalize_control_bytes(c.d.unwrap_or(c.match_text())))
+        .filter_map(|c| c.n.map(<[u8]>::len))
+        .max()
+        .map(|width| width.max(5));
+    // Parallel metadata over `sources`: digit range and command-text start,
+    // both char offsets within the composed source. The history profile
+    // guarantees ASCII digits, padding and delimiter, so their byte and char
+    // lengths coincide.
+    let mut number_ranges: Vec<Option<(usize, usize)>> = Vec::with_capacity(candidates.len());
+    let mut match_offsets: Vec<usize> = Vec::with_capacity(candidates.len());
+    let sources: Vec<Vec<u8>> = candidates
+        .iter()
+        .map(|c| {
+            let base = normalize_control_bytes(c.d.unwrap_or(c.match_text()));
+            let Some(number) = c.n else {
+                number_ranges.push(None);
+                match_offsets.push(0);
+                return base.into_owned();
+            };
+            let width = number_width.expect("a numbered candidate establishes number width");
+            let pad = width - number.len();
+            let mut source = Vec::with_capacity(width + 2 + base.len());
+            source.resize(pad, b' ');
+            source.extend_from_slice(number);
+            source.extend_from_slice(b"  ");
+            source.extend_from_slice(&base);
+            number_ranges.push(Some((pad, number.len())));
+            match_offsets.push(width + 2);
+            source
+        })
         .collect();
 
     let mut rows: Vec<Vec<u8>> = Vec::new();
@@ -327,6 +358,18 @@ pub(crate) fn build(
     for cm in &cell_marks {
         let start = row_start[cm.row] + cm.in_row_start;
         cell_ranges[cm.pos - 1] = (start, cm.content_chars);
+        if let Some(&(number_start, number_len)) = number_ranges[cm.candidate].as_ref() {
+            let ns = number_start.min(cm.content_chars);
+            let ne = (number_start + number_len).min(cm.content_chars);
+            if ne > ns {
+                highlights.push(Highlight {
+                    role: Role::HistoryNumber,
+                    pos: cm.pos,
+                    start: start + ns,
+                    len: ne - ns,
+                });
+            }
+        }
         // Match decoration only on cells showing match-text verbatim
         // (contract: "display-text 表示セルには発行されない").
         if candidates[cm.candidate].d.is_none()
@@ -334,15 +377,18 @@ pub(crate) fn build(
         {
             // matching.rs `spans()`: (start, end), 0-based end-exclusive
             // char range -- NOT (start, len). Clip both ends to the
-            // truncated cell's char count.
+            // visible command-text char count, after the history-number
+            // prefix when present.
+            let match_offset = match_offsets[cm.candidate];
+            let visible_match_chars = cm.content_chars.saturating_sub(match_offset);
             for &(s, e) in cand_spans {
-                let cs = s.min(cm.content_chars);
-                let ce = e.min(cm.content_chars);
+                let cs = s.min(visible_match_chars);
+                let ce = e.min(visible_match_chars);
                 if ce > cs {
                     highlights.push(Highlight {
                         role: Role::Match,
                         pos: cm.pos,
-                        start: start + cs,
+                        start: start + match_offset + cs,
                         len: ce - cs,
                     });
                 }
@@ -602,7 +648,23 @@ mod tests {
         d: Option<&'a [u8]>,
         batch: usize,
     ) -> Candidate<'a> {
-        Candidate { w, m, d, batch }
+        Candidate {
+            w,
+            m,
+            d,
+            n: None,
+            batch,
+        }
+    }
+
+    fn history_cand<'a>(w: &'a [u8], n: &'a [u8]) -> Candidate<'a> {
+        Candidate {
+            w,
+            m: None,
+            d: None,
+            n: Some(n),
+            batch: 0,
+        }
     }
 
     fn batch(j: &'static [u8], x: &'static [u8]) -> Batch<'static> {
@@ -920,6 +982,55 @@ mod tests {
         let plan = build(&cands, &batches, &spans, 10, 40);
         assert_eq!(plan.rows[0], b"shown");
         assert!(plan.highlights.iter().all(|h| h.role != Role::Match));
+    }
+
+    #[test]
+    fn history_numbers_share_a_minimum_five_column_field_and_shift_matches() {
+        let batches = [batch(b"", b"")];
+        let cands = [
+            history_cand(b"one", b"9"),
+            history_cand(b"two", b"123"),
+            history_cand(b"three", b"123456"),
+        ];
+        let spans = vec![Vec::new(), vec![(1, 3)], Vec::new()];
+        let plan = build(&cands, &batches, &spans, 10, 13);
+        assert_eq!(
+            plan.rows,
+            vec![
+                b"     9  one  ".to_vec(),
+                b"   123  two  ".to_vec(),
+                b"123456  three".to_vec(),
+            ]
+        );
+        assert_eq!(plan.cell_ranges, vec![(0, 11), (14, 11), (28, 13)]);
+        let numbers: Vec<_> = plan
+            .highlights
+            .iter()
+            .filter(|h| h.role == Role::HistoryNumber)
+            .map(|h| (h.pos, h.start, h.len))
+            .collect();
+        assert_eq!(numbers, vec![(1, 5, 1), (2, 17, 3), (3, 28, 6)]);
+        let m = plan
+            .highlights
+            .iter()
+            .find(|h| h.role == Role::Match)
+            .unwrap();
+        // Row 2 starts at 14; its command starts after 6 columns + 2 spaces.
+        assert_eq!((m.pos, m.start, m.len), (2, 23, 2));
+    }
+
+    #[test]
+    fn history_number_prefix_uses_the_existing_right_edge_truncation_rule() {
+        let batches = [batch(b"", b"")];
+        let cands = [history_cand(b"command", b"9")];
+        let plan = build(&cands, &batches, &spans_none(1), 10, 5);
+        assert_eq!(plan.rows, vec![b"    9".to_vec()]);
+        assert_eq!(plan.cell_ranges, vec![(0, 5)]);
+        assert!(
+            plan.highlights
+                .iter()
+                .any(|h| { (h.role, h.pos, h.start, h.len) == (Role::HistoryNumber, 1, 4, 1) })
+        );
     }
 
     // ---- navigation ----

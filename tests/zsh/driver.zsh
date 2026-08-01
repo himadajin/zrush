@@ -632,7 +632,8 @@ start_hist_host() {  # $1=zdotdir $2=xdg-config-home $3=logfile
     local listing_h1=${post_h1#$'\n'}
     local first_h1=${listing_h1%%$'\n'*}
     local last_h1=${listing_h1##*$'\n'}
-    if [[ $first_h1 == 'echo oldest'* && $last_h1 == 'echo newest'* ]]; then
+    if [[ $first_h1 =~ '^[[:space:]]*[0-9]+  echo oldest' \
+          && $last_h1 =~ '^[[:space:]]*[0-9]+  echo newest' ]]; then
       ok "(h1a') history is one column growing upward: oldest shown at top, position 1/newest at bottom"
     else
       ng "(h1a') unexpected history row order: ${(qqqq)post_h1}"
@@ -674,6 +675,22 @@ start_hist_host() {  # $1=zdotdir $2=xdg-config-home $3=logfile
     ng "(h2a) kind dump did not run"
   fi
   assert_buffer '' "(h2b) buffer stays empty while browsing"
+  # ---- (h27) history rows carry their real `$history` event number in a
+  # minimum-five-column right-aligned field followed by two spaces. Compare
+  # against a lazy lookup inside the host rather than assuming fixture event
+  # numbers are consecutive or start at a particular value.
+  if dump_get $'\C-xe' TESTEVENT; then
+    local newest_event=$REPLY
+    if [[ $newest_event == <-> ]] && dump_get $'\C-xp' TESTPOST; then
+      local post_numbered=${(Q)REPLY}
+      local expected_numbered=${(l:5:: :)newest_event}'  echo newest'
+      [[ $post_numbered == *$expected_numbered* ]] \
+        && ok "(h27) the newest row starts with its real right-aligned history event number and two spaces" \
+        || ng "(h27) numbered row missing: event=$newest_event post=${(qqqq)post_numbered}"
+    else
+      ng "(h27) newest fixture event number could not be resolved: $newest_event"
+    fi
+  fi
   press $'\r'
   assert_buffer 'echo newest' "(h2c) position 1 of the unfiltered menu is the single newest history entry"
   clear_line
