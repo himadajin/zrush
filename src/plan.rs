@@ -3,11 +3,12 @@
 //!
 //! Pipeline: record::parse -> matching::QueryMatcher (score every parsed
 //! candidate + common-prefix over the *untruncated* prefix-tier matches)
-//! -> ranking::rank (the pipeline's only producer-dependent stage;
-//! truncates to the grid's absolute capacity, rows*8)
+//! -> ranking::rank (using the producer's ordering and absolute layout
+//! capacity: rows*8 for compsys, rows for history)
 //! -> matching::QueryMatcher::spans (only for the ranked subset) ->
-//! layout::build (grouping/grid/highlights/nav, further truncated to the
-//! real per-group row budget) -> insert::build per displayed position
+//! layout::build (the producer's grid direction/column cap plus shared
+//! grouping/highlights/nav, further truncated to the real per-group row
+//! budget) -> insert::build per displayed position
 //! (this is where `-f` directory-synthesis stat happens, and only for
 //! positions layout actually kept) -> flat NUL-terminated serialization.
 //!
@@ -23,15 +24,38 @@ use crate::matching::{Mode, QueryMatcher, Tier};
 use crate::{insert, layout, ranking, record};
 
 /// Snapshot of the `zrush plan` arguments (cli-protocol.md "起動");
-/// `--producer` arrives as the result ordering it selects (ranking.rs).
+/// `--producer` selects result ordering and layout geometry.
 pub(crate) struct Params {
-    pub order: ranking::Order,
+    pub producer: Producer,
     pub query: Vec<u8>,
     pub mode: Mode,
     pub smart_case: bool,
     pub rows: usize,
     pub width: usize,
     pub trailing_space: bool,
+}
+
+/// Producer profile policy selected by `--producer`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Producer {
+    Compsys,
+    History,
+}
+
+impl Producer {
+    fn order(self) -> ranking::Order {
+        match self {
+            Producer::Compsys => ranking::Order::Quality,
+            Producer::History => ranking::Order::Stdin,
+        }
+    }
+
+    fn layout_style(self) -> layout::Style {
+        match self {
+            Producer::Compsys => layout::Style::Grid,
+            Producer::History => layout::Style::History,
+        }
+    }
 }
 
 /// The only error `run` itself can produce (cli-protocol.md exit code 3).
@@ -66,12 +90,12 @@ pub(crate) fn run(
     }
     let common_prefix = crate::matching::common_prefix(prefix_texts.into_iter());
 
-    // behavior.md "表示": rank the top rows*8 candidates -- the grid's
-    // absolute max capacity (8 columns cap, cli-protocol.md "列数").
-    // layout::build applies the real, per-group row budget on top of
-    // this coarse cap.
-    let cap = params.rows.saturating_mul(8);
-    let ranked = ranking::rank(&scored, cap, params.order);
+    // behavior.md "表示": cap ranking at the selected layout's absolute
+    // capacity. layout::build applies the real, per-group row budget on
+    // top of this coarse cap.
+    let style = params.producer.layout_style();
+    let cap = params.rows.saturating_mul(style.max_cols());
+    let ranked = ranking::rank(&scored, cap, params.producer.order());
     let candidates: Vec<record::Candidate<'_>> =
         ranked.iter().map(|&i| parsed.candidates[i]).collect();
     // spans() is a second pass by design (matching.rs docs): only run it
@@ -87,6 +111,7 @@ pub(crate) fn run(
         &spans,
         params.rows,
         params.width,
+        style,
     );
 
     // Insertion text, and thus the `-f` stat, is built only for the
@@ -243,7 +268,7 @@ mod tests {
             trailing_space in any::<bool>(),
         ) {
             let params = Params {
-                order: ranking::Order::Quality,
+                producer: Producer::Compsys,
                 query,
                 mode,
                 smart_case,
@@ -261,10 +286,10 @@ mod tests {
         }
     }
 
-    /// Params with the `--producer compsys` ordering (quality-ranked).
+    /// Params with the `--producer compsys` profile.
     fn params(query: &str, mode: Mode, rows: usize, width: usize, trailing_space: bool) -> Params {
         Params {
-            order: ranking::Order::Quality,
+            producer: Producer::Compsys,
             query: query.as_bytes().to_vec(),
             mode,
             smart_case: true,
@@ -274,10 +299,10 @@ mod tests {
         }
     }
 
-    /// Params with the `--producer history` ordering (stdin order kept).
+    /// Params with the `--producer history` profile.
     fn history_params(query: &str, mode: Mode, rows: usize, width: usize) -> Params {
         Params {
-            order: ranking::Order::Stdin,
+            producer: Producer::History,
             ..params(query, mode, rows, width, false)
         }
     }
@@ -648,12 +673,13 @@ mod tests {
         for w in ["echo xfoo", "unrelated", "foo"] {
             stdin.extend(word(w));
         }
-        // width 9 == the widest candidate, forcing a single column so the
-        // rows read top-to-bottom in position order.
-        let out = run(&history_params("foo", Mode::Typo, 10, 9), &stdin, &no_dir).unwrap();
+        // A wide terminal could fit both candidates in a completion-grid
+        // row, but history remains one column and renders logical position
+        // 1 at the bottom.
+        let out = run(&history_params("foo", Mode::Typo, 10, 40), &stdin, &no_dir).unwrap();
         let p = parse_wire(&out);
         // "unrelated" matches no tier and is the only candidate dropped.
-        assert_eq!(p.rows, vec![b"echo xfoo".to_vec(), b"foo      ".to_vec()]);
+        assert_eq!(p.rows, vec![b"foo      ".to_vec(), b"echo xfoo".to_vec()]);
         assert_eq!(p.inserts, vec![b"echo xfoo".to_vec(), b"foo".to_vec()]);
 
         // Same payload under the compsys ordering ranks by quality
@@ -661,6 +687,19 @@ mod tests {
         let out = run(&params("foo", Mode::Typo, 10, 9, false), &stdin, &no_dir).unwrap();
         let p = parse_wire(&out);
         assert_eq!(p.inserts, vec![b"foo".to_vec(), b"echo xfoo".to_vec()]);
+    }
+
+    #[test]
+    fn history_capacity_is_one_candidate_per_row() {
+        let mut stdin = header(&[]);
+        for w in ["newest", "newer", "older", "oldest"] {
+            stdin.extend(word(w));
+        }
+
+        let out = run(&history_params("", Mode::Typo, 2, 80), &stdin, &no_dir).unwrap();
+        let p = parse_wire(&out);
+        assert_eq!(p.rows, vec![b"newer ".to_vec(), b"newest".to_vec()]);
+        assert_eq!(p.inserts, vec![b"newest".to_vec(), b"newer".to_vec()]);
     }
 
     #[test]

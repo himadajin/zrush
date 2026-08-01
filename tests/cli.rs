@@ -196,17 +196,20 @@ fn plan_history_producer_keeps_stdin_order() {
     for w in ["echo xfoo", "unrelated", "foo"] {
         stdin.extend(word(w));
     }
-    // width=9 == the widest candidate: single column, one row each.
+    // Even at width=40, history is a single column with position 1 at the
+    // bottom. Logical insertion order remains newest-first.
     let (code, out) = run_plan(
-        &plan_args("history", "foo", "typo", "10", "9", "false"),
+        &plan_args("history", "foo", "typo", "10", "40", "false"),
         &stdin,
     );
     assert_eq!(code, 0);
     // "unrelated" matches no tier and is dropped; the rest keep their order.
+    let plan = parse_wire(&out);
     assert_eq!(
-        parse_wire(&out).inserts,
-        vec![b"echo xfoo".to_vec(), b"foo".to_vec()]
+        plan.rows,
+        vec![b"foo      ".to_vec(), b"echo xfoo".to_vec()]
     );
+    assert_eq!(plan.inserts, vec![b"echo xfoo".to_vec(), b"foo".to_vec()]);
 
     let (code, out) = run_plan(
         &plan_args("compsys", "foo", "typo", "10", "9", "false"),

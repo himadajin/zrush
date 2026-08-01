@@ -7,7 +7,8 @@
 //! and every offset computed against the listing text; it does not know
 //! about matching -- match spans (char offsets over a candidate's
 //! match-text, from matching::QueryMatcher::spans) are supplied by the
-//! caller and only get clipped/repositioned here.
+//! caller and only get clipped/repositioned here. The caller also supplies
+//! the producer-selected layout style defined by the same contract.
 //!
 //! Mixing char counts and display widths is a recurring source of offset
 //! bugs, which is why the contract spells out the split explicitly:
@@ -28,6 +29,26 @@ use crate::record::{Batch, Candidate};
 /// protocol (cli-protocol.md "列数").
 const MAX_COLS: usize = 8;
 const GUTTER: usize = 2;
+
+/// Producer-selected geometry (cli-protocol.md "表示行の中身").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Style {
+    Grid,
+    History,
+}
+
+impl Style {
+    pub fn max_cols(self) -> usize {
+        match self {
+            Style::Grid => MAX_COLS,
+            Style::History => 1,
+        }
+    }
+
+    fn bottom_up(self) -> bool {
+        self == Style::History
+    }
+}
 
 /// Highlight role (cli-protocol.md "ハイライト"). `heading` entries carry
 /// `pos == 0`; `match` entries carry the position they belong to.
@@ -95,12 +116,14 @@ pub(crate) struct Plan {
 /// missing or empty entry means no match decoration for that candidate.
 /// `row_budget`/`width` are `--rows`/`--width` (cli-protocol.md
 /// "起動"), assumed >= 1 by the caller but handled gracefully at 0 too.
+/// `style` is the producer-specific geometry from the contract.
 pub(crate) fn build(
     candidates: &[Candidate<'_>],
     batches: &[Batch<'_>],
     spans: &[Vec<(usize, usize)>],
     row_budget: usize,
     width: usize,
+    style: Style,
 ) -> Plan {
     // --- Group candidates by key, in first-occurrence order (contract:
     // "グループの割り当ては候補の初出現順による"). A group's own row
@@ -199,7 +222,13 @@ pub(crate) fn build(
             .max()
             .unwrap_or(1);
         let gmaxw = group_gmaxw(width, max_member_width);
-        let (cols, grows, gcount) = grid_dims(gmaxw, width, group.members.len(), candidate_budget);
+        let (cols, grows, gcount) = grid_dims(
+            gmaxw,
+            width,
+            group.members.len(),
+            candidate_budget,
+            style.max_cols(),
+        );
 
         if show_heading {
             let heading = normalize_control_bytes(group.heading);
@@ -227,7 +256,12 @@ pub(crate) fn build(
         // (and did) desync `positions` from `cell_ranges`/`nav`, which
         // are always written or read by position index.
         positions.extend_from_slice(members_shown);
-        for r in 1..=grows {
+        for visual_row in 0..grows {
+            let r = if style.bottom_up() {
+                grows - visual_row
+            } else {
+                visual_row + 1
+            };
             let mut row_bytes: Vec<u8> = Vec::new();
             let mut in_row = 0usize;
             for c in 1..=cols {
@@ -375,7 +409,7 @@ fn group_gmaxw(width: usize, max_member_width: usize) -> usize {
 }
 
 /// Grid dimensions for one group (cli-protocol.md "列数"/"行数"):
-/// `cols = clamp(floor((width+2)/(gmaxw+2)), 1, 8)`,
+/// `cols = clamp(floor((width+2)/(gmaxw+2)), 1, max_cols)`,
 /// `grows = ceil(members/cols)` clamped to the row budget,
 /// `gcount = min(cols*grows, members)`,
 /// then `cols` is recompressed to `ceil(gcount/grows)` so a shrunken
@@ -384,12 +418,18 @@ fn group_gmaxw(width: usize, max_member_width: usize) -> usize {
 /// Preconditions (upheld by `build`'s budget bookkeeping, not re-checked
 /// here): `members >= 1` and `budget >= 1` -- a zero budget must never
 /// reach this function (it means the group is dropped before grid math).
-fn grid_dims(gmaxw: usize, width: usize, members: usize, budget: usize) -> (usize, usize, usize) {
+fn grid_dims(
+    gmaxw: usize,
+    width: usize,
+    members: usize,
+    budget: usize,
+    max_cols: usize,
+) -> (usize, usize, usize) {
     // Saturating: `width`/`gmaxw` come from caller-controlled CLI args
     // and candidate byte lengths respectively, so `+2` must not wrap at
     // usize::MAX (a wrap would corrupt the column count silently instead
     // of just saturating to a large-but-sane value).
-    let cols = (width.saturating_add(2) / gmaxw.saturating_add(2)).clamp(1, MAX_COLS);
+    let cols = (width.saturating_add(2) / gmaxw.saturating_add(2)).clamp(1, max_cols.max(1));
     let grows = members.div_ceil(cols).min(budget);
     let gcount = cols.saturating_mul(grows).min(members);
     let cols = gcount.div_ceil(grows);
@@ -533,6 +573,28 @@ fn truncate_to_width(bytes: &[u8], budget: usize) -> (&[u8], usize, usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Most layout unit tests exercise the completion grid. Keep their call
+    // sites focused on the behavior under test while production callers pass
+    // the style explicitly.
+    fn build(
+        candidates: &[Candidate<'_>],
+        batches: &[Batch<'_>],
+        spans: &[Vec<(usize, usize)>],
+        row_budget: usize,
+        width: usize,
+    ) -> Plan {
+        super::build(candidates, batches, spans, row_budget, width, Style::Grid)
+    }
+
+    fn grid_dims(
+        gmaxw: usize,
+        width: usize,
+        members: usize,
+        budget: usize,
+    ) -> (usize, usize, usize) {
+        super::grid_dims(gmaxw, width, members, budget, MAX_COLS)
+    }
 
     fn cand<'a>(
         w: &'a [u8],
@@ -1026,6 +1088,60 @@ mod tests {
                 right: 5
             }
         ); // e
+    }
+
+    #[test]
+    fn history_is_single_column_with_position_one_at_the_bottom() {
+        let batches = [batch(b"", b"")];
+        let cands: Vec<Candidate<'_>> = ["a", "b", "c", "d", "e"]
+            .iter()
+            .map(|w| cand(w.as_bytes(), None, None, 0))
+            .collect();
+        let plan = super::build(&cands, &batches, &spans_none(5), 5, 40, Style::History);
+
+        // Logical positions and insertion lookup stay newest-first even
+        // though their visual rows run oldest-to-newest from top to bottom.
+        assert_eq!(plan.rows, vec![b"e", b"d", b"c", b"b", b"a"]);
+        assert_eq!(plan.positions, vec![0, 1, 2, 3, 4]);
+        assert_eq!(
+            plan.cell_ranges,
+            vec![(8, 1), (6, 1), (4, 1), (2, 1), (0, 1)]
+        );
+        assert_eq!(
+            plan.nav,
+            vec![
+                Nav {
+                    next: 2,
+                    prev: 0,
+                    left: 1,
+                    right: 5,
+                },
+                Nav {
+                    next: 3,
+                    prev: 1,
+                    left: 1,
+                    right: 5,
+                },
+                Nav {
+                    next: 4,
+                    prev: 2,
+                    left: 1,
+                    right: 5,
+                },
+                Nav {
+                    next: 5,
+                    prev: 3,
+                    left: 1,
+                    right: 5,
+                },
+                Nav {
+                    next: 5,
+                    prev: 4,
+                    left: 1,
+                    right: 5,
+                },
+            ]
+        );
     }
 
     #[test]

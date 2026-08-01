@@ -1,9 +1,9 @@
 //! Ranking of matched candidates.
 //!
 //! Semantics (cli-protocol.md "マッチング・ランキングの意味論"): the
-//! result order is the one thing `--producer` decides, and this module is
-//! the single place that branches on it. Everything upstream and
-//! downstream (matching, layout, insertion) is producer-independent.
+//! result order is one policy selected by `--producer`; this module owns
+//! that ordering policy while layout.rs owns the separately selected
+//! geometry. Matching and insertion remain producer-independent.
 
 use crate::matching::MatchScore;
 
