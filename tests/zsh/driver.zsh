@@ -183,6 +183,28 @@ dump_get() {
   return 1
 }
 
+# A send-break reset for scenarios that can leave a multiline BUFFER: ^U
+# (backward-kill-line) only clears the current physical line of a multiline
+# buffer, so those scenarios need a real line abandon + resync instead.
+reset_line() { send_keys $'\C-c'; drain 0.3; sync_prompt 5 }
+
+# Stop whatever is running as the "host" pty and start a fresh one under a
+# given ZDOTDIR/XDG_CONFIG_HOME/log file. Used by the history-menu section
+# below, which needs several isolated hosts (a default-config one plus
+# config-variant ones for limit/min-input/keybind) beyond the single host the
+# rest of this driver uses.
+start_hist_host() {  # $1=zdotdir $2=xdg-config-home $3=logfile
+  zpty -d host 2>/dev/null
+  export ZDOTDIR=$1 XDG_CONFIG_HOME=$2 ZRUSH_LOG=$3
+  cd $PLAYGROUND || return 1
+  local REPLY=
+  zpty -b host zsh -d -i || return 1
+  HOSTFD=$REPLY
+  expect '*MARK-RC-DONE*' 20 || return 1
+  drain 0.3
+  return 0
+}
+
 {
   # ---------------- Host startup ----------------
   cd $PLAYGROUND || exit 1
@@ -571,6 +593,439 @@ dump_get() {
   assert_buffer 'ls fx/basic/al' "(err-2) pending Tab resolved against a failed plan inserts nothing"
   clear_line
   drain 0.3
+
+  # ================================================================ (10) History menu (issue #9)
+  # docs/internal/specs/behavior.md "履歴メニュー" and cli-protocol.md
+  # "history profile" are the source of truth. This section runs on its own
+  # host(s) with fixture history (tests/zsh/rc/history.zshrc and friends)
+  # instead of the "host" pty used above, so it starts by restoring the
+  # shared private ZRUSH_BIN copy the (err-1/err-2) section just corrupted.
+  # The fixture history is isolated (HISTFILE under $WORK, SAVEHIST=0) and
+  # never touches the real ~/.zsh_history (AGENTS.md guardrail).
+  cp $REPO/target/release/zrush $WORK/bin/zrush
+  chmod +x $WORK/bin/zrush
+
+  mkdir -p $WORK/zdot-hist $WORK/xdg-hist/zrush
+  print "source $REPO/tests/zsh/rc/history.zshrc" > $WORK/zdot-hist/.zshrc
+  if start_hist_host $WORK/zdot-hist $WORK/xdg-hist $WORK/host-hist.log; then
+    ok "(hist-0) history-menu host started with fixture history loaded"
+  else
+    ng "(hist-0) history-menu host failed to start"
+  fi
+
+  # ---- (h1) mid-input Up opens the filtered menu at position 1; Up/Up/Down
+  # walks the nav table; Enter replaces the whole line with the landed-on
+  # entry's raw text (and, being a confirm rather than accept-line, never
+  # executes it).
+  send_keys 'echo'
+  drain 0.5
+  press $'\e[A'
+  if dump_get $'\C-xk' TESTKIND; then
+    [[ $REPLY == 'kind=history sel=1 listing=1 npos=6' ]] \
+      && ok "(h1a) mid-input Up opens the history menu filtered to the buffer, position 1 selected" \
+      || ng "(h1a) $REPLY"
+  else
+    ng "(h1a) kind dump did not run"
+  fi
+  press $'\e[A'
+  dump_get $'\C-xk' TESTKIND
+  [[ $REPLY == 'kind=history sel=2 listing=1 npos=6' ]] && ok "(h1b) Up moves to the next-older entry (position 2)" || ng "(h1b) $REPLY"
+  press $'\e[A'
+  dump_get $'\C-xk' TESTKIND
+  [[ $REPLY == 'kind=history sel=3 listing=1 npos=6' ]] && ok "(h1c) a second Up moves to position 3" || ng "(h1c) $REPLY"
+  press $'\e[B'
+  dump_get $'\C-xk' TESTKIND
+  [[ $REPLY == 'kind=history sel=2 listing=1 npos=6' ]] && ok "(h1d) Down moves back toward newer (position 2)" || ng "(h1d) $REPLY"
+  press $'\r'
+  assert_buffer $'echo *.glob \'sq\' "dq" \\bs -dash 日本語' "(h1e) Enter replaces the whole line with the landed-on entry's raw text (buffer retains it, so it was not executed)"
+  if dump_get $'\C-xk' TESTKIND; then
+    # A same-buffer recollection triggered by the confirm can legitimately
+    # already have settled by the time this dump runs; only a lingering
+    # 'history' kind would mean the menu's state was left behind (h18 is the
+    # dedicated, deterministic test for "recollection resumes normally").
+    [[ $REPLY != 'kind=history'* ]] && ok "(h1f) confirm leaves no residual history-menu kind" || ng "(h1f) $REPLY"
+  fi
+  clear_line
+  drain 0.3
+
+  # ---- (h2) empty buffer + Up: the full (unfiltered) history menu, newest
+  # first, position 1 = the single newest entry. The fixture has 13 unique,
+  # non-excluded entries, but this driver's headless terminal is narrow
+  # enough that some long fixture lines force a single-column grid, and
+  # [display].max-lines=10 (the default) then legitimately caps how many of
+  # them get a display position (cli-protocol.md "表示行の中身" row-budget
+  # truncation) -- so this only checks that the menu opens with *a* position
+  # 1 selected; (h2c) below is what actually pins down which entry that is.
+  press $'\e[A'
+  if dump_get $'\C-xk' TESTKIND; then
+    [[ $REPLY == 'kind=history sel=1 listing=1'* ]] \
+      && ok "(h2a) empty-buffer Up opens the full history menu, position 1 selected" \
+      || ng "(h2a) $REPLY"
+  else
+    ng "(h2a) kind dump did not run"
+  fi
+  assert_buffer '' "(h2b) buffer stays empty while browsing"
+  press $'\r'
+  assert_buffer 'echo newest' "(h2c) position 1 of the unfiltered menu is the single newest history entry"
+  clear_line
+  drain 0.3
+
+  # ---- (h3) dismiss (ctrl-g) closes the menu; buffer is untouched.
+  press $'\e[A'
+  dump_get $'\C-xk' TESTKIND
+  [[ $REPLY == 'kind=history'* ]] || ng "(h3-setup) history menu did not open: $REPLY"
+  press $'\C-g'
+  if dump_get $'\C-xk' TESTKIND; then
+    [[ $REPLY == 'kind=none sel=0 listing=0 npos=0' ]] && ok "(h3a) dismiss closes the history menu" || ng "(h3a) $REPLY"
+  fi
+  assert_buffer '' "(h3b) buffer is unchanged after dismiss"
+
+  # ---- (h4) typing while the menu is open erases the whole listing (unlike
+  # a completion listing, which keeps its text until the next result arrives).
+  # Uses an argument-position query (a real path prefix, then a suffix with
+  # no real matches) rather than a bare command-position character: at
+  # command position, typing hits the empty-word cache (behavior.md) and
+  # renders a large real-system-command listing, which only obscures this
+  # scenario's point without changing it.
+  send_keys 'ls fx/basic/'
+  drain 0.5
+  press $'\e[A'
+  dump_get $'\C-xk' TESTKIND
+  [[ $REPLY == 'kind=history sel=1 listing=1'* ]] || ng "(h4-setup) history menu did not open: $REPLY"
+  send_keys 'ZZZNOMATCH'
+  drain 0.6
+  if dump_get $'\C-xk' TESTKIND; then
+    # As in (h1f)/(h18a): a same-buffer recollection may have already
+    # settled (here, to an empty compsys result -- 'fx/basic/ZZZNOMATCH'
+    # matches no real file); only a lingering 'history' kind would be wrong.
+    [[ $REPLY != 'kind=history'* ]] && ok "(h4a) typing erases the whole history menu (no residual history kind)" || ng "(h4a) $REPLY"
+  fi
+  if dump_get $'\C-xp' TESTPOST; then
+    [[ -z ${(Q)REPLY} ]] && ok "(h4b) no history listing text is left behind" || ng "(h4b) post=${(qqqq)${(Q)REPLY}}"
+  fi
+  clear_line
+  drain 0.3
+
+  # ---- (h5) Tab while a history entry is selected confirms it exactly like Enter.
+  send_keys 'echo'
+  drain 0.5
+  press $'\e[A'
+  press $'\t'
+  assert_buffer 'echo newest' "(h5) Tab confirms the selected history entry (whole-line replacement)"
+  clear_line
+  drain 0.3
+
+  # ---- (h6) ordering is fixed by recency, never re-sorted by match quality:
+  # position 1 must be the newer substring-only match even though an older
+  # prefix match also matches (cli-protocol.md "history profile" /
+  # "マッチング・ランキングの意味論" -- the audit-flagged regression here).
+  send_keys 'zqx'
+  drain 0.5
+  press $'\e[A'
+  if dump_get $'\C-xk' TESTKIND; then
+    [[ $REPLY == 'kind=history sel=1 listing=1 npos=2' ]] && ok "(h6a) query 'zqx' matches both fixture entries" || ng "(h6a) $REPLY"
+  fi
+  press $'\r'
+  assert_buffer 'aa zqx bb' "(h6b) position 1 is the newer substring-only match, not the older (higher-tier) prefix match"
+  clear_line
+  drain 0.3
+
+  # ---- (h7) an identical history line appearing twice yields exactly one candidate (the newest).
+  send_keys 'dup'
+  drain 0.5
+  press $'\e[A'
+  if dump_get $'\C-xk' TESTKIND; then
+    [[ $REPLY == 'kind=history sel=1 listing=1 npos=1' ]] && ok "(h7) a duplicated history line is deduplicated to a single candidate" || ng "(h7) $REPLY"
+  fi
+  press $'\C-g'
+  clear_line
+  drain 0.3
+
+  # ---- (h9) a history line carrying a framing byte (SOH here) is excluded
+  # whole, not stripped-and-kept: querying its surviving text finds nothing.
+  send_keys 'ctrlone'
+  drain 0.5
+  press $'\e[A'
+  if dump_get $'\C-xk' TESTKIND; then
+    [[ $REPLY == 'kind=none sel=0 listing=0 npos=0' ]] && ok "(h9) a history line containing a framing byte never becomes a candidate" || ng "(h9) $REPLY"
+  fi
+  assert_buffer 'ctrlone' "(h9b) buffer unchanged (no menu opened, the key was still consumed)"
+  clear_line
+  drain 0.3
+
+  # ---- (h10) a history line that itself contains a newline: the listing
+  # shows it flattened to one row (control-byte normalization), but
+  # confirming inserts the raw multi-line text back into BUFFER.
+  send_keys 'multi'
+  drain 0.5
+  press $'\e[A'
+  if dump_get $'\C-xk' TESTKIND; then
+    [[ $REPLY == 'kind=history sel=1 listing=1 npos=1' ]] && ok "(h10a) the multi-line fixture entry is the sole match" || ng "(h10a) $REPLY"
+  fi
+  if dump_get $'\C-xp' TESTPOST; then
+    local post_ml=${(Q)REPLY}
+    if [[ $post_ml == *'multi line2'* && $post_ml != *'multi'$'\n''line2'* ]]; then
+      ok "(h10b) the listing shows the entry flattened to one row (embedded newline -> space)"
+    else
+      ng "(h10b) listing not flattened as expected: ${(qqqq)post_ml}"
+    fi
+  fi
+  press $'\r'
+  assert_buffer $'echo multi\nline2' "(h10c) confirming inserts the raw multi-line text, embedded newline included"
+  reset_line   # BUFFER now spans two lines; ^U would only clear the current one
+
+  # ---- (h11) glob characters, quotes, a backslash, a leading dash, and
+  # Japanese text in a history line are shown and inserted byte-for-byte,
+  # never interpreted (globbed, quote-parsed, or expanded).
+  send_keys 'glob'
+  drain 0.5
+  press $'\e[A'
+  if dump_get $'\C-xk' TESTKIND; then
+    [[ $REPLY == 'kind=history sel=1 listing=1 npos=1' ]] && ok "(h11a) the meta-character fixture entry is the sole match" || ng "(h11a) $REPLY"
+  fi
+  if dump_get $'\C-xp' TESTPOST; then
+    [[ ${(Q)REPLY} == *$'echo *.glob \'sq\' "dq" \\bs -dash 日本語'* ]] \
+      && ok "(h11b) the listing displays the meta-character line verbatim" || ng "(h11b) post=${(qqqq)${(Q)REPLY}}"
+  fi
+  press $'\r'
+  assert_buffer $'echo *.glob \'sq\' "dq" \\bs -dash 日本語' "(h11c) confirming inserts the meta-character line verbatim (no glob/quote interpretation)"
+  clear_line
+  drain 0.3
+
+  # ---- (h12) a nonempty query with zero matches: no menu opens, the key is
+  # consumed, and the buffer is left unchanged (no fallback to native history search).
+  send_keys 'zzqqxx000'
+  drain 0.5
+  press $'\e[A'
+  if dump_get $'\C-xk' TESTKIND; then
+    [[ $REPLY == 'kind=none sel=0 listing=0 npos=0' ]] && ok "(h12a) zero matches: no menu opens" || ng "(h12a) $REPLY"
+  fi
+  assert_buffer 'zzqqxx000' "(h12b) buffer is unchanged (key consumed, no native fallback)"
+  clear_line
+  drain 0.3
+
+  # ---- (h15) Down at position 1 erases the whole menu (unlike a completion
+  # listing, where the analogous transition just deselects and keeps the text).
+  send_keys 'echo'
+  drain 0.5
+  press $'\e[A'
+  dump_get $'\C-xk' TESTKIND
+  [[ $REPLY == 'kind=history sel=1'* ]] || ng "(h15-setup) history menu did not open at position 1: $REPLY"
+  press $'\e[B'
+  if dump_get $'\C-xk' TESTKIND; then
+    [[ $REPLY == 'kind=none sel=0 listing=0 npos=0' ]] && ok "(h15a) Down at position 1 erases the whole menu" || ng "(h15a) $REPLY"
+  fi
+  assert_buffer 'echo' "(h15b) buffer is unchanged"
+  clear_line
+  drain 0.3
+
+  # ---- (h16) select-prev at a completion listing's position 1 only
+  # deselects (listing text stays); pressing it again, now unselected, opens
+  # the history menu and replaces the completion listing outright.
+  send_keys 'ls fx/basic/al'
+  if expect '*alpha.txt*' 10; then
+    ok "(h16a) a completion listing is showing"
+  else
+    ng "(h16a) completion listing did not render"
+  fi
+  press $'\e[B'   # Down: select-start at position 1
+  dump_get $'\C-xk' TESTKIND
+  [[ $REPLY == 'kind=compsys sel=1'* ]] || ng "(h16b) selection did not start on the completion listing: $REPLY"
+  press $'\e[A'   # Up: position 1's prev is 0 -> deselect only (compsys kind, not history)
+  if dump_get $'\C-xk' TESTKIND; then
+    [[ $REPLY == 'kind=compsys sel=0 listing=1'* ]] \
+      && ok "(h16c) Up at the completion listing's position 1 only deselects (listing text remains)" \
+      || ng "(h16c) $REPLY"
+  fi
+  press $'\e[A'   # Up again, now unselected: opens the history menu, replacing the completion listing
+  if dump_get $'\C-xk' TESTKIND; then
+    [[ $REPLY == 'kind=history sel=1 listing=1'* ]] \
+      && ok "(h16d) a second Up (now unselected) opens the history menu, replacing the completion listing" \
+      || ng "(h16d) $REPLY"
+  fi
+  if dump_get $'\C-xp' TESTPOST; then
+    [[ ${(Q)REPLY} != *alpha.txt* ]] && ok "(h16e) the completion listing text is gone, not merely covered" || ng "(h16e) post=${(qqqq)${(Q)REPLY}}"
+  fi
+  clear_line
+  drain 0.3
+
+  # ---- (h17) opening the history menu cancels an in-flight completion
+  # collection; the collection's late-arriving result must not overwrite the
+  # menu once it (eventually) completes (behavior.md "候補収集": a cancelled
+  # request's result is never applied, even if it arrives afterward). The
+  # slow fixture completion (_zrushtestslow) is defined in
+  # tests/zsh/rc/history.zshrc itself, not typed here, so it never becomes a
+  # history entry that could confuse the query below.
+  send_keys 'zrushtestslow '
+  drain 0.2   # let debounce elapse and the fork start; it is still asleep
+  press $'\e[A'   # open the history menu while the slow collection is in flight
+  if dump_get $'\C-xk' TESTKIND; then
+    [[ $REPLY == 'kind=history sel=1 listing=1'* ]] \
+      && ok "(h17a) the history menu opens synchronously even with a slow collection in flight" \
+      || ng "(h17a) $REPLY"
+  fi
+  drain 0.8   # comfortably longer than the fixture's 0.5s sleep
+  if dump_get $'\C-xk' TESTKIND; then
+    [[ $REPLY == 'kind=history sel=1 listing=1'* ]] \
+      && ok "(h17b) the (cancelled) slow collection's late result did not overwrite the history menu" \
+      || ng "(h17b) $REPLY"
+  fi
+  if dump_get $'\C-xp' TESTPOST; then
+    [[ ${(Q)REPLY} != *slowcand* ]] && ok "(h17c) the slow completion's candidates never appear in the listing text" || ng "(h17c) post=${(qqqq)${(Q)REPLY}}"
+  fi
+
+  # ---- (h18) confirming a history entry leaves no residual history kind
+  # behind; the very next completion request resumes the normal pipeline.
+  press $'\r'   # confirm the still-open history menu from (h17)
+  if dump_get $'\C-xk' TESTKIND; then
+    # A same-buffer recollection can legitimately already have settled by the
+    # time this dump runs (its own debounce is much shorter than the drain
+    # above), so 'compsys' is an acceptable sighting here too; only a
+    # lingering 'history' kind would mean confirm left the menu's state behind.
+    [[ $REPLY != 'kind=history'* ]] && ok "(h18a) confirm leaves no residual history-menu state" || ng "(h18a) $REPLY"
+  fi
+  clear_line
+  drain 0.3
+  send_keys 'ls fx/basic/al'
+  if expect '*alpha.txt*' 10; then
+    ok "(h18b) a normal completion right after confirming a history entry still renders"
+  else
+    ng "(h18b) completion did not render after a history confirm"
+  fi
+  if dump_get $'\C-xk' TESTKIND; then
+    [[ $REPLY == 'kind=compsys'* ]] && ok "(h18c) the resumed listing's kind is 'compsys', not a leftover 'history'" || ng "(h18c) $REPLY"
+  fi
+  clear_line
+  drain 0.3
+
+  # ---- (h21) the fixture-injection mechanism itself (print -s, run from
+  # this host's rc file) never becomes a history candidate: a query matching
+  # its own invocation text finds nothing.
+  send_keys 'print'
+  drain 0.5
+  press $'\e[A'
+  if dump_get $'\C-xk' TESTKIND; then
+    [[ $REPLY == 'kind=none sel=0 listing=0 npos=0' ]] \
+      && ok "(h21) the fixture's own 'print -s ...' injection commands never appear as history candidates" \
+      || ng "(h21) $REPLY"
+  fi
+  clear_line
+  drain 0.3
+
+  # ---- (h13) while browsing plain history (HISTNO != HISTCMD, entered here
+  # via a raw ^Xu binding to up-line-or-history), select-prev/select-next
+  # both delegate to the predecessor instead of opening/moving a history menu.
+  # Each raw history step below changes BUFFER to a real history line, which
+  # (like any buffer edit) can arm and settle an ordinary recollection before
+  # the following dump runs; that legitimately shows up as 'compsys', so
+  # every check here is "never 'history'", not "always 'none'".
+  press $'\C-xu'
+  press $'\C-xu'   # two raw history-back steps, so there is room for a further Down below
+  dump_get $'\C-xk' TESTKIND
+  [[ $REPLY != 'kind=history'* ]] || ng "(h13-setup) unexpected history-menu kind after raw history browsing: $REPLY"
+  press $'\e[A'
+  if dump_get $'\C-xk' TESTKIND; then
+    [[ $REPLY != 'kind=history'* ]] && ok "(h13a) Up while browsing plain history delegates (no history menu opens)" || ng "(h13a) $REPLY"
+  fi
+  press $'\e[B'
+  if dump_get $'\C-xk' TESTKIND; then
+    [[ $REPLY != 'kind=history'* ]] && ok "(h13b) Down while browsing plain history delegates (no history menu opens)" || ng "(h13b) $REPLY"
+  fi
+  reset_line
+
+  # ---- (h14) a multiline buffer with the cursor off the first line: Up is
+  # cursor movement, not a history-menu open (behavior.md priority rule 1,
+  # symmetric with select-next's own multiline rule).
+  send_keys 'echo a'
+  send_keys $'\C-v\C-j'
+  send_keys 'b'
+  drain 0.5
+  press $'\e[A'
+  if dump_get $'\C-xk' TESTKIND; then
+    # A same-buffer recollection for the "b" argument word may have already
+    # settled (real or not, cli-protocol.md still records it as 'compsys');
+    # only a 'history' kind would mean the menu wrongly opened.
+    [[ $REPLY != 'kind=history'* ]] && ok "(h14a) Up with a newline in LBUFFER delegates (no history menu opens)" || ng "(h14a) $REPLY"
+  fi
+  assert_buffer $'echo a\nb' "(h14b) buffer content is unchanged (only the cursor moved)"
+  reset_line
+
+  # ---- (h8) [history].limit bounds the RAW scan window; entries that don't
+  # survive the in-window dedup/exclusion are never backfilled from outside
+  # that window (cli-protocol.md "history profile", config-schema.md "[history]").
+  mkdir -p $WORK/zdot-hist-lim $WORK/xdg-hist-lim/zrush
+  print "source $REPO/tests/zsh/rc/history-limit.zshrc" > $WORK/zdot-hist-lim/.zshrc
+  print -r -- $'[history]\nlimit = 5' > $WORK/xdg-hist-lim/zrush/config.toml
+  if start_hist_host $WORK/zdot-hist-lim $WORK/xdg-hist-lim $WORK/host-hist-limit.log; then
+    ok "(h8-0) limit=5 host started with its own fixture history"
+    press $'\e[A'
+    if dump_get $'\C-xp' TESTPOST; then
+      local post_lim=${(Q)REPLY}
+      if [[ $post_lim == *dupA* && $post_lim == *keep3* && $post_lim == *keep4* \
+            && $post_lim != *keep5-outside* && $post_lim != *oldest-outside* ]]; then
+        ok "(h8a) the newest-5 scan window yields dupA/keep3/keep4 and never backfills keep5-outside/oldest-outside from beyond it"
+      else
+        ng "(h8a) unexpected listing for limit=5: ${(qqqq)post_lim}"
+      fi
+      local -a lim_rows=( "${(f)post_lim}" )
+      local -i n_dupa=${#${(M)lim_rows:#*dupA*}}
+      (( n_dupa == 1 )) && ok "(h8b) the duplicate within the scan window is deduplicated to exactly one row" || ng "(h8b) dupA appeared in $n_dupa rows: ${(qqqq)post_lim}"
+    else
+      ng "(h8a) POSTDISPLAY dump did not run"
+    fi
+  else
+    ng "(h8-0) limit=5 host failed to start"
+  fi
+
+  # ---- (h19) min-input does not gate the history menu: even with min-input
+  # raised well above any possible word length, an empty-buffer Up still
+  # opens the full menu (behavior.md: min-input and the blank-buffer
+  # suppression rule apply only to the input-following auto display, not to
+  # the history menu).
+  mkdir -p $WORK/xdg-hist-mininput/zrush
+  print -r -- $'[display]\nmin-input = 50' > $WORK/xdg-hist-mininput/zrush/config.toml
+  if start_hist_host $WORK/zdot-hist $WORK/xdg-hist-mininput $WORK/host-hist-mininput.log; then
+    ok "(h19-0) min-input=50 host started"
+    press $'\e[A'
+    if dump_get $'\C-xk' TESTKIND; then
+      [[ $REPLY == 'kind=history sel=1 listing=1'* ]] \
+        && ok "(h19a) empty-buffer Up opens the history menu even with min-input=50" \
+        || ng "(h19a) $REPLY"
+    fi
+  else
+    ng "(h19-0) min-input=50 host failed to start"
+  fi
+
+  # ---- (h20) remapping select-prev to just ["up"] leaves ctrl-p bound to its
+  # predecessor (plain history movement, config-schema.md "[keybind]"); Up
+  # (still in the remapped list) still opens the history menu.
+  mkdir -p $WORK/xdg-hist-keybind/zrush
+  print -r -- $'[keybind]\nselect-prev = ["up"]' > $WORK/xdg-hist-keybind/zrush/config.toml
+  if start_hist_host $WORK/zdot-hist $WORK/xdg-hist-keybind $WORK/host-hist-keybind.log; then
+    ok "(h20-0) select-prev=[\"up\"] host started"
+    # Up first, on the pristine just-started state: ctrl-p's own predecessor
+    # (tested second, below) is real native history movement and would
+    # otherwise leave HISTNO != HISTCMD behind it, which changes what a
+    # *later* Up does (behavior.md priority rule 2) -- unrelated to what
+    # this remap is actually about.
+    press $'\e[A'
+    if dump_get $'\C-xk' TESTKIND; then
+      [[ $REPLY == 'kind=history sel=1 listing=1'* ]] \
+        && ok "(h20b) Up (still in the remapped select-prev list) still opens the history menu" \
+        || ng "(h20b) $REPLY"
+    fi
+    press $'\C-g'   # dismiss: back to an empty buffer, HISTNO still untouched
+    press $'\C-p'
+    if dump_get $'\C-xk' TESTKIND; then
+      # ctrl-p's predecessor may move BUFFER to a real history line, which
+      # (like any buffer edit) can arm and settle an ordinary recollection
+      # before this dump runs; only a 'history' kind would mean the menu
+      # wrongly opened.
+      [[ $REPLY != 'kind=history'* ]] && ok "(h20a) ctrl-p (excluded from select-prev) does not open the history menu" || ng "(h20a) $REPLY"
+    fi
+  else
+    ng "(h20-0) select-prev=[\"up\"] host failed to start"
+  fi
 
   out "SUMMARY: PASS=$PASS FAIL=$FAIL"
 } always {
