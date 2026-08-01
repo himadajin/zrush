@@ -1084,9 +1084,15 @@ _zrush_confirm_pos() {  # $1=one-based position into _zrush_plan_insert
   fi
   _zlog "confirm: kind=$_zrush_plan_kind pos=$pos insert=${(qqqq)text}"
 
-  # After confirmation, clear selection/list. last_buffer stays stale so the next
-  # pre-redraw treats the insertion as a buffer change and triggers recollection,
-  # matching the common-prefix insertion path.
+  # After confirmation, clear selection/list and invalidate the pre-redraw
+  # baseline, so the next pre-redraw always treats the insertion as a buffer
+  # change and triggers recollection (behavior.md "確定(挿入)"), matching the
+  # common-prefix insertion path. Leaving the baseline alone would not do: an
+  # insertion identical to what the baseline already records -- confirming the
+  # history candidate that equals the current line, say -- would read as "no
+  # change" and stall the recollection.
+  _zrush_last_buffer=
+  _zrush_last_cursor=-1
   _zrush_disarm_timer
   _zrush_cancel_collection
   _zrush_teardown
