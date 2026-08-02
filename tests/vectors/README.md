@@ -6,14 +6,14 @@ Each `plan/<name>/` directory contains `args`, `payload.bin`, and `expected.bin`
 Each `reject/<name>/` directory contains `args`, `payload.bin`, and `exit`.
 Each `reject-plan/<name>/` directory contains only `plan.bin`.
 Each `encode/<name>/` directory contains `argv.bin`, `hits.bin`, `dscr.bin`, `expected.bin`, and an optional `env`.
-The runner implicitly prepends the `plan` subcommand, so `args` contains flags and their values only.
+The runner sends each vector as a `plan` request to a persistent `zrush worker`; `args` contains flags and their values only.
 The `args` file stores one argument per line, with an empty line representing an empty argument.
 Shell quoting is not interpreted, and argument values containing newlines cannot be represented.
 The `.bin` files contain raw bytes, including `\0`, `\1`, and `\2` separators.
-The `exit` file contains one decimal line whose value is `2` or `3`.
+Reject vectors expect a worker session with exactly one terminal `error` response (`invalid-request` for malformed request shape/scalars, `invalid-payload` for candidate framing).
 Vector names use kebab case and describe the rule being fixed.
 
-`plan/` and `reject/` fix what the `zrush` process produces, so both run the binary.
+`plan/` and `reject/` fix what the `zrush worker` process produces, so both run the binary.
 `reject-plan/` fixes the opposite direction: each `plan.bin` is a byte string that is not a valid plan, and every receiver must reject it.
 One vector breaks exactly one acceptance condition from cli-protocol.md "エラー時の zsh 側挙動", and its name says which one.
 The corpus covers each condition at digit widths both within and beyond a receiver's integer type, because a receiver that evaluates a digit string arithmetically can wrap an out-of-range value back into range.
@@ -61,7 +61,7 @@ A generated `expected.bin` is a proposal, not an answer -- read it against cli-p
 
 ## Who checks what
 
-`cargo test` checks `plan/`, `reject/`, and `reject-plan/` against the Rust serializer and the `wire` reference parser.
+`cargo test` checks `plan/`, `reject/`, and `reject-plan/` against the Rust worker and the `wire` reference parser. Reject vectors structurally validate exactly `[ready,6]` plus one terminal in-band `error`; no process exit 2/3 compatibility is tested.
 `zsh -f tests/zsh/vectors.zsh` checks `encode/` against the zsh encoder `_zrush_encode_batch`,
 the history sender's line/event-number pairing and filtering against `_zrush_history_payload`,
 and the same `plan/` and `reject-plan/` corpus against the independent zsh decoder

@@ -1,5 +1,5 @@
-//! Orchestration for `zrush plan` (cli-protocol.md "`zrush plan`",
-//! source of truth for the whole pipeline and the stdout wire format).
+//! Orchestration for worker plan requests (cli-protocol.md "`zrush worker`",
+//! source of truth for the whole pipeline and render-plan wire format).
 //!
 //! Pipeline: record::parse -> matching::QueryMatcher (score every parsed
 //! candidate + common-prefix over the *untruncated* prefix-tier matches)
@@ -13,19 +13,18 @@
 //! (this is where `-f` directory-synthesis stat happens, and only for
 //! positions layout actually kept) -> flat NUL-terminated serialization.
 //!
-//! `run` takes the whole stdin buffer already read and an injected
+//! `run` takes one complete candidate payload and an injected
 //! `is_dir` predicate, so it stays free of I/O and is directly testable.
-//! The only error this pipeline itself can produce is a stdin framing
-//! violation (record.rs); reading stdin and writing stdout are main.rs's
-//! job and fail (if at all) with the CLI's own exit-1 I/O path.
+//! The only error this pipeline itself can produce is candidate framing
+//! violation (record.rs); session I/O belongs to worker.rs.
 
 use std::io::Write;
 
 use crate::matching::{Mode, QueryMatcher, Tier};
 use crate::{insert, layout, ranking, record};
 
-/// Snapshot of the `zrush plan` arguments (cli-protocol.md "起動");
-/// `--producer` selects result ordering and layout geometry.
+/// Snapshot of a plan request's scalar fields; producer selects result
+/// ordering and layout geometry.
 pub(crate) struct Params {
     pub producer: Producer,
     pub query: Vec<u8>,
@@ -36,7 +35,7 @@ pub(crate) struct Params {
     pub trailing_space: bool,
 }
 
-/// Producer profile policy selected by `--producer`.
+/// Producer profile policy selected by the request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Producer {
     Compsys,
@@ -59,8 +58,8 @@ impl Producer {
     }
 }
 
-/// The only error `run` itself can produce (cli-protocol.md exit code 3).
-/// I/O failures are main.rs's concern, not this pure pipeline's.
+/// The only error `run` itself can produce. Session I/O failures are
+/// worker.rs's concern, not this pure pipeline's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Error {
     Framing,
@@ -69,10 +68,10 @@ pub(crate) enum Error {
 /// Run the full pipeline and return the serialized render plan.
 pub(crate) fn run(
     params: &Params,
-    stdin: &[u8],
+    payload: &[u8],
     is_dir: &dyn Fn(&[u8]) -> bool,
 ) -> Result<Vec<u8>, Error> {
-    let parsed = record::parse(stdin).map_err(|_| Error::Framing)?;
+    let parsed = record::parse(payload).map_err(|_| Error::Framing)?;
 
     let mut qm = QueryMatcher::new(&params.query, params.mode, params.smart_case);
     let mut scored: Vec<(usize, crate::matching::MatchScore)> = Vec::new();
@@ -130,8 +129,8 @@ pub(crate) fn run(
     Ok(serialize(common_prefix, &built, &insert_texts))
 }
 
-/// Flatten the plan into the stdout wire format (cli-protocol.md
-/// "stdout(描画プラン)"): NUL-terminated fields, fixed order, total count
+/// Flatten the plan into the render-plan wire format: NUL-terminated fields,
+/// fixed order, total count
 /// `4 + L + H + 3P`. A plan with `L == P == H == 0` (nothing matched)
 /// naturally serializes to exactly the "0 マッチ" 4-field form.
 fn serialize(common_prefix: &[u8], plan: &layout::Plan, insert_texts: &[Vec<u8>]) -> Vec<u8> {
@@ -292,7 +291,7 @@ mod tests {
         }
     }
 
-    /// Params with the `--producer compsys` profile.
+    /// Params with the `compsys` producer profile.
     fn params(query: &str, mode: Mode, rows: usize, width: usize, trailing_space: bool) -> Params {
         Params {
             producer: Producer::Compsys,
@@ -305,7 +304,7 @@ mod tests {
         }
     }
 
-    /// Params with the `--producer history` profile.
+    /// Params with the `history` producer profile.
     fn history_params(query: &str, mode: Mode, rows: usize, width: usize) -> Params {
         Params {
             producer: Producer::History,
@@ -728,7 +727,7 @@ mod tests {
 
     #[test]
     fn history_order_keeps_stdin_order_regardless_of_match_quality() {
-        // cli-protocol.md "--producer history": the payload is newest
+        // cli-protocol.md "producer = history": the payload is newest
         // first. Approximate candidates are suppressed when literals exist,
         // while the surviving literal candidates keep that payload order.
         let mut stdin = header(&[]);

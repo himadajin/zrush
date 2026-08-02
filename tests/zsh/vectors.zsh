@@ -16,7 +16,7 @@
 #     Like the Rust runner, this deliberately fails and lists every file it
 #     changed, so a regenerated golden cannot land unreviewed.
 #
-# Scope: tests/vectors/ fixes the `zrush plan` wire format in both directions
+# Scope: tests/vectors/ fixes candidate encoding and render-plan decoding
 # (see its README and docs/internal/contracts/cli-protocol.md).
 #   - encode/<name>/: compadd argv plus captured candidate arrays in,
 #     expected.bin out. Fixes the sender-side guarantees that never appear in
@@ -165,6 +165,142 @@ reserialize_plan() {  # -> REPLY=bytes, or return 1 with REPLY=reason
   (( $+functions[_zrush_history_payload] )) || { out "FATAL: _zrush_history_payload undefined after source"; exit 1 }
   (( _zrush_enabled )) && { out "FATAL: ZRUSH_NO_INIT did not suppress initialization"; exit 1 }
 
+  # ---------------- Persistent-session framing ----------------
+  # Exercise the same incremental loop as _zrush_worker_read without a process
+  # or zle. Every byte boundary is tried, and two responses deliberately share
+  # one stream so delivery cannot depend on read chunking.
+  _zrush_encode_message ready 6
+  local ready_frame=$REPLY
+  _zrush_encode_message error 41 invalid-request
+  local error_frame=$REPLY
+  local response_stream=$ready_frame$error_frame
+  local -i split framing_ok=1 st delivered
+  local rx chunk message
+  local -a got=()
+  for (( split = 0; split <= $#response_stream; ++split )); do
+    rx= got=() delivered=0
+    for chunk in "${response_stream[1,split]}" "${response_stream[split+1,-1]}"; do
+      rx+=$chunk
+      while [[ -n $rx ]]; do
+        _zrush_netstring_take "$rx"; st=$?
+        if (( st == 0 )); then
+          message=$REPLY rx=$REPLY_REST
+          _zrush_decode_fields "$message" || { framing_ok=0; break 2 }
+          got+=( "${(j:|:)reply}" )
+          (( ++delivered ))
+        elif (( st == 1 )); then
+          break
+        else
+          framing_ok=0
+          break 2
+        fi
+      done
+    done
+    [[ -z $rx && $delivered == 2 && $got[1] == 'ready|6' \
+       && $got[2] == 'error|41|invalid-request' ]] || { framing_ok=0; break }
+  done
+  (( framing_ok )) \
+    && ok "session framing: arbitrary response chunking and multiple frames" \
+    || ng "session framing: split=$split delivered=$delivered rx=${(qqqq)rx} got=${(qqqq)got}"
+
+  # A malformed later frame is fatal, but already-complete prefix frames must
+  # have been surfaced first (the framing foundation's valid-prefix rule).
+  rx=$response_stream'01:x,' got=() delivered=0 st=0
+  while [[ -n $rx ]]; do
+    _zrush_netstring_take "$rx"; st=$?
+    if (( st == 0 )); then
+      message=$REPLY rx=$REPLY_REST
+      got+=( "$message" )
+      (( ++delivered ))
+    else
+      break
+    fi
+  done
+  if (( delivered == 2 && st == 2 )); then
+    ok "session framing: valid prefix is delivered before later corruption"
+  else
+    ng "session framing: delivered=$delivered terminal-status=$st"
+  fi
+
+  # A handshake alone is not a successful terminal response and therefore
+  # must not reset the consecutive-session failure streak. A request-level
+  # error is terminal, clears its pending request, and does reset the streak.
+  _zrush_worker_ready=0 _zrush_worker_failures=1 _zrush_disabled=0 _zrush_enabled=1
+  _zrush_netstring_take "$ready_frame"
+  _zrush_worker_handle_message "$REPLY"
+  local -i ready_kept_failures=$(( _zrush_worker_ready == 1 && _zrush_worker_failures == 1 ))
+  typeset -gA _zrush_worker_pending=( 41 compsys )
+  _zrush_current_request=0
+  _zrush_netstring_take "$error_frame"
+  _zrush_worker_handle_message "$REPLY"
+  if (( ready_kept_failures && _zrush_worker_failures == 0 \
+        && ! ${+_zrush_worker_pending[41]} && !_zrush_disabled )); then
+    ok "worker lifecycle: handshake keeps failure streak; terminal error resets it"
+  else
+    ng "worker lifecycle: ready=$ready_kept_failures failures=$_zrush_worker_failures pending=${+_zrush_worker_pending[41]} disabled=$_zrush_disabled"
+  fi
+
+  # A well-formed stale success is consumed but must not replace the plan for
+  # the currently relevant request.
+  local stale_plan="$(<$VECTORS/plan/empty-stdin/expected.bin)"
+  _zrush_worker_ready=1 _zrush_worker_failures=1 _zrush_disabled=0 _zrush_enabled=1
+  typeset -gA _zrush_worker_pending=( 41 compsys )
+  _zrush_current_request=42
+  _zrush_plan_text=sentinel _zrush_plan_cp=sentinel-cp _zrush_plan_kind=history
+  _zrush_plan_nlines=7 _zrush_plan_npos=0
+  _zrush_plan_hl=() _zrush_plan_cells=() _zrush_plan_nav=() _zrush_plan_insert=()
+  _zrush_encode_message ok 41 "$stale_plan"
+  local stale_frame=$REPLY
+  _zrush_netstring_take "$stale_frame"
+  _zrush_worker_handle_message "$REPLY"
+  if [[ $_zrush_plan_text == sentinel && $_zrush_plan_cp == sentinel-cp \
+        && $_zrush_plan_kind == history ]] && (( _zrush_plan_nlines == 7 \
+        && ! ${+_zrush_worker_pending[41]} && _zrush_worker_failures == 0 )); then
+    ok "worker lifecycle: stale well-formed success is discarded"
+  else
+    ng "worker lifecycle: stale response changed current plan or remained pending"
+  fi
+
+  # An explicit incompatible handshake opens the permanent shell-session
+  # disable immediately; it is not counted as the first retryable failure.
+  _zrush_worker_ready=0 _zrush_worker_failures=0 _zrush_disabled=0 _zrush_enabled=1
+  _zrush_worker_warned=0 _zrush_worker_pid=-1 _zrush_worker_rfd=-1 _zrush_worker_wfd=-1
+  _zrush_encode_message incompatible 7
+  local mismatch_frame=$REPLY
+  _zrush_netstring_take "$mismatch_frame"
+  _zrush_worker_handle_message "$REPLY" 2>/dev/null
+  if (( _zrush_disabled && !_zrush_enabled && _zrush_worker_failures == 0 \
+        && _zrush_worker_warned )); then
+    ok "worker lifecycle: protocol mismatch disables immediately"
+  else
+    ng "worker lifecycle: mismatch state enabled=$_zrush_enabled disabled=$_zrush_disabled failures=$_zrush_worker_failures warned=$_zrush_worker_warned"
+  fi
+  _zrush_disabled=0 _zrush_enabled=0 _zrush_worker_warned=0
+
+  # Two failed sessions without an intervening terminal response open the
+  # circuit breaker. The user-facing warning latch remains set after the first
+  # failure, while detailed reasons continue to be logged for both sessions.
+  local saved_log=${ZRUSH_LOG:-}
+  ZRUSH_LOG=$WORK/lifecycle.log
+  _zrush_worker_failures=0 _zrush_worker_warned=0 _zrush_disabled=0 _zrush_enabled=1
+  _zrush_worker_pid=-1 _zrush_worker_rfd=-1 _zrush_worker_wfd=-1
+  _zrush_worker_session_fail fixture-first 2>/dev/null
+  local -i first_failure_ok=$(( _zrush_worker_failures == 1 && _zrush_worker_warned \
+    && !_zrush_disabled && _zrush_enabled ))
+  _zrush_enabled=1
+  _zrush_worker_session_fail fixture-second 2>/dev/null
+  local lifecycle_log="$(<$ZRUSH_LOG)"
+  if (( first_failure_ok && _zrush_worker_failures == 2 && _zrush_disabled \
+        && !_zrush_enabled && _zrush_worker_warned )) \
+     && [[ $lifecycle_log == *'fixture-first'* && $lifecycle_log == *'fixture-second'* \
+           && $lifecycle_log == *'circuit breaker opened'* ]]; then
+    ok "worker lifecycle: second consecutive session failure disables; warning latches once"
+  else
+    ng "worker lifecycle: breaker state/log mismatch"
+  fi
+  ZRUSH_LOG=$saved_log
+  _zrush_worker_failures=0 _zrush_worker_warned=0 _zrush_disabled=0 _zrush_enabled=0
+
   # ---------------- History payload sender ----------------
   # `print -s` leaves its newest entry as the current event until another
   # entry is pushed, so the final sentinel makes "newest" visible without
@@ -279,7 +415,7 @@ reserialize_plan() {  # -> REPLY=bytes, or return 1 with REPLY=reason
 
   # ---------------- Encoder output reused as a decoder input ----------------
   # One byte string spans both directions: what the encoder emits for
-  # encode/shared-tags-all is exactly what plan/encoder-chain feeds `zrush plan`.
+  # encode/shared-tags-all is exactly the candidate payload used by plan/encoder-chain.
   if cmp -s $VECTORS/encode/shared-tags-all/expected.bin $VECTORS/plan/encoder-chain/payload.bin; then
     ok "chain: plan/encoder-chain/payload.bin is encode/shared-tags-all/expected.bin"
   else

@@ -15,7 +15,7 @@
 # highlight/nav-table computation, and insertion-text construction all live
 # in Rust and are covered by `cargo test`. This driver only smoke-tests what
 # Rust cannot verify: that the real zle/compsys integration captures
-# candidates, ships them to `zrush plan`, and applies the returned plan to
+# candidates, ships them to the persistent Rust worker, and applies its plan to
 # POSTDISPLAY/region_highlight/BUFFER correctly under real key input.
 #
 # Harness (shared with driver-coexist.zsh/driver-latency.zsh):
@@ -54,12 +54,15 @@ export XDG_CONFIG_HOME=$WORK/xdg   # no config.toml is written: every test runs 
 export ZRUSH_LOG=$WORK/host.log
 mkdir -p $ZDOTDIR $XDG_CONFIG_HOME/zrush
 
-# A private copy of the binary, so the error-path test (err-1/2) can corrupt it
-# in place without ever touching the real build artifact under target/release.
+# A test launcher delegates to the real binary unless its isolated control
+# file requests an active-session failure mode.
 mkdir -p $WORK/bin
-cp $REPO/target/release/zrush $WORK/bin/zrush
+cp $REPO/tests/zsh/fake-worker.py $WORK/bin/zrush
 chmod +x $WORK/bin/zrush
 export ZRUSH_BIN=$WORK/bin/zrush
+export ZRUSH_REAL_BIN=$REPO/target/release/zrush
+export ZRUSH_FAKE_CONTROL=$WORK/fake-control
+export ZRUSH_FAKE_STATE=$WORK/fake-state
 
 print "source $REPO/tests/zsh/rc/minimal.zshrc" > $ZDOTDIR/.zshrc
 
@@ -148,6 +151,22 @@ wait_log() {  # $1=fixed string $2=baseline $3=timeout(s) -> 0 when count increa
   return 1
 }
 
+fake_count() {  # $1=fixed state line -> REPLY=count
+  typeset -g REPLY=0
+  [[ -r $ZRUSH_FAKE_STATE ]] && REPLY=$(grep -cF -- "$1" $ZRUSH_FAKE_STATE 2>/dev/null)
+  return 0
+}
+
+wait_fake() {  # $1=fixed state line $2=baseline $3=timeout
+  local -F dl=$(( SECONDS + ${3:-5} ))
+  while (( SECONDS < dl )); do
+    drain 0.1
+    fake_count "$1"
+    (( REPLY > $2 )) && return 0
+  done
+  return 1
+}
+
 # Compare an exact ^Xb BUFFER dump against an expected string.
 assert_buffer() {  # $1=expected buffer $2=label
   local want=${(qqqq)1}
@@ -219,19 +238,34 @@ start_hist_host() {  # $1=zdotdir $2=xdg-config-home $3=logfile
   fi
   sync_prompt
 
+  # The Rust worker is lazy: sourcing/config validation alone must not start it.
+  if dump_get $'\C-xw' TESTWORKER && [[ $REPLY == 'pid=-1 ready=0 seq=0 '* ]]; then
+    ok "(worker-1a) source/config leaves the persistent worker stopped"
+  else
+    ng "(worker-1a) worker was not lazy: ${REPLY:-<none>}"
+  fi
+
   # ================================================================ (1) Capture fork -> candidate records
   # (cap-1a) A real compsys fork collects candidates, ships candidate records
-  # (b header + w/d), and the round trip through `zrush plan` renders a list.
+  # (b header + w/d), and the worker round trip renders a list.
   send_keys 'ls fx/basic/al'
   if expect '*alpha.txt*' 10; then
-    ok "(cap-1a) fork capture -> zrush plan -> apply round trip renders a list"
+    ok "(cap-1a) fork capture -> persistent worker -> apply round trip renders a list"
   else
     ng "(cap-1a) list not displayed"
+  fi
+  dump_get $'\C-xw' TESTWORKER
+  local worker_after_first=$REPLY
+  local -i first_worker_pid=${${worker_after_first#pid=}%% *}
+  if (( first_worker_pid > 1 )) && [[ $worker_after_first == *'ready=1'*'seq=1'* ]]; then
+    ok "(worker-1b) first real request starts and handshakes one worker"
+  else
+    ng "(worker-1b) unexpected first-request state: $worker_after_first"
   fi
   clear_line
   drain 0.3
 
-  # (cap-1b) The batch header's shared X/J tags reach `zrush plan` and come back
+  # (cap-1b) The batch header's shared X/J tags reach the worker and come back
   # as a heading line (_files' 'file' tag with group-name '').
   send_keys 'ls fx/headed/'
   if expect '*file*plainfile.txt*' 10; then
@@ -241,6 +275,23 @@ start_hist_host() {  # $1=zdotdir $2=xdg-config-home $3=logfile
   fi
   clear_line
   drain 0.3
+
+  dump_get $'\C-xw' TESTWORKER
+  local worker_after_successive=$REPLY
+  if [[ $worker_after_successive == "pid=$first_worker_pid "* ]] && (( ${${worker_after_successive#*seq=}%% *} > 1 )); then
+    ok "(worker-1c) successive completion requests reuse the same Rust worker"
+  else
+    ng "(worker-1c) worker was not reused: first=$worker_after_first now=$worker_after_successive"
+  fi
+
+  local -i seq_before_resource=${${worker_after_successive#*seq=}%% *}
+  send_line "source $REPO/zsh/zrush.zsh"
+  sync_prompt
+  if dump_get $'\C-xw' TESTWORKER && [[ $REPLY == "pid=-1 ready=0 seq=$seq_before_resource "* && $REPLY == *'rfd=-1 wfd=-1 retry=-1 pending=0' ]]; then
+    ok "(worker-1d) re-source tears down transport while preserving the request counter"
+  else
+    ng "(worker-1d) bad post-resource state: ${REPLY:-<none>}"
+  fi
 
   # (cap-1c) w vs m: a candidate whose quoted form differs from its raw text.
   # The listing must show the raw text (m, cli-protocol.md "候補レコード"), and
@@ -405,7 +456,8 @@ start_hist_host() {  # $1=zdotdir $2=xdg-config-home $3=logfile
   # RBUFFER must survive confirmation untouched: type a word, move the cursor
   # back inside it, and confirm what's before the cursor only.
   send_keys 'ls fx/basic/alpEND'
-  send_keys $'\e[D\e[D\e[D'   # Left x3: cursor lands between 'alp' and 'END'
+  send_keys $'\C-xv'            # test helper: cursor lands between 'alp' and 'END'
+  drain 0.2                    # ensure ZLE applies cursor motion before debounce fires
   expect '*alpha.txt*' 10 >/dev/null
   press $'\e[B'
   press $'\r'
@@ -531,26 +583,37 @@ start_hist_host() {  # $1=zdotdir $2=xdg-config-home $3=logfile
   send_line 'bindkey -r "^Xy"; zle -D _zrt-dump-plan; unfunction _zrt_dump_plan'
   sync_prompt
 
-  # ================================================================ (9) Error path: a broken ZRUSH_BIN
-  # Sanity: the (still-working) private binary copy behaves normally first.
+  # ================================================================ (9) Active persistent-worker death
+  # Sanity: the delegated real worker behaves normally first.
   send_keys 'ls fx/basic/al'
   if expect '*alpha.txt*' 10; then
-    ok "(err-0) sanity: the private ZRUSH_BIN copy still works before corruption"
+    ok "(err-0) sanity: the delegated real worker is ready and serving plans"
   else
-    ng "(err-0) sanity check failed before corrupting the binary; aborting error-path test"
+    ng "(err-0) real-worker sanity check failed before death injection"
   fi
   clear_line
   drain 0.3
 
-  print -r -- $'#!/bin/sh\nexit 7' > $WORK/bin/zrush
-  chmod +x $WORK/bin/zrush
-  TRANSCRIPT=
+  # Switch only future sessions to the fake. It handshakes ready, records the
+  # assigned request id, then exits without a terminal response.
+  send_keys $'\C-xq'
+  drain 0.3
+  dump_get $'\C-xw' TESTWORKER
+  [[ $REPLY == 'pid=-1 ready=0 '* ]] || ng "(err-setup) worker teardown failed: $REPLY"
+  print -r -- die > $ZRUSH_FAKE_CONTROL
+  log_count 'worker: session failure:'; local -i err_fail0=$REPLY
+  fake_count 'die 1 '; local -i fake_die0=$REPLY
   send_keys 'ls fx/basic/al'
-  if expect '*zrush: zrush plan failed*' 10; then
-    ok "(err-1a) a broken zrush binary triggers exactly one warning on the first collection"
+  if wait_fake 'die 1 ' $fake_die0 10 \
+     && wait_log 'worker: session failure:' $err_fail0 10 \
+     && dump_get $'\C-xw' TESTWORKER \
+     && [[ $REPLY == *'failures=1 disabled=0'*'warned=1'*'pending=0' ]]; then
+    ok "(err-1a) ready worker dies with an assigned request; pending is discarded and failure is retryable"
   else
-    ng "(err-1a) no warning shown for a broken binary"
+    ng "(err-1a) active-death state missing: ${REPLY:-<none>}"
   fi
+  local first_die=$(grep -F 'die 1 ' $ZRUSH_FAKE_STATE 2>/dev/null | tail -1)
+  local first_dead_id=${first_die##* }
   drain 0.5
   if dump_get $'\C-xp' TESTPOST; then
     local post2=${(Q)REPLY}
@@ -562,48 +625,81 @@ start_hist_host() {  # $1=zdotdir $2=xdg-config-home $3=logfile
   else
     ng "(err-1b) POSTDISPLAY dump did not run"
   fi
-  clear_line
-  drain 0.5
+  # The next real request lazily starts one replacement. Hold it after ready
+  # and assignment so state can be inspected before its terminal response.
+  clear_line; drain 0.3
+  print -r -- hold > $ZRUSH_FAKE_CONTROL
+  fake_count 'hold 2 '; local -i fake_hold0=$REPLY
   send_keys 'ls fx/basic/'
-  drain 1.5
-  local -i warn_count=${#${(M)${(f)TRANSCRIPT}:#*zrush: zrush plan failed*}}
-  if (( warn_count == 1 )); then
-    ok "(err-1c) the warning is not repeated on a second failing collection (session-once)"
+  if wait_fake 'hold 2 ' $fake_hold0 10 \
+     && dump_get $'\C-xw' TESTWORKER \
+     && [[ $REPLY == *'ready=1'*'failures=1 disabled=0'*'pending=1' ]] \
+     && (( $(grep -c '^start ' $ZRUSH_FAKE_STATE) == 2 )); then
+    ok "(err-1c) next request starts exactly one replacement; ready handshake does not reset failure streak"
   else
-    ng "(err-1c) warning fired $warn_count times, expected exactly 1"
+    ng "(err-1c) held replacement state missing: ${REPLY:-<none>}"
   fi
+  if (( $(grep -cE "^request [0-9]+ $first_dead_id\$" $ZRUSH_FAKE_STATE 2>/dev/null) == 1 )); then
+    ok "(err-1d) failed request_id=$first_dead_id is never replayed"
+  else
+    ng "(err-1d) failed request was replayed or fake-state accounting changed"
+  fi
+
+  log_count 'worker: error request_id='; local -i err_terminal0=$REPLY
+  print -r -- error > $ZRUSH_FAKE_CONTROL
+  if wait_log 'worker: error request_id=' $err_terminal0 10 \
+     && dump_get $'\C-xw' TESTWORKER \
+     && [[ $REPLY == *'failures=0 disabled=0'*'pending=0' ]]; then
+    ok "(err-1e) well-formed terminal error resets the session-failure streak"
+  else
+    ng "(err-1e) terminal response did not reset streak: ${REPLY:-<none>}"
+  fi
+
+  # Kill that active session, then kill its one lazy replacement too. The
+  # second consecutive active-session death opens the breaker. Pending Tab
+  # must not resolve against a failed plan.
+  print -r -- die > $ZRUSH_FAKE_CONTROL
+  clear_line; drain 0.3
+  fake_count 'die 2 '; local -i fake_die1=$REPLY
+  log_count 'worker: session failure:'; local -i active_fail1=$REPLY
+  send_keys 'ls fx/basic/al'
+  wait_fake 'die 2 ' $fake_die1 10 \
+    && wait_log 'worker: session failure:' $active_fail1 10
+  clear_line; drain 0.3
+  fake_count 'die 3 '; local -i fake_die2=$REPLY
+  log_count 'worker: session failure:'; local -i active_fail2=$REPLY
+  send_keys 'ls fx/basic/al'$'\t'
+  wait_fake 'die 3 ' $fake_die2 10 \
+    && wait_log 'worker: session failure:' $active_fail2 10
+  drain 0.5
+  assert_buffer 'ls fx/basic/al' "(err-2) pending Tab resolved against an actively-dead worker inserts nothing"
+  if dump_get $'\C-xw' TESTWORKER \
+     && [[ $REPLY == *'failures=2 disabled=1'*'warned=1'*'pending=0' ]] \
+     && (( $(grep -c '^start ' $ZRUSH_FAKE_STATE) == 3 )); then
+    ok "(err-3) two consecutive active-session deaths open the breaker after one lazy replacement"
+  else
+    ng "(err-3) active-death breaker state missing: ${REPLY:-<none>}"
+  fi
+
   clear_line
   drain 0.3
   send_keys 'print HISTMARK-AFTER-ERROR'
   send_keys $'\r'
-  if expect '*HISTMARK-AFTER-ERROR*' 5; then
-    ok "(err-1d) the shell keeps responding normally after zrush plan failures"
+  if expect '*HISTMARK-AFTER-ERROR*HP>*' 5; then
+    ok "(err-4) the shell keeps responding normally after worker failures"
   else
-    ng "(err-1d) shell did not respond after zrush plan failures"
+    ng "(err-4) shell did not respond after worker failures"
   fi
   sync_prompt
-
-  # Regression (err-2): a pending Tab resolved against a *failed* plan must
-  # never insert anything (_zrush_settle_plan's failure branch discards the
-  # pending Tab outright rather than resolving it, possibly against stale
-  # _zrush_plan_* from an earlier successful query). ZRUSH_BIN is still the
-  # broken copy from the block above.
-  send_keys 'ls fx/basic/al'$'\t'   # Tab races the debounce; the plan fetch will fail
-  drain 1.0
-  assert_buffer 'ls fx/basic/al' "(err-2) pending Tab resolved against a failed plan inserts nothing"
-  clear_line
-  drain 0.3
 
   # ================================================================ (10) History menu (issue #9)
   # docs/internal/specs/behavior.md "履歴メニュー" and cli-protocol.md
   # "history profile" are the source of truth. This section runs on its own
   # host(s) with fixture history (tests/zsh/rc/history.zshrc and friends)
-  # instead of the "host" pty used above, so it starts by restoring the
-  # shared private ZRUSH_BIN copy the (err-1/err-2) section just corrupted.
+  # instead of the "host" pty used above. Reset the test launcher to proxy.
   # The fixture history is isolated (HISTFILE under $WORK, SAVEHIST=0) and
   # never touches the real ~/.zsh_history (AGENTS.md guardrail).
-  cp $REPO/target/release/zrush $WORK/bin/zrush
-  chmod +x $WORK/bin/zrush
+  print -r -- proxy > $ZRUSH_FAKE_CONTROL
 
   mkdir -p $WORK/zdot-hist $WORK/xdg-hist/zrush
   print "source $REPO/tests/zsh/rc/history.zshrc" > $WORK/zdot-hist/.zshrc
@@ -983,9 +1079,9 @@ start_hist_host() {  # $1=zdotdir $2=xdg-config-home $3=logfile
   press $'\e[A'
   dump_get $'\C-xk' TESTKIND
   [[ $REPLY == 'kind=history sel=1 listing=1 npos=1' ]] || ng "(h22-setup-enter) exact-match menu did not open as expected: $REPLY"
-  log_count 'plan: ok producer=compsys'; local -i cc0=$REPLY
+  log_count 'worker: ok request_id='; local -i cc0=$REPLY
   press $'\r'
-  if wait_log 'plan: ok producer=compsys' $cc0 3; then
+  if wait_log 'worker: ok request_id=' $cc0 3; then
     ok "(h22a) confirming a history entry byte-identical to BUFFER (via Enter) still triggers a fresh compsys recollection"
   else
     ng "(h22a) no fresh compsys recollection observed after Enter confirmed an exact-BUFFER-match entry"
@@ -998,9 +1094,9 @@ start_hist_host() {  # $1=zdotdir $2=xdg-config-home $3=logfile
   press $'\e[A'
   dump_get $'\C-xk' TESTKIND
   [[ $REPLY == 'kind=history sel=1 listing=1 npos=1' ]] || ng "(h22-setup-tab) exact-match menu did not open as expected: $REPLY"
-  log_count 'plan: ok producer=compsys'; local -i cc1=$REPLY
+  log_count 'worker: ok request_id='; local -i cc1=$REPLY
   press $'\t'
-  if wait_log 'plan: ok producer=compsys' $cc1 3; then
+  if wait_log 'worker: ok request_id=' $cc1 3; then
     ok "(h22b) confirming a history entry byte-identical to BUFFER (via Tab) still triggers a fresh compsys recollection"
   else
     ng "(h22b) no fresh compsys recollection observed after Tab confirmed an exact-BUFFER-match entry"
@@ -1022,33 +1118,34 @@ start_hist_host() {  # $1=zdotdir $2=xdg-config-home $3=logfile
   clear_line
   drain 0.3
 
-  # ---- (h24) audit A2: a synchronous history-producer plan failure (same
-  # broken-binary technique as err-1/err-2, which only exercise the async
-  # compsys path) must leave no menu, no residual kind/listing, the buffer
+  # ---- (h24) A synchronous history request assigned to a ready worker which
+  # then dies must leave no menu, no residual kind/listing, the buffer
   # untouched, and the shell responsive (cli-protocol.md "エラー時の zsh 側
-  # 挙動" applies to `zrush plan --producer history`'s synchronous invocation
+  # 挙動" applies to the history producer's synchronous worker exchange
   # exactly as it does to the async compsys one).
   # An empty buffer (rather than a typed query) avoids a confound: typing
   # anything here would also arm its own compsys collection, which (via the
   # already-warm empty-word cache from earlier scenarios on this host) would
-  # hit the broken binary synchronously and consume the session's one-time
-  # warning before the history-menu attempt below even runs.
-  print -r -- $'#!/bin/sh\nexit 7' > $WORK/bin/zrush
-  chmod +x $WORK/bin/zrush
-  TRANSCRIPT=
+  # start an unrelated async request before the history-menu attempt.
+  send_keys $'\C-xq'
+  drain 0.3
+  local -i hist_fake_session=$(( ${$(<$ZRUSH_FAKE_STATE.count):-0} + 1 ))
+  print -r -- die > $ZRUSH_FAKE_CONTROL
+  fake_count "die $hist_fake_session "; local -i hist_die0=$REPLY
+  log_count 'worker: session failure:'; local -i hist_fail0=$REPLY
   send_keys $'\e[A'   # raw send, not press: press's own drain would already
                        # consume the one-shot warning before expect looks for it
-  if expect '*zrush: zrush plan failed*' 10; then
-    ok "(h24a) a broken zrush binary triggers a warning when opening the history menu"
+  if wait_fake "die $hist_fake_session " $hist_die0 10 \
+     && wait_log 'worker: session failure:' $hist_fail0 10; then
+    ok "(h24a) active worker death is recorded on the synchronous history path"
   else
-    ng "(h24a) no warning shown for a broken binary on the history-menu path"
+    ng "(h24a) no worker failure logged on the history-menu path"
   fi
   if dump_get $'\C-xk' TESTKIND; then
     [[ $REPLY == 'kind=none sel=0 listing=0 npos=0' ]] && ok "(h24b) no menu/kind/listing survives the failed sync plan" || ng "(h24b) $REPLY"
   fi
   assert_buffer '' "(h24c) buffer is unchanged after the failed sync plan"
-  cp $REPO/target/release/zrush $WORK/bin/zrush
-  chmod +x $WORK/bin/zrush
+  print -r -- proxy > $ZRUSH_FAKE_CONTROL
   clear_line
   drain 0.3
   send_keys 'print HISTMARK-AFTER-HIST-PLAN-ERROR'

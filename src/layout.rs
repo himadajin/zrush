@@ -1,6 +1,6 @@
-//! Grid layout, highlight, and navigation engine for `zrush plan`.
+//! Grid layout, highlight, and navigation engine for worker plan requests.
 //!
-//! Semantics: docs/internal/contracts/cli-protocol.md "stdout(描画プラン)",
+//! Semantics: docs/internal/contracts/cli-protocol.md "render_plan",
 //! specifically "表示行の中身" (grouping/grid), "オフセット規律"
 //! (char-count vs display-width split), "ハイライト", and "ナビ". This
 //! module owns grouping, the column-major grid, cell truncation/padding,
@@ -60,7 +60,7 @@ pub(crate) enum Role {
 }
 
 impl Role {
-    /// The stdout wire token (cli-protocol.md "ハイライト").
+    /// The render-plan wire token (cli-protocol.md "ハイライト").
     pub fn as_str(self) -> &'static str {
         match self {
             Role::Match => "match",
@@ -70,7 +70,7 @@ impl Role {
     }
 }
 
-/// One "role pos start len" stdout entry. `start`/`len` are char offsets
+/// One "role pos start len" render-plan entry. `start`/`len` are char offsets
 /// over the full listing text (rows joined by `\n`, no leading newline).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Highlight {
@@ -80,7 +80,7 @@ pub(crate) struct Highlight {
     pub len: usize,
 }
 
-/// One "next prev left right" stdout entry, absolute position numbers
+/// One "next prev left right" render-plan entry, absolute position numbers
 /// (0 = unselected). cli-protocol.md "ナビ".
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) struct Nav {

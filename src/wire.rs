@@ -1,4 +1,4 @@
-//! Reference parser for the `zrush plan` stdout wire format.
+//! Reference parser for the render-plan wire format.
 
 use std::fmt;
 
@@ -99,7 +99,7 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-/// Parse and validate a serialized `zrush plan` output.
+/// Parse and validate a serialized render plan.
 pub fn parse(output: &[u8]) -> Result<Plan, Error> {
     if output.is_empty() {
         return Err(Error::EmptyOutput);

@@ -1,13 +1,13 @@
 //! Ranking of matched candidates.
 //!
 //! Semantics (cli-protocol.md "マッチング・ランキングの意味論"): the
-//! result order is one policy selected by `--producer`; this module owns
+//! result order is one policy selected by the request producer; this module owns
 //! that ordering policy while layout.rs owns the separately selected
 //! geometry. Matching and insertion remain producer-independent.
 
 use crate::matching::{MatchScore, TierGroup};
 
-/// Result ordering, mapped from `--producer` by the CLI layer.
+/// Result ordering, mapped from the request producer by the plan layer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Order {
     /// Match quality descending — stricter tier first (prefix >

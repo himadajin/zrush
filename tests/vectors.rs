@@ -1,5 +1,6 @@
 use std::ffi::OsString;
 use std::io::Write;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -35,22 +36,55 @@ fn vector_dirs(kind: &str) -> Vec<PathBuf> {
     paths
 }
 
-fn run_vector(path: &Path) -> std::process::Output {
+fn run_vector_raw(path: &Path) -> std::process::Output {
+    let args = vector_args(path);
+    let value = |flag: &str| {
+        args.windows(2)
+            .find(|w| w[0] == flag)
+            .map(|w| w[1].clone())
+            .unwrap_or_default()
+    };
+    fn ns(payload: &[u8]) -> Vec<u8> {
+        let mut o = payload.len().to_string().into_bytes();
+        o.push(b':');
+        o.extend_from_slice(payload);
+        o.push(b',');
+        o
+    }
+    fn msg(fields: &[&[u8]]) -> Vec<u8> {
+        let mut p = Vec::new();
+        for f in fields {
+            p.extend(ns(f));
+        }
+        ns(&p)
+    }
+    let payload = std::fs::read(path.join("payload.bin")).expect("payload");
+    let cwd = std::env::current_dir().expect("cwd");
+    let request = msg(&[
+        b"plan",
+        b"1",
+        cwd.as_os_str().as_bytes(),
+        value("--producer").as_bytes(),
+        value("--query").as_bytes(),
+        value("--mode").as_bytes(),
+        value("--smart-case").as_bytes(),
+        value("--rows").as_bytes(),
+        value("--width").as_bytes(),
+        value("--trailing-space").as_bytes(),
+        &payload,
+    ]);
     let mut child = Command::new(env!("CARGO_BIN_EXE_zrush"))
-        .arg("plan")
-        .args(vector_args(path))
+        .arg("worker")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .unwrap_or_else(|error| panic!("{}: spawn zrush: {error}", path.display()));
-    let payload = std::fs::read(path.join("payload.bin"))
-        .unwrap_or_else(|error| panic!("{}: read payload.bin: {error}", path.display()));
     let write_result = child
         .stdin
         .take()
         .expect("vector child stdin")
-        .write_all(&payload);
+        .write_all(&[msg(&[b"hello", b"6"]), request].concat());
     if let Err(error) = write_result {
         assert_eq!(
             error.kind(),
@@ -62,6 +96,45 @@ fn run_vector(path: &Path) -> std::process::Output {
     child
         .wait_with_output()
         .unwrap_or_else(|error| panic!("{}: wait for zrush: {error}", path.display()))
+}
+
+fn run_vector(path: &Path) -> std::process::Output {
+    let mut output = run_vector_raw(path);
+    // Strip the handshake response and unwrap the terminal ok payload.
+    let frames = decode_strict(&output.stdout);
+    if let Some(frame) = frames.last() {
+        let fs = decode_fields_strict(frame);
+        if fs.first().map(Vec::as_slice) == Some(b"ok") {
+            output.stdout = fs.get(2).cloned().unwrap_or_default();
+        }
+    }
+    output
+}
+
+fn decode_strict(mut bytes: &[u8]) -> Vec<Vec<u8>> {
+    let mut frames = Vec::new();
+    while !bytes.is_empty() {
+        let colon = bytes
+            .iter()
+            .position(|&b| b == b':')
+            .expect("missing colon");
+        assert!(colon > 0 && (colon == 1 || bytes[0] != b'0'));
+        assert!(bytes[..colon].iter().all(u8::is_ascii_digit));
+        let len: usize = std::str::from_utf8(&bytes[..colon])
+            .unwrap()
+            .parse()
+            .unwrap();
+        let start = colon + 1;
+        let end = start.checked_add(len).expect("length overflow");
+        assert!(end < bytes.len() && bytes[end] == b',');
+        frames.push(bytes[start..end].to_vec());
+        bytes = &bytes[end + 1..];
+    }
+    frames
+}
+
+fn decode_fields_strict(frame: &[u8]) -> Vec<Vec<u8>> {
+    decode_strict(frame)
 }
 
 fn dump(bytes: &[u8]) -> String {
@@ -238,88 +311,31 @@ fn reject_plan_vectors_are_rejected() {
 }
 
 #[test]
-fn reject_vectors_match_expected_exit_codes() {
-    let update = std::env::var_os("UPDATE_GOLDEN").as_deref() == Some("1".as_ref());
+fn reject_vectors_match_expected_in_band_errors() {
     let mut failures = Vec::new();
-    let mut updated = Vec::new();
 
     for path in vector_dirs("reject") {
         let name = vector_name(&path);
-        let exit_path = path.join("exit");
-        let expected = if update {
-            None
+        let output = run_vector_raw(&path);
+        let frames = decode_strict(&output.stdout);
+        let expected = if name.ends_with("nonterminated-stdin") {
+            b"invalid-payload"
         } else {
-            let expected_text = match std::fs::read_to_string(&exit_path) {
-                Ok(text) => text,
-                Err(error) => {
-                    failures.push(format!("{name}: read exit: {error}"));
-                    continue;
-                }
-            };
-            let line = expected_text
-                .strip_suffix('\n')
-                .unwrap_or(expected_text.as_str());
-            if line.is_empty()
-                || line.contains('\n')
-                || !line.bytes().all(|byte| byte.is_ascii_digit())
-            {
-                failures.push(format!(
-                    "{name}: exit must be one decimal line containing 2 or 3, got {:?}",
-                    expected_text
-                ));
-                continue;
-            }
-            let expected = match line.parse::<i32>() {
-                Ok(value @ (2 | 3)) => value,
-                Ok(value) => {
-                    failures.push(format!("{name}: reject exit must be 2 or 3, got {value}"));
-                    continue;
-                }
-                Err(error) => {
-                    failures.push(format!("{name}: invalid exit file: {error}"));
-                    continue;
-                }
-            };
-            Some(expected)
+            b"invalid-request"
         };
-        let output = run_vector(&path);
-        let actual = output.status.code();
-
-        if update {
-            let Some(actual @ (2 | 3)) = actual else {
-                failures.push(format!(
-                    "{name}: cannot update reject exit from {actual:?}; stdout: {}; stderr: {}",
-                    dump(&output.stdout),
-                    dump(&output.stderr)
-                ));
-                continue;
-            };
-            let rendered = format!("{actual}\n");
-            let changed = match std::fs::read(&exit_path) {
-                Ok(current) => current != rendered.as_bytes(),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
-                Err(error) => panic!("{name}: read exit before update: {error}"),
-            };
-            if changed {
-                std::fs::write(&exit_path, rendered)
-                    .unwrap_or_else(|error| panic!("{name}: update exit: {error}"));
-                updated.push(format!("{name}/exit"));
-            }
-        } else if actual != expected {
+        let valid = output.status.code() == Some(0)
+            && frames.len() == 2
+            && decode_fields_strict(&frames[0]) == vec![b"ready".to_vec(), b"6".to_vec()]
+            && decode_fields_strict(&frames[1])
+                == vec![b"error".to_vec(), b"1".to_vec(), expected.to_vec()];
+        if !valid {
             failures.push(format!(
-                "{name}: expected exit {}, got {actual:?}; stdout: {}; stderr: {}",
-                expected.expect("normal mode loaded exit"),
+                "{name}: expected ready + one terminal in-band error; got exit {:?}, stdout: {}, stderr: {}",
+                output.status.code(),
                 dump(&output.stdout),
                 dump(&output.stderr)
             ));
         }
-    }
-
-    if !updated.is_empty() {
-        failures.push(format!(
-            "updated golden files (review these diffs, then rerun):\n{}",
-            updated.join("\n")
-        ));
     }
 
     assert!(

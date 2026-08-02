@@ -2,6 +2,7 @@
 //! docs/internal/contracts/cli-protocol.md.
 
 use std::io::Write;
+use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
@@ -11,26 +12,91 @@ fn zrush() -> Command {
     Command::new(env!("CARGO_BIN_EXE_zrush"))
 }
 
-// ---- zrush plan ----
+// ---- zrush worker ----
 
-/// Run `zrush plan` with the given trailing args and stdin bytes.
+/// Run one `plan` request through a fresh `zrush worker` session.
+fn ns(payload: &[u8]) -> Vec<u8> {
+    let mut out = payload.len().to_string().into_bytes();
+    out.push(b':');
+    out.extend_from_slice(payload);
+    out.push(b',');
+    out
+}
+fn msg(fields: &[&[u8]]) -> Vec<u8> {
+    let mut payload = Vec::new();
+    for f in fields {
+        payload.extend(ns(f));
+    }
+    ns(&payload)
+}
+fn decode_frames(mut bytes: &[u8]) -> Vec<Vec<u8>> {
+    let mut frames = Vec::new();
+    while !bytes.is_empty() {
+        let colon = bytes.iter().position(|&b| b == b':').expect("colon");
+        let len: usize = std::str::from_utf8(&bytes[..colon])
+            .unwrap()
+            .parse()
+            .unwrap();
+        let start = colon + 1;
+        let end = start + len;
+        assert_eq!(bytes.get(end), Some(&b','));
+        frames.push(bytes[start..end].to_vec());
+        bytes = &bytes[end + 1..];
+    }
+    frames
+}
+fn fields(frame: &[u8]) -> Vec<Vec<u8>> {
+    decode_frames(frame).into_iter().collect()
+}
+
 fn run_plan(extra: &[&str], stdin: &[u8]) -> (i32, Vec<u8>) {
+    let value = |flag: &str| {
+        extra
+            .windows(2)
+            .find(|w| w[0] == flag)
+            .map(|w| w[1])
+            .unwrap_or("")
+    };
+    let req = msg(&[
+        b"plan",
+        b"1",
+        std::env::current_dir().unwrap().as_os_str().as_bytes(),
+        value("--producer").as_bytes(),
+        value("--query").as_bytes(),
+        value("--mode").as_bytes(),
+        b"true",
+        value("--rows").as_bytes(),
+        value("--width").as_bytes(),
+        value("--trailing-space").as_bytes(),
+        stdin,
+    ]);
     let mut child = zrush()
-        .arg("plan")
-        .args(extra)
+        .arg("worker")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
-        .expect("spawn zrush plan");
+        .expect("spawn zrush worker");
     child
         .stdin
         .take()
         .expect("stdin")
-        .write_all(stdin)
+        .write_all(&[msg(&[b"hello", b"6"]), req].concat())
         .expect("write stdin");
     let out = child.wait_with_output().expect("wait");
-    (out.status.code().expect("exit code"), out.stdout)
+    let frames = decode_frames(&out.stdout);
+    let response = frames
+        .last()
+        .map(|frame| {
+            let fs = fields(frame);
+            if fs.first().map(Vec::as_slice) == Some(b"ok") {
+                fs.get(2).cloned().unwrap_or_default()
+            } else {
+                Vec::new()
+            }
+        })
+        .unwrap_or_default();
+    (out.status.code().expect("exit code"), response)
 }
 
 /// The full required flag set (cli-protocol.md "起動"); tests override
@@ -117,9 +183,9 @@ fn has_highlight(
 }
 
 #[test]
-fn plan_rejects_negative_width_with_exit_2() {
+fn plan_rejects_negative_width_in_band() {
     let (code, _) = run_plan(&plan_args("compsys", "a", "typo", "10", "-1", "true"), b"");
-    assert_eq!(code, 2);
+    assert_eq!(code, 0);
 }
 
 #[test]
@@ -266,6 +332,73 @@ fn plan_match_highlight_offset_is_non_trivial_for_a_mid_string_match() {
     assert!(has_highlight(&p, wire::Role::Match, 1, 1, 2));
 }
 
+#[test]
+fn worker_handshake_and_multiple_requests_share_one_process() {
+    let cwd = std::env::current_dir().unwrap();
+    let payload = {
+        let mut p = header(&[]);
+        p.extend(word("git"));
+        p
+    };
+    let request = |id: &[u8]| {
+        msg(&[
+            b"plan",
+            id,
+            cwd.as_os_str().as_bytes(),
+            b"compsys",
+            b"",
+            b"typo",
+            b"true",
+            b"10",
+            b"40",
+            b"true",
+            &payload,
+        ])
+    };
+    let mut child = zrush()
+        .arg("worker")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut input = Vec::new();
+    input.extend(msg(&[b"hello", b"6"]));
+    input.extend(request(b"1"));
+    input.extend(request(b"2"));
+    let mut stdin = child.stdin.take().unwrap();
+    for chunk in input.chunks(3) {
+        stdin.write_all(chunk).unwrap();
+    }
+    drop(stdin);
+    let out = child.wait_with_output().unwrap();
+    let frames = decode_frames(&out.stdout);
+    assert_eq!(frames.len(), 3, "ready plus two terminal responses");
+    assert_eq!(fields(&frames[0]), vec![b"ready".to_vec(), b"6".to_vec()]);
+    assert!(fields(&frames[1])[0] == b"ok" && fields(&frames[2])[0] == b"ok");
+}
+
+#[test]
+fn worker_protocol_mismatch_exits_after_incompatible_response() {
+    let mut child = zrush()
+        .arg("worker")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(&msg(&[b"hello", b"5"]))
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(
+        fields(&decode_frames(&out.stdout)[0]),
+        vec![b"incompatible".to_vec(), b"6".to_vec()]
+    );
+}
+
 // ---- zrush config ----
 
 /// Isolated XDG_CONFIG_HOME, removed on drop so runs don't litter TMPDIR.
@@ -317,7 +450,7 @@ fn config_without_file_prints_contract_default_output() {
     let (code, out) = run_config(&dir);
     assert_eq!(code, 0);
     let expected = "\
-typeset -g  ZRUSH_PROTOCOL_VERSION='5'
+typeset -g  ZRUSH_PROTOCOL_VERSION='6'
 typeset -g  ZRUSH_CFG_MAX_LINES='10'
 typeset -g  ZRUSH_CFG_DELAY_MS='30'
 typeset -g  ZRUSH_CFG_MIN_INPUT='0'

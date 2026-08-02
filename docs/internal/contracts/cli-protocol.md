@@ -18,9 +18,9 @@ zrush.zsh(zsh 側)と `zrush` バイナリ(Rust 側)の入出力仕様。
 
 > 検証: 版番号のコピーの一致 — `src/config.rs` のテスト `protocol_version_matches_docs_and_zsh`。
 
-- **PROTOCOL_VERSION = 5**
+- **PROTOCOL_VERSION = 6**
 - `zrush config` の出力に `ZRUSH_PROTOCOL_VERSION` が含まれる。
-  zrush.zsh は自身が期待する版番号と照合し、不一致なら警告を 1 回表示して動作は継続する
+  zrush.zsh は自身が期待する版番号と照合し、不一致なら警告を 1 回表示して zrush を無効化する
   (git pull 後の rebuild し忘れ検知)。
 - 照合の機会を保証するため、zrush.zsh は **source 時に無条件で `zrush config` を 1 回実行**する
   (config.toml の mtime 変化だけをトリガにすると、バイナリのみ更新された場合に照合されない)。
@@ -43,7 +43,7 @@ zrush.zsh(zsh 側)と `zrush` バイナリ(Rust 側)の入出力仕様。
      テスト内の独立したコピーと突き合わせるので、そのコピーも直す。
    直して `cargo test` が green になることを確認する。
 3. ワイヤ形式も変えた場合はゴールデンを再生成する:
-   `UPDATE_GOLDEN=1 cargo test`(`tests/vectors/plan/` の `expected.bin` と `tests/vectors/reject/` の `exit`)、
+   `UPDATE_GOLDEN=1 cargo test`(`tests/vectors/plan/` の worker セッション応答列)、
    `UPDATE_GOLDEN=1 zsh -f tests/zsh/vectors.zsh`(`tests/vectors/encode/` の `expected.bin`)。
    どちらも更新が生じると更新一覧を添えて**わざと失敗する**ので、差分をレビューしてから同じコマンドを再実行し、
    何も更新されない(= green になる)ことを確認する。
@@ -60,80 +60,147 @@ zrush.zsh(zsh 側)と `zrush` バイナリ(Rust 側)の入出力仕様。
 > 検証: 制御バイトを含む候補・値の除外(送信側の保証)のうち「compsys 捕獲 profile」の分 —
 > `tests/vectors/encode/`(`zsh -f tests/zsh/vectors.zsh`)。他の profile の分を固定するテストは無い。
 
-- `zrush` はキー入力・プロンプト表示のたびに都度起動される。常駐しない。
+- 対話シェルごとに `zrush worker` を最大 1 プロセス常駐させ、複数のプラン要求を同じ
+  stdin/stdout セッションで処理する。ワーカーは最初の実要求まで起動しない。
+  `zrush config` だけは設定の読み込みごとに one-shot で起動する。
 - 文字列はバイト列として扱い、エンコーディング変換をしない(ファイル名は任意バイト列であり得る)。
   マッチング・レイアウト計算の内部で lossy な UTF-8 解釈を行うのは構わないが、
   それはオフセット計算(文字数の数え上げ)のためだけに用いる。
   実際に返すバイト列を Rust 側が再エンコードすることはない:
   挿入テキストは由来となった候補語の原バイト列をそのまま保持し、
   表示行テキストは制御バイト→スペース正規化(「表示行の中身」節)だけを施したバイト列を保持する。
-- フレーミングに制御バイト(`\0` `\1` `\2`)を使う箇所(`zrush plan` の stdin)がある。
+- 候補 payload 内部のフレーミングには制御バイト(`\0` `\1` `\2`)を使う。
   これらのバイトを含む候補・値の除外は送信側(zsh)が保証し、
   Rust 側はフィールド内にこれらのバイトが出現しないことを前提としてよい。
-  どの機構が除外を担うかは producer profile が定める。詳細は「`zrush plan`」節。
+  どの機構が除外を担うかは producer profile が定める。詳細は「`zrush worker`」節。
 
 ### 終了コード
 
-> 検証: `zrush plan` が exit 2 / 3 を返す条件 — `tests/vectors/reject/`(ランナーは `tests/vectors.rs`)。
+> 検証: `zrush worker` の in-band エラー応答 — `tests/vectors/plan/`(ランナーは `tests/vectors.rs`)。
 > `--help` の exit 0、未知サブコマンドと `zrush config` への余計な引数の exit 2 — `tests/cli.rs`。
 > exit 1 と、`-h` / `help` サブコマンドを固定するテストは無い。
 
 | コード | 意味 |
 |---|---|
-| 0 | 成功。`zrush config` は設定ファイルの問題があっても既定値と警告を出力して成功する |
-| 1 | 内部エラー(stdin/stdout の I/O 失敗など) |
+| 0 | 成功。worker は frame 境界での stdin EOF、`zrush config` は設定ファイルの問題があっても既定値と警告を出力して成功する |
+| 1 | worker の session-fatal framing/I/O/内部エラー、または `zrush config` の内部エラー |
 | 2 | usage エラー(未知・不足・不正な引数、未知または未指定のサブコマンド) |
-| 3 | `zrush plan` のプロトコルエラー(非空ストリームが NUL で終端していない) |
 
 `--help` / `-h`、および `help` サブコマンドは使用方法を表示して exit 0 する。
 これは人間向けの補助機能であり、zsh がこれらを起動することはない。
+完全で相関可能な plan 要求のエラーは exit code を変えず、`error` 応答で通知する。
 
-## `zrush plan`
+## `zrush worker`
 
 候補列とクエリを受け取り、マッチング・ランキング・グループ分割・グリッドレイアウト・
 ハイライト計算・ナビゲーション表構築・挿入テキスト構築までを行い、
 zsh がそのまま適用できる描画プランを返す。
 
-### 起動
-
-> 検証: 引数の受理(`--producer` は両方の値を通す)— `tests/vectors/plan/`。
-> 引数の拒否(未知の引数・不足・不正値は exit 2)— `tests/vectors/reject/`。
+### 起動と責務
 
 ```
-zrush plan --producer <compsys|history> --query <bytes> --mode <prefix|substring|typo> \
-           --smart-case <true|false> --rows <N> --width <N> --trailing-space <true|false>
+zrush worker
 ```
 
-- `--producer`: stdin に流す payload の由来(producer profile 名)。省略できない。
+引数は取らない。未知の引数は起動前に exit 2 で拒否する。起動後は stdin から要求を読み、
+要求ごとにマッチング・ランキング・グループ分割・グリッドレイアウト・ハイライト計算・
+ナビゲーション表構築・挿入テキスト構築を行って stdout へ応答する。
+one-shot の `zrush plan` サブコマンドは存在しない。
+
+ワーカーは **config.toml を読まない**。設定スナップショットは要求フィールドで受け取る
+(設定の取得・mtime 監視は zsh 側の責務)。`HISTFILE` も読まず、候補 payload 全体を要求ごとに受け取る。
+ただしファイルシステムに対しては純粋でない: `f = 1` 候補の `/` 合成判定だけは要求の `cwd` を基準に stat する。
+
+### セッションフレーミングと握手
+
+stdin/stdout は pty を介さないバイトストリームである。両方向の各メッセージは canonical netstring 1 個で、
+その payload はフィールドを表す canonical netstring の連結である。したがってメッセージは再帰的に netstring で囲む。
+
+```
+netstring = <length> ":" <length bytes of payload> ","
+message   = netstring(netstring(field-1) ... netstring(field-N))
+```
+
+- `length` は payload の**バイト数**を表す非空の ASCII 10 進数。0 は `0`、正数は先頭ゼロなしで表す。
+- payload は NUL・`\1`・`\2`・不正 UTF-8 を含む任意のバイト列であり、エスケープや文字コード変換をしない。
+- 長さの整数オーバーフロー、空または先頭ゼロ付きの長さ、`:` / 末尾 `,` の欠落・不一致、
+  宣言長未満の EOF、外側 payload 内の不完全または余分なフィールドバイトは framing error である。
+- 読み取りの分割位置に意味はない。1 回の read に複数メッセージが含まれる場合、壊れた後続メッセージより前に
+  完成していたメッセージは先に処理し、OS の read 境界によって配送結果を変えない。
+- 候補レコードストリームと描画プランストリームは、それぞれ 1 個の opaque field として入れ子にする。
+  その内側の NUL フレーミングは後述の規範を保つ。
+- kind・版番号・request_id・列挙値・真偽値・数値・error code は、以下に示す ASCII バイト列と
+  完全一致しなければならない。前後空白、符号、別の大小文字表記を許さない。
+
+起動直後、zsh は最初の要求より前に `hello` を送り、worker はその版番号を照合して応答する。
+zsh は kind・フィールド数・版番号が完全一致する `ready` を受けたときだけセッションを利用する。
+
+```
+hello:        ["hello", "6"]
+ready:        ["ready", "6"]
+incompatible: ["incompatible", worker_version]
+```
+
+worker は `hello` の版番号が自身の版と一致しなければ、自身の canonical ASCII 版番号を
+`worker_version` に入れた `incompatible` を 1 個返して終了する。zsh は `incompatible`、版番号の異なる
+`ready`、または握手での別 kind・別フィールド数をプロトコル不一致として扱い、即座に zrush を無効化して
+同じシェル内で代替 worker を起動しない。EOF・I/O エラー・非 canonical framing は worker セッション失敗である。
+worker が受ける `hello` の kind・フィールド数・版番号表記自体が不正な場合は、応答せず終了する。
+
+### 要求と応答
+
+角括弧内は外側 message payload に固定順で並ぶ netstring field を表す。
+
+```
+plan:  ["plan", request_id, cwd, producer, query, mode, smart_case,
+        rows, width, trailing_space, candidate_payload]
+ok:    ["ok", request_id, render_plan]
+error: ["error", request_id, code]
+```
+
+- `request_id`: zsh が所有する `1..=9223372036854775807`(`i64::MAX`)の canonical ASCII 10 進識別子。
+  先頭ゼロを付けない。
+  シェルセッション内で単調増加し、worker の終了・再起動でもリセットまたは再利用しない。
+  候補集合や履歴の revision を表す値ではない。
+- `producer`: `compsys` または `history`。
   結果順に加えてレイアウト方針を選ぶ: `compsys` は最大 8 列・上から下、
   `history` は 1 列・下から上。レコード解釈・ハイライト・挿入テキスト構築は共通である
   (「表示行の中身」「マッチング・ランキングの意味論」節)。
-- `--query`: マッチングに用いるユーザーの as-typed テキスト(NUL 除去済み)。空文字列も有効
+- `query`: マッチングに用いるユーザーの as-typed バイト列(NUL 除去済み)。空も有効
   (空クエリは全候補が最高同点マッチになる)。
   渡す値は producer profile(「compsys 捕獲 profile」「history profile」)が定める。
-- `--mode` / `--smart-case`: マッチング設定のスナップショット(config-schema.md 参照)。
+- `mode` は `prefix` / `substring` / `typo`、`smart_case` は `true` / `false`。
+  マッチング設定のスナップショットであり、
   意味論は後述「マッチング・ランキングの意味論」節。
-- `--rows`: 表示行の最終予算。zsh が `min(max-lines, $LINES - 1)` を計算し、
+- `rows`: 先頭ゼロなしの正の ASCII 10 進数。表示行の最終予算。zsh が `min(max-lines, $LINES - 1)` を計算し、
   1 以上にクランプして渡す(Rust は端末サイズを知らない)。
-- `--width`: 使用可能桁数。zsh が `$COLUMNS - 1` を 1 以上にクランプして渡す。
-- `--trailing-space`: 挿入テキストへ末尾スペースを焼き込むかどうかの指定
+- `width`: 先頭ゼロなしの正の ASCII 10 進数。zsh が `$COLUMNS - 1` を 1 以上にクランプして渡す。
+- `trailing_space`: `true` / `false`。挿入テキストへ末尾スペースを焼き込むかどうかの指定
   (対応する設定は config-schema.md `[insert].trailing-space`)。
   渡す値は producer profile(「compsys 捕獲 profile」「history profile」)が定める。
-- 未知の引数・不正値は exit 2(usage エラー)。
-- `zrush plan` は **config.toml を読まない純関数**として設計する。
-  設定はすべて引数で渡す(設定スナップショットの取得・mtime 監視は zsh 側の責務)。
-  ただし **ファイルシステムに対しては純粋でない**: `-f` 候補の合成 `/` 判定のため、
-  レイアウト確定後に表示位置として採用された `P` 件のうち `f = 1` の候補のみ stat する
-  (グリッドが表示できる容量が stat 対象の上限であり、マッチした候補全件を stat するわけではない。
-  stat パスの構築規則は「挿入テキスト」節)。
-  この stat は起動時のカレントディレクトリを基準に解決するため、
-  `zrush plan` は対話シェルのカレントディレクトリで起動される前提を置く。
+- `cwd`: 要求時点の `$PWD` の生バイト列。`f = 1` 候補の stat パスが相対パスなら、このディレクトリを
+  基準に解決する。worker 自身の起動時 cwd は判定に使わない。絶対 stat パスはそのまま使い、
+  シンボリックリンクは追跡する。`~` は展開しない。cwd または対象パスを stat できない場合は
+  「ディレクトリでない」と扱い、`/` を合成しない。
+- `candidate_payload`: 後述の候補レコードストリーム全体をそのまま格納する opaque bytes。
 
-### stdin(レコードストリーム)
+完全な message から canonical な `request_id` を回収できた後に、kind・フィールド数・列挙値・数値の
+不正を検出した場合、worker は同じ `request_id` の `error` を返してセッションを継続する。
+`code` は `invalid-request`(plan 要求の kind・固定フィールド・scalar 不正)または
+`invalid-payload`(候補レコードストリームの framing error)のいずれかである。
+外側または nested netstring framing の破損、あるいは request_id の欠落・非 canonical 表記・範囲外によって
+安全に対応付けられない場合は応答せずセッションを終了する。
+
+相関可能な各 request は `ok` または `error` の**終端応答をちょうど 1 個**受ける。
+worker は要求を受信順に処理し、応答を黙って省略しない。`error` も正常に形成された終端応答であり、
+worker セッション失敗には数えない。`ok` の `render_plan` は後述の描画プランストリームそのものを格納する。
+
+### `candidate_payload`(候補レコードストリーム)
 
 > 検証(この節と以下の小節): 送信側(zsh のエンコーダ)の発行規範 — `tests/vectors/encode/`(`zsh -f tests/zsh/vectors.zsh`)。
-> 受信側(Rust のパーサ)の解釈規範 — `tests/vectors/plan/`(`tests/vectors.rs`)と `src/record.rs` の proptest(パーサの全域性)。
-> 非空ストリームの NUL 終端欠落 — `tests/vectors/reject/`。
+> worker セッションを通した受信側(Rust のパーサ)の解釈規範と、候補ストリーム framing error の
+> `invalid-payload` 応答 — `tests/vectors/plan/`(`tests/vectors.rs`)。
+> パーサの全域性 — `src/record.rs` の proptest。
 > 「history profile」の送信側規範(イベント番号との対応、重複・制御バイト除外) —
 > `tests/zsh/vectors.zsh`。受信側の解釈は上記のベクタが覆う。
 > 「compsys 捕獲 profile」の transport 側の規範(pid レコードの除去、
@@ -170,7 +237,7 @@ zrush plan --producer <compsys|history> --query <bytes> --mode <prefix|substring
   - `f`(値 `1`): ファイル候補であることを示す。
   - `rd`: チルダ・パラメータ展開済みの実ディレクトリ(ファイル候補の合成 `/` 判定に使う)。
   - `X`: グループ見出し文字列。`J`: グループ名。
-    グループキーの決定規則は stdout「表示行の中身」節。
+    グループキーの決定規則は `render_plan`「表示行の中身」節。
 - 共有フィールドが全て空でも、ヘッダレコードは必ず発行する
   (バッチ境界を一意に識別するため)。
 - 候補レコードを 1 件も発行しないバッチについては、
@@ -220,12 +287,11 @@ zpty 内で compsys を駆動して得る payload(behavior.md「候補収集」�
 - 重複候補(同一の match-text/display-text 組)は除去せずそのまま送ってよい。
 - 制御バイト(`\0` `\1` `\2`)を含む候補・値の除外は fork 内の compadd フックが保証する。
 - ワーカーの pid レコード(`pid\1<pid>\0` としてストリーム先頭に流れる)は、
-  zsh が受信中に取り除いてから `zrush plan` の stdin へ渡す。
+  zsh が受信中に取り除いてから plan 要求の `candidate_payload` へ入れる。
   空語収集キャッシュ(behavior.md)に保存する payload も pid を取り除いた形が契約である。
   Rust 側でのスキップは保険であり、通常の入力では発生しない。
-- `zrush plan` へ渡す引数値: `--producer` は `compsys`、
-  `--query` は広げ規則で削った末尾(behavior.md「候補収集」節)、
-  `--trailing-space` は `[insert].trailing-space` の設定値。
+- plan 要求のフィールド値: `producer` は `compsys`、`query` は広げ規則で削った末尾
+  (behavior.md「候補収集」節)、`trailing_space` は `[insert].trailing-space` の設定値。
 
 #### history profile
 
@@ -239,7 +305,7 @@ zsh が履歴から合成する payload。
   欠番を詰めず、キーをそのまま使う。`m` / `d` は発行しない
   (match-text も番号接頭辞を付ける前のセル表示テキストも `w` そのもの)。
 - 候補レコードは新しい順(最新の履歴行が先頭)。
-  `--producer history` は stdin の出現順を保つため(「マッチング・ランキングの意味論」節)、
+  `producer = history` は `candidate_payload` の出現順を保つため(「マッチング・ランキングの意味論」節)、
   この順序がそのまま位置番号順になり、位置 1 は**マッチした候補のうち最も新しい履歴行**になる
   (クエリにマッチしない履歴行は位置を持たないため、位置 1 が payload の先頭レコードとは限らない。
   クエリが非空でもマッチ品質で並べ替わらない)。
@@ -256,10 +322,10 @@ zsh が履歴から合成する payload。
 - payload の合成は、全履歴の値の一括展開 1 回(履歴の総件数に線形)と、
   走査範囲の処理(その範囲の行数と行長に線形)からなる
   (この payload は同期経路で合成される。behavior.md「履歴メニュー」節)。
-- `zrush plan` へ渡す引数値: `--producer` は `history`、`--query` はバッファ全体(as-typed)、
-  `--trailing-space` は常に `false`(挿入テキストを履歴行の原文と一致させるため)。
+- plan 要求のフィールド値: `producer` は `history`、`query` はバッファ全体(as-typed)、
+  `trailing_space` は常に `false`(挿入テキストを履歴行の原文と一致させるため)。
 
-### stdout(描画プラン)
+### `ok` の `render_plan`(描画プランストリーム)
 
 > 検証(この節と以下の小節。ただし「適用(zsh 側の規範)」を除く):
 > ワイヤ形式とプランの中身 — `tests/vectors/plan/` を、Rust のシリアライザと参照パーサ `src/wire.rs`(`tests/vectors.rs`)、
@@ -330,7 +396,7 @@ NUL(`\0`)終端フィールドの平坦列。数値は ASCII 10 進表記。順�
   受け取ったプランからエントリを再構築することで実現する:
   `pos == 選択位置` の match / history-number エントリをスキップし、
   代わりに選択エントリ(その位置のセル実テキスト範囲 + `selected` スペック)を追加する。
-  プランの再取得・`zrush plan` の再実行は伴わない。
+  プランの再取得・plan 要求の再送は伴わない。
 - match 装飾は match-text をそのまま表示しているセルにのみ発行される
   (display-text 表示セルには発行されない)。
   切り詰め済みセルへのクリップも Rust 側で計算済み。
@@ -412,11 +478,11 @@ NUL(`\0`)終端フィールドの平坦列。数値は ASCII 10 進表記。順�
   (バッチヘッダの共有フィールド + その候補固有の `w`)。
 - `f = 1` かつ連結結果の末尾が `/` でない候補は、`rd` と match-text
   (`m` があれば `m`、なければ `w`)の生バイト列を連結したパスを、
-  `zrush plan` プロセスのカレントディレクトリを基準に、シンボリックリンクを追跡して stat する。
+  plan 要求の `cwd` を基準に、シンボリックリンクを追跡して stat する。
   stat が失敗する場合・対象がディレクトリでない場合は `/` を合成しない。
   この判定はプラン計算時点のスナップショットであり、zsh は確定時に再検証しない
   (該当ディレクトリがプラン計算後に削除・変更されていても、返された挿入テキストをそのまま使う)。
-- 末尾スペースは `--trailing-space true` かつ nospace 条件
+- 末尾スペースは `trailing_space = true` かつ nospace 条件
   (`S` / `s` / `I` のいずれかが非空、または `/` 合成に該当)に該当しないとき、
   この時点で付与済みとして返す。
 
@@ -463,9 +529,9 @@ zsh は一覧を消す。
 
 > 検証: モードの累積性・ティアの序列と literal / approximate グループ分類・smart-case の真偽両方・誤字許容の範囲(候補の接頭辞に対する 1 編集、1 文字クエリでは不適用)・非 UTF-8 バイト列でもマッチすること —
 > `src/matching.rs` の単体テスト(小さなアルファベット上での DP 参照実装との網羅照合を含む)。
-> literal の存在による approximate の抑止・approximate だけが存在する場合の保持・両 producer の結果順・ティア順のソートと同点時の stdin 順保存 — `src/ranking.rs`。
-> `--producer history` がマッチ品質で並べ替えないこと — `src/plan.rs`。
-> プロセス越しの producer ごとの結果順と common-prefix — `tests/cli.rs`。`--producer history` のプラン全体 — `tests/vectors/plan/`。
+> literal の存在による approximate の抑止・approximate だけが存在する場合の保持・両 producer の結果順・ティア順のソートと同点時の candidate payload 順保存 — `src/ranking.rs`。
+> `producer = history` がマッチ品質で並べ替えないこと — `src/plan.rs`。
+> worker セッション越しの producer ごとの結果順と common-prefix — `tests/cli.rs`。`producer = history` のプラン全体 — `tests/vectors/plan/`。
 > 大文字小文字の畳み込みを ASCII に限る規範は、どのテストも固定していない。
 
 - モードは累積的に広がる: `typo` ⊇ `substring` ⊇ `prefix`。
@@ -486,16 +552,16 @@ zsh は一覧を消す。
   - literal のマッチが 1 件以上あれば、prefix と substring のマッチはすべて残し、
     edit と fuzzy のマッチはすべて除外する。
   - literal のマッチが 0 件なら、`mode` が許す edit と fuzzy のマッチを除外せず残す。
-  この規則は `--producer compsys` と `--producer history` の両方に同一に適用する。
+  この規則は `producer = compsys` と `producer = history` の両方に同一に適用する。
   絞り込みを通過した候補のマッチハイライトは各候補のティアから計算し、
   common-prefix は prefix ティアだけから計算する(「common-prefix の意味論」節)。
 - `smart-case = true`: クエリが全て小文字なら大文字小文字を無視、
   大文字を含むなら区別する。`false`: 常に区別しない。
   大文字小文字の畳み込みは **ASCII の範囲のみ**(非 ASCII はバイト安全のため区別される。
   バイト列意味論を保つための意図的制限)。
-- ランキング: 結果順は `--producer` で決まる。
-  - `--producer compsys`: マッチ品質スコアの降順。同点は stdin での出現順(送信側が発行した順)を保つ。
-  - `--producer history`: stdin での出現順をそのまま保つ(マッチ品質で並べ替えない)。
+- ランキング: 結果順は `producer` で決まる。
+  - `producer = compsys`: マッチ品質スコアの降順。同点は candidate payload での出現順(送信側が発行した順)を保つ。
+  - `producer = history`: candidate payload での出現順をそのまま保つ(マッチ品質で並べ替えない)。
     ティアはこのとき「候補を一覧に含めるかの判定(グループ単位の動的な絞り込みを含む)」と
     「ハイライト範囲の計算」にのみ使う。
   どちらの producer でも、ティアに 1 つも該当しない候補は一覧に含めない。
@@ -508,24 +574,31 @@ zsh は一覧を消す。
   同一ティア内の順位付け(語頭・境界で始まる一致の優遇など)は実装詳細とし、
   スコアの数値自体もプロトコルに含まれない。
 
-### エラー時の zsh 側挙動(規範)
+### 応答の検証と zsh 側の適用(規範)
 
 > 検証: プランの受理条件(下記の拒否条件)— `tests/vectors/reject-plan/` を、
 > Rust の参照パーサ `src/wire.rs`(`tests/vectors.rs`)と zsh の `_zrush_parse_plan`(`zsh -f tests/zsh/vectors.zsh`)の双方が拒否することを検査する。
 > 破棄と「セッション内 1 回警告」の実挙動 — `tests/zsh/driver.zsh` のスモークテスト。
 
-- `zrush plan` の exit が非 0(2/3 に限らず、パニック・シグナル死・実行失敗 127 を含む)の場合、
-  zsh 側は出力を破棄して一覧を出さず(既存の一覧は消し)、動作を継続する。
-  警告表示はセッション内で初回のみ(キー入力毎のスパム防止)。
-- exit 0 であっても出力が仕様を満たさない場合
+- zsh は応答の外側/nested netstring、固定フィールド数、kind、canonical な request_id、
+  および request_id が未完了要求の 1 つに対応することを検証する。不正なら worker セッションを壊れたものとして終了する。
+- `error` は相関する要求の正常な終端応答である。その要求の結果を破棄し、それが現在の最新要求なら
+  既存一覧も消す。stale 要求なら UI 状態を変えない。どちらの場合も worker は継続利用する。
+- `ok` の `render_plan` が仕様を満たさない場合
   (最終フィールドの NUL 終端欠落、`L` / `P` / `H` が非負の数字列でない、
   総フィールド数が `4 + L + H + 3P` と一致しない、ハイライト・セル範囲・ナビゲーションの
   各タプルの要素数が不正、`role` が `match` / `heading` / `history-number` 以外、
   位置・ナビゲーション値が `0..P` の範囲外、
   ハイライト範囲・セル実テキスト範囲の `start + len` が listing text の文字数を超える)は、
-  プラン全体を破棄して一覧を消し、
-  非 0 exit の場合と同じ「セッション内 1 回警告」の方針で動作を継続する。
-- `zrush plan` の stderr は端末に流さない(zle 表示を壊さないため。`/dev/null` へ)。
+  プラン全体を破棄して一覧を消し、worker セッションを終了する。
+  同じ session の他の未完了要求も behavior.md「worker ライフサイクル」に従ってすべて破棄する。
+  壊れた success を受理してセッションを継続してはならない。
+- 正常に形成された `ok` / `error` は worker セッションの連続失敗回数を 0 に戻す。
+  `ok` であっても、対応する要求より後の実要求を zsh が既に開始していれば stale なので適用せず捨てる。
+  stale 応答も正常に形成されていれば終端応答として扱い、失敗回数を戻す。
+- worker の stderr は端末に流さない(zle 表示を壊さないため)。`ZRUSH_LOG` が設定されていれば
+  診断をそこへ追記し、未設定なら `/dev/null` へ送る。
+- セッション失敗時の破棄・再起動・無効化・警告は behavior.md「worker ライフサイクル」が定める。
 
 ## zrush config
 
@@ -551,7 +624,7 @@ zrush config
 ### stdout(zsh source 形式)
 
 ```zsh
-typeset -g  ZRUSH_PROTOCOL_VERSION='5'
+typeset -g  ZRUSH_PROTOCOL_VERSION='6'
 typeset -g  ZRUSH_CFG_MAX_LINES='10'
 typeset -g  ZRUSH_CFG_DELAY_MS='30'
 typeset -g  ZRUSH_CFG_MIN_INPUT='0'
@@ -611,11 +684,12 @@ typeset -ga ZRUSH_CFG_WARNINGS=()
 1. source 時: `zrush config` を実行して source、版番号を照合、キーバインドを適用。
 2. プロンプト表示ごと: config.toml の mtime を確認し、変化していれば
    `zrush config` を再実行して source、キーバインドを再適用、警告があれば表示。
-3. 入力変化 → デバウンス → zpty 収集完了後: zsh が pid レコードを取り除いた
-   捕獲 payload をそのまま `zrush plan --producer compsys` の stdin に流す。
-   返った描画プランを POSTDISPLAY / region_highlight に適用する。
+3. 最初の実要求時: `zrush worker` を起動して `hello` / `ready` を交換する。
+4. 入力変化 → デバウンス → zpty 収集完了後: zsh が pid レコードを取り除いた
+   捕獲 payload を `producer = compsys` の plan 要求で worker に送る。
+   対応する `ok` の描画プランを POSTDISPLAY / region_highlight に適用する。
    以降の選択移動・確定は、プラン内のナビゲーション表・セル範囲・挿入テキストの配列引きだけで完結する
-   (`zrush plan` の再実行はしない)。
-4. 非選択での select-prev(既定 ↑): zsh がメモリ上の履歴から payload を合成し、
-   `zrush plan --producer history` を同期実行して、返ったプランを同じように適用する
+   (plan 要求の再送はしない)。
+5. 非選択での select-prev(既定 ↑): zsh がメモリ上の履歴から payload を合成し、
+   `producer = history` の plan 要求と応答を同期交換して、返ったプランを同じように適用する
    (fork も compsys も介さない。behavior.md「履歴メニュー」節)。

@@ -1,13 +1,13 @@
-//! stdin record parser for `zrush plan`.
+//! Candidate-payload record parser for worker plan requests.
 //!
 //! Format and semantics: docs/internal/contracts/cli-protocol.md
-//! ("`zrush plan`" -> "stdin(レコードストリーム)", source of truth). NUL-terminated
+//! ("`zrush worker`" -> "candidate_payload", source of truth). NUL-terminated
 //! records; fields within a record are `\2`-joined `<tag>\1<value>` pairs.
 //! Batch header records (first field tag `b`) carry shared fields that
 //! apply to every candidate record up to the next header; candidate
 //! records (first field tag `w`) carry per-candidate `w`/`m`/`d`/`n`.
 //!
-//! Zero-copy: every value here borrows from the caller's stdin buffer.
+//! Zero-copy: every value here borrows from the request payload.
 //! plan.rs is the consumer.
 
 const REC_SEP: u8 = 0; // \0: terminates a record
@@ -68,20 +68,19 @@ impl<'a> Candidate<'a> {
     }
 }
 
-/// Parsed stdin payload: batch headers and candidates in stream order.
+/// Parsed candidate payload: batch headers and candidates in stream order.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct Parsed<'a> {
     pub batches: Vec<Batch<'a>>,
     pub candidates: Vec<Candidate<'a>>,
 }
 
-/// The only parse error (cli-protocol.md exit code 3): a non-empty stream
-/// whose last byte is not NUL.
+/// The only parse error: a non-empty stream whose last byte is not NUL.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct FramingError;
 
-/// Parse the full stdin buffer per cli-protocol.md. Exit-code mapping for
-/// `FramingError` is plan.rs's job, not this module's.
+/// Parse one complete candidate payload per cli-protocol.md. Mapping a
+/// `FramingError` to the worker response belongs to plan.rs/worker.rs.
 pub(crate) fn parse(input: &[u8]) -> Result<Parsed<'_>, FramingError> {
     // NUL-terminated records: a non-empty stream must end with NUL, and
     // stripping it yields exactly the record list.
