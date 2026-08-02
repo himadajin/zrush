@@ -57,6 +57,23 @@ pub enum Tier {
     Fuzzy,
 }
 
+impl Tier {
+    /// Classify this tier for literal-vs-approximate suppression.
+    pub const fn group(self) -> TierGroup {
+        match self {
+            Self::Prefix | Self::Substring => TierGroup::Literal,
+            Self::Edit | Self::Fuzzy => TierGroup::Approximate,
+        }
+    }
+}
+
+/// Broad match class used when suppressing approximate results.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TierGroup {
+    Literal,
+    Approximate,
+}
+
 /// Match result for one candidate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MatchScore {
@@ -453,6 +470,14 @@ mod tests {
         assert_eq!(tier("doc", "dot-config", Mode::Typo), Some(Tier::Edit));
         // a subsequence not reachable by one edit stays in the fuzzy tier
         assert_eq!(tier("dcf", "dot-config", Mode::Typo), Some(Tier::Fuzzy));
+    }
+
+    #[test]
+    fn tier_classification_separates_literal_and_approximate() {
+        assert_eq!(Tier::Prefix.group(), TierGroup::Literal);
+        assert_eq!(Tier::Substring.group(), TierGroup::Literal);
+        assert_eq!(Tier::Edit.group(), TierGroup::Approximate);
+        assert_eq!(Tier::Fuzzy.group(), TierGroup::Approximate);
     }
 
     #[test]

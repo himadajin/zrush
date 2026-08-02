@@ -165,35 +165,37 @@ fn plan_trailing_space_true_appends_space() {
 }
 
 #[test]
-fn plan_ranking_tiers_and_common_prefix() {
+fn plan_literal_matches_suppress_approximate_and_keep_common_prefix() {
     let mut stdin = header(&[]);
     for w in ["mydocs", "docs", "dot-config", "doc", "xxx"] {
         stdin.extend(word(w));
     }
-    // width=10 == the widest match: gmaxw=10, cols=floor(12/12)=1,
-    // forcing a single column so rows appear in rank order top-to-bottom.
+    // width=10 leaves one column, so rows appear in rank order top-to-bottom.
     let (code, out) = run_plan(
         &plan_args("compsys", "doc", "typo", "10", "10", "false"),
         &stdin,
     );
     assert_eq!(code, 0);
     let p = parse_wire(&out);
-    // prefix-exact(doc) > prefix(docs) > substring(mydocs) > edit(dot-config); xxx excluded.
+    // The literal survivors keep quality order. dot-config is an Edit
+    // match and is explicitly suppressed; xxx matches no tier.
     assert_eq!(p.common_prefix, b"doc");
-    let pad = |w: &str| format!("{w:<10}").into_bytes();
+    let pad = |w: &str| format!("{w:<6}").into_bytes();
+    assert_eq!(p.rows, vec![pad("doc"), pad("docs"), pad("mydocs")]);
     assert_eq!(
-        p.rows,
-        vec![pad("doc"), pad("docs"), pad("mydocs"), pad("dot-config")]
+        p.inserts,
+        vec![b"doc".to_vec(), b"docs".to_vec(), b"mydocs".to_vec()]
     );
+    assert!(!p.inserts.iter().any(|text| text == b"dot-config"));
 }
 
 #[test]
 fn plan_history_producer_keeps_stdin_order() {
     // cli-protocol.md "マッチング・ランキングの意味論": --producer history
-    // keeps the payload's (newest-first) order whatever the match
-    // quality, while --producer compsys ranks the same payload by tier.
+    // keeps the payload's (newest-first) order among literal survivors,
+    // while --producer compsys ranks the same survivors by tier.
     let mut stdin = header(&[]);
-    for w in ["echo xfoo", "unrelated", "foo"] {
+    for w in ["fop", "echo xfoo", "far-out-object", "unrelated", "foo"] {
         stdin.extend(word(w));
     }
     // Even at width=40, history is a single column with position 1 at the
@@ -203,13 +205,16 @@ fn plan_history_producer_keeps_stdin_order() {
         &stdin,
     );
     assert_eq!(code, 0);
-    // "unrelated" matches no tier and is dropped; the rest keep their order.
+    // fop is Edit and far-out-object is Fuzzy; literal matches suppress
+    // both. unrelated matches no tier.
     let plan = parse_wire(&out);
     assert_eq!(
         plan.rows,
         vec![b"foo      ".to_vec(), b"echo xfoo".to_vec()]
     );
     assert_eq!(plan.inserts, vec![b"echo xfoo".to_vec(), b"foo".to_vec()]);
+    assert!(!plan.inserts.iter().any(|text| text == b"fop"));
+    assert!(!plan.inserts.iter().any(|text| text == b"far-out-object"));
 
     let (code, out) = run_plan(
         &plan_args("compsys", "foo", "typo", "10", "9", "false"),
@@ -238,7 +243,7 @@ fn plan_typo_transposition_gti() {
     let p = parse_wire(&out);
     // No prefix-tier match under "gti" -> empty common prefix.
     assert_eq!(p.common_prefix, b"");
-    assert_eq!(p.rows.len(), 2); // "git" and "git-lfs" via the edit tier; "grep" excluded
+    assert_eq!(p.inserts, vec![b"git".to_vec(), b"git-lfs".to_vec()]);
 }
 
 #[test]

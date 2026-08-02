@@ -93,8 +93,11 @@ zsh は zle 統合・compsys 呼び出しによる捕獲・プランの適用
 
 - `zrush plan`(都度起動)が担う。ティア序列は
   **prefix > substring > edit(誤字許容)> fuzzy(部分列)** で、`mode` が
-  どのティアまで拾うかを決める。`smart-case` はクエリが全小文字のとき大小を無視する。
-  意味論の規範は cli-protocol.md。
+  どのティアまで拾うかの上限を決める。prefix / substring は literal、edit / fuzzy は
+  approximate とする。`mode` が許す literal マッチが 1 件以上あれば approximate マッチを
+  すべて除外し、literal マッチがなければ `mode` が許す approximate マッチを残す。
+  この規則は補完一覧と履歴一覧の両方に適用する。`smart-case` はクエリが全小文字のとき大小を無視する。
+  結果順を含む意味論の規範は cli-protocol.md「マッチング・ランキングの意味論」節。
 - common-prefix は prefix 階層マッチのバイト単位 LCP(cli-protocol.md)。
 
 ## 表示
