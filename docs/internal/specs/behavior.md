@@ -39,6 +39,7 @@ zsh は zle 統合・compsys 呼び出しによる捕獲・プランの適用
 - worker の stdin/stdout は pty ではなく専用 pipe へ接続する。zsh は stdout の read fd を `zle -F` で監視し、
   通常の補完 plan 応答を非同期に読む。セッションの nested-netstring 形式と `hello` / `ready` 握手は
   `../contracts/cli-protocol.md` が定める。
+- worker は対話シェルの job table に登録せず、動作中でもシェルの `exit` を妨げない。
 - 通常の補完経路では、worker の cold start と握手を待たない。起動処理は ZLE へ直ちに制御を返し、
   `hello` も outbound queue から nonblocking に送り、残りの送信と `ready` の受信を fd callback / 非同期 retry で進める。
   握手中に生じた plan 要求は `hello` より後ろの outbound queue に置く。
@@ -58,7 +59,7 @@ zsh は zle 統合・compsys 呼び出しによる捕獲・プランの適用
   要求と対応しない応答、仕様を満たさない `ok` の描画プラン、履歴交換の deadline 超過は
   **worker セッション失敗**である。その session に割り当て済みで終端応答のない要求を、partial write 中・
   outbound queue 内・送信済みの区別なくすべて破棄し、既存一覧も消す。いずれも自動 replay しない。
-  worker プロセスが残っていれば終了して回収し、`zle -F` watcher を解除して stdin/stdout pipe fd を閉じ、
+  worker プロセスが残っていれば終了させて消滅を確認し、`zle -F` watcher を解除して stdin/stdout pipe fd を閉じ、
   head-of-line blocking を残さない。この cleanup が完了するまで代替 worker を起動せず、worker を重複させない。
 - 連続 worker セッション失敗回数は、正常に形成された終端 `ok` / `error` を受けたときだけ 0 に戻す。
   握手成功だけでは戻さない。1 回目の失敗後は worker 不在のままにし、**次の実要求**で 1 個だけ代替 worker を
@@ -71,11 +72,11 @@ zsh は zle 統合・compsys 呼び出しによる捕獲・プランの適用
 - worker の起動・通常終了・異常終了・再起動・re-source・無効化を含む全 lifecycle で、zsh が所有する
   内部 fd の操作は対話シェル自身の fd 0 / 1 / 2 の open / closed 状態と接続先を変更しない。
   内部 fd の close error を抑止するときも、その抑止を対話シェルの標準エラーへ恒久適用しない。
-- 同じシェルで zrush.zsh を re-source するときは、既存 worker プロセスを終了して回収し、`zle -F` watcher を解除して
+- 同じシェルで zrush.zsh を re-source するときは、既存 worker プロセスを終了させて消滅を確認し、`zle -F` watcher を解除して
   stdin/stdout pipe fd を閉じてからフックとキーバインドを再構築する。cleanup 中に新旧 worker を重複させない。
   re-source は同じシェルセッションの request_id 単調性・警告済み状態・連続失敗回数・無効化状態を巻き戻さない。
-  `zshexit` でも worker プロセスを終了して回収し、watcher を解除して pipe fd を閉じる。
-  worker が既に終了・回収済みであることはエラーにしない。
+  `zshexit` でも worker プロセスを終了させて消滅を確認し、watcher を解除して pipe fd を閉じる。
+  worker が既に終了していることはエラーにしない。
 
 ## 候補収集
 
@@ -234,7 +235,7 @@ zsh は zle 統合・compsys 呼び出しによる捕獲・プランの適用
   payload 合成に費やす時間はこの deadline に含めない。
 - 同期待ちの間に先行する非同期要求の応答を受けた場合も通常どおり終端まで読み、stale なら破棄して
   対象 request_id を待ち続ける。先行要求の outbound queue 送信と直列処理に費やす時間も同じ deadline を消費する。
-  deadline を要求ごと・write/read ごとに延長しない。超過時は worker プロセスを終了して回収し、
+  deadline を要求ごと・write/read ごとに延長しない。超過時は worker プロセスを終了させて消滅を確認し、
   watcher を解除して pipe fd を閉じてから、その session の未完了要求をすべて破棄する。自動 replay しない
   (連続失敗の扱いは「worker ライフサイクル」)。
 - クエリは `BUFFER` 全体。`min-input` と空バッファ抑止規則は適用しないため、
