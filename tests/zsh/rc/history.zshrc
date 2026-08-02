@@ -56,6 +56,12 @@ _zrt_dump_fds() { _zlog "TESTFDS=timer=$_zrush_timer_fd rfd=$_zrush_rfd wfd=$_zr
 zle -N _zrt-dump-fds _zrt_dump_fds
 bindkey '^Xt' _zrt-dump-fds
 
+# ^Xq: deterministic test-only transport teardown before replacing the private
+# binary. Unlike typing an internal function call, this does not pollute history.
+_zrt_teardown_worker() { _zrush_worker_transport_teardown test }
+zle -N _zrt-teardown-worker _zrt_teardown_worker
+bindkey '^Xq' _zrt-teardown-worker
+
 # ^Xe: the real event number for the newest fixture line. Resolve it lazily
 # in the widget so every `print -s` fixture below has entered `$history`.
 _zrt_dump_newest_event() {

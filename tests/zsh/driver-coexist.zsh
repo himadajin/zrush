@@ -51,12 +51,19 @@ fi
 typeset -gi HAVE_MEMO=0
 is-at-least 5.9 $ZSH_VERSION && HAVE_MEMO=1
 
-typeset -gi PASS=0 FAIL=0
+typeset -gi PASS=0 FAIL=0 SKIP=0
 out() { print -r -u2 -- "$@" }
 ok()  { out "PASS: $1"; (( ++PASS )) }
 ng()  { out "FAIL: $1"; (( ++FAIL )) }
+sk()  { out "SKIP: $1"; (( ++SKIP )) }
 
 typeset -g WORK=$(mktemp -d ${TMPDIR:-/tmp}/zrush-coex.XXXXXX)
+# tmux appends /tmux-UID/socket to TMUX_TMPDIR and Unix-domain socket paths
+# are short. Keep this throwaway root deliberately short even when the
+# requested playground lives under a deep review-artifact directory.
+typeset -g TMUX_SCRATCH=$(mktemp -d /tmp/zt.XXXXXX)
+export TMUX_TMPDIR=$TMUX_SCRATCH
+chmod 700 $TMUX_TMPDIR
 export TERM=xterm-256color
 # POSTDISPLAY passes through ZLE rendering, which escapes UTF-8 bytes as unprintable
 # under the C locale. Explicitly match the UTF-8 locale used in practice.
@@ -353,6 +360,28 @@ basic_flow() {  # $1=label prefix
     fi
 
     basic_flow "(2c)"   # listing + selection + confirmation exercises pre-redraw and wrapped dispatch
+
+    # Re-source while z-sy-h owns wrappers above zrush. The transport and
+    # zrush registrations are rebuilt, but third-party wrappers/predecessors
+    # must remain in the chain.
+    send_line "source $REPO/zsh/zrush.zsh"
+    sync_prompt
+    send_keys 'qqqqxx'
+    if expect '*'$'\e''\[31m*' 8; then
+      ok "(2d) z-sy-h wrapper survives manual zrush re-source"
+    else
+      ng "(2d) highlighting wrapper lost after zrush re-source"
+    fi
+    clear_line
+    drain 0.3
+    basic_flow "(2e)"   # dispatch still reaches both zrush and predecessors
+
+    # Config reload reapplies the current binding set. With z-sy-h's in-place
+    # widget wrappers present, this must allocate/preserve ownership layers
+    # instead of overwriting the wrapper via zle -N.
+    send_line '_zrush_apply_keybinds'
+    sync_prompt
+    basic_flow "(2f)"
   else
     ng "(2) z-sy-h host failed to start"
   fi
@@ -450,8 +479,9 @@ basic_flow() {  # $1=label prefix
     return 1
   }
   local TLOG=$WORK/tmux.log
+  local TMERR=$WORK/tmux-start.err
   tm new-session -d -s coex -x 100 -y 30 \
-    "ZDOTDIR=$ZDOT_MIN XDG_CONFIG_HOME=$WORK/xdg HOME=$PLAYGROUND ZRUSH_REPO=$REPO ZRUSH_TEST_TMP=$WORK/t-tmux ZRUSH_LOG=$TLOG exec zsh -d -i" 2>/dev/null
+    "ZDOTDIR=$ZDOT_MIN XDG_CONFIG_HOME=$WORK/xdg HOME=$PLAYGROUND ZRUSH_REPO=$REPO ZRUSH_TEST_TMP=$WORK/t-tmux ZRUSH_LOG=$TLOG exec zsh -d -i" 2>$TMERR
   if tm_wait '*HP>*' 15; then
     ok "(4) host started inside tmux (TERM=$(tm display-message -p -t coex '#{client_termname}' 2>/dev/null || print '?'))"
     tm send-keys -t coex -l ' print -r -- TERM-INSIDE-$TERM'
@@ -524,15 +554,21 @@ basic_flow() {  # $1=label prefix
       ng "(4a) list not displayed inside tmux"
     fi
   else
-    ng "(4) host failed to start inside tmux: $(tm_cap | tail -3)"
+    local tmerr=$(<$TMERR)
+    if [[ $tmerr == *'Operation not permitted'* ]]; then
+      sk "(4)(8) tmux socket creation denied by the execution sandbox: $tmerr"
+    else
+      ng "(4) host failed to start inside tmux: pane=$(tm_cap | tail -3) start=$tmerr"
+    fi
   fi
   tm kill-server 2>/dev/null
 
-  out "SUMMARY: PASS=$PASS FAIL=$FAIL"
+  out "SUMMARY: PASS=$PASS FAIL=$FAIL SKIP=$SKIP"
 } always {
   local h
   for h in "${(@k)HFD}"; do zpty -d $h 2>/dev/null; done
   $TMUX_BIN -L zrush-coex-$$ kill-server 2>/dev/null
+  [[ -n $TMUX_SCRATCH && $TMUX_SCRATCH == /tmp/zt.* ]] && rm -rf $TMUX_SCRATCH
   [[ -n $WORK && $WORK == */zrush-coex.* ]] && rm -rf $WORK
 }
 (( FAIL == 0 ))

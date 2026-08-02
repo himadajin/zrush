@@ -4,7 +4,7 @@
 # zsh-syntax-highlighting. $ZRUSH_BIN overrides ../target/release/zrush.
 #
 # zsh captures compsys candidates in a forked shell and hands the raw
-# capture stream straight to `zrush plan` (Rust), which performs matching,
+# capture stream to the persistent Rust worker, which performs matching,
 # ranking, grouping, grid layout, highlight/navigation-table computation,
 # and insertion-text construction. This file only captures and applies:
 # it does not parse candidate records, compute layout, or reconstruct
@@ -19,30 +19,50 @@
 typeset -g _zrush_source_dir=${${(%):-%N}:A:h}
 
 # ---------------------------------------------------------------- Re-source teardown
-# Re-sourcing this file is supported, but the `typeset -g` block right below
-# immediately resets fd/zpty/timer identifiers to -1/empty -- if a previous
-# sourcing already completed _zrush_init (_zrush_enabled=1), its live
-# timer/collection/zpty worker/region_highlight entries must be torn down
-# FIRST, using the still-defined functions and still-live values left over
-# from that previous sourcing, or they would be stranded (leaked fds, an
-# orphaned worker, dangling region_highlight entries). On a first-ever
-# sourcing _zrush_enabled is unset, so this is a no-op.
-# Keybind predecessor chains need no action here: they are embedded in each
-# dispatch widget's own function body at bind time (_zrush_bind_one), not
-# read from these globals, so _zrush_apply_keybinds' normal re-application
-# later in _zrush_init already handles them correctly on re-source.
-if (( ${+_zrush_enabled} )) && (( _zrush_enabled )); then
-  (( $+functions[_zrush_disarm_timer] ))      && _zrush_disarm_timer
-  (( $+functions[_zrush_cancel_collection] )) && _zrush_cancel_collection
-  (( $+functions[_zrush_rh_clear] ))          && _zrush_rh_clear
+# This runs while the previous definitions and ledgers are still available.
+# It is intentionally keyed on prior state, not _zrush_enabled: the circuit
+# breaker disables dispatch but leaves registrations that a re-source must undo.
+if (( ${_zrush_installed:-0} || ( ${+_zrush_bound} && $#_zrush_bound ) )); then
+  () {
+    emulate -L zsh
+    local seq w prev cur
+    for seq in "${(@k)_zrush_bound}"; do
+      w=$_zrush_bound[$seq]
+      cur=${${(z)"$(builtin bindkey -M main -- "$seq" 2>/dev/null)"}[2]:-}
+      # Do not overwrite a third-party binding installed above zrush.
+      if [[ $cur == $w && ${widgets[$w]:-} == user:$w ]]; then
+        prev=${_zrush_dsp_prev[$w]:-}
+        builtin bindkey -M main -- "$seq" ${prev:-undefined-key}
+      fi
+    done
+    (( $+functions[add-zle-hook-widget] )) && {
+      add-zle-hook-widget -d line-pre-redraw _zrush-line-pre-redraw 2>/dev/null
+      add-zle-hook-widget -d line-init _zrush-line-init 2>/dev/null
+      add-zle-hook-widget -d line-finish _zrush-line-finish 2>/dev/null
+    }
+    (( $+functions[add-zsh-hook] )) && {
+      add-zsh-hook -d precmd _zrush_precmd 2>/dev/null
+      add-zsh-hook -d zshexit _zrush_zshexit 2>/dev/null
+    }
+    (( $+functions[_zrush_disarm_timer] )) && _zrush_disarm_timer
+    (( $+functions[_zrush_cancel_collection] )) && _zrush_cancel_collection
+    (( $+functions[_zrush_worker_transport_teardown] )) && _zrush_worker_transport_teardown resource
+    (( $+functions[_zrush_rh_clear] )) && _zrush_rh_clear
+  }
 fi
 
 # ---------------------------------------------------------------- Global state
 typeset -g  ZRUSH_BIN=${ZRUSH_BIN:-$_zrush_source_dir/../target/release/zrush}
 typeset -gi _zrush_enabled=0
-typeset -gi _ZRUSH_EXPECTED_PROTO=5
+typeset -gi _ZRUSH_EXPECTED_PROTO=6
 typeset -g  _zrush_cfg_path= _zrush_cfg_mtime=
-typeset -gi _zrush_plan_warned=0 _zrush_proto_warned=0
+# Shell-session state intentionally survives a manual re-source.
+typeset -gi _zrush_request_seq=${_zrush_request_seq:-0}
+typeset -gi _zrush_worker_warned=${_zrush_worker_warned:-0}
+typeset -gi _zrush_proto_warned=${_zrush_proto_warned:-0}
+typeset -gi _zrush_worker_failures=${_zrush_worker_failures:-0}
+typeset -gi _zrush_disabled=${_zrush_disabled:-0}
+typeset -gi _zrush_installed=0
 # Variables this script consumes from `zrush config` output (validation and rollback)
 typeset -ga _ZRUSH_CFG_VARS=(
   ZRUSH_CFG_MAX_LINES ZRUSH_CFG_DELAY_MS ZRUSH_CFG_MIN_INPUT
@@ -53,13 +73,24 @@ typeset -ga _ZRUSH_CFG_VARS=(
 )
 
 # Collection request state
-typeset -g  _zrush_query= _zrush_fuzzy= _zrush_buf= _zrush_pty= _zrush_worker_pid=
+typeset -g  _zrush_query= _zrush_fuzzy= _zrush_buf= _zrush_pty= _zrush_capture_pid=
 typeset -gi _zrush_rfd=-1 _zrush_wfd=-1 _zrush_gen=0 _zrush_timer_fd=-1
 typeset -g  _zrush_pending_buffer=
 typeset -g  _zrush_last_buffer=
 typeset -gi _zrush_last_cursor=-1
 
-# Render plan received from `zrush plan` (cli-protocol.md "stdout(描画プラン)").
+# Persistent Rust worker transport.
+typeset -gi _zrush_worker_rfd=-1 _zrush_worker_wfd=-1 _zrush_worker_retry_fd=-1
+typeset -gi _zrush_worker_drain_fd=-1
+typeset -gi _zrush_worker_pid=-1 _zrush_worker_ready=0
+typeset -g  _zrush_worker_rx= _zrush_worker_tx=
+typeset -gi _zrush_worker_setup_fd=-1 _zrush_worker_setup_pid=-1
+typeset -g  _zrush_worker_setup_req= _zrush_worker_setup_resp=
+typeset -gA _zrush_worker_pending=()
+typeset -gi _zrush_current_request=0
+typeset -gi _zrush_sync_target=0 _zrush_sync_done=0 _zrush_sync_ok=0
+
+# Render plan received from the Rust worker (cli-protocol.md "render_plan").
 # zsh applies these verbatim; it never recomputes layout, offsets, or spans.
 typeset -g  _zrush_plan_text=          # L display-row texts, \n-joined
 typeset -gi _zrush_plan_nlines=0       # L
@@ -87,7 +118,7 @@ typeset -gi _zrush_tab_pending=0   # Tab was pressed before candidates arrived
 # See docs/internal/specs/behavior.md "空語収集キャッシュ".
 # Cache storage is separate from working state and survives across prompts.
 # The stored payload is the raw capture stream (pid record already stripped,
-# cli-protocol.md "候補レコード" / "スキップ規律"), fed to `zrush plan` unparsed
+# cli-protocol.md "候補レコード" / "スキップ規律"), sent to the worker unparsed
 # on a hit; an empty fingerprint means no cache entry.
 typeset -g  _zrush_cc_fp=          # fingerprint at save time
 typeset -gi _zrush_cc_time=0       # save time (EPOCHSECONDS)
@@ -95,8 +126,8 @@ typeset -g  _zrush_cc_payload=
 typeset -gi _ZRUSH_CC_TTL=300      # seconds; catches same-count replacement and is not configurable
 
 # Key bindings (dispatch widget -> predecessor/action)
-typeset -gA _zrush_dsp_prev=() _zrush_bound=()
-typeset -gi _zrush_dsp_n=0
+typeset -gA _zrush_dsp_prev=() _zrush_bound=() _zrush_active_dsp=()
+typeset -gi _zrush_dsp_n=${_zrush_dsp_n:-0}
 
 # ---------------------------------------------------------------- Utilities
 _zlog() { [[ -n $ZRUSH_LOG ]] && print -r -- "[$$ ${EPOCHREALTIME:-0}] $1" >>| $ZRUSH_LOG; return 0 }
@@ -154,10 +185,15 @@ _zrush_load_config() {
     [[ -n $rollback ]] && eval "$rollback"
     return 1
   fi
-  # A version mismatch warns once and does not disable the session.
-  if [[ $ZRUSH_PROTOCOL_VERSION != $_ZRUSH_EXPECTED_PROTO ]] && (( ! _zrush_proto_warned )); then
-    _zrush_warn "protocol version mismatch: zsh expects $_ZRUSH_EXPECTED_PROTO, binary reports $ZRUSH_PROTOCOL_VERSION (rebuild zrush?)"
-    _zrush_proto_warned=1
+  if [[ $ZRUSH_PROTOCOL_VERSION != $_ZRUSH_EXPECTED_PROTO ]]; then
+    if (( ! _zrush_proto_warned )); then
+      _zrush_warn "protocol version mismatch: zsh expects $_ZRUSH_EXPECTED_PROTO, binary reports $ZRUSH_PROTOCOL_VERSION (rebuild zrush?); zrush disabled"
+      _zrush_proto_warned=1
+    fi
+    _zrush_disabled=1
+    _zrush_enabled=0
+    (( $+functions[_zrush_worker_transport_teardown] )) && _zrush_worker_transport_teardown incompatible
+    return 1
   fi
   _zrush_config_mtime
   _zrush_cfg_mtime=$REPLY
@@ -374,7 +410,7 @@ _zrush_capture_entry() {
 }
 
 # Fork body executed by zpty after forking the current shell
-_zrush_worker() {
+_zrush_capture_worker() {
   # Prevent recursive zrush activation.
   typeset -gx ZRUSH_INTERNAL=1
   # Fork hygiene: disable inherited hooks and history writes.
@@ -414,14 +450,14 @@ _zrush_cancel_collection() {
   if [[ -n $_zrush_pty ]]; then
     # SIGINT the worker's real process group to interrupt external-command waits.
     # Before the pid arrives, zpty -d HUP plus EPIPE after pipe closure is the fallback.
-    if [[ $_zrush_worker_pid == <-> ]] && (( _zrush_worker_pid > 1 )); then
-      _zlog "cancel: SIGINT to worker pgid $_zrush_worker_pid"
-      kill -INT -$_zrush_worker_pid 2>/dev/null || kill -INT $_zrush_worker_pid 2>/dev/null
+    if [[ $_zrush_capture_pid == <-> ]] && (( _zrush_capture_pid > 1 )); then
+      _zlog "cancel: SIGINT to capture pgid $_zrush_capture_pid"
+      kill -INT -$_zrush_capture_pid 2>/dev/null || kill -INT $_zrush_capture_pid 2>/dev/null
     fi
     zpty -d $_zrush_pty 2>/dev/null
     _zrush_pty=
   fi
-  _zrush_worker_pid=
+  _zrush_capture_pid=
   _zrush_buf=
 }
 
@@ -504,6 +540,7 @@ _zrush_teardown() {
   _zrush_plan_hl=() _zrush_plan_cells=() _zrush_plan_nav=() _zrush_plan_insert=()
   _zrush_plan_cp=
   _zrush_plan_kind=none
+  _zrush_current_request=0
   return 0
 }
 
@@ -587,8 +624,7 @@ _zrush_start_request() {
 
   # See behavior.md "空語収集キャッシュ". zle -F -w callers require explicit redraw.
   if [[ -z $_zrush_query ]] && _zrush_cc_check; then
-    _zrush_run_plan "$_zrush_cc_payload" compsys "$_zrush_fuzzy" "$ZRUSH_CFG_TRAILING_SPACE"
-    _zrush_settle_plan $?
+    _zrush_request_plan "$_zrush_cc_payload" compsys "$_zrush_fuzzy" "$ZRUSH_CFG_TRAILING_SPACE" || _zrush_teardown
     zle -R
     return 0
   fi
@@ -604,7 +640,7 @@ _zrush_start_request() {
   rm -f $fifo
 
   _zrush_pty=zrush-w$(( ++_zrush_gen ))
-  if ! zpty $_zrush_pty _zrush_worker; then
+  if ! zpty $_zrush_pty _zrush_capture_worker; then
     _zlog "request: zpty create failed"
     _zrush_cancel_collection
     return 1
@@ -627,10 +663,10 @@ _zrush_on_data() {  # zle -F -w handler ($1=fd)
   if (( st == 0 )); then
     _zrush_buf+=$chunk
     # Consume the leading pid-report record.
-    if [[ -z $_zrush_worker_pid && $_zrush_buf == *$'\0'* ]]; then
+    if [[ -z $_zrush_capture_pid && $_zrush_buf == *$'\0'* ]]; then
       local first=${_zrush_buf%%$'\0'*}
       if [[ $first == pid$'\1'<-> ]]; then
-        _zrush_worker_pid=${first#pid$'\1'}
+        _zrush_capture_pid=${first#pid$'\1'}
         _zrush_buf=${_zrush_buf#*$'\0'}
       fi
     fi
@@ -642,7 +678,7 @@ _zrush_on_data() {  # zle -F -w handler ($1=fd)
   _zrush_rfd=-1
   zpty -d $_zrush_pty 2>/dev/null
   _zrush_pty=
-  _zrush_worker_pid=
+  _zrush_capture_pid=
   if (( st == 5 )); then
     _zrush_finalize
     # zle -F -w does not redraw on return. Apply POSTDISPLAY, region_highlight, and
@@ -655,8 +691,8 @@ _zrush_on_data() {  # zle -F -w handler ($1=fd)
   return 0
 }
 
-# Collection payload (pid already stripped) -> `zrush plan`, applied on success.
-# The payload is handed to `zrush plan` unparsed: record parsing, matching,
+# Collection payload (pid already stripped) -> worker request.
+# The payload is handed to Rust unparsed: record parsing, matching,
 # ranking, layout, and highlight/nav/insert construction are all Rust's job
 # (cli-protocol.md). Cache successful empty-word command-position results
 # across prompts (behavior.md "空語収集キャッシュ").
@@ -671,15 +707,14 @@ _zrush_finalize() {
   if [[ -z $_zrush_query && -n $payload ]]; then
     _zrush_cc_save "$payload"
   fi
-  _zrush_run_plan "$payload" compsys "$_zrush_fuzzy" "$ZRUSH_CFG_TRAILING_SPACE"
-  _zrush_settle_plan $?
+  _zrush_request_plan "$payload" compsys "$_zrush_fuzzy" "$ZRUSH_CFG_TRAILING_SPACE" || _zrush_teardown
   return 0
 }
 
-# Apply (or discard, on failure) the plan just fetched by `_zrush_run_plan`,
+# Apply (or discard, on failure) the plan just received from the worker,
 # then resolve a Tab recorded before it arrived. $1=0 on success (state
-# already populated), nonzero on failure. Shared by both `_zrush_run_plan`
-# call sites (fresh collection and cache hit) so the pending-Tab handling
+# already populated), nonzero on failure. Shared by fresh collection and
+# cache-hit responses so the pending-Tab handling
 # in behavior.md "Tab" ("候補未着時の Tab は...結果到着時に上記の挙動を適用する")
 # cannot be forgotten on one path but not the other.
 #
@@ -699,14 +734,501 @@ _zrush_settle_plan() {
   return 0
 }
 
-# ---------------------------------------------------------------- Plan retrieval
-# See docs/internal/contracts/cli-protocol.md "`zrush plan`" and "stdout(描画プラン)".
-# Runs the pure `zrush plan` pipeline over a payload and populates
-# _zrush_plan_* on success. The argument values that differ per producer
-# (query, trailing-space) belong to the producer profile, so the caller that
-# owns the payload passes them in rather than this function guessing.
-_zrush_run_plan() {  # $1=NUL-terminated payload ("" is valid: 0 candidates)
-                     # $2=producer  $3=--query value  $4=--trailing-space value
+# ---------------------------------------------------------------- Worker transport
+_zrush_netstring() {
+  emulate -L zsh
+  local LC_ALL=C data=$1
+  typeset -g REPLY="${#data}:$data,"
+}
+
+# Return 0 with REPLY/REPLY_REST, 1 for incomplete input, or 2 for malformed input.
+_zrush_netstring_take() {
+  emulate -L zsh
+  setopt localoptions extendedglob
+  local LC_ALL=C data=$1 digits payload
+  typeset -g REPLY= REPLY_REST=
+  if [[ $data != *:* ]]; then
+    [[ -z $data || $data == [0-9]# ]] && return 1
+    return 2
+  fi
+  digits=${data%%:*}
+  [[ $digits == 0 || $digits == [1-9][0-9]# ]] || return 2
+  # Reject an unrepresentable declared length lexically, before either the
+  # available-byte comparison or zsh integer conversion can truncate it.
+  _zrush_dec_le_all 9223372036854775807 "$digits" || return 2
+  (( $#digits + 2 <= $#data )) || return 1
+  local -i available=$(( $#data - $#digits - 2 ))
+  _zrush_dec_le_all $available "$digits" || return 1
+  local -i n=$digits start=$(( $#digits + 2 )) comma
+  comma=$(( start + n ))
+  (( comma <= $#data )) || return 1
+  [[ ${data[comma]} == , ]] || return 2
+  payload=${data[start,comma-1]}
+  typeset -g REPLY=$payload REPLY_REST=${data[comma+1,-1]}
+  return 0
+}
+
+_zrush_decode_fields() {
+  emulate -L zsh
+  local data=$1 field rest
+  local -a fields=()
+  while [[ -n $data ]]; do
+    _zrush_netstring_take "$data"
+    (( $? == 0 )) || return 1
+    field=$REPLY rest=$REPLY_REST
+    fields+=( "$field" )
+    data=$rest
+  done
+  typeset -ga reply=( "${(@)fields}" )
+  return 0
+}
+
+_zrush_encode_message() {
+  emulate -L zsh
+  local payload= field
+  for field in "$@"; do
+    _zrush_netstring "$field"
+    payload+=$REPLY
+  done
+  _zrush_netstring "$payload"
+}
+
+_zrush_worker_warn_once() {
+  (( _zrush_worker_warned )) && return 0
+  _zrush_warn "worker transport failed; suppressing further warnings this session"
+  _zrush_worker_warned=1
+}
+
+_zrush_worker_disarm_retry() {
+  if (( _zrush_worker_retry_fd >= 0 )); then
+    zle -F $_zrush_worker_retry_fd 2>/dev/null
+    exec {_zrush_worker_retry_fd}<&- 2>/dev/null
+    _zrush_worker_retry_fd=-1
+  fi
+  if (( _zrush_worker_drain_fd >= 0 )); then
+    zle -F $_zrush_worker_drain_fd 2>/dev/null
+    exec {_zrush_worker_drain_fd}<&- 2>/dev/null
+    _zrush_worker_drain_fd=-1
+  fi
+}
+
+_zrush_worker_terminate_and_reap() {
+  emulate -L zsh
+  local -i pid=$1
+  (( pid > 1 )) || return 0
+  kill -TERM $pid 2>/dev/null
+  if kill -0 $pid 2>/dev/null; then
+    zselect -t 1 2>/dev/null
+    kill -0 $pid 2>/dev/null && kill -KILL $pid 2>/dev/null
+  fi
+  local -i st=0
+  wait $pid 2>/dev/null; st=$?
+  _zlog "worker: reaped pid=$pid status=$st"
+  return 0
+}
+
+_zrush_worker_transport_teardown() {
+  emulate -L zsh
+  setopt localoptions no_bg_nice
+  _zrush_worker_disarm_retry
+  if (( _zrush_worker_setup_fd >= 0 )); then
+    zle -F $_zrush_worker_setup_fd 2>/dev/null
+    exec {_zrush_worker_setup_fd}<&- 2>/dev/null
+    _zrush_worker_setup_fd=-1
+  fi
+  _zrush_worker_terminate_and_reap $_zrush_worker_setup_pid
+  _zrush_worker_setup_pid=-1
+  if [[ -n $_zrush_worker_setup_req || -n $_zrush_worker_setup_resp ]]; then
+    command rm -f "$_zrush_worker_setup_req" "$_zrush_worker_setup_resp" >/dev/null 2>&1 &!
+  fi
+  _zrush_worker_setup_req= _zrush_worker_setup_resp=
+  if (( _zrush_worker_rfd >= 0 )); then
+    zle -F $_zrush_worker_rfd 2>/dev/null
+    exec {_zrush_worker_rfd}<&- 2>/dev/null
+    _zrush_worker_rfd=-1
+  fi
+  if (( _zrush_worker_wfd >= 0 )); then
+    exec {_zrush_worker_wfd}>&- 2>/dev/null
+    _zrush_worker_wfd=-1
+  fi
+  if (( _zrush_worker_pid > 1 )); then
+    _zrush_worker_terminate_and_reap $_zrush_worker_pid
+  fi
+  _zrush_worker_pid=-1
+  _zrush_worker_ready=0
+  _zrush_worker_rx=
+  _zrush_worker_tx=
+  _zrush_worker_pending=()
+  _zrush_current_request=0
+  _zrush_sync_target=0 _zrush_sync_done=0 _zrush_sync_ok=0
+  return 0
+}
+
+_zrush_worker_disable() {
+  emulate -L zsh
+  _zlog "worker: disabling: $1"
+  _zrush_worker_warn_once
+  _zrush_worker_transport_teardown disable
+  _zrush_teardown
+  _zrush_disabled=1
+  _zrush_enabled=0
+}
+
+_zrush_worker_session_fail() {
+  emulate -L zsh
+  local why=$1
+  _zlog "worker: session failure: $why"
+  _zrush_worker_warn_once
+  _zrush_worker_transport_teardown failure
+  _zrush_teardown
+  (( ++_zrush_worker_failures ))
+  if (( _zrush_worker_failures >= 2 )); then
+    _zrush_disabled=1
+    _zrush_enabled=0
+    _zlog "worker: circuit breaker opened"
+  fi
+  return 1
+}
+
+_zrush_worker_start() {
+  emulate -L zsh
+  setopt localoptions no_monitor no_notify no_bg_nice
+  (( !_zrush_disabled )) || return 1
+  (( _zrush_worker_pid > 1 )) && return 0
+  (( _zrush_worker_setup_fd >= 0 )) && return 0
+
+  local base=${TMPDIR:-/tmp}/zrush-worker-$$-$RANDOM
+  _zrush_worker_setup_req=$base.in
+  _zrush_worker_setup_resp=$base.out
+  local fd
+  exec {fd}< <(
+    umask 077
+    if command mkfifo "$_zrush_worker_setup_req" "$_zrush_worker_setup_resp" 2>/dev/null; then
+      print -rn -- 1
+    else
+      print -rn -- 0
+    fi
+  )
+  _zrush_worker_setup_fd=$fd
+  _zrush_worker_setup_pid=$!
+  _zrush_worker_ready=0
+  _zrush_worker_rx= _zrush_worker_tx=
+  _zrush_encode_message hello "$_ZRUSH_EXPECTED_PROTO"
+  _zrush_worker_tx=$REPLY
+  if ! zle -F -w $fd _zrush-worker-on-setup 2>/dev/null; then
+    _zrush_worker_session_fail "setup fd registration failed"
+    return 1
+  fi
+  _zlog "worker: asynchronous pipe setup pid=$_zrush_worker_setup_pid fd=$fd"
+  return 0
+}
+
+_zrush_worker_finish_start() {
+  emulate -L zsh
+  setopt localoptions no_monitor no_notify no_bg_nice
+  local req=$_zrush_worker_setup_req resp=$_zrush_worker_setup_resp
+  local req_anchor resp_anchor child_in child_out
+  if ! sysopen -rw -o cloexec -u req_anchor "$req" ||
+     ! sysopen -r -o cloexec -u child_in "$req" ||
+     ! sysopen -w -o nonblock,cloexec -u _zrush_worker_wfd "$req" ||
+     ! sysopen -rw -o cloexec -u resp_anchor "$resp" ||
+     ! sysopen -r -o nonblock,cloexec -u _zrush_worker_rfd "$resp" ||
+     ! sysopen -w -o cloexec -u child_out "$resp"; then
+    (( ${req_anchor:--1} >= 0 )) && exec {req_anchor}>&- 2>/dev/null
+    (( ${resp_anchor:--1} >= 0 )) && exec {resp_anchor}>&- 2>/dev/null
+    (( ${child_in:--1} >= 0 )) && exec {child_in}<&- 2>/dev/null
+    (( ${child_out:--1} >= 0 )) && exec {child_out}>&- 2>/dev/null
+    (( _zrush_worker_wfd >= 0 )) && exec {_zrush_worker_wfd}>&- 2>/dev/null
+    (( _zrush_worker_rfd >= 0 )) && exec {_zrush_worker_rfd}<&- 2>/dev/null
+    _zrush_worker_wfd=-1 _zrush_worker_rfd=-1
+    return 1
+  fi
+
+  (
+    exec 0<&$child_in 1>&$child_out
+    exec {req_anchor}>&- {resp_anchor}>&- {child_in}<&- {child_out}>&-
+    exec {_zrush_worker_rfd}<&- {_zrush_worker_wfd}>&-
+    exec "$ZRUSH_BIN" worker 2>>| "${ZRUSH_LOG:-/dev/null}"
+  ) &
+  _zrush_worker_pid=$!
+  exec {req_anchor}>&- {resp_anchor}>&- {child_in}<&- {child_out}>&-
+  command rm -f "$req" "$resp" >/dev/null 2>&1 &!
+  _zrush_worker_setup_req= _zrush_worker_setup_resp=
+  if ! zle -F -w $_zrush_worker_rfd _zrush-worker-on-data 2>/dev/null; then
+    _zrush_worker_session_fail "data fd registration failed"
+    return 1
+  fi
+  _zlog "worker: started pid=$_zrush_worker_pid rfd=$_zrush_worker_rfd wfd=$_zrush_worker_wfd"
+  _zrush_worker_flush
+}
+
+_zrush_worker_consume_setup() {
+  emulate -L zsh
+  local signal= st
+  local -i setup_pid=$_zrush_worker_setup_pid
+  sysread -t 0 -i $_zrush_worker_setup_fd signal; st=$?
+  (( st == 0 )) || return 1
+  zle -F $_zrush_worker_setup_fd 2>/dev/null
+  exec {_zrush_worker_setup_fd}<&- 2>/dev/null
+  _zrush_worker_setup_fd=-1 _zrush_worker_setup_pid=-1
+  _zrush_worker_terminate_and_reap $setup_pid
+  [[ $signal == 1 ]] || return 1
+  _zrush_worker_finish_start
+}
+
+_zrush_worker_on_setup() {
+  emulate -L zsh
+  (( $1 == _zrush_worker_setup_fd )) || return 0
+  _zrush_worker_consume_setup_checked
+  return 0
+}
+
+_zrush_worker_consume_setup_checked() {
+  emulate -L zsh
+  local -i failures_before=$_zrush_worker_failures
+  _zrush_worker_consume_setup && return 0
+  (( _zrush_worker_failures != failures_before || _zrush_disabled )) && return 1
+  _zrush_worker_session_fail "pipe setup failed"
+}
+
+_zrush_worker_arm_retry() {
+  (( _zrush_worker_retry_fd < 0 )) || return 0
+  local fd
+  exec {fd}< <( zselect -t 1; print )
+  _zrush_worker_retry_fd=$fd
+  zle -F -w $fd _zrush-worker-on-write 2>/dev/null || {
+    exec {fd}<&-
+    _zrush_worker_retry_fd=-1
+    _zrush_worker_session_fail "write retry fd registration failed"
+    return 1
+  }
+  return 0
+}
+
+_zrush_worker_flush() {
+  emulate -L zsh
+  local LC_ALL=C
+  [[ -n $_zrush_worker_tx ]] || { _zrush_worker_disarm_retry; return 0 }
+  if (( _zrush_worker_wfd < 0 )); then
+    (( _zrush_worker_setup_fd >= 0 )) && return 0
+    return 1
+  fi
+  local -i wrote=0 st
+  local write_errno=
+  syswrite -c wrote -o $_zrush_worker_wfd "$_zrush_worker_tx"
+  st=$? write_errno=$ERRNO
+  (( wrote > 0 )) && _zrush_worker_tx=${_zrush_worker_tx[wrote+1,-1]}
+  if (( st == 0 )); then
+    if [[ -n $_zrush_worker_tx ]]; then
+      _zrush_worker_arm_retry || return 1
+    else
+      _zrush_worker_disarm_retry
+    fi
+    return 0
+  fi
+  if (( st == 2 )) && [[ $write_errno == 11 || $write_errno == 35 ]]; then
+    _zlog "worker: write backpressure errno=$write_errno wrote=$wrote remaining=${#_zrush_worker_tx}"
+    _zrush_worker_arm_retry || return 1
+    return 0
+  fi
+  if (( st == 2 )) && [[ -z $write_errno ]] && (( wrote > 0 )); then
+    _zlog "worker: macOS write backpressure wrote=$wrote remaining=${#_zrush_worker_tx}"
+    _zrush_worker_arm_retry || return 1
+    return 0
+  fi
+  if (( st == 2 )) && [[ -z $write_errno ]] && (( _zrush_worker_pid > 1 )) && \
+     kill -0 $_zrush_worker_pid 2>/dev/null; then
+    _zrush_worker_read async || return 1
+    (( _zrush_worker_wfd >= 0 && _zrush_worker_pid > 1 )) || return 1
+    kill -0 $_zrush_worker_pid 2>/dev/null || {
+      _zrush_worker_session_fail "worker died during zero-progress write"
+      return 1
+    }
+    _zlog "worker: macOS write backpressure wrote=0 remaining=${#_zrush_worker_tx}"
+    _zrush_worker_arm_retry || return 1
+    return 0
+  fi
+  _zrush_worker_session_fail "write error status=$st errno=${write_errno:-unknown} wrote=$wrote"
+}
+
+_zrush_worker_on_write() {
+  emulate -L zsh
+  local -i fd=$1
+  zle -F $fd 2>/dev/null
+  exec {fd}<&- 2>/dev/null
+  (( fd == _zrush_worker_retry_fd )) && _zrush_worker_retry_fd=-1
+  _zrush_worker_flush
+  return 0
+}
+
+_zrush_worker_deadline_expired() {
+  [[ -n $1 ]] && (( EPOCHREALTIME >= $1 ))
+}
+
+_zrush_worker_handle_message() {  # message [absolute-deadline]
+  emulate -L zsh
+  setopt localoptions extendedglob
+  local message=$1 deadline=${2:-}
+  if _zrush_worker_deadline_expired "$deadline"; then
+    _zrush_worker_session_fail "history deadline exceeded request_id=$_zrush_sync_target"
+    return 1
+  fi
+  _zrush_decode_fields "$message" || { _zrush_worker_session_fail "malformed nested response"; return 1 }
+  local -a f=( "${(@)reply}" )
+
+  if (( !_zrush_worker_ready )); then
+    if (( $#f == 2 )) && [[ $f[1] == ready && $f[2] == $_ZRUSH_EXPECTED_PROTO ]]; then
+      _zrush_worker_ready=1
+      _zlog "worker: handshake ready"
+      return 0
+    fi
+    if (( $#f == 2 )) && [[ $f[1] == incompatible ]]; then
+      _zrush_worker_disable "incompatible worker version ${(qqqq)f[2]}"
+      return 1
+    fi
+    _zrush_worker_disable "invalid handshake response"
+    return 1
+  fi
+
+  (( $#f == 3 )) || { _zrush_worker_session_fail "invalid response field count"; return 1 }
+  local kind=$f[1] id=$f[2]
+  [[ $id == [1-9][0-9]# ]] && _zrush_dec_le_all 9223372036854775807 "$id" || {
+    _zrush_worker_session_fail "noncanonical response request_id"
+    return 1
+  }
+  (( ${+_zrush_worker_pending[$id]} )) || {
+    _zrush_worker_session_fail "response for unknown request_id=$id"
+    return 1
+  }
+  local producer=$_zrush_worker_pending[$id]
+
+  if [[ $kind == error ]]; then
+    [[ $f[3] == invalid-request || $f[3] == invalid-payload ]] || {
+      _zrush_worker_session_fail "invalid error code"
+      return 1
+    }
+    if (( id == _zrush_sync_target )) && _zrush_worker_deadline_expired "$deadline"; then
+      _zrush_worker_session_fail "history deadline exceeded request_id=$id"
+      return 1
+    fi
+    unset "_zrush_worker_pending[$id]"
+    _zrush_worker_failures=0
+    if (( id == _zrush_sync_target )); then
+      _zrush_sync_done=1 _zrush_sync_ok=0
+    elif (( id == _zrush_current_request )); then
+      _zrush_teardown
+      zle -R 2>/dev/null
+    fi
+    _zlog "worker: error request_id=$id code=$f[3]"
+    return 0
+  fi
+  [[ $kind == ok ]] || { _zrush_worker_session_fail "invalid response kind"; return 1 }
+
+  local old_text=$_zrush_plan_text old_cp=$_zrush_plan_cp old_kind=$_zrush_plan_kind
+  local -i old_l=$_zrush_plan_nlines old_p=$_zrush_plan_npos
+  local -a old_hl=( "${(@)_zrush_plan_hl}" ) old_cells=( "${(@)_zrush_plan_cells}" )
+  local -a old_nav=( "${(@)_zrush_plan_nav}" ) old_insert=( "${(@)_zrush_plan_insert}" )
+  _zrush_parse_plan "$f[3]" || { _zrush_worker_session_fail "malformed render plan request_id=$id"; return 1 }
+  if (( id == _zrush_sync_target )) && _zrush_worker_deadline_expired "$deadline"; then
+    _zrush_worker_session_fail "history deadline exceeded request_id=$id"
+    return 1
+  fi
+  unset "_zrush_worker_pending[$id]"
+  _zrush_worker_failures=0
+  if (( id == _zrush_sync_target )); then
+    _zrush_plan_kind=$producer
+    _zrush_sync_done=1 _zrush_sync_ok=1
+  elif (( id == _zrush_current_request )); then
+    _zrush_plan_kind=$producer
+    _zrush_settle_plan 0
+    zle -R 2>/dev/null
+  else
+    _zrush_plan_text=$old_text _zrush_plan_nlines=$old_l _zrush_plan_npos=$old_p
+    _zrush_plan_cp=$old_cp _zrush_plan_kind=$old_kind
+    _zrush_plan_hl=( "${(@)old_hl}" ) _zrush_plan_cells=( "${(@)old_cells}" )
+    _zrush_plan_nav=( "${(@)old_nav}" ) _zrush_plan_insert=( "${(@)old_insert}" )
+  fi
+  _zlog "worker: ok request_id=$id producer=$producer"
+  return 0
+}
+
+_zrush_worker_arm_drain() {
+  (( _zrush_worker_drain_fd < 0 )) || return 0
+  local fd
+  exec {fd}< <( zselect -t 1; print )
+  _zrush_worker_drain_fd=$fd
+  zle -F -w $fd _zrush-worker-on-drain 2>/dev/null || {
+    exec {fd}<&-
+    _zrush_worker_drain_fd=-1
+    _zrush_worker_session_fail "read continuation fd registration failed"
+    return 1
+  }
+  return 0
+}
+
+_zrush_worker_read() {  # async | sync [absolute-deadline]
+  emulate -L zsh
+  local mode=${1:-async} deadline=${2:-} chunk= st
+  local -i reads=0 bytes=0 frames=0 got=0
+  while true; do
+    if [[ $mode == sync ]] && _zrush_worker_deadline_expired "$deadline"; then
+      _zrush_worker_session_fail "history deadline exceeded request_id=$_zrush_sync_target"
+      return 1
+    fi
+    if [[ $mode == async ]] && (( frames >= 32 )); then
+      _zrush_worker_arm_drain || return 1
+      return 0
+    fi
+    _zrush_netstring_take "$_zrush_worker_rx"; st=$?
+    if (( st == 0 )); then
+      local message=$REPLY
+      _zrush_worker_rx=$REPLY_REST
+      (( ++frames ))
+      _zrush_worker_handle_message "$message" "$deadline" || return 1
+      continue
+    fi
+    if (( st == 2 )); then
+      _zrush_worker_session_fail "malformed outer response"
+      return 1
+    fi
+    if [[ $mode == async ]] && (( reads >= 4 || bytes >= 32768 )); then
+      return 0
+    fi
+    got=0
+    sysread -c got -t 0 -i $_zrush_worker_rfd chunk; st=$?
+    if (( st == 0 )); then
+      (( ++reads, bytes += got ))
+      _zrush_worker_rx+=$chunk
+      continue
+    fi
+    (( st == 4 )) && return 0
+    if (( st == 5 )); then
+      _zrush_worker_session_fail "unexpected stdout EOF"
+    else
+      _zrush_worker_session_fail "read error status=$st errno=$ERRNO"
+    fi
+    return 1
+  done
+}
+
+_zrush_worker_on_data() {
+  emulate -L zsh
+  (( $1 == _zrush_worker_rfd )) || return 0
+  _zrush_worker_read async
+  return 0
+}
+
+_zrush_worker_on_drain() {
+  emulate -L zsh
+  local -i fd=$1
+  zle -F $fd 2>/dev/null
+  exec {fd}<&- 2>/dev/null
+  (( fd == _zrush_worker_drain_fd )) && _zrush_worker_drain_fd=-1
+  _zrush_worker_read async
+  return 0
+}
+
+_zrush_request_plan() {  # payload producer query trailing-space
   emulate -L zsh
   setopt localoptions typesetsilent no_monitor no_notify
   local payload=$1 producer=$2 query=$3 tspace=$4
@@ -720,28 +1242,27 @@ _zrush_run_plan() {  # $1=NUL-terminated payload ("" is valid: 0 candidates)
   local -i width=$(( COLUMNS - 1 ))
   (( width < 1 )) && width=1
 
-  # `zrush plan` is pure over its arguments and stdin; suppress stderr to protect ZLE.
-  local out
-  out=$(print -rn -- "$payload" | \
-        "$ZRUSH_BIN" plan --producer "$producer" \
-                          --query "$query" --mode "$ZRUSH_CFG_MODE" \
-                          --smart-case "$ZRUSH_CFG_SMART_CASE" \
-                          --rows $rows --width $width \
-                          --trailing-space "$tspace" 2>/dev/null)
-  local -i rc=$?
-  if (( rc == 0 )) && _zrush_parse_plan "$out"; then
-    _zrush_plan_kind=$producer
-    _zlog "plan: ok producer=$producer L=$_zrush_plan_nlines P=$_zrush_plan_npos"
-    return 0
+  (( _zrush_request_seq < 9223372036854775807 )) || {
+    _zrush_worker_disable "request_id exhausted"
+    return 1
+  }
+  local -i id=$(( ++_zrush_request_seq ))
+  _zrush_current_request=$id
+  _zrush_worker_pending[$id]=$producer
+  if (( _zrush_worker_pid <= 1 )); then
+    local -i failures_before=$_zrush_worker_failures
+    if ! _zrush_worker_start; then
+      (( _zrush_worker_failures != failures_before )) || _zrush_worker_session_fail "startup failed"
+      return 1
+    fi
   fi
-  # cli-protocol.md "エラー時の zsh 側挙動": discard, warn once per session; the
-  # caller is responsible for clearing any existing display.
-  if (( ! _zrush_plan_warned )); then
-    _zrush_warn "zrush plan failed or returned a malformed plan; suppressing further warnings this session"
-    _zrush_plan_warned=1
-  fi
-  _zlog "plan: failed (exit=$rc)"
-  return 1
+  _zrush_encode_message plan "$id" "$PWD" "$producer" "$query" \
+    "$ZRUSH_CFG_MODE" "$ZRUSH_CFG_SMART_CASE" "$rows" "$width" "$tspace" "$payload"
+  _zrush_worker_tx+=$REPLY
+  _zlog "worker: queued request_id=$id producer=$producer bytes=${#REPLY}"
+  _zrush_worker_flush || return 1
+  typeset -g REPLY=$id
+  return 0
 }
 
 # Upper-bound check for every non-negative decimal in a plan, without
@@ -764,11 +1285,11 @@ _zrush_dec_le_all() {  # $1=bound, $2.. = values, all matched by <->
   return 0
 }
 
-# Validate and split one `zrush plan` stdout buffer into _zrush_plan_*.
+# Validate and split one render-plan buffer into _zrush_plan_*.
 # Field layout is fixed (cli-protocol.md "stdout(描画プラン)"):
 #   common-prefix, L, P, L rows, H, H "role pos start len", P "start len",
 #   P "next prev left right", P insert texts -- total 4 + L + H + 3P fields.
-_zrush_parse_plan() {  # $1=raw `zrush plan` stdout
+_zrush_parse_plan() {  # $1=raw render-plan bytes
   emulate -L zsh
   local out=$1
   [[ $out == *$'\0' ]] || return 1   # final NUL required (cli-protocol.md)
@@ -919,7 +1440,7 @@ _zrush_apply_highlights() {
 # Event numbers have gaps, so the newest `limit` entries are the first `limit`
 # values -- never a decrement from HISTCMD, and never `fc` output (multi-line
 # entries break its line-oriented format).
-_zrush_history_payload() {  # -> REPLY = payload bytes for `zrush plan` stdin
+_zrush_history_payload() {  # -> REPLY = candidate payload bytes
   emulate -L zsh
   local -i limit=$ZRUSH_CFG_HISTORY_LIMIT
   local -a events=()
@@ -944,6 +1465,50 @@ _zrush_history_payload() {  # -> REPLY = payload bytes for `zrush plan` stdin
   return 0
 }
 
+_zrush_request_plan_sync() {
+  emulate -L zsh
+  local payload=$1 producer=$2 query=$3 tspace=$4
+  local -F deadline=$(( EPOCHREALTIME + 0.100 )) remaining
+  _zrush_request_plan "$payload" "$producer" "$query" "$tspace" || return 1
+  local -i target=$REPLY cs
+  _zrush_sync_target=$target _zrush_sync_done=0 _zrush_sync_ok=0
+  while (( !_zrush_sync_done )); do
+    remaining=$(( deadline - EPOCHREALTIME ))
+    if (( remaining <= 0 )); then
+      _zrush_worker_session_fail "history deadline exceeded request_id=$target"
+      return 1
+    fi
+    cs=$(( remaining * 100 ))
+    (( cs < 1 )) && cs=1
+    if (( _zrush_worker_setup_fd >= 0 )); then
+      local -i select_st
+      zselect -t $cs -r $_zrush_worker_setup_fd >/dev/null 2>&1; select_st=$?
+      if (( EPOCHREALTIME >= deadline )); then
+        _zrush_worker_session_fail "history deadline exceeded request_id=$target"
+        return 1
+      fi
+      (( select_st == 0 )) || continue
+      _zrush_worker_consume_setup_checked || return 1
+      continue
+    fi
+    if [[ -n $_zrush_worker_tx ]]; then
+      zselect -t $cs -r $_zrush_worker_rfd -w $_zrush_worker_wfd >/dev/null 2>&1
+      _zrush_worker_flush || return 1
+    else
+      zselect -t $cs -r $_zrush_worker_rfd >/dev/null 2>&1
+    fi
+    if (( EPOCHREALTIME >= deadline )); then
+      _zrush_worker_session_fail "history deadline exceeded request_id=$target"
+      return 1
+    fi
+    (( _zrush_worker_rfd >= 0 )) || return 1
+    _zrush_worker_read sync "$deadline" || return 1
+  done
+  local -i ok=$_zrush_sync_ok
+  _zrush_sync_target=0 _zrush_sync_done=0 _zrush_sync_ok=0
+  (( ok ))
+}
+
 # The one indivisible transition that opens the history menu: stop everything
 # in flight, drop the current listing, then synthesize, plan, show and select
 # position 1 in one go. Zero matches and a failed plan both leave the buffer
@@ -962,7 +1527,7 @@ _zrush_open_history_menu() {  # ZLE widget context
   _zrush_history_payload
   # cli-protocol.md "history profile": the whole buffer is the query (the
   # sender strips NUL from --query) and trailing-space is always false.
-  if _zrush_run_plan "$REPLY" history "${BUFFER//$'\0'/}" false && (( _zrush_plan_npos > 0 )); then
+  if _zrush_request_plan_sync "$REPLY" history "${BUFFER//$'\0'/}" false && (( _zrush_plan_npos > 0 )); then
     _zrush_selected=1
     _zrush_apply_plan
     _zlog "history: menu opened P=$_zrush_plan_npos"
@@ -1013,6 +1578,11 @@ _zrush_line_pre_redraw() {
   [[ $BUFFER == "$_zrush_last_buffer" ]] && (( CURSOR == _zrush_last_cursor )) && return 0
   _zrush_last_buffer=$BUFFER
   _zrush_last_cursor=$CURSOR
+  # The previous async request stops being eligible immediately. Waiting for
+  # the next debounce/capture to assign a new id leaves a window where its
+  # delayed response could settle against the new buffer and consume a Tab
+  # intended for that newer query.
+  _zrush_current_request=0
   # Reaching here means the change came from something other than a zrush
   # action (every zrush action tears the listing down itself, leaving kind
   # `none`), so a history menu goes away whole -- listing text included --
@@ -1077,7 +1647,7 @@ _zrush_line_finish() {
 # See docs/internal/specs/behavior.md "確定(挿入)" and cli-protocol.md "適用".
 # The insertion text (IPREFIX+ipre+apre+hpre+word+hsuf+asuf+isuf, `-f`
 # directory '/' synthesis, trailing-space) is already fully built by
-# `zrush plan`; this only computes the replacement boundary and swaps it in.
+# the worker; this only computes the replacement boundary and swaps it in.
 _zrush_confirm_pos() {  # $1=one-based position into _zrush_plan_insert
   emulate -L zsh
   local -i pos=$1
@@ -1322,9 +1892,13 @@ _zrush_action_tab() {
   return 0
 }
 
-_zrush_dispatch() {  # $1=action $2=predecessor widget name embedded at binding time
+_zrush_dispatch() {  # $1=action $2=predecessor $3=dispatcher name
   emulate -L zsh
   _zrush_dispatch_prev=${2:-}
+  if (( !_zrush_enabled || _zrush_disabled || ! ${+_zrush_active_dsp[${3:-}]} )); then
+    _zrush_call_prev
+    return 0
+  fi
   case ${1:-} in
     select-next)  _zrush_action_next ;;
     select-prev)  _zrush_action_prev ;;
@@ -1368,19 +1942,16 @@ _zrush_bind_one() {  # $1=action $2=key sequence in bindkey notation or raw form
   emulate -L zsh
   local action=$1 seq=$2
   local cur=${${(z)"$(builtin bindkey -M main -- "$seq" 2>/dev/null)"}[2]:-}
-  local prev=
-  if [[ $cur == _zrush-dsp-* ]]; then
-    prev=${_zrush_dsp_prev[$cur]:-}
-  elif [[ -n $cur && $cur != undefined-key ]]; then
-    prev=$cur
-  fi
-  local wname=${_zrush_bound[$seq]:-}
-  if [[ -z $wname ]]; then
+  local prev= wname=${_zrush_bound[$seq]:-}
+  if [[ -n $wname && $cur == $wname && ${widgets[$wname]:-} == user:$wname ]]; then
+    prev=${_zrush_dsp_prev[$wname]:-}
+  else
+    [[ -n $cur && $cur != undefined-key ]] && prev=$cur
     wname=_zrush-dsp-$(( ++_zrush_dsp_n ))
   fi
   _zrush_dsp_prev[$wname]=$prev      # ledger for restoration and self-capture detection
   # Embed action and predecessor in the function body to tolerate widget wrappers; see above.
-  functions[$wname]="_zrush_dispatch ${(q)action} ${(q)prev}"
+  functions[$wname]="_zrush_dispatch ${(q)action} ${(q)prev} ${(q)wname}"
   zle -N $wname
   builtin bindkey -M main -- "$seq" $wname
   _zrush_new_bound[$seq]=$wname
@@ -1422,12 +1993,19 @@ _zrush_apply_keybinds() {
   for seq in "${(@k)_zrush_bound}"; do
     if [[ -z ${_zrush_new_bound[$seq]:-} ]]; then
       w=${_zrush_bound[$seq]}
-      p=${_zrush_dsp_prev[$w]:-}
-      builtin bindkey -M main -- "$seq" ${p:-undefined-key}
-      _zlog "keybinds: restored ${(qqqq)seq} -> ${p:-undefined-key}"
+      local cur=${${(z)"$(builtin bindkey -M main -- "$seq" 2>/dev/null)"}[2]:-}
+      if [[ $cur == $w && ${widgets[$w]:-} == user:$w ]]; then
+        p=${_zrush_dsp_prev[$w]:-}
+        builtin bindkey -M main -- "$seq" ${p:-undefined-key}
+        _zlog "keybinds: restored ${(qqqq)seq} -> ${p:-undefined-key}"
+      fi
     fi
   done
   typeset -gA _zrush_bound=( "${(@kv)_zrush_new_bound}" )
+  typeset -gA _zrush_active_dsp=()
+  for w in "${(@v)_zrush_bound}"; do
+    _zrush_active_dsp[$w]=1
+  done
   unset _zrush_new_bound
   return 0
 }
@@ -1436,12 +2014,13 @@ _zrush_apply_keybinds() {
 _zrush_zshexit() {
   emulate -L zsh
   # ZLE is inactive here; leave it untouched and reliably close only fds and zpty.
+  _zrush_worker_transport_teardown exit
   (( _zrush_timer_fd >= 0 )) && { exec {_zrush_timer_fd}<&- 2>/dev/null; _zrush_timer_fd=-1 }
   if (( _zrush_rfd >= 0 )); then exec {_zrush_rfd}<&-; _zrush_rfd=-1; fi
   if (( _zrush_wfd >= 0 )); then exec {_zrush_wfd}>&-; _zrush_wfd=-1; fi
   if [[ -n $_zrush_pty ]]; then
-    if [[ $_zrush_worker_pid == <-> ]] && (( _zrush_worker_pid > 1 )); then
-      kill -INT -$_zrush_worker_pid 2>/dev/null || kill -INT $_zrush_worker_pid 2>/dev/null
+    if [[ $_zrush_capture_pid == <-> ]] && (( _zrush_capture_pid > 1 )); then
+      kill -INT -$_zrush_capture_pid 2>/dev/null || kill -INT $_zrush_capture_pid 2>/dev/null
     fi
     zpty -d $_zrush_pty 2>/dev/null
     _zrush_pty=
@@ -1475,9 +2054,10 @@ _zrush_init() {
   _zrush_config_path
   # Always load config once at source time to guarantee protocol-version comparison.
   if ! _zrush_load_config initial; then
-    _zrush_warn "initial 'zrush config' failed; zrush disabled"
+    (( _zrush_disabled )) || _zrush_warn "initial 'zrush config' failed; zrush disabled"
     return 1
   fi
+  (( _zrush_disabled )) && return 1
 
   # Detect compinit via _main_complete, including setups delegated to zsh-autocomplete.
   if (( ! $+functions[_main_complete] )); then
@@ -1487,6 +2067,10 @@ _zrush_init() {
   # Register widgets; _zrush-capture-* are invoked only inside the fork.
   zle -N _zrush-on-data _zrush_on_data
   zle -N _zrush-timer-fire _zrush_timer_fire
+  zle -N _zrush-worker-on-data _zrush_worker_on_data
+  zle -N _zrush-worker-on-write _zrush_worker_on_write
+  zle -N _zrush-worker-on-drain _zrush_worker_on_drain
+  zle -N _zrush-worker-on-setup _zrush_worker_on_setup
   zle -N _zrush-capture-entry _zrush_capture_entry
   zle -C _zrush-capture-comp list-choices _zrush_capture_complete
   zle -N _zrush-line-pre-redraw _zrush_line_pre_redraw
@@ -1504,6 +2088,7 @@ _zrush_init() {
   _zrush_apply_keybinds
 
   _zrush_enabled=1
+  _zrush_installed=1
   _zlog "init: enabled (bin=$ZRUSH_BIN proto=$ZRUSH_PROTOCOL_VERSION)"
   return 0
 }

@@ -4,6 +4,8 @@
 # Usage: zsh -f tests/zsh/driver-latency.zsh <playground-dir>
 #   Prerequisite: cargo build --release completed. Use a real-terminal TERM
 #   (xterm-256color), because zsh-autocomplete skips initialization under vt100.
+#   ZRUSH_LATENCY_TRIALS=N bounds every case to N attempts (default 4); CI or
+#   review runs may use 1 so an unavailable optional comparison stays bounded.
 #
 # Hosts:
 #   min-zrush     zsh -d -i + isolated minimal.zshrc
@@ -19,13 +21,12 @@
 #   first-paint: elapsed time from key sequence to expected pty text after stripping
 #                SGR, with roughly 10ms zselect resolution
 #   breakdown  : ZRUSH_LOG intervals, keyed off zsh's own _zlog checkpoints
-#                (cli-protocol.md / zsh/zrush.zsh -- matching, ranking, grid
-#                layout, and highlight/nav-table construction all happen in
-#                Rust inside the single `zrush plan` external call, so the
-#                breakdown has one "plan" bucket (the whole `zrush plan`
-#                round trip) followed by a thin "apply" bucket (zsh copying
-#                the already-built plan into POSTDISPLAY/region_highlight)):
-#                arm (last key) -> request -> fork -> compsys -> transport -> plan -> apply
+#                matching, ranking, layout, and render-plan construction happen
+#                in the persistent Rust worker. The worker-roundtrip bucket
+#                starts after capture transport completes; there is deliberately
+#                no per-plan Rust process-spawn bucket:
+#                arm -> request -> capture-start -> compsys -> capture-transport
+#                    -> worker-roundtrip+apply
 emulate -L zsh
 setopt extended_glob
 zmodload zsh/zpty    || { print -u2 FATAL: zpty; exit 1 }
@@ -117,7 +118,7 @@ median() {
 fmt() { [[ $1 == NA ]] && print -rn NA || printf '%.0f' $1 }
 
 paint_case() {  # $1=host-label $2=case-label $3=keys $4=pattern [$5=trials]
-  local -i trials=${5:-4}
+  local -i trials=${5:-${ZRUSH_LATENCY_TRIALS:-4}}
   local -a ms=()
   local -i i
   for (( i = 1; i <= trials; ++i )); do
@@ -145,14 +146,11 @@ breakdown_last() {  # $1=logfile $2=number of leading lines to skip -> one table
     [[ $L[i] == *" plan: applied "* ]] && { ir=i; break }
   done
   (( ir )) || { out "WARN: breakdown: 'plan: applied' line not found"; return 1 }
-  local -F t_apply t_plan t_xfer t_comp t_fork t_req t_arm
-  t_apply=0; t_plan=0; t_xfer=0; t_comp=0; t_fork=0; t_req=0; t_arm=0
+  local -F t_apply t_xfer t_comp t_fork t_req t_arm
+  t_apply=0; t_xfer=0; t_comp=0; t_fork=0; t_req=0; t_arm=0
   ts_of $L[ir]; t_apply=$REPLY
   for (( i = ir - 1; i >= 1; --i )); do
     case $L[i] in
-      # `zrush plan` does matching/ranking/layout/highlights/nav/insert in one
-      # external call, so all of that shows up as a single "plan: ok" line.
-      *" plan: ok "*)                (( t_plan == 0 ))  && { ts_of $L[i]; t_plan=$REPLY } ;;
       *" finalize: "*" bytes"*)      (( t_xfer == 0 ))  && { ts_of $L[i]; t_xfer=$REPLY } ;;
       *" fork: _main_complete "*)    (( t_comp == 0 ))  && { ts_of $L[i]; t_comp=$REPLY } ;;
       *" fork: start "*)             (( t_fork == 0 ))  && { ts_of $L[i]; t_fork=$REPLY } ;;
@@ -160,14 +158,13 @@ breakdown_last() {  # $1=logfile $2=number of leading lines to skip -> one table
       *" MEAS-arm"*)                 (( t_req != 0 )) && { ts_of $L[i]; t_arm=$REPLY; break } ;;
     esac
   done
-  (( t_arm && t_req && t_fork && t_comp && t_xfer && t_plan )) || { out "WARN: breakdown: incomplete chain"; return 1 }
-  printf 'BREAK | debounce=%4.0f | spawn=%4.0f | compsys=%5.0f | transport=%4.0f | plan=%4.0f | apply=%4.0f | total(arm→apply)=%5.0f ms\n' \
+  (( t_arm && t_req && t_fork && t_comp && t_xfer )) || { out "WARN: breakdown: incomplete chain"; return 1 }
+  printf 'BREAK | debounce=%4.0f | capture-start=%4.0f | compsys=%5.0f | capture-transport=%4.0f | worker-roundtrip+apply=%4.0f | total(arm→apply)=%5.0f ms\n' \
     $(( (t_req - t_arm) * 1000 )) \
     $(( (t_fork - t_req) * 1000 )) \
     $(( (t_comp - t_fork) * 1000 )) \
     $(( (t_xfer - t_comp) * 1000 )) \
-    $(( (t_plan - t_xfer) * 1000 )) \
-    $(( (t_apply - t_plan) * 1000 )) \
+    $(( (t_apply - t_xfer) * 1000 )) \
     $(( (t_apply - t_arm) * 1000 )) >&2
   return 0
 }
@@ -182,7 +179,7 @@ paint_break_case() {  # $1=host-label $2=case-label $3=keys $4=pattern
   return 0
 }
 
-# Cache-hit breakdown: arm -> request -> cache hit -> plan -> apply
+# Cache-hit breakdown: arm -> request -> cache hit -> worker roundtrip + apply
 breakdown_hit_last() {  # $1=logfile $2=number of leading lines to skip
   local -a L=( ${(f)"$(<$1)"} )
   L=( "${(@)L[$(( $2 + 1 )),-1]}" )
@@ -191,24 +188,22 @@ breakdown_hit_last() {  # $1=logfile $2=number of leading lines to skip
     [[ $L[i] == *" plan: applied "* ]] && { ir=i; break }
   done
   (( ir )) || { out "WARN: breakdown-hit: 'plan: applied' line not found"; return 1 }
-  local -F t_apply t_plan t_hit t_req t_arm
-  t_apply=0; t_plan=0; t_hit=0; t_req=0; t_arm=0
+  local -F t_apply t_hit t_req t_arm
+  t_apply=0; t_hit=0; t_req=0; t_arm=0
   ts_of $L[ir]; t_apply=$REPLY
   for (( i = ir - 1; i >= 1; --i )); do
     case $L[i] in
-      *" plan: ok "*)         (( t_plan == 0 )) && { ts_of $L[i]; t_plan=$REPLY } ;;
       *" cache: hit"*)        (( t_hit == 0 ))  && { ts_of $L[i]; t_hit=$REPLY } ;;
       *" request: widened"*)  (( t_req == 0 ))  && { ts_of $L[i]; t_req=$REPLY } ;;
       *" MEAS-arm"*)          (( t_req != 0 )) && { ts_of $L[i]; t_arm=$REPLY; break } ;;
     esac
   done
-  (( t_arm && t_req && t_hit && t_plan )) || \
+  (( t_arm && t_req && t_hit )) || \
     { out "WARN: breakdown-hit: incomplete chain (cache miss?)"; return 1 }
-  printf 'BREAK | debounce=%4.0f | cache-check=%4.0f | plan=%4.0f | apply=%4.0f | total(arm→apply)=%5.0f ms\n' \
+  printf 'BREAK | debounce=%4.0f | cache-check=%4.0f | worker-roundtrip+apply=%4.0f | total(arm→apply)=%5.0f ms\n' \
     $(( (t_req - t_arm) * 1000 )) \
     $(( (t_hit - t_req) * 1000 )) \
-    $(( (t_plan - t_hit) * 1000 )) \
-    $(( (t_apply - t_plan) * 1000 )) \
+    $(( (t_apply - t_hit) * 1000 )) \
     $(( (t_apply - t_arm) * 1000 )) >&2
   return 0
 }
@@ -326,7 +321,7 @@ paint_history_once() {  # $1=pattern $2=timeout -> REPLY=ms (NA if not reached)
 }
 
 paint_history_case() {  # $1=host-label $2=case-label $3=pattern [$4=trials]
-  local -i trials=${4:-4}
+  local -i trials=${4:-${ZRUSH_LATENCY_TRIALS:-4}}
   local -a ms=()
   local -i i
   for (( i = 1; i <= trials; ++i )); do
