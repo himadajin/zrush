@@ -42,6 +42,12 @@ Commit messages additionally follow [Conventional Commits](https://www.conventio
 (e.g. `docs: update config schema`, `feat(match): add typo-tolerant matching`, `fix(zle): clear listing on accept-line`).
 Bodies may be English or Japanese.
 
+Issue bodies must be self-contained for a reader who was not part of the conversation that spawned them:
+open with one or two paragraphs stating the current state, the change or decision being made, and the reason, before any detail.
+Do not use vocabulary or references that only made sense in that conversation; reference other issues as `#N` plus a short description.
+Numbers used as evidence come with the measurement environment and reproduction steps.
+Templates under `.github/ISSUE_TEMPLATE/` mirror these rules; only the opening paragraphs are mandatory — the other sections are guidance to keep or drop.
+
 ## Core principles
 
 Details live in `docs/internal/specs/`; these are the invariants:
