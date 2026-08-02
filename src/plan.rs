@@ -3,8 +3,9 @@
 //!
 //! Pipeline: record::parse -> matching::QueryMatcher (score every parsed
 //! candidate + common-prefix over the *untruncated* prefix-tier matches)
-//! -> ranking::rank (using the producer's ordering and absolute layout
-//! capacity: rows*8 for compsys, rows for history)
+//! -> ranking::rank (suppress approximate tiers when a literal exists,
+//! then use the producer's ordering and absolute layout capacity: rows*8
+//! for compsys, rows for history)
 //! -> matching::QueryMatcher::spans (only for the ranked subset) ->
 //! layout::build (the producer's grid direction/column cap plus shared
 //! grouping/highlights/nav, further truncated to the real per-group row
@@ -524,7 +525,7 @@ mod tests {
     }
 
     #[test]
-    fn ranking_tiers_and_common_prefix() {
+    fn literal_matches_suppress_approximate_for_compsys_and_keep_common_prefix() {
         let stdin = {
             let mut s = header(&[]);
             for w in ["mydocs", "docs", "dot-config", "doc", "xxx"] {
@@ -532,18 +533,66 @@ mod tests {
             }
             s
         };
-        // width=10 == the widest match ("dot-config"): gmaxw=10,
-        // cols=floor(12/12)=1, forcing a single column so rows appear
-        // in rank order top-to-bottom (each padded to width 10).
+        // width=10 leaves one column, so rows appear in rank order
+        // top-to-bottom (each padded to the surviving gmaxw of 6).
         let out = run(&params("doc", Mode::Typo, 10, 10, false), &stdin, &no_dir).unwrap();
         let p = parse_wire(&out);
         assert_eq!(p.common_prefix, b"doc");
-        // prefix-exact(doc) > prefix(docs) > substring(mydocs) > edit(dot-config); xxx excluded.
-        let pad = |w: &str| format!("{w:<10}").into_bytes();
+        // The literal survivors retain their quality order; dot-config is
+        // an Edit match and is explicitly suppressed rather than ranked
+        // below them. xxx matches no tier.
+        let pad = |w: &str| format!("{w:<6}").into_bytes();
+        assert_eq!(p.rows, vec![pad("doc"), pad("docs"), pad("mydocs")]);
         assert_eq!(
-            p.rows,
-            vec![pad("doc"), pad("docs"), pad("mydocs"), pad("dot-config")]
+            p.inserts,
+            vec![b"doc".to_vec(), b"docs".to_vec(), b"mydocs".to_vec()]
         );
+        assert!(!p.inserts.iter().any(|text| text == b"dot-config"));
+    }
+
+    #[test]
+    fn approximate_only_typo_rescue_is_preserved_for_compsys() {
+        let mut stdin = header(&[]);
+        for w in ["git", "grep", "git-lfs"] {
+            stdin.extend(word(w));
+        }
+
+        let out = run(&params("gti", Mode::Typo, 10, 8, false), &stdin, &no_dir).unwrap();
+        let p = parse_wire(&out);
+        assert_eq!(p.common_prefix, b"");
+        assert_eq!(p.inserts, vec![b"git".to_vec(), b"git-lfs".to_vec()]);
+    }
+
+    #[test]
+    fn late_literal_suppresses_approximates_before_the_coarse_capacity_cap() {
+        let mut stdin = header(&[]);
+        // rows=1 gives compsys a coarse capacity of 8. These eight Edit
+        // matches would fill it if ranking truncated before suppression.
+        for n in 0..8 {
+            stdin.extend(word(&format!("dot{n}")));
+        }
+        // The only literal match deliberately arrives beyond that capacity.
+        stdin.extend(word("doc"));
+
+        let out = run(&params("doc", Mode::Typo, 1, 10, false), &stdin, &no_dir).unwrap();
+        let p = parse_wire(&out);
+        assert_eq!(p.common_prefix, b"doc");
+        assert_eq!(p.inserts, vec![b"doc".to_vec()]);
+    }
+
+    #[test]
+    fn substring_alone_suppresses_approximate_matches() {
+        let mut stdin = header(&[]);
+        // fop is Edit, far-out-object is Fuzzy, and echo foo is the only
+        // literal match (Substring rather than Prefix).
+        for w in ["fop", "far-out-object", "echo foo"] {
+            stdin.extend(word(w));
+        }
+
+        let out = run(&params("foo", Mode::Typo, 10, 40, false), &stdin, &no_dir).unwrap();
+        let p = parse_wire(&out);
+        assert_eq!(p.common_prefix, b"");
+        assert_eq!(p.inserts, vec![b"echo foo".to_vec()]);
     }
 
     #[test]
@@ -680,11 +729,10 @@ mod tests {
     #[test]
     fn history_order_keeps_stdin_order_regardless_of_match_quality() {
         // cli-protocol.md "--producer history": the payload is newest
-        // first and that order survives verbatim, so position 1 is the
-        // newest *matching* history line even though the older candidate
-        // is the better (prefix-tier) match.
+        // first. Approximate candidates are suppressed when literals exist,
+        // while the surviving literal candidates keep that payload order.
         let mut stdin = header(&[]);
-        for w in ["echo xfoo", "unrelated", "foo"] {
+        for w in ["fop", "echo xfoo", "far-out-object", "unrelated", "foo"] {
             stdin.extend(word(w));
         }
         // A wide terminal could fit both candidates in a completion-grid
@@ -692,15 +740,32 @@ mod tests {
         // 1 at the bottom.
         let out = run(&history_params("foo", Mode::Typo, 10, 40), &stdin, &no_dir).unwrap();
         let p = parse_wire(&out);
-        // "unrelated" matches no tier and is the only candidate dropped.
+        // fop is Edit and far-out-object is Fuzzy; both are explicitly
+        // suppressed. unrelated matches no tier.
         assert_eq!(p.rows, vec![b"foo      ".to_vec(), b"echo xfoo".to_vec()]);
         assert_eq!(p.inserts, vec![b"echo xfoo".to_vec(), b"foo".to_vec()]);
+        assert!(!p.inserts.iter().any(|text| text == b"fop"));
+        assert!(!p.inserts.iter().any(|text| text == b"far-out-object"));
 
         // Same payload under the compsys ordering ranks by quality
         // instead, so the two orderings really are distinguishable here.
         let out = run(&params("foo", Mode::Typo, 10, 9, false), &stdin, &no_dir).unwrap();
         let p = parse_wire(&out);
         assert_eq!(p.inserts, vec![b"foo".to_vec(), b"echo xfoo".to_vec()]);
+    }
+
+    #[test]
+    fn history_approximate_only_matches_keep_stdin_order() {
+        let mut stdin = header(&[]);
+        // fop is Edit and far-out-object is Fuzzy. With no literal match,
+        // both remain in the payload's newest-first order.
+        stdin.extend(word("fop"));
+        stdin.extend(word("far-out-object"));
+
+        let out = run(&history_params("foo", Mode::Typo, 10, 40), &stdin, &no_dir).unwrap();
+        let p = parse_wire(&out);
+        assert_eq!(p.common_prefix, b"");
+        assert_eq!(p.inserts, vec![b"fop".to_vec(), b"far-out-object".to_vec()]);
     }
 
     #[test]

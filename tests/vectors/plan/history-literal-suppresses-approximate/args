@@ -1,0 +1,14 @@
+--producer
+history
+--query
+gh
+--mode
+typo
+--smart-case
+true
+--rows
+10
+--width
+24
+--trailing-space
+false

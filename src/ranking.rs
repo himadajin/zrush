@@ -5,7 +5,7 @@
 //! that ordering policy while layout.rs owns the separately selected
 //! geometry. Matching and insertion remain producer-independent.
 
-use crate::matching::MatchScore;
+use crate::matching::{MatchScore, TierGroup};
 
 /// Result ordering, mapped from `--producer` by the CLI layer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,7 +25,18 @@ pub enum Order {
 /// returned values are the stdin positions. The sort is stable, so
 /// equal (tier, score) pairs keep stdin order per the contract.
 pub fn rank(scored: &[(usize, MatchScore)], max_lines: usize, order: Order) -> Vec<usize> {
-    let mut ranked: Vec<usize> = (0..scored.len()).collect();
+    // Suppress approximate tiers at the matching/ranking boundary whenever a
+    // literal result exists.  Apply this before either producer ordering and
+    // before truncation so both orders share the same candidate set.
+    let has_literal = scored
+        .iter()
+        .any(|(_, score)| score.tier.group() == TierGroup::Literal);
+    let mut ranked: Vec<usize> = scored
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, score))| !has_literal || score.tier.group() != TierGroup::Approximate)
+        .map(|(k, _)| k)
+        .collect();
     if order == Order::Quality {
         ranked.sort_by_key(|&k| (scored[k].1.tier, std::cmp::Reverse(scored[k].1.score)));
     }
@@ -45,8 +56,8 @@ mod tests {
         MatchScore { tier, score }
     }
 
-    /// The mixed-quality fixture both orderings are checked against, so
-    /// the two tests differ only in the ordering they pass.
+    /// The mixed-quality fixture checks that approximate tiers are suppressed
+    /// once any literal tier is present.
     fn mixed() -> Vec<(usize, MatchScore)> {
         vec![
             (0, ms(Tier::Edit, 0)),
@@ -60,16 +71,27 @@ mod tests {
 
     #[test]
     fn quality_sorts_by_tier_then_score_desc() {
-        assert_eq!(rank(&mixed(), 10, Order::Quality), vec![3, 1, 4, 0, 5, 2]);
+        assert_eq!(rank(&mixed(), 10, Order::Quality), vec![3, 1, 4]);
     }
 
     #[test]
     fn stdin_order_ignores_match_quality() {
         assert_eq!(
             rank(&mixed(), 10, Order::Stdin),
-            vec![0, 1, 2, 3, 4, 5],
-            "Order::Stdin must not reorder by tier or score"
+            vec![1, 3, 4],
+            "Order::Stdin must preserve stdin order after suppression"
         );
+    }
+
+    #[test]
+    fn approximate_only_inputs_are_preserved() {
+        let scored = vec![
+            (8, ms(Tier::Fuzzy, 10)),
+            (2, ms(Tier::Edit, 20)),
+            (5, ms(Tier::Fuzzy, 30)),
+        ];
+        assert_eq!(rank(&scored, 10, Order::Quality), vec![2, 5, 8]);
+        assert_eq!(rank(&scored, 10, Order::Stdin), vec![8, 2, 5]);
     }
 
     #[test]
@@ -88,6 +110,11 @@ mod tests {
         assert_eq!(rank(&scored, 3, Order::Quality), vec![0, 1, 2]);
         assert_eq!(rank(&scored, 0, Order::Quality), Vec::<usize>::new());
         assert_eq!(rank(&scored, 3, Order::Stdin), vec![0, 1, 2]);
+
+        // Suppression precedes truncation, so approximate entries cannot
+        // consume the output cap when literals are available.
+        assert_eq!(rank(&mixed(), 2, Order::Quality), vec![3, 1]);
+        assert_eq!(rank(&mixed(), 2, Order::Stdin), vec![1, 3]);
     }
 
     #[test]
