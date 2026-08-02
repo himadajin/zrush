@@ -15,6 +15,8 @@
 //! The library surface is intentionally limited to [`run`] and [`wire`].
 
 mod config;
+#[allow(dead_code)]
+mod framing;
 mod insert;
 mod keybind;
 mod layout;
