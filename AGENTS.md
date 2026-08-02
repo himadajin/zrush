@@ -37,16 +37,19 @@ For changes touching `zsh/`, the zle-integration drivers `tests/zsh/driver.zsh` 
 
 ## Commits, issues, and pull requests
 
-One-line titles — commit messages, issue titles, PR titles — are concise English, because they flow through tooling.
-Commit messages additionally follow [Conventional Commits](https://www.conventionalcommits.org/)
-(e.g. `docs: update config schema`, `feat(match): add typo-tolerant matching`, `fix(zle): clear listing on accept-line`).
+One-line titles — issue titles, PR titles, commit messages — are concise English following [Conventional Commits](https://www.conventionalcommits.org/)
+(e.g. `docs: update config schema`, `feat(match): add typo-tolerant matching`, `fix(zle): clear listing on accept-line`), because they flow through tooling.
+A change is titled once: the issue names it, and the PR reuses that title — written as the commit message for the whole change, so that it can land on `main` unedited.
+Never write the ` (#N)` suffix by hand; GitHub appends it on squash merge.
+Omit the scope when the affected component is not yet known.
+Mark the type with `!` only for breakage the user sees — configuration, keybindings, observable behavior; a zsh ↔ Rust protocol version bump is internal and does not qualify.
 Bodies may be English or Japanese.
 
 Issue bodies must be self-contained for a reader who was not part of the conversation that spawned them:
 open with one or two paragraphs stating the current state, the change or decision being made, and the reason, before any detail.
 Do not use vocabulary or references that only made sense in that conversation; reference other issues as `#N` plus a short description.
 Numbers used as evidence come with the measurement environment and reproduction steps.
-Templates under `.github/ISSUE_TEMPLATE/` mirror these rules; only the opening paragraphs are mandatory — the other sections are guidance to keep or drop.
+Templates under `.github/ISSUE_TEMPLATE/` mirror these rules; only the title and the opening paragraphs are mandatory — the other sections are guidance to keep or drop.
 
 ## Core principles
 
