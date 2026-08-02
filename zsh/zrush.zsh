@@ -1030,7 +1030,7 @@ _zrush_worker_flush() {
   fi
   local -i wrote=0 st
   local write_errno=
-  syswrite -c wrote -o $_zrush_worker_wfd "$_zrush_worker_tx"
+  syswrite -c wrote -o $_zrush_worker_wfd -- "$_zrush_worker_tx"
   st=$? write_errno=$ERRNO
   (( wrote > 0 )) && _zrush_worker_tx=${_zrush_worker_tx[wrote+1,-1]}
   if (( st == 0 )); then

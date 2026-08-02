@@ -32,7 +32,8 @@ cargo build --release
 cargo test
 ```
 
-For changes touching `zsh/`, the zle-integration drivers `tests/zsh/driver.zsh` and `tests/zsh/driver-coexist.zsh` must also pass — run them locally; CI runs only the headless `driver.zsh`.
+For changes touching `zsh/`, the zle-integration drivers `tests/zsh/driver.zsh` and `tests/zsh/driver-coexist.zsh` must also pass — run them locally.
+CI runs the headless `driver.zsh`, `tests/zsh/vectors.zsh` (capture-encoder and plan-decoder golden vectors), and `tests/zsh/transport.zsh` (worker transport write path); `driver-coexist.zsh` remains local-only.
 `zsh/verify.zsh` launches an isolated shell for manual verification, and `tests/zsh/driver-latency.zsh` measures first-paint latency; each file's header documents prerequisites and usage.
 
 ## Commits, issues, and pull requests
