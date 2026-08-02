@@ -292,6 +292,14 @@ start_hist_host() {  # $1=zdotdir $2=xdg-config-home $3=logfile
   else
     ng "(worker-1d) bad post-resource state: ${REPLY:-<none>}"
   fi
+  local reaped_resource=$(grep -F "worker: reaped pid=$first_worker_pid status=" $ZRUSH_LOG 2>/dev/null | tail -1)
+  local reaped_resource_status=${reaped_resource##*status=}
+  if [[ -n $reaped_resource && $reaped_resource_status != 127 ]] \
+     && ! kill -0 $first_worker_pid 2>/dev/null; then
+    ok "(worker-1e) re-source terminates and wait-reaps old worker pid=$first_worker_pid (status=$reaped_resource_status)"
+  else
+    ng "(worker-1e) old worker was not wait-reaped: line=${reaped_resource:-<none>}"
+  fi
 
   # (cap-1c) w vs m: a candidate whose quoted form differs from its raw text.
   # The listing must show the raw text (m, cli-protocol.md "候補レコード"), and
@@ -596,21 +604,48 @@ start_hist_host() {  # $1=zdotdir $2=xdg-config-home $3=logfile
 
   # Switch only future sessions to the fake. It handshakes ready, records the
   # assigned request id, then exits without a terminal response.
+  dump_get $'\C-xw' TESTWORKER
+  local -i explicit_teardown_pid=${${REPLY#pid=}%% *}
   send_keys $'\C-xq'
   drain 0.3
   dump_get $'\C-xw' TESTWORKER
   [[ $REPLY == 'pid=-1 ready=0 '* ]] || ng "(err-setup) worker teardown failed: $REPLY"
+  local explicit_reap=$(grep -F "worker: reaped pid=$explicit_teardown_pid status=" $ZRUSH_LOG 2>/dev/null | tail -1)
+  if (( explicit_teardown_pid > 1 )) && [[ -n $explicit_reap && $explicit_reap != *'status=127' ]] \
+     && ! kill -0 $explicit_teardown_pid 2>/dev/null; then
+    ok "(err-setup) explicit teardown terminates and wait-reaps pid=$explicit_teardown_pid"
+  else
+    ng "(err-setup) explicit teardown did not reap old worker: ${explicit_reap:-<none>}"
+  fi
   print -r -- die > $ZRUSH_FAKE_CONTROL
   log_count 'worker: session failure:'; local -i err_fail0=$REPLY
   fake_count 'die 1 '; local -i fake_die0=$REPLY
+  local -i err_log_line0=0
+  [[ -r $ZRUSH_LOG ]] && err_log_line0=$(wc -l < $ZRUSH_LOG)
   send_keys 'ls fx/basic/al'
-  if wait_fake 'die 1 ' $fake_die0 10 \
-     && wait_log 'worker: session failure:' $err_fail0 10 \
+  local -i active_death_ok=1
+  wait_fake 'die 1 ' $fake_die0 10 || active_death_ok=0
+  wait_log 'worker: session failure:' $err_fail0 10 || active_death_ok=0
+  local err_log_delta=$(sed -n "$(( err_log_line0 + 1 )),\$p" $ZRUSH_LOG 2>/dev/null)
+  local fake_started=$(print -r -- "$err_log_delta" | grep -F 'worker: started pid=' 2>/dev/null)
+  local -i fake_started_count=$(print -r -- "$fake_started" | grep -cF 'worker: started pid=' 2>/dev/null)
+  local -i fake_worker_pid=-1
+  if (( fake_started_count == 1 )); then
+    local fake_worker_tail=${fake_started#*'worker: started pid='}
+    fake_worker_pid=${fake_worker_tail%% *}
+  fi
+  local exact_fake_reap=
+  if (( fake_worker_pid > 1 )); then
+    exact_fake_reap=$(print -r -- "$err_log_delta" \
+      | grep -E "\\] worker: reaped pid=$fake_worker_pid status=19\$" 2>/dev/null)
+  fi
+  if (( active_death_ok && fake_started_count == 1 && fake_worker_pid > 1 )) \
+     && [[ -n $exact_fake_reap ]] \
      && dump_get $'\C-xw' TESTWORKER \
      && [[ $REPLY == *'failures=1 disabled=0'*'warned=1'*'pending=0' ]]; then
     ok "(err-1a) ready worker dies with an assigned request; pending is discarded and failure is retryable"
   else
-    ng "(err-1a) active-death state missing: ${REPLY:-<none>}"
+    ng "(err-1a) active-death state missing: state=${REPLY:-<none>} pid=$fake_worker_pid reap=${exact_fake_reap:-<none>}"
   fi
   local first_die=$(grep -F 'die 1 ' $ZRUSH_FAKE_STATE 2>/dev/null | tail -1)
   local first_dead_id=${first_die##* }

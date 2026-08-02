@@ -818,7 +818,9 @@ _zrush_worker_terminate_and_reap() {
     zselect -t 1 2>/dev/null
     kill -0 $pid 2>/dev/null && kill -KILL $pid 2>/dev/null
   fi
-  wait $pid 2>/dev/null
+  local -i st=0
+  wait $pid 2>/dev/null; st=$?
+  _zlog "worker: reaped pid=$pid status=$st"
   return 0
 }
 
@@ -944,7 +946,7 @@ _zrush_worker_finish_start() {
     exec {req_anchor}>&- {resp_anchor}>&- {child_in}<&- {child_out}>&-
     exec {_zrush_worker_rfd}<&- {_zrush_worker_wfd}>&-
     exec "$ZRUSH_BIN" worker 2>>| "${ZRUSH_LOG:-/dev/null}"
-  ) &!
+  ) &
   _zrush_worker_pid=$!
   exec {req_anchor}>&- {resp_anchor}>&- {child_in}<&- {child_out}>&-
   command rm -f "$req" "$resp" >/dev/null 2>&1 &!
@@ -1573,6 +1575,11 @@ _zrush_line_pre_redraw() {
   [[ $BUFFER == "$_zrush_last_buffer" ]] && (( CURSOR == _zrush_last_cursor )) && return 0
   _zrush_last_buffer=$BUFFER
   _zrush_last_cursor=$CURSOR
+  # The previous async request stops being eligible immediately. Waiting for
+  # the next debounce/capture to assign a new id leaves a window where its
+  # delayed response could settle against the new buffer and consume a Tab
+  # intended for that newer query.
+  _zrush_current_request=0
   # Reaching here means the change came from something other than a zrush
   # action (every zrush action tears the listing down itself, leaving kind
   # `none`), so a history menu goes away whole -- listing text included --

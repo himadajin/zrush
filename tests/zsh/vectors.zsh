@@ -261,6 +261,43 @@ reserialize_plan() {  # -> REPLY=bytes, or return 1 with REPLY=reason
     ng "worker lifecycle: stale response changed current plan or remained pending"
   fi
 
+  # A buffer/cursor change invalidates the old async request before debounce
+  # assigns its successor. A Tab pressed in that window belongs to the newer
+  # query: the delayed old response must leave it pending, while the successor
+  # response may settle it normally.
+  local saved_arm_timer=$functions[_zrush_arm_timer]
+  local saved_settle_plan=$functions[_zrush_settle_plan]
+  functions[_zrush_arm_timer]='return 0'
+  typeset -gi _zrt_settle_calls=0
+  functions[_zrush_settle_plan]='(( ++_zrt_settle_calls )); _zrush_tab_pending=0; return 0'
+  _zrush_enabled=1 _zrush_disabled=0 _zrush_current_request=41
+  _zrush_last_buffer=old _zrush_last_cursor=0
+  BUFFER=new LBUFFER=new CURSOR=3
+  _zrush_plan_kind=none _zrush_tab_pending=0 _zrush_selected=0
+  ZRUSH_CFG_MIN_INPUT=0
+  _zrush_line_pre_redraw
+  local -i invalidated=$(( _zrush_current_request == 0 ))
+  _zrush_tab_pending=1
+  typeset -gA _zrush_worker_pending=( 41 compsys )
+  _zrush_encode_message ok 41 "$stale_plan"
+  _zrush_netstring_take "$REPLY"
+  _zrush_worker_handle_message "$REPLY"
+  local -i old_stayed_stale=$(( _zrt_settle_calls == 0 && _zrush_tab_pending == 1 ))
+  _zrush_current_request=42
+  _zrush_worker_pending[42]=compsys
+  _zrush_encode_message ok 42 "$stale_plan"
+  _zrush_netstring_take "$REPLY"
+  _zrush_worker_handle_message "$REPLY"
+  functions[_zrush_arm_timer]=$saved_arm_timer
+  functions[_zrush_settle_plan]=$saved_settle_plan
+  if (( invalidated && old_stayed_stale && _zrt_settle_calls == 1 \
+        && _zrush_tab_pending == 0 )); then
+    ok "worker lifecycle: buffer change makes old response stale; successor settles pending Tab"
+  else
+    ng "worker lifecycle: invalidated=$invalidated old-stale=$old_stayed_stale settles=$_zrt_settle_calls tab=$_zrush_tab_pending"
+  fi
+  unset _zrt_settle_calls
+
   # An explicit incompatible handshake opens the permanent shell-session
   # disable immediately; it is not counted as the first retryable failure.
   _zrush_worker_ready=0 _zrush_worker_failures=0 _zrush_disabled=0 _zrush_enabled=1

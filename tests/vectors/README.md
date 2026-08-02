@@ -3,7 +3,7 @@
 This corpus turns the prose rules in `docs/internal/contracts/cli-protocol.md` into executable byte-level fixtures.
 
 Each `plan/<name>/` directory contains `args`, `payload.bin`, and `expected.bin`.
-Each `reject/<name>/` directory contains `args`, `payload.bin`, and `exit`.
+Each `reject/<name>/` directory contains `args` and `payload.bin`.
 Each `reject-plan/<name>/` directory contains only `plan.bin`.
 Each `encode/<name>/` directory contains `argv.bin`, `hits.bin`, `dscr.bin`, `expected.bin`, and an optional `env`.
 The runner sends each vector as a `plan` request to a persistent `zrush worker`; `args` contains flags and their values only.
