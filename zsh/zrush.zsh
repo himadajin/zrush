@@ -753,6 +753,9 @@ _zrush_netstring_take() {
   fi
   digits=${data%%:*}
   [[ $digits == 0 || $digits == [1-9][0-9]# ]] || return 2
+  # Reject an unrepresentable declared length lexically, before either the
+  # available-byte comparison or zsh integer conversion can truncate it.
+  _zrush_dec_le_all 9223372036854775807 "$digits" || return 2
   (( $#digits + 2 <= $#data )) || return 1
   local -i available=$(( $#data - $#digits - 2 ))
   _zrush_dec_le_all $available "$digits" || return 1

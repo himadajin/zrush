@@ -222,6 +222,37 @@ reserialize_plan() {  # -> REPLY=bytes, or return 1 with REPLY=reason
     ng "session framing: delivered=$delivered terminal-status=$st"
   fi
 
+  # Length parsing stays lexical until the declaration is known to fit a zsh
+  # integer. The maximum representable declaration is a valid (incomplete)
+  # shape here; its successor, wider decimals, and leading-zero spellings are
+  # malformed immediately rather than waiting forever for impossible bytes.
+  _zrush_netstring_take '9223372036854775807:'; local -i max_length_st=$?
+  _zrush_netstring_take '9223372036854775808:x,'; local -i overflow_length_st=$?
+  _zrush_netstring_take '999999999999999999999999999999:x,'; local -i wide_length_st=$?
+  _zrush_netstring_take '09223372036854775807:x,'; local -i leading_zero_st=$?
+  if (( max_length_st == 1 && overflow_length_st == 2 \
+        && wide_length_st == 2 && leading_zero_st == 2 )); then
+    ok "session framing: representable maximum is incomplete; overflow/noncanonical lengths are malformed"
+  else
+    ng "session framing: length statuses max=$max_length_st overflow=$overflow_length_st wide=$wide_length_st leading-zero=$leading_zero_st"
+  fi
+
+  # The real reader must turn that malformed parser status into the fatal
+  # outer-response path without attempting an OS read.
+  local saved_session_fail=${functions[_zrush_worker_session_fail]}
+  typeset -g _zrt_session_failure=
+  functions[_zrush_worker_session_fail]='_zrt_session_failure=$1; return 0'
+  _zrush_worker_rx='9223372036854775808:x,'
+  _zrush_worker_read async; local -i overflow_reader_st=$?
+  functions[_zrush_worker_session_fail]=$saved_session_fail
+  if (( overflow_reader_st == 1 )) \
+     && [[ $_zrt_session_failure == 'malformed outer response' ]]; then
+    ok "session framing: overflow is fatal in the worker reader"
+  else
+    ng "session framing: overflow reader status=$overflow_reader_st failure=${_zrt_session_failure:-<none>}"
+  fi
+  unset _zrt_session_failure
+
   # A handshake alone is not a successful terminal response and therefore
   # must not reset the consecutive-session failure streak. A request-level
   # error is terminal, clears its pending request, and does reset the streak.
