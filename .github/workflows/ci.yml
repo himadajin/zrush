@@ -36,3 +36,5 @@ jobs:
         run: zsh -f tests/zsh/driver.zsh "$(mktemp -d)"
       - name: zsh plan-decoder vectors
         run: zsh -f tests/zsh/vectors.zsh
+      - name: zsh worker transport
+        run: zsh -f tests/zsh/transport.zsh
