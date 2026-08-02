@@ -85,7 +85,7 @@ typeset -gi _zrush_worker_drain_fd=-1
 typeset -gi _zrush_worker_pid=-1 _zrush_worker_ready=0
 typeset -g  _zrush_worker_rx= _zrush_worker_tx=
 typeset -gi _zrush_worker_setup_fd=-1 _zrush_worker_setup_pid=-1
-typeset -g  _zrush_worker_setup_req= _zrush_worker_setup_resp=
+typeset -g  _zrush_worker_setup_req=
 typeset -gA _zrush_worker_pending=()
 typeset -gi _zrush_current_request=0
 typeset -gi _zrush_sync_target=0 _zrush_sync_done=0 _zrush_sync_ok=0
@@ -826,7 +826,7 @@ _zrush_worker_disarm_retry() {
   fi
 }
 
-_zrush_worker_terminate_and_reap() {
+_zrush_worker_terminate() {
   emulate -L zsh
   local -i pid=$1
   (( pid > 1 )) || return 0
@@ -835,9 +835,10 @@ _zrush_worker_terminate_and_reap() {
     zselect -t 1 2>/dev/null
     kill -0 $pid 2>/dev/null && kill -KILL $pid 2>/dev/null
   fi
-  local -i st=0
-  wait $pid 2>/dev/null; st=$?
-  _zlog "worker: reaped pid=$pid status=$st"
+  kill -0 $pid 2>/dev/null && zselect -t 1 2>/dev/null
+  local -i gone=0
+  kill -0 $pid 2>/dev/null || gone=1
+  _zlog "worker: terminated pid=$pid gone=$gone"
   return 0
 }
 
@@ -850,12 +851,12 @@ _zrush_worker_transport_teardown() {
     _zrush_close_internal_fd $_zrush_worker_setup_fd
     _zrush_worker_setup_fd=-1
   fi
-  _zrush_worker_terminate_and_reap $_zrush_worker_setup_pid
+  _zrush_worker_terminate $_zrush_worker_setup_pid
   _zrush_worker_setup_pid=-1
-  if [[ -n $_zrush_worker_setup_req || -n $_zrush_worker_setup_resp ]]; then
-    command rm -f "$_zrush_worker_setup_req" "$_zrush_worker_setup_resp" >/dev/null 2>&1 &!
+  if [[ -n $_zrush_worker_setup_req ]]; then
+    command rm -f "$_zrush_worker_setup_req" >/dev/null 2>&1 &!
   fi
-  _zrush_worker_setup_req= _zrush_worker_setup_resp=
+  _zrush_worker_setup_req=
   if (( _zrush_worker_rfd >= 0 )); then
     zle -F $_zrush_worker_rfd 2>/dev/null
     _zrush_close_internal_fd $_zrush_worker_rfd
@@ -866,7 +867,7 @@ _zrush_worker_transport_teardown() {
     _zrush_worker_wfd=-1
   fi
   if (( _zrush_worker_pid > 1 )); then
-    _zrush_worker_terminate_and_reap $_zrush_worker_pid
+    _zrush_worker_terminate $_zrush_worker_pid
   fi
   _zrush_worker_pid=-1
   _zrush_worker_ready=0
@@ -913,11 +914,10 @@ _zrush_worker_start() {
 
   local base=${TMPDIR:-/tmp}/zrush-worker-$$-$RANDOM
   _zrush_worker_setup_req=$base.in
-  _zrush_worker_setup_resp=$base.out
   local fd
   exec {fd}< <(
     umask 077
-    if command mkfifo "$_zrush_worker_setup_req" "$_zrush_worker_setup_resp" 2>/dev/null; then
+    if command mkfifo "$_zrush_worker_setup_req" 2>/dev/null; then
       print -rn -- 1
     else
       print -rn -- 0
@@ -940,41 +940,35 @@ _zrush_worker_start() {
 _zrush_worker_finish_start() {
   emulate -L zsh
   setopt localoptions no_monitor no_notify no_bg_nice
-  local req=$_zrush_worker_setup_req resp=$_zrush_worker_setup_resp
-  local req_anchor resp_anchor child_in child_out
+  local req=$_zrush_worker_setup_req
+  local req_anchor child_in
+  local -i failed=0
   if ! sysopen -rw -o cloexec -u req_anchor "$req" ||
      ! sysopen -r -o cloexec -u child_in "$req" ||
-     ! sysopen -w -o nonblock,cloexec -u _zrush_worker_wfd "$req" ||
-     ! sysopen -rw -o cloexec -u resp_anchor "$resp" ||
-     ! sysopen -r -o nonblock,cloexec -u _zrush_worker_rfd "$resp" ||
-     ! sysopen -w -o cloexec -u child_out "$resp"; then
+     ! sysopen -w -o nonblock,cloexec -u _zrush_worker_wfd "$req"; then
+    failed=1
+  else
+    # The substitution forks before sysopen runs, so record the pid whether or not
+    # sysopen succeeded: a failure here still has a worker to terminate.
+    sysopen -r -o nonblock,cloexec -u _zrush_worker_rfd \
+      <( exec "$ZRUSH_BIN" worker <&$child_in 2>>| "${ZRUSH_LOG:-/dev/null}" ) || failed=1
+    _zrush_worker_pid=${sysparams[procsubstpid]:--1}
+  fi
+  if (( failed )); then
+    _zrush_worker_terminate $_zrush_worker_pid
+    _zrush_worker_pid=-1
     _zrush_close_internal_fd ${req_anchor:--1}
-    _zrush_close_internal_fd ${resp_anchor:--1}
     _zrush_close_internal_fd ${child_in:--1}
-    _zrush_close_internal_fd ${child_out:--1}
     _zrush_close_internal_fd $_zrush_worker_wfd
     _zrush_close_internal_fd $_zrush_worker_rfd
     _zrush_worker_wfd=-1 _zrush_worker_rfd=-1
     return 1
   fi
 
-  (
-    exec 0<&$child_in 1>&$child_out
-    _zrush_close_internal_fd $req_anchor
-    _zrush_close_internal_fd $resp_anchor
-    _zrush_close_internal_fd $child_in
-    _zrush_close_internal_fd $child_out
-    _zrush_close_internal_fd $_zrush_worker_rfd
-    _zrush_close_internal_fd $_zrush_worker_wfd
-    exec "$ZRUSH_BIN" worker 2>>| "${ZRUSH_LOG:-/dev/null}"
-  ) &
-  _zrush_worker_pid=$!
   _zrush_close_internal_fd $req_anchor
-  _zrush_close_internal_fd $resp_anchor
   _zrush_close_internal_fd $child_in
-  _zrush_close_internal_fd $child_out
-  command rm -f "$req" "$resp" >/dev/null 2>&1 &!
-  _zrush_worker_setup_req= _zrush_worker_setup_resp=
+  command rm -f "$req" >/dev/null 2>&1 &!
+  _zrush_worker_setup_req=
   if ! zle -F -w $_zrush_worker_rfd _zrush-worker-on-data 2>/dev/null; then
     _zrush_worker_session_fail "data fd registration failed"
     return 1
@@ -992,7 +986,7 @@ _zrush_worker_consume_setup() {
   zle -F $_zrush_worker_setup_fd 2>/dev/null
   _zrush_close_internal_fd $_zrush_worker_setup_fd
   _zrush_worker_setup_fd=-1 _zrush_worker_setup_pid=-1
-  _zrush_worker_terminate_and_reap $setup_pid
+  _zrush_worker_terminate $setup_pid
   [[ $signal == 1 ]] || return 1
   _zrush_worker_finish_start
 }

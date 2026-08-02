@@ -341,13 +341,12 @@ start_hist_host() {  # $1=zdotdir $2=xdg-config-home $3=logfile
   else
     ng "(worker-1d) bad post-resource state: ${REPLY:-<none>}"
   fi
-  local reaped_resource=$(grep -F "worker: reaped pid=$first_worker_pid status=" $ZRUSH_LOG 2>/dev/null | tail -1)
-  local reaped_resource_status=${reaped_resource##*status=}
-  if [[ -n $reaped_resource && $reaped_resource_status != 127 ]] \
+  local terminated_resource=$(grep -F "worker: terminated pid=$first_worker_pid gone=1" $ZRUSH_LOG 2>/dev/null | tail -1)
+  if [[ -n $terminated_resource ]] \
      && ! kill -0 $first_worker_pid 2>/dev/null; then
-    ok "(worker-1e) re-source terminates and wait-reaps old worker pid=$first_worker_pid (status=$reaped_resource_status)"
+    ok "(worker-1e) re-source terminates old worker pid=$first_worker_pid and confirms it is gone"
   else
-    ng "(worker-1e) old worker was not wait-reaped: line=${reaped_resource:-<none>}"
+    ng "(worker-1e) old worker did not disappear: line=${terminated_resource:-<none>}"
   fi
   assert_host_stdio "(fd-3) re-source teardown preserves host fd 0/1/2"
 
@@ -660,12 +659,12 @@ start_hist_host() {  # $1=zdotdir $2=xdg-config-home $3=logfile
   drain 0.3
   dump_get $'\C-xw' TESTWORKER
   [[ $REPLY == 'pid=-1 ready=0 '* ]] || ng "(err-setup) worker teardown failed: $REPLY"
-  local explicit_reap=$(grep -F "worker: reaped pid=$explicit_teardown_pid status=" $ZRUSH_LOG 2>/dev/null | tail -1)
-  if (( explicit_teardown_pid > 1 )) && [[ -n $explicit_reap && $explicit_reap != *'status=127' ]] \
+  local explicit_termination=$(grep -F "worker: terminated pid=$explicit_teardown_pid gone=1" $ZRUSH_LOG 2>/dev/null | tail -1)
+  if (( explicit_teardown_pid > 1 )) && [[ -n $explicit_termination ]] \
      && ! kill -0 $explicit_teardown_pid 2>/dev/null; then
-    ok "(err-setup) explicit teardown terminates and wait-reaps pid=$explicit_teardown_pid"
+    ok "(err-setup) explicit teardown terminates pid=$explicit_teardown_pid and confirms it is gone"
   else
-    ng "(err-setup) explicit teardown did not reap old worker: ${explicit_reap:-<none>}"
+    ng "(err-setup) explicit teardown did not confirm old worker disappeared: ${explicit_termination:-<none>}"
   fi
   assert_host_stdio "(fd-4) explicit worker teardown preserves host fd 0/1/2"
   print -r -- die > $ZRUSH_FAKE_CONTROL
@@ -692,18 +691,18 @@ start_hist_host() {  # $1=zdotdir $2=xdg-config-home $3=logfile
     local fake_worker_tail=${fake_started#*'worker: started pid='}
     fake_worker_pid=${fake_worker_tail%% *}
   fi
-  local exact_fake_reap=
+  local exact_fake_termination=
   if (( fake_worker_pid > 1 )); then
-    exact_fake_reap=$(print -r -- "$err_log_delta" \
-      | grep -E "\\] worker: reaped pid=$fake_worker_pid status=19\$" 2>/dev/null)
+    exact_fake_termination=$(print -r -- "$err_log_delta" \
+      | grep -E "\\] worker: terminated pid=$fake_worker_pid gone=1\$" 2>/dev/null)
   fi
   if (( active_death_ok && fake_started_count == 1 && fake_worker_pid > 1 )) \
-     && [[ -n $exact_fake_reap ]] \
+     && [[ -n $exact_fake_termination ]] \
      && dump_get $'\C-xw' TESTWORKER \
      && [[ $REPLY == *'failures=1 disabled=0'*'warned=1'*'pending=0' ]]; then
     ok "(err-1a) ready worker dies with an assigned request; pending is discarded and failure is retryable"
   else
-    ng "(err-1a) active-death state missing: state=${REPLY:-<none>} pid=$fake_worker_pid reap=${exact_fake_reap:-<none>}"
+    ng "(err-1a) active-death state missing: state=${REPLY:-<none>} pid=$fake_worker_pid termination=${exact_fake_termination:-<none>}"
   fi
   local first_die=$(grep -F 'die 1 ' $ZRUSH_FAKE_STATE 2>/dev/null | tail -1)
   local first_dead_id=${first_die##* }
@@ -1491,6 +1490,50 @@ start_hist_host() {  # $1=zdotdir $2=xdg-config-home $3=logfile
       || ng "(h20a') ctrl-p did not change the buffer; it may have been silently swallowed instead of delegated"
   else
     ng "(h20-0) select-prev=[\"up\"] host failed to start"
+  fi
+
+  # ================================================================ Worker job-table isolation
+  # This host must exit during the assertion, so give it dedicated rc/config/log
+  # state rather than reusing any host needed by the preceding cases.
+  mkdir -p $WORK/zdot-exit $WORK/xdg-exit/zrush
+  print "source $REPO/tests/zsh/rc/minimal.zshrc" > $WORK/zdot-exit/.zshrc
+  if start_hist_host $WORK/zdot-exit $WORK/xdg-exit $WORK/host-exit.log; then
+    send_line '[[ -o checkjobs && -o checkrunningjobs ]] && print CHECK-JOBS-ENABLED'
+    if expect '*CHECK-JOBS-ENABLED*HP>*' 5; then
+      send_keys 'ls fx/basic/al'
+      expect '*alpha.txt*' 10 >/dev/null
+      if dump_get $'\C-xw' TESTWORKER && [[ $REPLY == 'pid='<->' ready=1 '* ]]; then
+        clear_line
+        drain 0.3
+        local -F exit_deadline=$(( SECONDS + 5 ))
+        local -i exit_eof=0 exit_read_status=0
+        local exit_output= exit_chunk=
+        send_line exit
+        while (( SECONDS < exit_deadline )); do
+          if zselect -t 20 -r $HOSTFD 2>/dev/null; then
+            exit_chunk=
+            zpty -r host exit_chunk 2>/dev/null; exit_read_status=$?
+            (( exit_read_status == 0 )) && exit_output+=$exit_chunk
+            if (( exit_read_status == 2 )); then
+              exit_eof=1
+              break
+            fi
+          fi
+        done
+        local visible_exit_output=${exit_output//$'\e['[0-9;]#m/}
+        if (( exit_eof )) && [[ $visible_exit_output != *'zsh: you have running jobs.'* ]]; then
+          ok "(worker-job-table) one exit terminates a worker-owning shell without a running-jobs refusal"
+        else
+          ng "(worker-job-table) exit did not terminate cleanly: eof=$exit_eof output=${(qqqq)visible_exit_output}"
+        fi
+      else
+        ng "(worker-job-table) dedicated host did not start its worker: ${REPLY:-<none>}"
+      fi
+    else
+      ng "(worker-job-table) dedicated host did not enable CHECK_JOBS and CHECK_RUNNING_JOBS"
+    fi
+  else
+    ng "(worker-job-table) dedicated exit host failed to start"
   fi
 
   out "SUMMARY: PASS=$PASS FAIL=$FAIL"
