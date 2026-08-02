@@ -68,6 +68,9 @@ zsh は zle 統合・compsys 呼び出しによる捕獲・プランの適用
   即座に zrush を無効化する。source 時の `zrush config` 版照合も同じく不一致なら無効化する。
 - worker 障害のユーザー向け警告は、種類や再発回数によらず同じシェルセッションで高々 1 回表示する。
   `ZRUSH_LOG` が設定されている場合、ユーザー向け警告を抑止した後も各障害の診断を追記する。
+- worker の起動・通常終了・異常終了・再起動・re-source・無効化を含む全 lifecycle で、zsh が所有する
+  内部 fd の操作は対話シェル自身の fd 0 / 1 / 2 の open / closed 状態と接続先を変更しない。
+  内部 fd の close error を抑止するときも、その抑止を対話シェルの標準エラーへ恒久適用しない。
 - 同じシェルで zrush.zsh を re-source するときは、既存 worker プロセスを終了して回収し、`zle -F` watcher を解除して
   stdin/stdout pipe fd を閉じてからフックとキーバインドを再構築する。cleanup 中に新旧 worker を重複させない。
   re-source は同じシェルセッションの request_id 単調性・警告済み状態・連続失敗回数・無効化状態を巻き戻さない。
