@@ -134,6 +134,20 @@ _zlog() { [[ -n $ZRUSH_LOG ]] && print -r -- "[$$ ${EPOCHREALTIME:-0}] $1" >>| $
 
 _zrush_warn() { print -ru2 -- "zrush: $1" }
 
+_zrush_close_internal_fd() {  # $1=owned fd; idempotent best-effort close
+  emulate -L zsh
+  local -i fd=${1:--1}
+  (( fd < 0 )) && return 0
+  if (( fd <= 2 )); then
+    _zlog "fd: refusing to close reserved fd=$fd"
+    return 0
+  fi
+  { exec {fd}>&- } 2>/dev/null
+  local -i st=$?
+  (( st == 0 )) || _zlog "fd: close failed fd=$fd status=$st"
+  return 0
+}
+
 # ---------------------------------------------------------------- Widening
 # See docs/internal/specs/behavior.md "候補収集" and cli-protocol.md "起動".
 _zrush_widen() {  # $1=buffer through the cursor
@@ -404,7 +418,7 @@ _zrush_capture_entry() {
     RBUFFER=
     builtin zle _zrush-capture-comp -w 2>>| ${ZRUSH_LOG:-/dev/null}
   } always {
-    exec {_zrush_wfd}>&-
+    _zrush_close_internal_fd $_zrush_wfd
     builtin exit 0
   }
 }
@@ -427,7 +441,7 @@ _zrush_capture_worker() {
   SAVEHIST=0
   _zlog "fork: start wfd=$_zrush_wfd"
   # The inherited read-side copy is not needed.
-  (( _zrush_rfd >= 0 )) && exec {_zrush_rfd}<&-
+  _zrush_close_internal_fd $_zrush_rfd
   # Report the real pid first so the parent can SIGINT its process group on cancellation.
   print -rn -u $_zrush_wfd -- "pid"$'\1'"$sysparams[pid]"$'\0' 2>/dev/null
   # The fork inherits active ZLE state, so it can invoke the widget directly.
@@ -440,11 +454,11 @@ _zrush_cancel_collection() {
   emulate -L zsh
   if (( _zrush_rfd >= 0 )); then
     zle -F $_zrush_rfd 2>/dev/null
-    exec {_zrush_rfd}<&-
+    _zrush_close_internal_fd $_zrush_rfd
     _zrush_rfd=-1
   fi
   if (( _zrush_wfd >= 0 )); then
-    exec {_zrush_wfd}>&-
+    _zrush_close_internal_fd $_zrush_wfd
     _zrush_wfd=-1
   fi
   if [[ -n $_zrush_pty ]]; then
@@ -465,7 +479,7 @@ _zrush_disarm_timer() {
   emulate -L zsh
   if (( _zrush_timer_fd >= 0 )); then
     zle -F $_zrush_timer_fd 2>/dev/null
-    exec {_zrush_timer_fd}<&-
+    _zrush_close_internal_fd $_zrush_timer_fd
     _zrush_timer_fd=-1
   fi
 }
@@ -636,7 +650,7 @@ _zrush_start_request() {
   exec {rw}<>$fifo
   exec {_zrush_rfd}<$fifo
   exec {_zrush_wfd}>$fifo
-  exec {rw}>&-
+  _zrush_close_internal_fd $rw
   rm -f $fifo
 
   _zrush_pty=zrush-w$(( ++_zrush_gen ))
@@ -646,7 +660,7 @@ _zrush_start_request() {
     return 1
   fi
   # Close the parent's write-side copy immediately after the fork so EOF remains detectable.
-  exec {_zrush_wfd}>&-
+  _zrush_close_internal_fd $_zrush_wfd
   _zrush_wfd=-1
 
   zle -F -w $_zrush_rfd _zrush-on-data
@@ -674,7 +688,7 @@ _zrush_on_data() {  # zle -F -w handler ($1=fd)
   fi
   # EOF (5) or a read error ends reception for this request.
   zle -F $fd 2>/dev/null
-  exec {fd}<&-
+  _zrush_close_internal_fd $fd
   _zrush_rfd=-1
   zpty -d $_zrush_pty 2>/dev/null
   _zrush_pty=
@@ -802,12 +816,12 @@ _zrush_worker_warn_once() {
 _zrush_worker_disarm_retry() {
   if (( _zrush_worker_retry_fd >= 0 )); then
     zle -F $_zrush_worker_retry_fd 2>/dev/null
-    exec {_zrush_worker_retry_fd}<&- 2>/dev/null
+    _zrush_close_internal_fd $_zrush_worker_retry_fd
     _zrush_worker_retry_fd=-1
   fi
   if (( _zrush_worker_drain_fd >= 0 )); then
     zle -F $_zrush_worker_drain_fd 2>/dev/null
-    exec {_zrush_worker_drain_fd}<&- 2>/dev/null
+    _zrush_close_internal_fd $_zrush_worker_drain_fd
     _zrush_worker_drain_fd=-1
   fi
 }
@@ -833,7 +847,7 @@ _zrush_worker_transport_teardown() {
   _zrush_worker_disarm_retry
   if (( _zrush_worker_setup_fd >= 0 )); then
     zle -F $_zrush_worker_setup_fd 2>/dev/null
-    exec {_zrush_worker_setup_fd}<&- 2>/dev/null
+    _zrush_close_internal_fd $_zrush_worker_setup_fd
     _zrush_worker_setup_fd=-1
   fi
   _zrush_worker_terminate_and_reap $_zrush_worker_setup_pid
@@ -844,11 +858,11 @@ _zrush_worker_transport_teardown() {
   _zrush_worker_setup_req= _zrush_worker_setup_resp=
   if (( _zrush_worker_rfd >= 0 )); then
     zle -F $_zrush_worker_rfd 2>/dev/null
-    exec {_zrush_worker_rfd}<&- 2>/dev/null
+    _zrush_close_internal_fd $_zrush_worker_rfd
     _zrush_worker_rfd=-1
   fi
   if (( _zrush_worker_wfd >= 0 )); then
-    exec {_zrush_worker_wfd}>&- 2>/dev/null
+    _zrush_close_internal_fd $_zrush_worker_wfd
     _zrush_worker_wfd=-1
   fi
   if (( _zrush_worker_pid > 1 )); then
@@ -934,24 +948,31 @@ _zrush_worker_finish_start() {
      ! sysopen -rw -o cloexec -u resp_anchor "$resp" ||
      ! sysopen -r -o nonblock,cloexec -u _zrush_worker_rfd "$resp" ||
      ! sysopen -w -o cloexec -u child_out "$resp"; then
-    (( ${req_anchor:--1} >= 0 )) && exec {req_anchor}>&- 2>/dev/null
-    (( ${resp_anchor:--1} >= 0 )) && exec {resp_anchor}>&- 2>/dev/null
-    (( ${child_in:--1} >= 0 )) && exec {child_in}<&- 2>/dev/null
-    (( ${child_out:--1} >= 0 )) && exec {child_out}>&- 2>/dev/null
-    (( _zrush_worker_wfd >= 0 )) && exec {_zrush_worker_wfd}>&- 2>/dev/null
-    (( _zrush_worker_rfd >= 0 )) && exec {_zrush_worker_rfd}<&- 2>/dev/null
+    _zrush_close_internal_fd ${req_anchor:--1}
+    _zrush_close_internal_fd ${resp_anchor:--1}
+    _zrush_close_internal_fd ${child_in:--1}
+    _zrush_close_internal_fd ${child_out:--1}
+    _zrush_close_internal_fd $_zrush_worker_wfd
+    _zrush_close_internal_fd $_zrush_worker_rfd
     _zrush_worker_wfd=-1 _zrush_worker_rfd=-1
     return 1
   fi
 
   (
     exec 0<&$child_in 1>&$child_out
-    exec {req_anchor}>&- {resp_anchor}>&- {child_in}<&- {child_out}>&-
-    exec {_zrush_worker_rfd}<&- {_zrush_worker_wfd}>&-
+    _zrush_close_internal_fd $req_anchor
+    _zrush_close_internal_fd $resp_anchor
+    _zrush_close_internal_fd $child_in
+    _zrush_close_internal_fd $child_out
+    _zrush_close_internal_fd $_zrush_worker_rfd
+    _zrush_close_internal_fd $_zrush_worker_wfd
     exec "$ZRUSH_BIN" worker 2>>| "${ZRUSH_LOG:-/dev/null}"
   ) &
   _zrush_worker_pid=$!
-  exec {req_anchor}>&- {resp_anchor}>&- {child_in}<&- {child_out}>&-
+  _zrush_close_internal_fd $req_anchor
+  _zrush_close_internal_fd $resp_anchor
+  _zrush_close_internal_fd $child_in
+  _zrush_close_internal_fd $child_out
   command rm -f "$req" "$resp" >/dev/null 2>&1 &!
   _zrush_worker_setup_req= _zrush_worker_setup_resp=
   if ! zle -F -w $_zrush_worker_rfd _zrush-worker-on-data 2>/dev/null; then
@@ -969,7 +990,7 @@ _zrush_worker_consume_setup() {
   sysread -t 0 -i $_zrush_worker_setup_fd signal; st=$?
   (( st == 0 )) || return 1
   zle -F $_zrush_worker_setup_fd 2>/dev/null
-  exec {_zrush_worker_setup_fd}<&- 2>/dev/null
+  _zrush_close_internal_fd $_zrush_worker_setup_fd
   _zrush_worker_setup_fd=-1 _zrush_worker_setup_pid=-1
   _zrush_worker_terminate_and_reap $setup_pid
   [[ $signal == 1 ]] || return 1
@@ -997,7 +1018,7 @@ _zrush_worker_arm_retry() {
   exec {fd}< <( zselect -t 1; print )
   _zrush_worker_retry_fd=$fd
   zle -F -w $fd _zrush-worker-on-write 2>/dev/null || {
-    exec {fd}<&-
+    _zrush_close_internal_fd $fd
     _zrush_worker_retry_fd=-1
     _zrush_worker_session_fail "write retry fd registration failed"
     return 1
@@ -1055,7 +1076,7 @@ _zrush_worker_on_write() {
   emulate -L zsh
   local -i fd=$1
   zle -F $fd 2>/dev/null
-  exec {fd}<&- 2>/dev/null
+  _zrush_close_internal_fd $fd
   (( fd == _zrush_worker_retry_fd )) && _zrush_worker_retry_fd=-1
   _zrush_worker_flush
   return 0
@@ -1158,7 +1179,7 @@ _zrush_worker_arm_drain() {
   exec {fd}< <( zselect -t 1; print )
   _zrush_worker_drain_fd=$fd
   zle -F -w $fd _zrush-worker-on-drain 2>/dev/null || {
-    exec {fd}<&-
+    _zrush_close_internal_fd $fd
     _zrush_worker_drain_fd=-1
     _zrush_worker_session_fail "read continuation fd registration failed"
     return 1
@@ -1222,7 +1243,7 @@ _zrush_worker_on_drain() {
   emulate -L zsh
   local -i fd=$1
   zle -F $fd 2>/dev/null
-  exec {fd}<&- 2>/dev/null
+  _zrush_close_internal_fd $fd
   (( fd == _zrush_worker_drain_fd )) && _zrush_worker_drain_fd=-1
   _zrush_worker_read async
   return 0
@@ -1561,7 +1582,7 @@ _zrush_timer_fire() {  # zle -F -w handler ($1=fd)
   emulate -L zsh
   local -i fd=$1
   zle -F $fd 2>/dev/null
-  exec {fd}<&-
+  _zrush_close_internal_fd $fd
   (( fd == _zrush_timer_fd )) && _zrush_timer_fd=-1
   # Discard if the buffer changed; pre-redraw has armed a newer timer.
   [[ $BUFFER == "$_zrush_pending_buffer" ]] || return 0
@@ -2015,9 +2036,9 @@ _zrush_zshexit() {
   emulate -L zsh
   # ZLE is inactive here; leave it untouched and reliably close only fds and zpty.
   _zrush_worker_transport_teardown exit
-  (( _zrush_timer_fd >= 0 )) && { exec {_zrush_timer_fd}<&- 2>/dev/null; _zrush_timer_fd=-1 }
-  if (( _zrush_rfd >= 0 )); then exec {_zrush_rfd}<&-; _zrush_rfd=-1; fi
-  if (( _zrush_wfd >= 0 )); then exec {_zrush_wfd}>&-; _zrush_wfd=-1; fi
+  (( _zrush_timer_fd >= 0 )) && { _zrush_close_internal_fd $_zrush_timer_fd; _zrush_timer_fd=-1 }
+  if (( _zrush_rfd >= 0 )); then _zrush_close_internal_fd $_zrush_rfd; _zrush_rfd=-1; fi
+  if (( _zrush_wfd >= 0 )); then _zrush_close_internal_fd $_zrush_wfd; _zrush_wfd=-1; fi
   if [[ -n $_zrush_pty ]]; then
     if [[ $_zrush_capture_pid == <-> ]] && (( _zrush_capture_pid > 1 )); then
       kill -INT -$_zrush_capture_pid 2>/dev/null || kill -INT $_zrush_capture_pid 2>/dev/null

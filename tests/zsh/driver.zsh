@@ -98,7 +98,7 @@ mkdir -p $PLAYGROUND/fx/longcol
 : >| $PLAYGROUND/fx/longcol/"item-${(l:90::x:)}-3.txt"
 
 typeset -gi HOSTFD=-1
-typeset -g TRANSCRIPT= EXPECT_BUF=
+typeset -g TRANSCRIPT= EXPECT_BUF= STDIO_BASELINE=
 
 send_line() { zpty -w  host $1 }
 send_keys() { zpty -wn host $1 }
@@ -202,6 +202,31 @@ dump_get() {
   return 1
 }
 
+assert_host_stdio() {  # $1=label; compare fd targets and stdout/stderr delivery
+  local label=$1
+  log_count 'TESTSTDIO='; local -i baseline=$REPLY
+  EXPECT_BUF=
+  send_keys $'\C-xf'
+  if ! wait_log 'TESTSTDIO=' $baseline 5; then
+    ng "$label: stdio probe did not run"
+    return 1
+  fi
+  drain 0.2
+  local -a lines=( "${(@f)"$(grep -F 'TESTSTDIO=' $ZRUSH_LOG 2>/dev/null)"}" )
+  local latest=${lines[-1]#*TESTSTDIO=}
+  local signature=${latest#*fds=}
+  local visible=${EXPECT_BUF//$'\e['[0-9;]#m/}
+  [[ -n $STDIO_BASELINE ]] || STDIO_BASELINE=$signature
+  if [[ $signature == "$STDIO_BASELINE" \
+        && $visible == *ZRUSH-STDOUT-SENTINEL* \
+        && $visible == *ZRUSH-STDERR-SENTINEL* ]]; then
+    ok "$label"
+    return 0
+  fi
+  ng "$label: fds=${signature:-<none>} baseline=${STDIO_BASELINE:-<none>} output=${(qqqq)visible}"
+  return 1
+}
+
 # A send-break reset for scenarios that can leave a multiline BUFFER: ^U
 # (backward-kill-line) only clears the current physical line of a multiline
 # buffer, so those scenarios need a real line abandon + resync instead.
@@ -244,6 +269,15 @@ start_hist_host() {  # $1=zdotdir $2=xdg-config-home $3=logfile
   else
     ng "(worker-1a) worker was not lazy: ${REPLY:-<none>}"
   fi
+  assert_host_stdio "(fd-1a) source leaves host fd 0/1/2 attached and writable"
+
+  if dump_get $'\C-xj' TESTAUX \
+     && [[ $REPLY == 'closed=1 retry=-1 drain=-1 timer=-1' ]]; then
+    ok "(fd-1b) timer/retry/drain descriptors close through shared teardown"
+  else
+    ng "(fd-1b) auxiliary fd teardown mismatch: ${REPLY:-<none>}"
+  fi
+  assert_host_stdio "(fd-1c) timer/retry/drain teardown preserves host fd 0/1/2"
 
   # ================================================================ (1) Capture fork -> candidate records
   # (cap-1a) A real compsys fork collects candidates, ships candidate records
@@ -264,6 +298,21 @@ start_hist_host() {  # $1=zdotdir $2=xdg-config-home $3=logfile
   fi
   clear_line
   drain 0.3
+  assert_host_stdio "(fd-2a) lazy worker start preserves host fd 0/1/2"
+
+  # A config reload after the worker is live must still deliver its warning to
+  # the host pty. The fixture is removed immediately so later cases use defaults.
+  print -r -- $'[unknown]\nvalue = true' >| $XDG_CONFIG_HOME/zrush/config.toml
+  send_line ':'
+  if expect '*zrush: config:*unknown table*ignoring*HP>*' 5; then
+    ok "(fd-2b) config warning reaches stderr after worker startup"
+  else
+    ng "(fd-2b) config warning missing after worker startup"
+  fi
+  rm -f $XDG_CONFIG_HOME/zrush/config.toml
+  send_line ':'
+  sync_prompt
+  assert_host_stdio "(fd-2c) config reload preserves host fd 0/1/2"
 
   # (cap-1b) The batch header's shared X/J tags reach the worker and come back
   # as a heading line (_files' 'file' tag with group-name '').
@@ -300,6 +349,7 @@ start_hist_host() {  # $1=zdotdir $2=xdg-config-home $3=logfile
   else
     ng "(worker-1e) old worker was not wait-reaped: line=${reaped_resource:-<none>}"
   fi
+  assert_host_stdio "(fd-3) re-source teardown preserves host fd 0/1/2"
 
   # (cap-1c) w vs m: a candidate whose quoted form differs from its raw text.
   # The listing must show the raw text (m, cli-protocol.md "候補レコード"), and
@@ -617,15 +667,23 @@ start_hist_host() {  # $1=zdotdir $2=xdg-config-home $3=logfile
   else
     ng "(err-setup) explicit teardown did not reap old worker: ${explicit_reap:-<none>}"
   fi
+  assert_host_stdio "(fd-4) explicit worker teardown preserves host fd 0/1/2"
   print -r -- die > $ZRUSH_FAKE_CONTROL
   log_count 'worker: session failure:'; local -i err_fail0=$REPLY
   fake_count 'die 1 '; local -i fake_die0=$REPLY
   local -i err_log_line0=0
   [[ -r $ZRUSH_LOG ]] && err_log_line0=$(wc -l < $ZRUSH_LOG)
+  EXPECT_BUF=
   send_keys 'ls fx/basic/al'
   local -i active_death_ok=1
   wait_fake 'die 1 ' $fake_die0 10 || active_death_ok=0
   wait_log 'worker: session failure:' $err_fail0 10 || active_death_ok=0
+  local worker_warning_output=${EXPECT_BUF//$'\e['[0-9;]#m/}
+  if [[ $worker_warning_output == *'zrush: worker transport failed; suppressing further warnings this session'* ]]; then
+    ok "(fd-5a) worker warning reaches stderr after worker startup"
+  else
+    ng "(fd-5a) worker warning missing from pty output: ${(qqqq)worker_warning_output}"
+  fi
   local err_log_delta=$(sed -n "$(( err_log_line0 + 1 )),\$p" $ZRUSH_LOG 2>/dev/null)
   local fake_started=$(print -r -- "$err_log_delta" | grep -F 'worker: started pid=' 2>/dev/null)
   local -i fake_started_count=$(print -r -- "$fake_started" | grep -cF 'worker: started pid=' 2>/dev/null)
@@ -663,6 +721,7 @@ start_hist_host() {  # $1=zdotdir $2=xdg-config-home $3=logfile
   # The next real request lazily starts one replacement. Hold it after ready
   # and assignment so state can be inspected before its terminal response.
   clear_line; drain 0.3
+  assert_host_stdio "(fd-5b) session failure teardown preserves host fd 0/1/2"
   print -r -- hold > $ZRUSH_FAKE_CONTROL
   fake_count 'hold 2 '; local -i fake_hold0=$REPLY
   send_keys 'ls fx/basic/'
@@ -718,6 +777,7 @@ start_hist_host() {  # $1=zdotdir $2=xdg-config-home $3=logfile
 
   clear_line
   drain 0.3
+  assert_host_stdio "(fd-6) explicit disable preserves host fd 0/1/2"
   send_keys 'print HISTMARK-AFTER-ERROR'
   send_keys $'\r'
   if expect '*HISTMARK-AFTER-ERROR*HP>*' 5; then
