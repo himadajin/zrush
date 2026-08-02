@@ -1,9 +1,15 @@
 ---
 name: Change (fix / feat)
-about: Behavior, spec, or implementation change. Only the opening paragraphs are mandatory.
+about: Behavior, spec, or implementation change. Only the title and the opening paragraphs are mandatory.
 ---
 
 <!--
+Title (mandatory): Conventional Commits, naming the change itself
+(e.g. "fix(zle): clear listing on accept-line"). It is reused as the PR title
+and can land on main unedited as the commit subject, so write it as that
+commit message.
+Omit the scope when the affected component is not yet known.
+
 Opening paragraphs (mandatory, 1-2):
   1. Current state (point to the relevant docs/ section if any)
   2. What changes

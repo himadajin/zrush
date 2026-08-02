@@ -1,9 +1,13 @@
 ---
 name: Design decision
-about: Architecture / policy decision record. Only the opening paragraphs are mandatory.
+about: Architecture / policy decision record. Only the title and the opening paragraphs are mandatory.
 ---
 
 <!--
+Title (mandatory): Conventional Commits, naming the change the decision
+commits to (e.g. "feat: adopt a persistent per-shell worker process"),
+not the act of deciding.
+
 Opening paragraphs (mandatory, 1-2):
   1. Current state
   2. The decision itself (write it here; do not assume it was made elsewhere)
