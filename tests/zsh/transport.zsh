@@ -24,6 +24,9 @@
 #   - The ZLE callback never runs headless, so the shared consume path
 #     (_zrush_worker_consume_ack) is called directly, exactly as the synchronous
 #     history loop calls it.
+#   - ZRUSH_LOG points at a file under the temp directory, so that teardown's
+#     classification of the writer child (signal it, or leave its pid alone)
+#     can be read back.
 #   - The notification fd is duplicated before consuming, so that "exactly one
 #     ack byte" and "EOF without an ack byte" can be observed independently of
 #     the code under test. The writer child is never `wait`ed on and its exit
@@ -67,6 +70,18 @@ mkdir -p $HOME $XDG_CONFIG_HOME
   typeset -ga WARNINGS=()
   _zrush_warn() { WARNINGS+=( "$1" ) }   # test seam: record instead of printing
 
+  # _zlog appends only when ZRUSH_LOG is set (zsh/zrush.zsh); point it at the
+  # temp directory so teardown's writer classification is observable.
+  typeset -g LOGFILE=$WORK/zrush.log
+  typeset -g ZRUSH_LOG=$LOGFILE
+  : >| $LOGFILE
+  log_reset() { : >| $LOGFILE }
+  log_has() { command grep -qF -- "$1" $LOGFILE }
+  log_lines() {  # append the whole log to the failure reasons, for diagnosis
+    local l
+    for l in ${(f)"$(command cat $LOGFILE 2>/dev/null)"}; do WHY+=( "log| $l" ); done
+  }
+
   # ------------------------------------------------------------- assertions
   typeset -ga WHY=()
   eq() {  # $1=what $2=actual $3=expected
@@ -87,6 +102,32 @@ mkdir -p $HOME $XDG_CONFIG_HOME
   # ------------------------------------------------------------- fixtures
   typeset -gi RFD=-1 ANCHOR=-1
   typeset -g FIFO=
+
+  # A writer child forked by _zrush_worker_flush inherits this runner's reader
+  # fds on the FIFO, so a child left blocked inside syswrite by a failing
+  # implementation would never see EPIPE and would outlive the run holding the
+  # runner's stdout. Remember the pids and reap the survivors at exit; never an
+  # oracle, only a safety net for failing runs.
+  typeset -ga SPAWNED=()
+  remember_writer() { (( _zrush_worker_writer_pid > 1 )) && SPAWNED+=( $_zrush_worker_writer_pid ); return 0 }
+  flush_now() {
+    _zrush_worker_flush
+    local -i s=$?
+    remember_writer
+    return $s
+  }
+  reap_spawned() {
+    local -i p
+    local pp
+    for p in ${(@)SPAWNED}; do
+      kill -0 $p 2>/dev/null || continue
+      # Only ever signal a pid that is still one of this runner's own children,
+      # so a recycled pid cannot be hit.
+      pp=${${(f)"$(command ps -o ppid= -p $p 2>/dev/null)"}//[[:space:]]/}
+      [[ $pp == $$ ]] && kill -KILL $p 2>/dev/null
+    done
+    SPAWNED=()
+  }
 
   # Reset every transport global the write path reads, so each case starts from
   # a clean session with no worker process behind it.
@@ -197,7 +238,7 @@ mkdir -p $HOME $XDG_CONFIG_HOME
   build_frame; typeset -g FRAME=$REPLY
   print -rn -- "$FRAME" >| $WORK/one.expected
   _zrush_worker_txq=( "$FRAME" )
-  _zrush_worker_flush; typeset -gi st=$?
+  flush_now; typeset -gi st=$?
   eq "flush status" $st 0
   eq "queue drained into the child" $#_zrush_worker_txq 0
   (( _zrush_worker_ack_fd >= 0 )) || note "no notification fd after flush"
@@ -241,7 +282,7 @@ mkdir -p $HOME $XDG_CONFIG_HOME
   print -rn -- "$FRAME_A" >| $WORK/order.a.expected
   print -rn -- "$FRAME_B" >| $WORK/order.b.expected
   _zrush_worker_txq=( "$FRAME_A" "$FRAME_B" )
-  _zrush_worker_flush; st=$?
+  flush_now; st=$?
   typeset -gi ACK_A=$_zrush_worker_ack_fd PID_A=$_zrush_worker_writer_pid
   eq "flush status" $st 0
   eq "second frame still queued" $#_zrush_worker_txq 1
@@ -249,7 +290,7 @@ mkdir -p $HOME $XDG_CONFIG_HOME
   (( PID_A > 1 )) || note "no writer child for frame A"
   # A is larger than the FIFO's 8192-byte capacity and nothing drains yet, so A
   # is still in flight here. A second flush must not hand B to another child.
-  _zrush_worker_flush; st=$?
+  flush_now; st=$?
   eq "flush while a child is in flight" $st 0
   eq "notification fd unchanged" $_zrush_worker_ack_fd $ACK_A
   eq "writer pid unchanged" $_zrush_worker_writer_pid $PID_A
@@ -264,6 +305,7 @@ mkdir -p $HOME $XDG_CONFIG_HOME
   eq "B still queued before A's ack" $#_zrush_worker_txq 1
   if readable $_zrush_worker_ack_fd $WAIT_CS; then
     _zrush_worker_consume_ack; cst=$?
+    remember_writer   # consume_ack flushed B itself
     eq "consume_ack status for A" $cst 0
     eq "B handed to a child on A's ack" $#_zrush_worker_txq 0
     (( _zrush_worker_ack_fd >= 0 )) || note "no notification fd for frame B"
@@ -296,7 +338,7 @@ mkdir -p $HOME $XDG_CONFIG_HOME
   fifo_setup killed
   build_frame 40000; typeset -g FRAME_BIG=$REPLY
   _zrush_worker_txq=( "$FRAME_BIG" )
-  _zrush_worker_flush; st=$?
+  flush_now; st=$?
   eq "flush status" $st 0
   typeset -gi VICTIM=$_zrush_worker_writer_pid
   if (( VICTIM > 1 )) && kill -0 $VICTIM 2>/dev/null && peek_open; then
@@ -334,7 +376,7 @@ mkdir -p $HOME $XDG_CONFIG_HOME
   typeset -g ODD=$'-cvar\1-f\0--\2 -s 1'
   print -rn -- "$ODD" >| $WORK/opaque.expected
   _zrush_worker_txq=( "$ODD" )
-  _zrush_worker_flush; st=$?
+  flush_now; st=$?
   eq "flush status" $st 0
   if drain_bytes $RFD $WORK/opaque.actual ${#ODD}; then
     cmp -s $WORK/opaque.expected $WORK/opaque.actual || note "option-like frame bytes differ"
@@ -352,19 +394,28 @@ mkdir -p $HOME $XDG_CONFIG_HOME
   verdict "frame: option-like leading bytes are written verbatim, not parsed by syswrite"
 
   # ============================================================ case 5
-  # Teardown drops the unsent queue and lets go of the in-flight child.
+  # Teardown drops the unsent queue and signals the child that is still inside
+  # its blocking syswrite: nothing readable on the notification fd is the only
+  # state in which the recorded pid is still the writer child's.
   fifo_setup drop
   build_frame 40000; FRAME_A=$REPLY
   build_frame;       FRAME_B=$REPLY
   _zrush_worker_txq=( "$FRAME_A" "$FRAME_B" )
-  _zrush_worker_flush; st=$?
+  flush_now; st=$?
   eq "flush status" $st 0
+  typeset -gi PID_BLOCKED=$_zrush_worker_writer_pid
   if peek_open; then
+    log_reset
     _zrush_worker_transport_teardown failure
     eq "queued frames dropped" $#_zrush_worker_txq 0
     eq "notification fd released" $_zrush_worker_ack_fd -1
     eq "writer pid released" $_zrush_worker_writer_pid -1
     eq "request fd closed" $_zrush_worker_wfd -1
+    if ! log_has "worker: teardown terminating writer pid=$PID_BLOCKED"; then
+      note "teardown did not signal the child blocked in syswrite"
+      log_lines
+    fi
+    log_has "teardown writer done" && note "teardown classified a blocked child as done"
     if readable $PEEK $WAIT_CS; then
       peek_read
       eq "in-flight child gone without an ack" $PEEK_ST 5
@@ -377,10 +428,75 @@ mkdir -p $HOME $XDG_CONFIG_HOME
   fi
   peek_close
   fifo_teardown
-  verdict "teardown: unsent frames are dropped and the in-flight child is released"
+  verdict "teardown: unsent frames are dropped and the blocked child is signalled"
+
+  # ============================================================ case 6
+  # A child that already acked owns nothing any more, even when the ack byte has
+  # not been consumed yet: teardown must not signal that pid, which by then may
+  # belong to an unrelated process.
+  fifo_setup acked
+  build_frame; FRAME=$REPLY
+  _zrush_worker_txq=( "$FRAME" )
+  flush_now; st=$?
+  eq "flush status" $st 0
+  typeset -gi PID_DONE=$_zrush_worker_writer_pid
+  if drain_bytes $RFD $WORK/acked.actual ${#FRAME}; then
+    if readable $_zrush_worker_ack_fd $WAIT_CS; then
+      # The ack byte is deliberately left unconsumed: teardown, not
+      # _zrush_worker_consume_ack, has to classify it.
+      log_reset
+      _zrush_worker_transport_teardown failure
+      if ! log_has "worker: teardown writer done pid=$PID_DONE status=0"; then
+        note "teardown did not classify the acked child as done"
+        log_lines
+      fi
+      log_has "teardown terminating writer" && note "teardown signalled a child that had already acked"
+      eq "notification fd released" $_zrush_worker_ack_fd -1
+      eq "writer pid released" $_zrush_worker_writer_pid -1
+      eq "queue emptied" $#_zrush_worker_txq 0
+    else
+      note "no ack within ${WAIT_CS}cs"
+    fi
+  else
+    note "reader did not observe the frame within ${WAIT_CS}cs"
+  fi
+  fifo_teardown
+  verdict "teardown: a child that already acked is never signalled"
+
+  # ============================================================ case 7
+  # Same classification at the other end: a child that died mid-frame leaves the
+  # notification fd at EOF, and a dead pid must not be signalled either.
+  fifo_setup gone
+  build_frame 40000; FRAME_BIG=$REPLY
+  _zrush_worker_txq=( "$FRAME_BIG" )
+  flush_now; st=$?
+  eq "flush status" $st 0
+  VICTIM=$_zrush_worker_writer_pid
+  if (( VICTIM > 1 )) && kill -0 $VICTIM 2>/dev/null && peek_open; then
+    kill -KILL $VICTIM 2>/dev/null || note "cannot kill the writer child"
+    if readable $PEEK $WAIT_CS; then
+      log_reset
+      _zrush_worker_transport_teardown failure
+      if ! log_has "worker: teardown writer done pid=$VICTIM status=5"; then
+        note "teardown did not classify the EOF as a finished child"
+        log_lines
+      fi
+      log_has "teardown terminating writer" && note "teardown signalled a child that had already died"
+      eq "notification fd released" $_zrush_worker_ack_fd -1
+      eq "writer pid released" $_zrush_worker_writer_pid -1
+    else
+      note "notification fd did not reach EOF within ${WAIT_CS}cs after the kill"
+    fi
+  else
+    note "no live writer child to kill"
+  fi
+  peek_close
+  fifo_teardown
+  verdict "teardown: a child already at EOF is never signalled"
 
   out "SUMMARY: PASS=$PASS FAIL=$FAIL"
 } always {
+  (( $+functions[reap_spawned] )) && reap_spawned
   [[ -n $WORK && $WORK == */zrush-transport.* ]] && rm -rf $WORK
 }
 (( FAIL == 0 ))

@@ -855,14 +855,26 @@ _zrush_worker_transport_teardown() {
   setopt localoptions no_bg_nice
   _zrush_worker_disarm_drain
   _zrush_worker_txq=()
+  # _zrush_worker_writer_pid is >1 only while an ack fd exists, so signalling
+  # belongs inside this branch. Nothing readable after the bounded wait is the
+  # only state in which the child still owns that pid; once its single write is
+  # over the pid may already have been reused by an unrelated process.
   if (( _zrush_worker_ack_fd >= 0 )); then
+    local ack=
+    local -i ack_st
     zle -F $_zrush_worker_ack_fd 2>/dev/null
-    # Bounded wait: the notification fd becomes readable on the ack byte and on
-    # the child's death alike, so this cannot outlast the child.
+    # The notification fd becomes readable on the ack byte and on the child's
+    # death alike, so this bounded wait cannot outlast the child.
     zselect -t 1 -r $_zrush_worker_ack_fd >/dev/null 2>&1
+    sysread -t 0 -i $_zrush_worker_ack_fd ack; ack_st=$?
     _zrush_worker_release_writer
+    if (( ack_st == 4 )); then
+      _zlog "worker: teardown terminating writer pid=$_zrush_worker_writer_pid"
+      _zrush_worker_terminate $_zrush_worker_writer_pid
+    else
+      _zlog "worker: teardown writer done pid=$_zrush_worker_writer_pid status=$ack_st"
+    fi
   fi
-  _zrush_worker_terminate $_zrush_worker_writer_pid
   _zrush_worker_writer_pid=-1
   if (( _zrush_worker_setup_fd >= 0 )); then
     zle -F $_zrush_worker_setup_fd 2>/dev/null
