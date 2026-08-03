@@ -924,7 +924,7 @@ _zrush_worker_start() {
     fi
   )
   _zrush_worker_setup_fd=$fd
-  _zrush_worker_setup_pid=$!
+  _zrush_worker_setup_pid=${sysparams[procsubstpid]:--1}
   _zrush_worker_ready=0
   _zrush_worker_rx= _zrush_worker_tx=
   _zrush_encode_message hello "$_ZRUSH_EXPECTED_PROTO"
