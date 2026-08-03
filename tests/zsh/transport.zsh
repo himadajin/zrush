@@ -167,10 +167,16 @@ mkdir -p $HOME $XDG_CONFIG_HOME
     FIFO=
   }
 
+  # Padding that leaves the writer child blocked inside its single syswrite.
+  # A FIFO's buffer is 8192 bytes on macOS but 65536 on Linux, so a frame only
+  # blocks on both platforms if it exceeds the larger figure with margin; the
+  # cases below never hard-code a capacity, they pad by this amount.
+  typeset -gi BLOCK_PAD=131072
+
   # A representative encoded plan request. Fields carry the bytes the transport
   # must ship verbatim: option-like values ("-f", "-cvar"), and NUL / SOH / STX,
-  # which cli-protocol.md allows anywhere in a payload. $1 pads the frame past
-  # the FIFO's 8192-byte capacity so the writer child blocks inside syswrite.
+  # which cli-protocol.md allows anywhere in a payload. $1 pads the frame; pass
+  # $BLOCK_PAD when the case needs a writer child blocked inside syswrite.
   build_frame() {  # $1=pad bytes (default 0) -> REPLY
     emulate -L zsh
     setopt localoptions nomultibyte
@@ -182,7 +188,7 @@ mkdir -p $HOME $XDG_CONFIG_HOME
       "w"$'\1'"-cvar"
       "w"$'\2'"README.md"$'\0'"after-nul"
     )
-    (( pad > 0 )) && fields+=( "w"$'\1'"${${(l:40000::x:)}[1,pad]}" )
+    (( pad > 0 )) && fields+=( "w"$'\1'"${(l:pad::x:)}" )
     _zrush_encode_message "${(@)fields}"
   }
 
@@ -277,7 +283,7 @@ mkdir -p $HOME $XDG_CONFIG_HOME
   # Two frames: the second waits for the first frame's ack, and the reader sees
   # the first frame complete before any byte of the second.
   fifo_setup order
-  build_frame 40000; typeset -g FRAME_A=$REPLY
+  build_frame $BLOCK_PAD; typeset -g FRAME_A=$REPLY
   build_frame;       typeset -g FRAME_B=$REPLY
   print -rn -- "$FRAME_A" >| $WORK/order.a.expected
   print -rn -- "$FRAME_B" >| $WORK/order.b.expected
@@ -288,8 +294,8 @@ mkdir -p $HOME $XDG_CONFIG_HOME
   eq "second frame still queued" $#_zrush_worker_txq 1
   eq "queued frame is B" "$_zrush_worker_txq[1]" "$FRAME_B"
   (( PID_A > 1 )) || note "no writer child for frame A"
-  # A is larger than the FIFO's 8192-byte capacity and nothing drains yet, so A
-  # is still in flight here. A second flush must not hand B to another child.
+  # A outgrows the FIFO's buffer on either platform and nothing drains yet, so
+  # A is still in flight here. A second flush must not hand B to another child.
   flush_now; st=$?
   eq "flush while a child is in flight" $st 0
   eq "notification fd unchanged" $_zrush_worker_ack_fd $ACK_A
@@ -336,7 +342,7 @@ mkdir -p $HOME $XDG_CONFIG_HOME
   # A child killed mid-frame: EOF without an ack byte is a worker session
   # failure, never a silently truncated success.
   fifo_setup killed
-  build_frame 40000; typeset -g FRAME_BIG=$REPLY
+  build_frame $BLOCK_PAD; typeset -g FRAME_BIG=$REPLY
   _zrush_worker_txq=( "$FRAME_BIG" )
   flush_now; st=$?
   eq "flush status" $st 0
@@ -398,7 +404,7 @@ mkdir -p $HOME $XDG_CONFIG_HOME
   # its blocking syswrite: nothing readable on the notification fd is the only
   # state in which the recorded pid is still the writer child's.
   fifo_setup drop
-  build_frame 40000; FRAME_A=$REPLY
+  build_frame $BLOCK_PAD; FRAME_A=$REPLY
   build_frame;       FRAME_B=$REPLY
   _zrush_worker_txq=( "$FRAME_A" "$FRAME_B" )
   flush_now; st=$?
@@ -467,7 +473,7 @@ mkdir -p $HOME $XDG_CONFIG_HOME
   # Same classification at the other end: a child that died mid-frame leaves the
   # notification fd at EOF, and a dead pid must not be signalled either.
   fifo_setup gone
-  build_frame 40000; FRAME_BIG=$REPLY
+  build_frame $BLOCK_PAD; FRAME_BIG=$REPLY
   _zrush_worker_txq=( "$FRAME_BIG" )
   flush_now; st=$?
   eq "flush status" $st 0
