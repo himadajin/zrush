@@ -272,12 +272,12 @@ start_hist_host() {  # $1=zdotdir $2=xdg-config-home $3=logfile
   assert_host_stdio "(fd-1a) source leaves host fd 0/1/2 attached and writable"
 
   if dump_get $'\C-xj' TESTAUX \
-     && [[ $REPLY == 'closed=1 retry=-1 drain=-1 timer=-1' ]]; then
-    ok "(fd-1b) timer/retry/drain descriptors close through shared teardown"
+     && [[ $REPLY == 'closed=1 ack=-1 drain=-1 timer=-1' ]]; then
+    ok "(fd-1b) timer/ack/drain descriptors close through shared teardown"
   else
     ng "(fd-1b) auxiliary fd teardown mismatch: ${REPLY:-<none>}"
   fi
-  assert_host_stdio "(fd-1c) timer/retry/drain teardown preserves host fd 0/1/2"
+  assert_host_stdio "(fd-1c) timer/ack/drain teardown preserves host fd 0/1/2"
 
   # ================================================================ (1) Capture fork -> candidate records
   # (cap-1a) A real compsys fork collects candidates, ships candidate records
@@ -336,7 +336,7 @@ start_hist_host() {  # $1=zdotdir $2=xdg-config-home $3=logfile
   local -i seq_before_resource=${${worker_after_successive#*seq=}%% *}
   send_line "source $REPO/zsh/zrush.zsh"
   sync_prompt
-  if dump_get $'\C-xw' TESTWORKER && [[ $REPLY == "pid=-1 ready=0 seq=$seq_before_resource "* && $REPLY == *'rfd=-1 wfd=-1 retry=-1 pending=0' ]]; then
+  if dump_get $'\C-xw' TESTWORKER && [[ $REPLY == "pid=-1 ready=0 seq=$seq_before_resource "* && $REPLY == *'rfd=-1 wfd=-1 ack=-1 pending=0' ]]; then
     ok "(worker-1d) re-source tears down transport while preserving the request counter"
   else
     ng "(worker-1d) bad post-resource state: ${REPLY:-<none>}"

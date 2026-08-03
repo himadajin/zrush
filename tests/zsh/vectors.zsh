@@ -206,7 +206,7 @@ reserialize_plan() {  # -> REPLY=bytes, or return 1 with REPLY=reason
   _zrush_timer_fd=$exit_timer_fd _zrush_rfd=$exit_rfd _zrush_wfd=$exit_wfd
   _zrush_pty= _zrush_worker_pid=-1 _zrush_worker_setup_pid=-1
   _zrush_worker_rfd=-1 _zrush_worker_wfd=-1 _zrush_worker_setup_fd=-1
-  _zrush_worker_retry_fd=-1 _zrush_worker_drain_fd=-1
+  _zrush_worker_ack_fd=-1 _zrush_worker_drain_fd=-1
   _zrush_zshexit
   if (( _zrush_timer_fd == -1 && _zrush_rfd == -1 && _zrush_wfd == -1 )) \
      && [[ ! -e /dev/fd/$exit_timer_fd && ! -e /dev/fd/$exit_rfd \
@@ -391,25 +391,25 @@ reserialize_plan() {  # -> REPLY=bytes, or return 1 with REPLY=reason
   # disable immediately; it is not counted as the first retryable failure.
   _zrush_worker_ready=0 _zrush_worker_failures=0 _zrush_disabled=0 _zrush_enabled=1
   _zrush_worker_warned=0 _zrush_worker_pid=-1 _zrush_worker_setup_pid=-1
-  local -i mismatch_rfd mismatch_wfd mismatch_setup_fd mismatch_retry_fd mismatch_drain_fd
+  local -i mismatch_rfd mismatch_wfd mismatch_setup_fd mismatch_ack_fd mismatch_drain_fd
   exec {mismatch_rfd}< /dev/null
   exec {mismatch_wfd}> /dev/null
   exec {mismatch_setup_fd}< /dev/null
-  exec {mismatch_retry_fd}< /dev/null
+  exec {mismatch_ack_fd}< /dev/null
   exec {mismatch_drain_fd}< /dev/null
   _zrush_worker_rfd=$mismatch_rfd _zrush_worker_wfd=$mismatch_wfd
   _zrush_worker_setup_fd=$mismatch_setup_fd
-  _zrush_worker_retry_fd=$mismatch_retry_fd _zrush_worker_drain_fd=$mismatch_drain_fd
+  _zrush_worker_ack_fd=$mismatch_ack_fd _zrush_worker_drain_fd=$mismatch_drain_fd
   _zrush_encode_message incompatible 7
   local mismatch_frame=$REPLY
   _zrush_netstring_take "$mismatch_frame"
   _zrush_worker_handle_message "$REPLY" 2>/dev/null
   if (( _zrush_disabled && !_zrush_enabled && _zrush_worker_failures == 0 \
         && _zrush_worker_warned && _zrush_worker_rfd == -1 && _zrush_worker_wfd == -1 \
-        && _zrush_worker_setup_fd == -1 && _zrush_worker_retry_fd == -1 \
+        && _zrush_worker_setup_fd == -1 && _zrush_worker_ack_fd == -1 \
         && _zrush_worker_drain_fd == -1 )) \
      && [[ ! -e /dev/fd/$mismatch_rfd && ! -e /dev/fd/$mismatch_wfd \
-           && ! -e /dev/fd/$mismatch_setup_fd && ! -e /dev/fd/$mismatch_retry_fd \
+           && ! -e /dev/fd/$mismatch_setup_fd && ! -e /dev/fd/$mismatch_ack_fd \
            && ! -e /dev/fd/$mismatch_drain_fd ]]; then
     ok "worker lifecycle: protocol mismatch disables immediately and closes every transport fd"
   else

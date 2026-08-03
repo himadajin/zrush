@@ -25,7 +25,7 @@ bindkey '^Xh' _zrt-dump-rh
 # ^Xw: persistent-worker lifecycle state. This exposes only stable invariants
 # needed by driver.zsh (lazy start, reuse, monotonic ids, and clean teardown).
 _zrt_dump_worker() {
-  _zlog "TESTWORKER=pid=$_zrush_worker_pid ready=$_zrush_worker_ready seq=$_zrush_request_seq failures=$_zrush_worker_failures disabled=$_zrush_disabled warned=$_zrush_worker_warned rfd=$_zrush_worker_rfd wfd=$_zrush_worker_wfd retry=$_zrush_worker_retry_fd pending=$#_zrush_worker_pending"
+  _zlog "TESTWORKER=pid=$_zrush_worker_pid ready=$_zrush_worker_ready seq=$_zrush_request_seq failures=$_zrush_worker_failures disabled=$_zrush_disabled warned=$_zrush_worker_warned rfd=$_zrush_worker_rfd wfd=$_zrush_worker_wfd ack=$_zrush_worker_ack_fd pending=$#_zrush_worker_pending"
 }
 zle -N _zrt-dump-worker _zrt_dump_worker
 bindkey '^Xw' _zrt-dump-worker
@@ -63,21 +63,22 @@ _zrt_probe_stdio() {
 zle -N _zrt-probe-stdio _zrt_probe_stdio
 bindkey '^Xf' _zrt-probe-stdio
 
-# ^Xj: synthesize the timer/retry/drain descriptors and exercise their shared
+# ^Xj: synthesize the timer/ack/drain descriptors and exercise their shared
 # teardown paths without depending on timing or kernel backpressure.
 _zrt_close_aux_fds() {
   emulate -L zsh
-  local -i retry_fd drain_fd timer_fd closed=1
-  exec {retry_fd}< <( print )
+  local -i ack_fd drain_fd timer_fd closed=1
+  exec {ack_fd}< <( print )
   exec {drain_fd}< <( print )
   exec {timer_fd}< <( print )
-  _zrush_worker_retry_fd=$retry_fd
+  _zrush_worker_ack_fd=$ack_fd
   _zrush_worker_drain_fd=$drain_fd
   _zrush_timer_fd=$timer_fd
-  _zrush_worker_disarm_retry
+  _zrush_worker_release_writer
+  _zrush_worker_disarm_drain
   _zrush_disarm_timer
-  [[ -e /dev/fd/$retry_fd || -e /dev/fd/$drain_fd || -e /dev/fd/$timer_fd ]] && closed=0
-  _zlog "TESTAUX=closed=$closed retry=$_zrush_worker_retry_fd drain=$_zrush_worker_drain_fd timer=$_zrush_timer_fd"
+  [[ -e /dev/fd/$ack_fd || -e /dev/fd/$drain_fd || -e /dev/fd/$timer_fd ]] && closed=0
+  _zlog "TESTAUX=closed=$closed ack=$_zrush_worker_ack_fd drain=$_zrush_worker_drain_fd timer=$_zrush_timer_fd"
 }
 zle -N _zrt-close-aux-fds _zrt_close_aux_fds
 bindkey '^Xj' _zrt-close-aux-fds
