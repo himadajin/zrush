@@ -55,8 +55,10 @@ zsh は zle 統合・compsys 呼び出しによる捕獲・プランの適用
   writer child は 1 回の `syswrite` でフレーム全体を書き切り、書き終えたら通知用パイプへ
   ack バイトを 1 個書く。
   writer child は worker と同じく対話シェルの job table に登録しない。
-  対話シェルは通知 fd を `zle -F` で監視するだけで、blocking write を一切行わず
+  対話シェルは通知 fd を `zle -F` で監視し、blocking write を一切行わず
   ZLE callback 内で書き込み完了を待たない。
+  ack の消費は通知 fd の readiness を確認したうえで行い、通知 fd の `zle -F` callback・
+  worker 応答の受信時・同期履歴ループのいずれから行ってもよい。
   in-flight の writer child は常に高々 1 個であり、次のフレームは直前の child が
   ack バイトを書いた時点で送る。
   worker は受信した plan を直列に処理するため、この直列送信によって queue も request_id 順を保つ。

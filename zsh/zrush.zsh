@@ -1236,6 +1236,13 @@ _zrush_worker_read() {  # async | sync [absolute-deadline]
 _zrush_worker_on_data() {
   emulate -L zsh
   (( $1 == _zrush_worker_rfd )) || return 0
+  # The ack is usually ready in the same wakeup as the response it precedes.
+  # Consuming it before the plan is painted leaves the ack watcher's own
+  # dispatch with nothing to do, because work running in a callback after a
+  # paint holds a SIGINT that zsh 5.9 defers onto the next input byte.
+  if (( _zrush_worker_ack_fd >= 0 )); then
+    _zrush_worker_consume_ack || return 0
+  fi
   _zrush_worker_read async
   return 0
 }
