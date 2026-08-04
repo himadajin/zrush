@@ -1,0 +1,16 @@
+gh pr view\0
+2\0
+2\0
+  106  gh pr view   \0
+  107  echo gh issue\0
+4\0
+history-number 2 2 3\0
+match 2 7 2\0
+history-number 1 23 3\0
+match 1 33 2\0
+21 20\0
+0 17\0
+2 0 1 2\0
+2 1 1 2\0
+echo gh issue\0
+gh pr view\0

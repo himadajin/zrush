@@ -1,0 +1,16 @@
+foo\0
+2\0
+2\0
+   99  foo      \0
+  105  echo xfoo\0
+4\0
+history-number 2 3 2\0
+match 2 7 3\0
+history-number 1 19 3\0
+match 1 30 3\0
+17 16\0
+0 10\0
+2 0 1 2\0
+2 1 1 2\0
+echo xfoo\0
+foo\0

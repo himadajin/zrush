@@ -12,20 +12,22 @@
 #     $HOME and $XDG_CONFIG_HOME are redirected to a fresh mktemp directory,
 #     so the real ~/.zshrc, shell history and ~/.config/zrush are untouched.
 #   UPDATE_GOLDEN=1 zsh -f tests/zsh/vectors.zsh
-#     Regenerate encode/<name>/expected.bin from the current implementation.
+#     Regenerate encode/<name>/expected from the current implementation.
 #     Like the Rust runner, this deliberately fails and lists every file it
 #     changed, so a regenerated golden cannot land unreviewed.
 #
 # Scope: tests/vectors/ fixes candidate encoding and render-plan decoding
 # (see its README and docs/internal/contracts/cli-protocol.md).
+#   - every corpus file must be canonical escaped text, so the codec below
+#     cannot silently substitute one byte string for another.
 #   - encode/<name>/: compadd argv plus captured candidate arrays in,
-#     expected.bin out. Fixes the sender-side guarantees that never appear in
+#     expected out. Fixes the sender-side guarantees that never appear in
 #     Rust output and so cannot be covered by plan/ vectors.
-#   - plan/<name>/expected.bin must parse, and the _zrush_plan_* state must
+#   - plan/<name>/expected must parse, and the _zrush_plan_* state must
 #     re-serialize to exactly those bytes (a decode/encode round trip).
 #     `cargo test` checks the same corpus against the Rust serializer and the
 #     Rust reference parser, so both sides are held to one set of bytes.
-#   - reject-plan/<name>/plan.bin must be rejected (return 1).
+#   - reject-plan/<name>/plan must be rejected (return 1).
 #
 # Unlike driver.zsh (a zle/compsys end-to-end smoke test over zpty), nothing
 # here touches zle, so a failure points at the encoder or decoder itself.
@@ -48,23 +50,27 @@ export HISTFILE=$WORK/histfile     # nothing writes history, but never the real 
 unset ZDOTDIR
 mkdir -p $HOME $XDG_CONFIG_HOME
 
-# Render a byte string with control bytes escaped, so failures are readable.
+# ---------------- corpus text format ----------------
+# Every file under tests/vectors/ stores its byte string as escaped text; a
+# line break is layout, never data (tests/vectors/README.md).
 # nomultibyte makes ${#s} a byte count and $s[i] a single byte.
-dump_bytes() {  # $1=byte string -> REPLY
+enc_bytes() {  # $1=byte string -> REPLY=text
   emulate -L zsh
   setopt nomultibyte
   local s=$1 o= c
   local -i i b
   for (( i = 1; i <= $#s; i++ )); do
     c=$s[i]
-    case $c in
-      $'\0') o+='\0' ;;
-      $'\n') o+='\n' ;;
-      $'\r') o+='\r' ;;
-      $'\t') o+='\t' ;;
-      '\')   o+='\\' ;;
+    b=$(( #c ))
+    case $b in
+      0)  o+='\0'$'\n' ;;
+      1)  o+='\1' ;;
+      2)  o+='\2'$'\n' ;;
+      9)  o+='\t' ;;
+      10) o+='\n' ;;
+      13) o+='\r' ;;
+      92) o+='\\' ;;
       *)
-        b=$(( #c ))
         if (( b >= 32 && b <= 126 )); then
           o+=$c
         else
@@ -73,21 +79,91 @@ dump_bytes() {  # $1=byte string -> REPLY
         ;;
     esac
   done
+  [[ -z $o || $o == *$'\n' ]] || o+=$'\n'
   typeset -g REPLY=$o
 }
 
-dump_file() {  # $1=path -> REPLY
-  dump_bytes "$(<$1)"
+dec_bytes() {  # $1=text -> REPLY=byte string, or return 1 with REPLY=reason
+  emulate -L zsh
+  setopt nomultibyte
+  local t=$1 o= c n h
+  local -i i b
+  for (( i = 1; i <= $#t; i++ )); do
+    c=$t[i]
+    b=$(( #c ))
+    (( b == 10 )) && continue
+    if (( b != 92 )); then
+      if (( b < 32 || b > 126 )); then
+        typeset -g REPLY="raw byte outside the escape alphabet at offset $i"
+        return 1
+      fi
+      o+=$c
+      continue
+    fi
+    (( ++i ))
+    n=$t[i]
+    case $n in
+      0) o+=$'\0' ;;
+      1) o+=$'\1' ;;
+      2) o+=$'\2' ;;
+      n) o+=$'\n' ;;
+      r) o+=$'\r' ;;
+      t) o+=$'\t' ;;
+      x) h=$t[i+1,i+2]; (( i += 2 ))
+         if [[ $h != [0-9a-fA-F][0-9a-fA-F] ]]; then
+           typeset -g REPLY="bad \\x escape at offset $i"
+           return 1
+         fi
+         o+=${(#)$((16#$h))} ;;
+      '') typeset -g REPLY='trailing backslash'; return 1 ;;
+      *)
+        if (( $(( #n )) == 92 )); then
+          o+='\'
+        else
+          typeset -g REPLY="unknown escape \\$n at offset $i"
+          return 1
+        fi
+        ;;
+    esac
+  done
+  typeset -g REPLY=$o
+  return 0
+}
+
+# $(<file) strips every trailing newline, which would hide a non-canonical
+# file from the corpus check below; read to the first NUL instead, and the
+# corpus (being text) has none.
+read_text() {  # $1=path -> REPLY=exact file contents, or return 1 with REPLY=reason
+  emulate -L zsh
+  [[ -e $1 ]] || { typeset -g REPLY="missing ${1:t}"; return 1 }
+  typeset -g REPLY=
+  IFS= read -rd '' REPLY < $1
+  return 0
+}
+
+read_vector() {  # $1=path -> REPLY=byte string, or return 1 with REPLY=reason
+  emulate -L zsh
+  read_text $1 || return 1
+  dec_bytes "$REPLY" || { typeset -g REPLY="${1:t}: $REPLY"; return 1 }
+  return 0
+}
+
+# Single-line rendering for failure messages. Layout newlines are the only
+# literal newlines enc_bytes emits, so dropping them collapses the escaped
+# form onto one line without touching the escapes themselves.
+dump_bytes() {  # $1=byte string -> REPLY
+  emulate -L zsh
+  enc_bytes "$1"
+  typeset -g REPLY=${REPLY//$'\n'/}
 }
 
 # ---------------- encode/ ----------------
-# Read one NUL-terminated list file (encode/ inputs are arbitrary byte strings,
-# so they cannot use the line-per-argument form plan/args uses).
+# Read one NUL-terminated list file.
 read_nul() {  # $1=path -> reply=(elements), or return 1 with REPLY=reason
   emulate -L zsh
   typeset -ga reply=()
-  [[ -e $1 ]] || { typeset -g REPLY="missing ${1:t}"; return 1 }
-  local s=$(<$1)
+  read_vector $1 || return 1
+  local s=$REPLY
   [[ -z $s ]] && return 0
   [[ $s == *$'\0' ]] || { typeset -g REPLY="${1:t} is not NUL-terminated"; return 1 }
   reply=( "${(@0)${s%$'\0'}}" )
@@ -115,11 +191,11 @@ encode_call() {  # $1=env file (may be absent), $2.. = compadd argv -> REPLY
 encode_vector() {  # $1=vector directory -> REPLY=wire bytes, or return 1 with REPLY=reason
   emulate -L zsh
   local dir=$1
-  read_nul $dir/argv.bin || return 1
+  read_nul $dir/argv || return 1
   local -a vargv=( "${(@)reply}" )
-  read_nul $dir/hits.bin || return 1
+  read_nul $dir/hits || return 1
   typeset -ga _zrush_enc_hits=( "${(@)reply}" )
-  read_nul $dir/dscr.bin || return 1
+  read_nul $dir/dscr || return 1
   typeset -ga _zrush_enc_dscr=( "${(@)reply}" )
   encode_call $dir/env "${(@)vargv}"
 }
@@ -331,7 +407,9 @@ reserialize_plan() {  # -> REPLY=bytes, or return 1 with REPLY=reason
 
   # A well-formed stale success is consumed but must not replace the plan for
   # the currently relevant request.
-  local stale_plan="$(<$VECTORS/plan/empty-stdin/expected.bin)"
+  read_vector $VECTORS/plan/empty-stdin/expected \
+    || { out "FATAL: $REPLY"; exit 1 }
+  local stale_plan=$REPLY
   _zrush_worker_ready=1 _zrush_worker_failures=1 _zrush_disabled=0 _zrush_enabled=1
   typeset -gA _zrush_worker_pending=( 41 compsys )
   _zrush_current_request=42
@@ -508,8 +586,34 @@ reserialize_plan() {  # -> REPLY=bytes, or return 1 with REPLY=reason
   fi
   unset REPLY
 
+  # ---------------- Corpus is canonical text ----------------
+  # Without this a dec_bytes bug could quietly map a vector onto some *other*
+  # byte string -- a reject-plan/ vector mangled into a different malformed
+  # plan is still rejected, and that check would pass while fixing nothing.
+  # `env` holds zsh parameter assignments, not a wire byte string.
+  typeset -a corpus=( $VECTORS/**/*(.N^-/) )
+  corpus=( ${(@)corpus:#*/(env|README.md)} )
+  (( $#corpus )) || { out "FATAL: no corpus files under $VECTORS"; exit 1 }
+  typeset -a noncanonical=()
+  local f text
+  for f in "${(@)corpus}"; do
+    read_text $f; text=$REPLY
+    if ! dec_bytes "$text"; then
+      noncanonical+=( "${f#$VECTORS/}: $REPLY" )
+      continue
+    fi
+    enc_bytes "$REPLY"
+    [[ $REPLY == $text ]] || noncanonical+=( "${f#$VECTORS/}" )
+  done
+  if (( $#noncanonical )); then
+    ng "corpus files that are not canonical text:
+      ${(pj:\n      :)noncanonical}"
+  else
+    ok "corpus: all $#corpus files are canonical escaped text"
+  fi
+
   # ---------------- Encode ----------------
-  typeset -a inputs=( $VECTORS/encode/*/argv.bin(N) )
+  typeset -a inputs=( $VECTORS/encode/*/argv(N) )
   (( $#inputs )) || { out "FATAL: no encode vectors under $VECTORS/encode"; exit 1 }
   typeset -a updated=()
 
@@ -521,30 +625,30 @@ reserialize_plan() {  # -> REPLY=bytes, or return 1 with REPLY=reason
       ng "encode/$name: $REPLY"
       continue
     fi
-    actual=$REPLY
-    goldenfile=$dir/expected.bin
-    print -rn -- "$actual" >| $WORK/actual.bin
+    # Comparing in text space keeps a wrong enc_bytes from ever producing a
+    # false pass: it can only make the two forms differ.
+    enc_bytes "$REPLY"; actual=$REPLY
+    goldenfile=$dir/expected
     if [[ $UPDATE_GOLDEN == 1 ]]; then
-      if cmp -s $WORK/actual.bin $goldenfile 2>/dev/null; then
+      if read_text $goldenfile && [[ $actual == $REPLY ]]; then
         ok "encode/$name: golden unchanged"
       else
-        cp $WORK/actual.bin $goldenfile
-        updated+=( "encode/$name/expected.bin" )
+        print -rn -- "$actual" >| $goldenfile
+        updated+=( "encode/$name/expected" )
       fi
       continue
     fi
-    if [[ ! -e $goldenfile ]]; then
-      ng "encode/$name: expected.bin missing (run UPDATE_GOLDEN=1 and review the result)"
+    if ! read_text $goldenfile; then
+      ng "encode/$name: expected missing (run UPDATE_GOLDEN=1 and review the result)"
       continue
     fi
-    if cmp -s $goldenfile $WORK/actual.bin; then
+    expected=$REPLY
+    if [[ $actual == $expected ]]; then
       ok "encode/$name: encodes to the golden bytes"
     else
-      dump_file $goldenfile; local want=$REPLY
-      dump_bytes "$actual"; local got=$REPLY
       ng "encode/$name: encoded bytes differ
-      expected: $want
-      actual:   $got"
+      expected: ${expected//$'\n'/}
+      actual:   ${actual//$'\n'/}"
     fi
   done
 
@@ -556,21 +660,25 @@ reserialize_plan() {  # -> REPLY=bytes, or return 1 with REPLY=reason
   # ---------------- Encoder output reused as a decoder input ----------------
   # One byte string spans both directions: what the encoder emits for
   # encode/shared-tags-all is exactly the candidate payload used by plan/encoder-chain.
-  if cmp -s $VECTORS/encode/shared-tags-all/expected.bin $VECTORS/plan/encoder-chain/payload.bin; then
-    ok "chain: plan/encoder-chain/payload.bin is encode/shared-tags-all/expected.bin"
+  if cmp -s $VECTORS/encode/shared-tags-all/expected $VECTORS/plan/encoder-chain/payload; then
+    ok "chain: plan/encoder-chain/payload is encode/shared-tags-all/expected"
   else
-    ng "chain: plan/encoder-chain/payload.bin no longer matches encode/shared-tags-all/expected.bin"
+    ng "chain: plan/encoder-chain/payload no longer matches encode/shared-tags-all/expected"
   fi
 
   # ---------------- Accept + round trip ----------------
-  typeset -a golden=( $VECTORS/plan/*/expected.bin(N) )
+  typeset -a golden=( $VECTORS/plan/*/expected(N) )
   (( $#golden )) || { out "FATAL: no plan vectors under $VECTORS/plan"; exit 1 }
 
   for g in "${(@)golden}"; do
     name=${${g:h}:t}
-    expected=$(<$g)
+    if ! read_vector $g; then
+      ng "plan/$name: $REPLY"
+      continue
+    fi
+    expected=$REPLY
     if ! _zrush_parse_plan "$expected"; then
-      dump_file $g
+      dump_bytes "$expected"
       ng "plan/$name: _zrush_parse_plan rejected a golden plan: $REPLY"
       continue
     fi
@@ -579,8 +687,7 @@ reserialize_plan() {  # -> REPLY=bytes, or return 1 with REPLY=reason
       continue
     fi
     actual=$REPLY
-    print -rn -- "$actual" >| $WORK/actual.bin
-    if cmp -s $g $WORK/actual.bin; then
+    if [[ $actual == $expected ]]; then
       ok "plan/$name: parses and round-trips byte for byte"
     else
       dump_bytes "$expected"; local want=$REPLY
@@ -592,13 +699,18 @@ reserialize_plan() {  # -> REPLY=bytes, or return 1 with REPLY=reason
   done
 
   # ---------------- Reject ----------------
-  typeset -a bad=( $VECTORS/reject-plan/*/plan.bin(N) )
+  typeset -a bad=( $VECTORS/reject-plan/*/plan(N) )
   (( $#bad )) || { out "FATAL: no reject-plan vectors under $VECTORS/reject-plan"; exit 1 }
 
   for g in "${(@)bad}"; do
     name=${${g:h}:t}
-    if _zrush_parse_plan "$(<$g)"; then
-      dump_file $g
+    if ! read_vector $g; then
+      ng "reject-plan/$name: $REPLY"
+      continue
+    fi
+    expected=$REPLY
+    if _zrush_parse_plan "$expected"; then
+      dump_bytes "$expected"
       ng "reject-plan/$name: _zrush_parse_plan accepted a malformed plan: $REPLY"
     else
       ok "reject-plan/$name: rejected"

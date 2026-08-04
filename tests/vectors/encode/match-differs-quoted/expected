@@ -1,0 +1,5 @@
+b\1\0
+w\1space\\ name.txt\2
+m\1space name.txt\0
+w\1weird\\$var.txt\2
+m\1weird$var.txt\0

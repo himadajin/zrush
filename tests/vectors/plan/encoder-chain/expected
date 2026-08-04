@@ -1,0 +1,15 @@
+foo\0
+2\0
+2\0
+Heading\0
+foo     barfoo\0
+3\0
+heading 0 0 7\0
+match 1 8 3\0
+match 2 19 3\0
+8 3\0
+16 6\0
+2 0 1 2\0
+2 1 1 2\0
+iprefixignorevis-prehidden-prefoohidden-suffixvis-suffixhidden-ignore\0
+iprefixignorevis-prehidden-prebarfoohidden-suffixvis-suffixhidden-ignore\0

@@ -1,4 +1,4 @@
---producer
-compsys
---query
-a
+--producer\0
+compsys\0
+--query\0
+a\0

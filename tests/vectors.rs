@@ -8,17 +8,107 @@ use zrush::wire;
 
 const VECTOR_ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/vectors");
 
+/// Render a byte string in the corpus text format (tests/vectors/README.md).
+/// A line break is layout, never data, so the writer is free to start a new
+/// line after every `\0` and `\2`.
+fn encode_text(bytes: &[u8]) -> String {
+    let mut out = String::new();
+    for &byte in bytes {
+        match byte {
+            0 => out.push_str("\\0\n"),
+            1 => out.push_str("\\1"),
+            2 => out.push_str("\\2\n"),
+            b'\n' => out.push_str("\\n"),
+            b'\r' => out.push_str("\\r"),
+            b'\t' => out.push_str("\\t"),
+            b'\\' => out.push_str("\\\\"),
+            0x20..=0x7e => out.push(byte as char),
+            _ => out.push_str(&format!("\\x{byte:02x}")),
+        }
+    }
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out
+}
+
+fn decode_text(text: &str) -> Result<Vec<u8>, String> {
+    let mut out = Vec::new();
+    let mut rest = text.as_bytes();
+    while let Some((&byte, tail)) = rest.split_first() {
+        rest = tail;
+        let offset = text.len() - rest.len();
+        match byte {
+            b'\n' => {}
+            b'\\' => {
+                let (&escape, tail) = rest
+                    .split_first()
+                    .ok_or_else(|| "trailing backslash".to_string())?;
+                rest = tail;
+                out.push(match escape {
+                    b'0' => 0,
+                    b'1' => 1,
+                    b'2' => 2,
+                    b'n' => b'\n',
+                    b'r' => b'\r',
+                    b't' => b'\t',
+                    b'\\' => b'\\',
+                    b'x' => {
+                        let digits = rest
+                            .get(..2)
+                            .ok_or_else(|| format!("truncated \\x escape at offset {offset}"))?;
+                        rest = &rest[2..];
+                        let digits = std::str::from_utf8(digits)
+                            .map_err(|_| format!("bad \\x escape at offset {offset}"))?;
+                        u8::from_str_radix(digits, 16)
+                            .map_err(|_| format!("bad \\x escape \\x{digits} at offset {offset}"))?
+                    }
+                    _ => {
+                        return Err(format!(
+                            "unknown escape \\{} at offset {offset}",
+                            escape.escape_ascii()
+                        ));
+                    }
+                });
+            }
+            0x20..=0x7e => out.push(byte),
+            _ => {
+                return Err(format!(
+                    "raw byte 0x{byte:02x} outside the escape alphabet at offset {offset}"
+                ));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Single-line rendering for failure messages. Layout newlines are the only
+/// literal newlines `encode_text` emits, so dropping them collapses the
+/// escaped form onto one line without touching the escapes themselves.
+fn dump(bytes: &[u8]) -> String {
+    encode_text(bytes).replace('\n', "")
+}
+
+fn read_vector_file(path: &Path) -> Vec<u8> {
+    let text = std::fs::read_to_string(path)
+        .unwrap_or_else(|error| panic!("{}: read: {error}", path.display()));
+    decode_text(&text).unwrap_or_else(|error| panic!("{}: {error}", path.display()))
+}
+
 fn vector_args(path: &Path) -> Vec<OsString> {
-    let mut bytes = std::fs::read(path.join("args")).expect("read vector args");
+    let bytes = read_vector_file(&path.join("args"));
     if bytes.is_empty() {
         return Vec::new();
     }
-    if bytes.last() == Some(&b'\n') {
-        bytes.pop();
-    }
-    bytes
-        .split(|&byte| byte == b'\n')
-        .map(|line| std::os::unix::ffi::OsStringExt::from_vec(line.to_vec()))
+    assert_eq!(
+        bytes.last(),
+        Some(&0),
+        "{}: args is not NUL-terminated",
+        path.display()
+    );
+    bytes[..bytes.len() - 1]
+        .split(|&byte| byte == 0)
+        .map(|value| std::os::unix::ffi::OsStringExt::from_vec(value.to_vec()))
         .collect()
 }
 
@@ -58,7 +148,7 @@ fn run_vector_raw(path: &Path) -> std::process::Output {
         }
         ns(&p)
     }
-    let payload = std::fs::read(path.join("payload.bin")).expect("payload");
+    let payload = read_vector_file(&path.join("payload"));
     let cwd = std::env::current_dir().expect("cwd");
     let request = msg(&[
         b"plan",
@@ -137,66 +227,25 @@ fn decode_fields_strict(frame: &[u8]) -> Vec<Vec<u8>> {
     decode_strict(frame)
 }
 
-fn dump(bytes: &[u8]) -> String {
-    let mut out = String::new();
-    for &byte in bytes {
-        match byte {
-            0 => out.push_str("\\0"),
-            1 => out.push_str("\\1"),
-            2 => out.push_str("\\2"),
-            b'\n' => out.push_str("\\n"),
-            b'\r' => out.push_str("\\r"),
-            b'\t' => out.push_str("\\t"),
-            b'\\' => out.push_str("\\\\"),
-            0x20..=0x7e => out.push(byte as char),
-            _ => out.push_str(&format!("\\x{byte:02x}")),
-        }
-    }
-    out
-}
-
-fn first_difference(expected: &[u8], actual: &[u8]) -> String {
-    let expected_fields: Vec<_> = expected[..expected.len() - 1]
-        .split(|&byte| byte == 0)
-        .collect();
-    let actual_fields: Vec<_> = actual[..actual.len() - 1]
-        .split(|&byte| byte == 0)
-        .collect();
-    if expected_fields.len() != actual_fields.len() {
-        return format!(
-            "field count differs (expected {}, actual {}); expected: {}; actual: {}",
-            expected_fields.len(),
-            actual_fields.len(),
-            dump(expected),
-            dump(actual)
-        );
-    }
-
-    let field = expected_fields
+/// Both sides are corpus text, one plan field per line, so the report names
+/// the first differing line and then prints each form whole -- a vector is a
+/// few hundred bytes, and the surrounding lines are the context that matters.
+fn first_difference(expected: &str, actual: &str) -> String {
+    let expected_lines: Vec<_> = expected.lines().collect();
+    let actual_lines: Vec<_> = actual.lines().collect();
+    let line = expected_lines
         .iter()
-        .zip(&actual_fields)
+        .zip(&actual_lines)
         .position(|(left, right)| left != right)
-        .expect("different byte strings have a different field");
-    let byte = expected_fields[field]
-        .iter()
-        .zip(actual_fields[field])
-        .position(|(left, right)| left != right)
-        .unwrap_or(expected_fields[field].len().min(actual_fields[field].len()));
-    let start = field.saturating_sub(2);
-    let end = (field + 3).min(expected_fields.len());
-    let context = |fields: &[&[u8]]| {
-        fields[start..end]
-            .iter()
-            .enumerate()
-            .map(|(offset, value)| format!("{}: {}", start + offset + 1, dump(value)))
-            .collect::<Vec<_>>()
-            .join(" | ")
-    };
+        .unwrap_or(expected_lines.len().min(actual_lines.len()));
+    let at = |lines: &[&str]| lines.get(line).map_or("<end of file>", |v| v).to_string();
     format!(
-        "first difference at field {} (byte {byte} within field); expected context: {}; actual context: {}",
-        field + 1,
-        context(&expected_fields),
-        context(&actual_fields)
+        "line {} differs (expected {} lines, actual {}); expected: {}; actual: {}\nexpected:\n{expected}actual:\n{actual}",
+        line + 1,
+        expected_lines.len(),
+        actual_lines.len(),
+        at(&expected_lines),
+        at(&actual_lines),
     )
 }
 
@@ -215,20 +264,21 @@ fn plan_vectors_match_golden_outputs() {
 
     for path in vector_dirs("plan") {
         let name = vector_name(&path);
-        let expected_path = path.join("expected.bin");
+        let expected_path = path.join("expected");
         let expected = if update {
             None
         } else {
-            let expected = std::fs::read(&expected_path)
-                .unwrap_or_else(|error| panic!("{name}: read expected.bin: {error}"));
-            if let Err(error) = wire::parse(&expected) {
+            let text = std::fs::read_to_string(&expected_path)
+                .unwrap_or_else(|error| panic!("{name}: read expected: {error}"));
+            let bytes = decode_text(&text).unwrap_or_else(|error| panic!("{name}: {error}"));
+            if let Err(error) = wire::parse(&bytes) {
                 failures.push(format!(
-                    "{name}: expected.bin is not a valid plan: {error}; bytes: {}",
-                    dump(&expected)
+                    "{name}: expected is not a valid plan: {error}; bytes: {}",
+                    dump(&bytes)
                 ));
                 continue;
             }
-            Some(expected)
+            Some(text)
         };
 
         let output = run_vector(&path);
@@ -249,21 +299,24 @@ fn plan_vectors_match_golden_outputs() {
             continue;
         }
 
+        // Comparing in text space keeps a wrong encoder from ever producing a
+        // false pass: it can only make the two forms differ.
+        let actual = encode_text(&output.stdout);
         if update {
-            let changed = match std::fs::read(&expected_path) {
-                Ok(current) => current != output.stdout,
+            let changed = match std::fs::read_to_string(&expected_path) {
+                Ok(current) => current != actual,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
-                Err(error) => panic!("{name}: read expected.bin before update: {error}"),
+                Err(error) => panic!("{name}: read expected before update: {error}"),
             };
             if changed {
-                std::fs::write(&expected_path, &output.stdout)
-                    .unwrap_or_else(|error| panic!("{name}: update expected.bin: {error}"));
-                updated.push(format!("{name}/expected.bin"));
+                std::fs::write(&expected_path, &actual)
+                    .unwrap_or_else(|error| panic!("{name}: update expected: {error}"));
+                updated.push(format!("{name}/expected"));
             }
-        } else if output.stdout != expected.as_deref().expect("golden was loaded") {
+        } else if actual != *expected.as_deref().expect("golden was loaded") {
             failures.push(format!(
                 "{name}: golden output mismatch; {}",
-                first_difference(expected.as_deref().unwrap(), &output.stdout)
+                first_difference(expected.as_deref().unwrap(), &actual)
             ));
         }
     }
@@ -288,13 +341,7 @@ fn reject_plan_vectors_are_rejected() {
 
     for path in vector_dirs("reject-plan") {
         let name = vector_name(&path);
-        let plan = match std::fs::read(path.join("plan.bin")) {
-            Ok(bytes) => bytes,
-            Err(error) => {
-                failures.push(format!("{name}: read plan.bin: {error}"));
-                continue;
-            }
-        };
+        let plan = read_vector_file(&path.join("plan"));
         if let Ok(parsed) = wire::parse(&plan) {
             failures.push(format!(
                 "{name}: expected rejection, parsed as {parsed:?}; bytes: {}",
@@ -343,4 +390,74 @@ fn reject_vectors_match_expected_in_band_errors() {
         "vector failures:\n{}",
         failures.join("\n")
     );
+}
+
+/// Every corpus file must be spelled the way the writer spells it. Without
+/// this a decoder bug could quietly map a vector onto some *other* byte
+/// string -- a `reject-plan/` vector mangled into a different malformed plan
+/// is still rejected, and the check would pass while fixing nothing.
+#[test]
+fn vector_files_are_canonical_text() {
+    fn walk(dir: &Path, files: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(dir).expect("read vector directory") {
+            let path = entry.expect("read vector entry").path();
+            if path.is_dir() {
+                walk(&path, files);
+            } else {
+                files.push(path);
+            }
+        }
+    }
+
+    let mut files = Vec::new();
+    walk(Path::new(VECTOR_ROOT), &mut files);
+    files.sort();
+    // `env` holds zsh parameter assignments read only by the zsh runner, and
+    // README.md documents the corpus; neither is a wire byte string.
+    files.retain(|path| {
+        !matches!(
+            path.file_name().and_then(|name| name.to_str()),
+            Some("env" | "README.md")
+        )
+    });
+    assert!(
+        !files.is_empty(),
+        "no corpus files found under tests/vectors"
+    );
+
+    let mut failures = Vec::new();
+    for path in files {
+        let name = vector_name(&path);
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(error) => {
+                failures.push(format!("{name}: not readable as text: {error}"));
+                continue;
+            }
+        };
+        match decode_text(&text) {
+            Ok(bytes) => {
+                let canonical = encode_text(&bytes);
+                if canonical != text {
+                    failures.push(format!("{name}: not canonical; rewrite as:\n{canonical}"));
+                }
+            }
+            Err(error) => failures.push(format!("{name}: {error}")),
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "corpus files that are not canonical text:\n{}",
+        failures.join("\n")
+    );
+}
+
+proptest::proptest! {
+    /// The canonicality check above pins `decode` only where `encode` is
+    /// exact, so pin `encode` over the whole input space separately.
+    #[test]
+    fn corpus_text_round_trips_arbitrary_bytes(bytes: Vec<u8>) {
+        proptest::prop_assert_eq!(decode_text(&encode_text(&bytes)).unwrap(), bytes);
+    }
 }
