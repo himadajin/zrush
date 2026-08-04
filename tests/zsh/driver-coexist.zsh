@@ -199,9 +199,11 @@ send_keys() { EXPECT_BUF=; zpty -wn $HOST $1 }
 
 buf_has() {  # $1=glob -> 0 when EXPECT_BUF already satisfies it
   # Match the raw bytes first, so raw escape-sequence patterns get their
-  # chance, then again with SGR stripped: highlighting can split a word the
-  # pattern expects to be contiguous.
-  [[ $EXPECT_BUF == ${~1} || ${EXPECT_BUF//$'\e['[0-9;]#m/} == ${~1} ]]
+  # chance, then again with SGR sequences stripped: highlighting can split a
+  # word the pattern expects to be contiguous. Each SGR is stripped together
+  # with the NUL run some platforms emit after it (terminfo padding, #64);
+  # unrelated literal NULs are left alone.
+  [[ $EXPECT_BUF == ${~1} || ${EXPECT_BUF//$'\e['[0-9;]#m$'\0'#/} == ${~1} ]]
 }
 
 expect() {

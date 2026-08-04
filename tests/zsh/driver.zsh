@@ -25,6 +25,13 @@
 #   - Always drain the pty in wait loops to prevent tcsetattr TCSADRAIN blocking.
 #     Draining never hides output from a later expect: EXPECT_BUF holds
 #     everything the host has emitted since the last input we sent it.
+#   - Listing renders are synchronized on ZRUSH_LOG "plan: applied" lines
+#     (send_keys_wait_plan), never on candidate text reaching the pty: the pty
+#     byte stream is zle's own encoding (diff redraw, highlight splitting,
+#     terminfo padding), so a listing word is not guaranteed to survive in it
+#     contiguously (#64). The few expect calls that do assert listing text
+#     assert exactly terminal delivery, with SGR sequences and their padding
+#     normalized away (buf_has).
 #   - After executing a command, synchronize on the HP> prompt before sending more keys.
 emulate -L zsh
 setopt extended_glob
@@ -129,9 +136,11 @@ send_line() { EXPECT_BUF=; zpty -w  host $1 }
 send_keys() { EXPECT_BUF=; zpty -wn host $1 }
 
 buf_has() {  # $1=glob -> 0 when EXPECT_BUF already satisfies it
-  # Match the raw bytes, then again with SGR stripped: highlighting can split
-  # a word the pattern expects to be contiguous.
-  [[ $EXPECT_BUF == ${~1} || ${EXPECT_BUF//$'\e['[0-9;]#m/} == ${~1} ]]
+  # Match the raw bytes, then again with SGR sequences stripped: highlighting
+  # can split a word the pattern expects to be contiguous. Each SGR is
+  # stripped together with the NUL run some platforms emit after it (terminfo
+  # padding, #64); unrelated literal NULs are left alone.
+  [[ $EXPECT_BUF == ${~1} || ${EXPECT_BUF//$'\e['[0-9;]#m$'\0'#/} == ${~1} ]]
 }
 
 expect() {  # $1=glob $2=timeout(s)
@@ -182,6 +191,35 @@ wait_log() {  # $1=fixed string $2=baseline $3=timeout(s) -> 0 when count increa
     log_count $1
     (( REPLY > $2 )) && return 0
   done
+  return 1
+}
+
+# Send keys and wait for the render plan they provoke to be applied: a NEW
+# "plan: applied" ZRUSH_LOG line (written by _zrush_apply_plan right after the
+# plan reaches POSTDISPLAY/region_highlight state) of the required shape --
+# "zero" for the empty plan (its log line is always the fixed "L=0 P=0"),
+# "nonempty" for a listing with selectable positions. This is the only
+# listing-render synchronization: candidate text reaching the pty is not
+# waited on (see the header note and #64). A timeout is reported immediately;
+# a silent one would be exactly the do-nothing wait this helper replaces.
+send_keys_wait_plan() {  # $1=zero|nonempty $2=keys $3=timeout(s)
+  local shape=$1 keys=$2 caller=${funcfiletrace[1]}
+  [[ $shape == (zero|nonempty) ]] || { ng "send_keys_wait_plan: bad shape ${(qqqq)shape} ($caller)"; return 2 }
+  local -i base_all=$(grep -cF 'plan: applied' $ZRUSH_LOG 2>/dev/null)
+  local -i base_zero=$(grep -cF 'plan: applied L=0 P=0' $ZRUSH_LOG 2>/dev/null)
+  send_keys $keys
+  local -F dl=$(( SECONDS + ${3:-10} ))
+  local -i all zero
+  while (( SECONDS < dl )); do
+    drain 0.15
+    all=$(grep -cF 'plan: applied' $ZRUSH_LOG 2>/dev/null)
+    zero=$(grep -cF 'plan: applied L=0 P=0' $ZRUSH_LOG 2>/dev/null)
+    case $shape in
+      zero)     (( zero > base_zero )) && return 0 ;;
+      nonempty) (( all - zero > base_all - base_zero )) && return 0 ;;
+    esac
+  done
+  ng "send_keys_wait_plan: no $shape plan after ${(qqqq)keys} ($caller)"
   return 1
 }
 
@@ -404,10 +442,7 @@ start_hist_host() {  # $1=zdotdir $2=xdg-config-home $3=logfile
   # (cap-1c) w vs m: a candidate whose quoted form differs from its raw text.
   # The listing must show the raw text (m, cli-protocol.md "候補レコード"), and
   # confirming must insert the quoted form (w) so the shell word stays valid.
-  send_keys 'ls fx/spacey/has'
-  # 'space' alone would already match the typed 'spacey' path segment; require
-  # the full candidate text so this actually waits for the async render.
-  expect '*has space.txt*' 10 >/dev/null
+  send_keys_wait_plan nonempty 'ls fx/spacey/has'
   if dump_get $'\C-xp' TESTPOST && [[ ${(Q)REPLY} == *'has space.txt'* ]]; then
     ok "(cap-1c) listing displays the raw (m) text 'has space.txt', not the quoted form"
   else
@@ -424,8 +459,7 @@ start_hist_host() {  # $1=zdotdir $2=xdg-config-home $3=logfile
   # break the *next* completion. A prefix with no real match yields at least
   # one zero-hit compadd call inside compsys; a normal completion right after
   # must still work cleanly.
-  send_keys 'ls fx/basic/ZZZNOMATCH'
-  drain 0.8   # let debounce + collection + the (zero-result) plan settle
+  send_keys_wait_plan zero 'ls fx/basic/ZZZNOMATCH'
   if dump_get $'\C-xp' TESTPOST && [[ -z ${(Q)REPLY} ]]; then
     ok "(cap-2a) a prefix with zero real candidates shows no list"
   else
@@ -498,8 +532,7 @@ start_hist_host() {  # $1=zdotdir $2=xdg-config-home $3=logfile
   drain 0.3
 
   # ================================================================ (3) Plan application: POSTDISPLAY + region_highlight
-  send_keys 'ls fx/basic/al'
-  expect '*alpha.txt*' 10 >/dev/null
+  send_keys_wait_plan nonempty 'ls fx/basic/al'
   if dump_get $'\C-xp' TESTPOST; then
     local post=${(Q)REPLY}
     if [[ $post == $'\n'* && $post == *alpha.txt* && $post == *alsoalpha.txt* ]]; then
@@ -528,8 +561,7 @@ start_hist_host() {  # $1=zdotdir $2=xdg-config-home $3=logfile
   drain 0.3
 
   # ================================================================ (4) Selection: nav table + highlight swap
-  send_keys 'ls fx/basic/al'
-  expect '*alpha.txt*' 10 >/dev/null
+  send_keys_wait_plan nonempty 'ls fx/basic/al'
   press $'\e[B'   # Down: select-next with nothing selected -> select-start (pos=1)
   if wait_log 'select: start' -1 3; then
     ok "(sel-1a) Down with a visible list starts selection (pos=1)"
@@ -566,8 +598,7 @@ start_hist_host() {  # $1=zdotdir $2=xdg-config-home $3=logfile
 
   # select-left/right on a forced single-column grid jump to the group's
   # first/last position (cli-protocol.md "ナビ": grows == member count when cols=1).
-  send_keys 'ls fx/longcol/item'
-  expect '*item-*' 10 >/dev/null
+  send_keys_wait_plan nonempty 'ls fx/longcol/item'
   press $'\e[B'   # select-start at pos=1
   log_count 'select: dir=right'; local -i c_right=$REPLY
   press $'\e[C'
@@ -580,10 +611,7 @@ start_hist_host() {  # $1=zdotdir $2=xdg-config-home $3=logfile
   drain 0.3
 
   # ================================================================ (5) Confirm: insertion text + RBUFFER preserved
-  send_keys 'ls fx/basic/subd'
-  # Typed text stops at 'subd' so the full candidate 'subdir' (the render) is
-  # distinguishable from the just-echoed input.
-  expect '*subdir*' 10 >/dev/null
+  send_keys_wait_plan nonempty 'ls fx/basic/subd'
   press $'\e[B'
   press $'\r'
   assert_buffer 'ls fx/basic/subdir/' "(cfm-1) confirm inserts the plan's insertion text (directory '/' synthesis, no trailing space)"
@@ -592,10 +620,10 @@ start_hist_host() {  # $1=zdotdir $2=xdg-config-home $3=logfile
 
   # RBUFFER must survive confirmation untouched: type a word, move the cursor
   # back inside it, and confirm what's before the cursor only.
-  send_keys 'ls fx/basic/alpEND'
-  send_keys $'\C-xv'            # test helper: cursor lands between 'alp' and 'END'
-  drain 0.2                    # ensure ZLE applies cursor motion before debounce fires
-  expect '*alpha.txt*' 10 >/dev/null
+  send_keys_wait_plan zero 'ls fx/basic/alpEND'   # 'alpEND' matches nothing (case-sensitive: uppercase query)
+  # ^Xv (test helper): cursor lands between 'alp' and 'END'; the cursor move
+  # re-collects with the word 'alp', and that second plan is confirmed below.
+  send_keys_wait_plan nonempty $'\C-xv'
   press $'\e[B'
   press $'\r'
   assert_buffer 'ls fx/basic/alpha.txt END' "(cfm-2) RBUFFER ('END') is preserved verbatim after confirming mid-word"
@@ -603,8 +631,7 @@ start_hist_host() {  # $1=zdotdir $2=xdg-config-home $3=logfile
   drain 0.3
 
   # ================================================================ (6) dismiss / accept-line
-  send_keys 'ls fx/basic/'
-  expect '*alpha.txt*' 10 >/dev/null
+  send_keys_wait_plan nonempty 'ls fx/basic/'
   log_count 'dismiss: closing list'; local -i c_dis=$REPLY
   press $'\C-g'
   wait_log 'dismiss: closing list' $c_dis 3 && ok "(dis-1a) dismiss closes the list" || ng "(dis-1a) dismiss did not work"
@@ -620,8 +647,7 @@ start_hist_host() {  # $1=zdotdir $2=xdg-config-home $3=logfile
   # first (broader) list stays visible (no-flash design) while the narrowing
   # 'git chec' collection is armed/in flight; dismissing at that instant must
   # win the race even though the narrower collection is still pending.
-  send_keys 'git c'
-  expect '*checkout*' 10 >/dev/null   # first list showing; _zrush_listing=1
+  send_keys_wait_plan nonempty 'git c'   # first list applied; _zrush_listing=1
   send_keys 'hec'                     # -> 'git chec': re-arms debounce/collection
   send_keys $'\C-g'                   # dismiss immediately, no drain in between
   drain 1.0                           # comfortably longer than 'git chec' compsys (~150-200ms)
@@ -652,8 +678,7 @@ start_hist_host() {  # $1=zdotdir $2=xdg-config-home $3=logfile
   # ================================================================ (7) Empty-word collection cache: no fork on hit
   clear_line
   drain 0.5
-  send_keys 'whic'
-  expect '*which*' 10 >/dev/null
+  send_keys_wait_plan nonempty 'whic'
   clear_line
   drain 0.5
   log_count 'cache: hit';          local -i cc_hit=$REPLY
@@ -698,8 +723,7 @@ start_hist_host() {  # $1=zdotdir $2=xdg-config-home $3=logfile
   # prompt's line-init has already cleared the display.
   send_line '_zrt_dump_plan() { _zlog "TESTPLAN=npos=$_zrush_plan_npos listing=$_zrush_listing" }; zle -N _zrt-dump-plan _zrt_dump_plan; bindkey "^Xy" _zrt-dump-plan'
   sync_prompt
-  send_keys 'ls fx/basic/al'
-  expect '*alpha.txt*' 10 >/dev/null   # real, non-empty _zrush_plan_* now populated
+  send_keys_wait_plan nonempty 'ls fx/basic/al'   # real, non-empty _zrush_plan_* now populated
   send_keys $'\C-c'                    # send-break: abandon the line, bypassing line-finish
   if sync_prompt 15; then
     ok "(sb-1a) a new prompt appears after send-break"
@@ -1579,8 +1603,7 @@ start_hist_host() {  # $1=zdotdir $2=xdg-config-home $3=logfile
   if start_hist_host $WORK/zdot-exit $WORK/xdg-exit $WORK/host-exit.log; then
     send_line '[[ -o checkjobs && -o checkrunningjobs ]] && print CHECK-JOBS-ENABLED'
     if expect '*CHECK-JOBS-ENABLED*HP>*' 5; then
-      send_keys 'ls fx/basic/al'
-      expect '*alpha.txt*' 10 >/dev/null
+      send_keys_wait_plan nonempty 'ls fx/basic/al'
       if dump_get $'\C-xw' TESTWORKER && [[ $REPLY == 'pid='<->' ready=1 '* ]]; then
         clear_line
         drain 0.3
@@ -1641,8 +1664,7 @@ start_hist_host() {  # $1=zdotdir $2=xdg-config-home $3=logfile
     if expect '*CHECK-JOBS-ENABLED*HP>*' 5; then
       # Warm the persistent worker up on a small request first so handshake/
       # startup latency cannot masquerade as "frame in flight" below.
-      send_keys 'ls fx/basic/al'
-      expect '*alpha.txt*' 10 >/dev/null
+      send_keys_wait_plan nonempty 'ls fx/basic/al'
       clear_line
       drain 0.3
       log_count 'worker: sending frame'; local -i inflight_sending_before=$REPLY
