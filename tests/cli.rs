@@ -541,6 +541,80 @@ fn config_rejects_arguments_with_exit_2() {
     assert_eq!(out.status.code(), Some(2));
 }
 
+// ---- zrush init ----
+
+/// Independent copy of the byte-level quoting discipline (cli-protocol.md
+/// "zrush init" / "zrush config") for cross-checking the real process's
+/// output, matching the golden-copy pattern used for "zrush config" below.
+fn sq_bytes(s: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(s.len() + 2);
+    out.push(b'\'');
+    for &b in s {
+        if b == b'\'' {
+            out.extend_from_slice(b"'\\''");
+        } else {
+            out.push(b);
+        }
+    }
+    out.push(b'\'');
+    out
+}
+
+#[test]
+fn init_zsh_prelude_and_body_match_binary_and_source() {
+    let bin = env!("CARGO_BIN_EXE_zrush");
+    let out = zrush()
+        .args(["init", "zsh"])
+        .output()
+        .expect("run zrush init zsh");
+    assert_eq!(out.status.code(), Some(0));
+
+    let mut expected = b"typeset -g ZRUSH_BIN=${ZRUSH_BIN:-".to_vec();
+    expected.extend(sq_bytes(bin.as_bytes()));
+    expected.extend_from_slice(b"}\n");
+    let script =
+        std::fs::read(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("zsh/zrush.zsh"))
+            .expect("read zsh/zrush.zsh");
+    expected.extend_from_slice(&script);
+    assert_eq!(out.stdout, expected);
+}
+
+#[test]
+fn init_zsh_output_parses_as_zsh() {
+    let out = zrush()
+        .args(["init", "zsh"])
+        .output()
+        .expect("run zrush init zsh");
+    assert_eq!(out.status.code(), Some(0));
+
+    let path = std::env::temp_dir().join(format!("zrush-init-it-{}.zsh", std::process::id()));
+    std::fs::write(&path, &out.stdout).expect("write init output");
+    let check = Command::new("zsh")
+        .arg("-fn")
+        .arg(&path)
+        .output()
+        .expect("run zsh -fn (zsh is a test prerequisite)");
+    let _ = std::fs::remove_file(&path);
+    assert!(
+        check.status.success(),
+        "zsh -fn rejected init output: {}",
+        String::from_utf8_lossy(&check.stderr)
+    );
+}
+
+#[test]
+fn init_missing_or_unknown_shell_or_extra_args_exit_2() {
+    let cases: [&[&str]; 3] = [&["init"], &["init", "bash"], &["init", "zsh", "extra"]];
+    for args in cases {
+        let out = zrush()
+            .args(args)
+            .stderr(Stdio::null())
+            .output()
+            .expect("run");
+        assert_eq!(out.status.code(), Some(2), "{args:?}");
+    }
+}
+
 #[test]
 fn help_flag_exits_0() {
     // Human-facing affordance (cli-protocol.md "終了コード"): zsh never

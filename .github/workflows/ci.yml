@@ -27,11 +27,11 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
       - name: cargo build (release)
         run: cargo build --release
-      - name: cargo test
-        run: cargo test
       - name: Install zsh (Linux)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y zsh
+      - name: cargo test
+        run: cargo test
       - name: zle driver
         run: zsh -f tests/zsh/driver.zsh "$(mktemp -d)"
       - name: zsh plan-decoder vectors

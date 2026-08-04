@@ -1,7 +1,7 @@
 # Host rc for the headless history-menu regression scenarios in
 # tests/zsh/driver.zsh (issue #9: docs/internal/specs/behavior.md "履歴メニュー",
 # docs/internal/contracts/cli-protocol.md "history profile").
-# Required environment: ZRUSH_REPO, ZRUSH_TEST_TMP (see tests/zsh/rc/minimal.zshrc).
+# Required environment: ZRUSH_REAL_BIN, ZRUSH_TEST_TMP (see tests/zsh/rc/minimal.zshrc).
 # Isolated HISTFILE + SAVEHIST=0: the fixture history below lives only in this
 # throwaway shell's memory and is never written out or read back from the
 # real ~/.zsh_history (AGENTS.md guardrail).
@@ -11,7 +11,7 @@ HISTSIZE=1000
 SAVEHIST=0
 autoload -Uz compinit
 compinit -u -d ${ZRUSH_TEST_TMP:-${TMPDIR:-/tmp}}/zcompdump-zrush-histtest
-source $ZRUSH_REPO/zsh/zrush.zsh
+source <($ZRUSH_REAL_BIN init zsh)
 
 # Test-only dump widgets (see tests/zsh/rc/minimal.zshrc for the ^Xb/^Xp precedent).
 _zrt_dump_buffer() { _zlog "TESTBUF=${(qqqq)BUFFER}" }
