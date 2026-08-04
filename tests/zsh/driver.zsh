@@ -208,21 +208,29 @@ assert_buffer() {  # $1=expected buffer $2=label
   return 1
 }
 
-# Trigger a ^Xp/^Xh dump and return the freshest matching ZRUSH_LOG line's value
-# (post-tag text) in REPLY. $1=dump key-sequence $2=log tag (TESTPOST|TESTRH).
+# Trigger a ^X* dump widget and return the freshest matching ZRUSH_LOG line's
+# value (post-tag text) in REPLY. $1=dump key-sequence $2=log tag.
+# Waits for the tag's occurrence count to grow past its pre-press value, so a
+# line left behind by an earlier dump of the same tag can never satisfy the
+# wait. The key is re-sent once per second within the deadline: a keystroke
+# that lands while the host is still unwinding a pty-level interrupt
+# (send-break) can be consumed without running its widget (#47), and every
+# dump widget is a pure observer, so an extra press is harmless.
 dump_get() {
-  send_keys $1
-  local -F dl=$(( SECONDS + 5 ))
-  local -a tl
+  local key=$1 tag=$2
+  log_count "$tag="; local -i base=$REPLY
   typeset -g REPLY=
+  local -a tl
+  local -F dl=$(( SECONDS + 8 ))
   while (( SECONDS < dl )); do
-    drain 0.15
-    tl=( ${(f)"$(grep -F "$2=" $ZRUSH_LOG 2>/dev/null)"} )
-    if (( $#tl )); then
-      typeset -g REPLY=${tl[-1]#*$2=}
+    send_keys $key
+    if wait_log "$tag=" $base 1; then
+      tl=( ${(f)"$(grep -F "$tag=" $ZRUSH_LOG 2>/dev/null)"} )
+      typeset -g REPLY=${tl[-1]#*$tag=}
       return 0
     fi
   done
+  typeset -g REPLY=   # wait_log left its counter here; failure means "no value"
   return 1
 }
 
@@ -254,7 +262,10 @@ assert_host_stdio() {  # $1=label; compare fd targets and stdout/stderr delivery
 # A send-break reset for scenarios that can leave a multiline BUFFER: ^U
 # (backward-kill-line) only clears the current physical line of a multiline
 # buffer, so those scenarios need a real line abandon + resync instead.
-reset_line() { send_keys $'\C-c'; drain 0.3; sync_prompt 5 }
+# The generous bound matches the other send-break sites: a loaded host has
+# been observed to spend >5s inside pty-^C interrupt handling before the new
+# prompt appears (#47).
+reset_line() { send_keys $'\C-c'; drain 0.3; sync_prompt 15 }
 
 # Stop whatever is running as the "host" pty and start a fresh one under a
 # given ZDOTDIR/XDG_CONFIG_HOME/log file. Used by the history-menu section
@@ -447,6 +458,7 @@ start_hist_host() {  # $1=zdotdir $2=xdg-config-home $3=logfile
   # A fake completion function that sleeps inside the fork; the parent shell
   # must keep echoing keystrokes while it runs.
   send_line '_zrushtestslow() { local -a m=(slowcandA slowcandB slowcandC); sleep 0.5; compadd -a m }'
+  sync_prompt
   send_line 'compdef _zrushtestslow zrushtestslow'
   sync_prompt
   send_keys 'zrushtestslow '
@@ -673,7 +685,7 @@ start_hist_host() {  # $1=zdotdir $2=xdg-config-home $3=logfile
   send_keys 'ls fx/basic/al'
   expect '*alpha.txt*' 10 >/dev/null   # real, non-empty _zrush_plan_* now populated
   send_keys $'\C-c'                    # send-break: abandon the line, bypassing line-finish
-  if sync_prompt 5; then
+  if sync_prompt 15; then
     ok "(sb-1a) a new prompt appears after send-break"
     if dump_get $'\C-xy' TESTPLAN; then
       if [[ $REPLY == *'npos=0'* && $REPLY == *'listing=0'* ]]; then
@@ -836,7 +848,9 @@ start_hist_host() {  # $1=zdotdir $2=xdg-config-home $3=logfile
   else
     ng "(err-4) shell did not respond after worker failures"
   fi
-  sync_prompt
+  # No sync_prompt here: the expect above already consumed this command's
+  # prompt, so another wait could only time out.
+  drain 0.2
 
   # ================================================================ (10) History menu (issue #9)
   # docs/internal/specs/behavior.md "履歴メニュー" and cli-protocol.md
@@ -1319,7 +1333,7 @@ start_hist_host() {  # $1=zdotdir $2=xdg-config-home $3=logfile
   dump_get $'\C-xk' TESTKIND
   [[ $REPLY == 'kind=history'* ]] || ng "(h26-setup) history menu did not open: $REPLY"
   send_keys $'\C-c'   # send-break: abandon the line, bypassing confirm/dismiss/line-finish
-  if sync_prompt 5; then
+  if sync_prompt 15; then
     ok "(h26a) a new prompt appears after send-break with the history menu open"
     if dump_get $'\C-xk' TESTKIND; then
       [[ $REPLY == 'kind=none sel=0 listing=0 npos=0' ]] && ok "(h26b) no kind/listing state leaks into the new prompt" || ng "(h26b) $REPLY"
@@ -1344,7 +1358,7 @@ start_hist_host() {  # $1=zdotdir $2=xdg-config-home $3=logfile
       || ng "(h26d-pre) no in-flight collection detected before send-break: $REPLY"
   fi
   send_keys $'\C-c'
-  if sync_prompt 5; then
+  if sync_prompt 15; then
     ok "(h26d-a) a new prompt appears after send-break during an in-flight collection"
     if dump_get $'\C-xt' TESTFDS; then
       [[ $REPLY == 'timer=-1 rfd=-1 wfd=-1 pty=<none>' ]] \
@@ -1442,7 +1456,7 @@ start_hist_host() {  # $1=zdotdir $2=xdg-config-home $3=logfile
         || ng "(h26c-pre) timer was not armed as expected before send-break: $REPLY"
     fi
     send_keys $'\C-c'
-    if sync_prompt 5; then
+    if sync_prompt 15; then
       ok "(h26c-a) a new prompt appears after send-break during the debounce wait"
       if dump_get $'\C-xt' TESTFDS; then
         [[ $REPLY == 'timer=-1 rfd=-1 wfd=-1 pty=<none>' ]] \
