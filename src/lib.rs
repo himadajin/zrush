@@ -20,6 +20,7 @@ mod matching;
 mod plan;
 mod ranking;
 mod record;
+mod span;
 mod worker;
 
 pub mod wire;

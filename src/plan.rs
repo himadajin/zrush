@@ -21,6 +21,7 @@
 use std::io::Write;
 
 use crate::matching::{Mode, QueryMatcher, Tier};
+use crate::span::CharSpan;
 use crate::{insert, layout, ranking, record};
 
 /// Snapshot of a plan request's scalar fields; producer selects result
@@ -103,7 +104,7 @@ pub(crate) fn run(
     // spans() is a second pass by design (matching.rs docs): only run it
     // on the ranked subset that actually reaches layout, and derive it
     // from the hit that candidate was already classified by.
-    let spans: Vec<Vec<(usize, usize)>> = candidates
+    let spans: Vec<Vec<CharSpan>> = candidates
         .iter()
         .zip(&ranked)
         .map(|(c, &(_, hit))| qm.spans(c.match_text(), hit))
@@ -149,12 +150,21 @@ fn serialize(common_prefix: &[u8], plan: &layout::Plan, insert_texts: &[Vec<u8>]
     }
     let _ = write!(out, "{}", plan.highlights.len());
     out.push(0);
+    // The end-exclusive spans become the wire's `start len` here, and
+    // only here (span.rs).
     for h in &plan.highlights {
-        let _ = write!(out, "{} {} {} {}", h.role.as_str(), h.pos, h.start, h.len);
+        let _ = write!(
+            out,
+            "{} {} {} {}",
+            h.role.as_str(),
+            h.pos,
+            h.span.start,
+            h.span.len()
+        );
         out.push(0);
     }
-    for &(start, len) in &plan.cell_ranges {
-        let _ = write!(out, "{start} {len}");
+    for cell in &plan.cell_ranges {
+        let _ = write!(out, "{} {}", cell.start, cell.len());
         out.push(0);
     }
     for n in &plan.nav {
@@ -601,9 +611,11 @@ mod tests {
     #[test]
     fn match_highlight_offset_is_non_trivial_for_a_mid_string_match() {
         // Regression: a start==0 span can't distinguish a correct
-        // (start, end) reading from a buggy (start, start+len) one.
-        // "ar" is a substring of "cargo" at char index 1 (a-r), so
-        // matching::spans() emits (1, 3) -- start != 0, len != 1.
+        // end-exclusive reading from a buggy (start, start+len) one, and
+        // this is the end-to-end check of the one span -> wire `start len`
+        // conversion (span.rs). "ar" is a substring of "cargo" at char
+        // index 1 (a-r), so matching::spans() emits chars [1,3) --
+        // start != 0, len != 1.
         let stdin = {
             let mut s = header(&[]);
             s.extend(word("cargo"));
