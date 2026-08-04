@@ -186,26 +186,35 @@ start_host() {  # $1=host name $2=ZDOTDIR $3=log file $4=working tmp
   return 0
 }
 
-use_host() { HOST=$1; HOSTFD=${HFD[$1]}; CURLOG=${2:-$CURLOG} }
+# EXPECT_BUF is the observation window: everything the current host has emitted
+# since the last input we sent it. Sending input, and switching to another host
+# (a different output stream), are the only things that open a fresh window, so
+# output that an intervening drain happened to read is still there for a later
+# expect to match.
+use_host() { HOST=$1; HOSTFD=${HFD[$1]}; CURLOG=${2:-$CURLOG}; EXPECT_BUF= }
 stop_host() { zpty -d $1 2>/dev/null; unset "HFD[$1]" }
 
-send_line() { zpty -w  $HOST $1 }
-send_keys() { zpty -wn $HOST $1 }
+send_line() { EXPECT_BUF=; zpty -w  $HOST $1 }
+send_keys() { EXPECT_BUF=; zpty -wn $HOST $1 }
+
+buf_has() {  # $1=glob -> 0 when EXPECT_BUF already satisfies it
+  # Match the raw bytes first, so raw escape-sequence patterns get their
+  # chance, then again with SGR stripped: highlighting can split a word the
+  # pattern expects to be contiguous.
+  [[ $EXPECT_BUF == ${~1} || ${EXPECT_BUF//$'\e['[0-9;]#m/} == ${~1} ]]
+}
 
 expect() {
   local pat=$1
   local -F deadline=$(( SECONDS + ${2:-10} ))
-  EXPECT_BUF=
+  buf_has "$pat" && return 0
   local chunk
   while (( SECONDS < deadline )); do
     if zselect -t 20 -r $HOSTFD 2>/dev/null; then
       zpty -r $HOST chunk 2>/dev/null || return 2
       EXPECT_BUF+=$chunk
       TRANSCRIPT+=$chunk
-      [[ $EXPECT_BUF == ${~pat} ]] && return 0
-      # Match again after stripping SGR that may split words for highlighting.
-      # Raw escape-sequence patterns already had the first chance to match above.
-      [[ ${EXPECT_BUF//$'\e['[0-9;]#m/} == ${~pat} ]] && return 0
+      buf_has "$pat" && return 0
     fi
   done
   return 1
@@ -216,7 +225,7 @@ drain() {
   local chunk
   while (( SECONDS < dl )); do
     if zselect -t 10 -r $HOSTFD 2>/dev/null; then
-      zpty -r $HOST chunk 2>/dev/null && TRANSCRIPT+=$chunk
+      zpty -r $HOST chunk 2>/dev/null && { TRANSCRIPT+=$chunk; EXPECT_BUF+=$chunk }
     fi
   done
 }
@@ -307,7 +316,7 @@ basic_flow() {  # $1=label prefix
     ok "(1) abbr+zrush host started"
     send_keys 'zzz'
     drain 0.5
-    send_keys $ENTER          # press() would consume output while draining
+    send_keys $ENTER
     if expect '*ABBR-EXPANDED-OK*' 8; then
       ok "(1a) abbreviation expansion works on Enter without selection (via predecessor chain)"
     else

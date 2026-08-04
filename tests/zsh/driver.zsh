@@ -23,6 +23,8 @@
 #     both pty output and the ZRUSH_LOG file (including the ^Xb/^Xp/^Xh test-only
 #     dump widgets registered by rc/minimal.zshrc).
 #   - Always drain the pty in wait loops to prevent tcsetattr TCSADRAIN blocking.
+#     Draining never hides output from a later expect: EXPECT_BUF holds
+#     everything the host has emitted since the last input we sent it.
 #   - After executing a command, synchronize on the HP> prompt before sending more keys.
 emulate -L zsh
 setopt extended_glob
@@ -119,22 +121,30 @@ unset OVERFLOW_ITEM
 typeset -gi HOSTFD=-1
 typeset -g TRANSCRIPT= EXPECT_BUF= STDIO_BASELINE=
 
-send_line() { zpty -w  host $1 }
-send_keys() { zpty -wn host $1 }
+# EXPECT_BUF is the observation window: everything the host has emitted since
+# the last input we sent it. Sending input (and adopting a new host's fd) is
+# the only thing that opens a fresh window, so output that an intervening
+# drain happened to read is still there for a later expect to match.
+send_line() { EXPECT_BUF=; zpty -w  host $1 }
+send_keys() { EXPECT_BUF=; zpty -wn host $1 }
+
+buf_has() {  # $1=glob -> 0 when EXPECT_BUF already satisfies it
+  # Match the raw bytes, then again with SGR stripped: highlighting can split
+  # a word the pattern expects to be contiguous.
+  [[ $EXPECT_BUF == ${~1} || ${EXPECT_BUF//$'\e['[0-9;]#m/} == ${~1} ]]
+}
 
 expect() {  # $1=glob $2=timeout(s)
   local pat=$1
   local -F deadline=$(( SECONDS + ${2:-10} ))
-  EXPECT_BUF=
+  buf_has "$pat" && return 0
   local chunk
   while (( SECONDS < deadline )); do
     if zselect -t 20 -r $HOSTFD 2>/dev/null; then
       zpty -r host chunk 2>/dev/null || return 2
       EXPECT_BUF+=$chunk
       TRANSCRIPT+=$chunk
-      [[ $EXPECT_BUF == ${~pat} ]] && return 0
-      # Match again after stripping SGR that may split words for highlighting.
-      [[ ${EXPECT_BUF//$'\e['[0-9;]#m/} == ${~pat} ]] && return 0
+      buf_has "$pat" && return 0
     fi
   done
   return 1
@@ -237,7 +247,6 @@ dump_get() {
 assert_host_stdio() {  # $1=label; compare fd targets and stdout/stderr delivery
   local label=$1
   log_count 'TESTSTDIO='; local -i baseline=$REPLY
-  EXPECT_BUF=
   send_keys $'\C-xf'
   if ! wait_log 'TESTSTDIO=' $baseline 5; then
     ng "$label: stdio probe did not run"
@@ -279,6 +288,7 @@ start_hist_host() {  # $1=zdotdir $2=xdg-config-home $3=logfile
   local REPLY=
   zpty -b host zsh -d -i || return 1
   HOSTFD=$REPLY
+  EXPECT_BUF=
   expect '*MARK-RC-DONE*' 20 || return 1
   drain 0.3
   return 0
@@ -290,6 +300,7 @@ start_hist_host() {  # $1=zdotdir $2=xdg-config-home $3=logfile
   local REPLY=
   zpty -b host zsh -d -i || { ng "host failed to start"; exit 1 }
   HOSTFD=$REPLY
+  EXPECT_BUF=
   if expect '*MARK-RC-DONE*' 20; then
     ok "host started + compinit + zrush.zsh sourced (config loaded)"
   else
@@ -736,7 +747,6 @@ start_hist_host() {  # $1=zdotdir $2=xdg-config-home $3=logfile
   fake_count 'die 1 '; local -i fake_die0=$REPLY
   local -i err_log_line0=0
   [[ -r $ZRUSH_LOG ]] && err_log_line0=$(wc -l < $ZRUSH_LOG)
-  EXPECT_BUF=
   send_keys 'ls fx/basic/al'
   local -i active_death_ok=1
   wait_fake 'die 1 ' $fake_die0 10 || active_death_ok=0
@@ -848,8 +858,7 @@ start_hist_host() {  # $1=zdotdir $2=xdg-config-home $3=logfile
   else
     ng "(err-4) shell did not respond after worker failures"
   fi
-  # No sync_prompt here: the expect above already consumed this command's
-  # prompt, so another wait could only time out.
+  # No sync_prompt here: the expect above already covers this command's prompt.
   drain 0.2
 
   # ================================================================ (10) History menu (issue #9)
@@ -1293,8 +1302,7 @@ start_hist_host() {  # $1=zdotdir $2=xdg-config-home $3=logfile
   print -r -- die > $ZRUSH_FAKE_CONTROL
   fake_count "die $hist_fake_session "; local -i hist_die0=$REPLY
   log_count 'worker: session failure:'; local -i hist_fail0=$REPLY
-  send_keys $'\e[A'   # raw send, not press: press's own drain would already
-                       # consume the one-shot warning before expect looks for it
+  send_keys $'\e[A'
   if wait_fake "die $hist_fake_session " $hist_die0 10 \
      && wait_log 'worker: session failure:' $hist_fail0 10; then
     ok "(h24a) active worker death is recorded on the synchronous history path"
