@@ -41,26 +41,51 @@ zsh は zle 統合・compsys 呼び出しによる捕獲・プランの適用
   `../contracts/cli-protocol.md` が定める。
 - worker は対話シェルの job table に登録せず、動作中でもシェルの `exit` を妨げない。
 - 通常の補完経路では、worker の cold start と握手を待たない。起動処理は ZLE へ直ちに制御を返し、
-  `hello` も outbound queue から nonblocking に送り、残りの送信と `ready` の受信を fd callback / 非同期 retry で進める。
+  `hello` も outbound queue の先頭フレームとして、他の plan 要求と同じく後述の writer child 経由で送る。
+  `ready` の受信は worker stdout の既存の `zle -F` callback で進める。
   握手中に生じた plan 要求は `hello` より後ろの outbound queue に置く。
   同期的に worker を待ってよいのは履歴メニューだけであり、その待機も後述の 1 本の絶対 100ms deadline 内に限る。
-- worker stdin は nonblocking とし、通常の補完経路は要求全体を書けるまで ZLE callback 内で待たない。
-  nested-netstring 化した message を outbound queue に保持し、partial write では書けた接頭辞だけを取り除き、
-  `EAGAIN` / `EWOULDBLOCK` では残りを次の fd-ready callback または非同期 retry へ回して直ちに戻る。
-  busy loop と blocking write は行わない。worker は受信した plan を直列に処理するため、queue も request_id 順を保つ。
+- worker stdin への送信はフレーム単位で行う。
+  フレームは不可分な送信単位であり、outbound queue は完成済みフレームのリストを持つだけで、
+  対話シェル側に送信オフセットは存在しない。
+  対話シェルは worker stdin(request FIFO)への blocking な write fd を worker 起動時に確保し、
+  FIFO パスの unlink 前に開いた上で cloexec を付けて worker には継承させない
+  (fork した子は cloexec の性質上、exec するまで fd を引き継ぐ)。
+  1 フレームの送信は、この blocking fd を渡して fork した短命な writer child に委譲する。
+  writer child は 1 回の `syswrite` でフレーム全体を書き切り、書き終えたら通知用パイプへ
+  ack バイトを 1 個書く。
+  writer child は worker と同じく対話シェルの job table に登録しない。
+  対話シェルは通知 fd を `zle -F` で監視し、blocking write を一切行わず
+  ZLE callback 内で書き込み完了を待たない。
+  ack の消費は通知 fd の readiness を確認したうえで行い、通知 fd の `zle -F` callback・
+  worker 応答の受信時・同期履歴ループのいずれから行ってもよい。
+  in-flight の writer child は常に高々 1 個であり、次のフレームは直前の child が
+  ack バイトを書いた時点で送る。
+  worker は受信した plan を直列に処理するため、この直列送信によって queue も request_id 順を保つ。
+  busy loop は行わない。
 - queue に入った通常の補完要求は、新しい要求で coalesce・置換・除去しない。
   送信時点ですでに stale でも同じ session 上で順に送り、worker の終端応答まで読み取って UI への適用だけを捨てる。
-  backpressure は ZLE を止める理由にならず、queue の残りを後続 callback で送る。
+  request FIFO の backpressure が及ぶのは writer child の `syswrite` だけであり、ZLE を止める理由にはならない。
+  queue の残りは、writer child からの ack を受けてから次のフレームとして送る。
 - `request_id` は zsh が所有し、実 plan 要求ごとに増やす。同じシェルセッションでは worker の再起動後も
   リセット・再利用しない。新しい実要求を開始した後に古い request_id の正常応答が届いても stale として捨て、
   表示には適用しない。worker は受け取った各要求へ `ok` / `error` を 1 個返し、zsh 側の stale 判定を理由に
   応答を省略させない。
-- 外側/nested framing の破損、stdout の EOF/read error、stdin の write error、予期しない終了、
-  要求と対応しない応答、仕様を満たさない `ok` の描画プラン、履歴交換の deadline 超過は
-  **worker セッション失敗**である。その session に割り当て済みで終端応答のない要求を、partial write 中・
-  outbound queue 内・送信済みの区別なくすべて破棄し、既存一覧も消す。いずれも自動 replay しない。
-  worker プロセスが残っていれば終了させて消滅を確認し、`zle -F` watcher を解除して stdin/stdout pipe fd を閉じ、
-  head-of-line blocking を残さない。この cleanup が完了するまで代替 worker を起動せず、worker を重複させない。
+- 外側/nested framing の破損、stdout の EOF/read error、writer child の通知 fd が ack バイトなしで
+  EOF に達すること(stdin の write 失敗)、予期しない終了、要求と対応しない応答、
+  仕様を満たさない `ok` の描画プラン、履歴交換の deadline 超過は **worker セッション失敗**である。
+  stdin の write 失敗は通知 fd の EOF/ack のみで判定し、writer child の終了ステータスからは
+  一切推測しない。
+  その session に割り当て済みで終端応答のない要求を、writer child に渡して送信中のフレーム・
+  outbound queue 内のフレーム・送信済みの要求の区別なくすべて破棄し、既存一覧も消す。
+  いずれも自動 replay しない。
+  in-flight の writer child がいれば、未送信のフレームを queue から破棄したうえで
+  その child の終了を有界時間だけ待ち、なお終了しなければ TERM してから KILL する。
+  フレーム送信の途中で kill された child は request FIFO に不完全なフレームを残すが、
+  これは worker がフレーミングエラーとして検出する想定内の abort 挙動であり、正常な EOF とは区別できる。
+  worker プロセスが残っていれば終了させて消滅を確認し、`zle -F` watcher を解除して
+  stdin/stdout pipe fd と通知 fd を閉じ、head-of-line blocking を残さない。
+  この cleanup が完了するまで代替 worker を起動せず、worker を重複させない。
 - 連続 worker セッション失敗回数は、正常に形成された終端 `ok` / `error` を受けたときだけ 0 に戻す。
   握手成功だけでは戻さない。1 回目の失敗後は worker 不在のままにし、**次の実要求**で 1 個だけ代替 worker を
   遅延起動する。終端応答を 1 個も受けないまま 2 回目のセッション失敗が起きたら、そのシェルでは zrush を無効化する。

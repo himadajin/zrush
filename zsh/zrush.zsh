@@ -80,10 +80,12 @@ typeset -g  _zrush_last_buffer=
 typeset -gi _zrush_last_cursor=-1
 
 # Persistent Rust worker transport.
-typeset -gi _zrush_worker_rfd=-1 _zrush_worker_wfd=-1 _zrush_worker_retry_fd=-1
+typeset -gi _zrush_worker_rfd=-1 _zrush_worker_wfd=-1
 typeset -gi _zrush_worker_drain_fd=-1
+typeset -gi _zrush_worker_ack_fd=-1 _zrush_worker_writer_pid=-1
 typeset -gi _zrush_worker_pid=-1 _zrush_worker_ready=0
-typeset -g  _zrush_worker_rx= _zrush_worker_tx=
+typeset -g  _zrush_worker_rx=
+typeset -ga _zrush_worker_txq=()      # complete outbound frames; no send offset exists
 typeset -gi _zrush_worker_setup_fd=-1 _zrush_worker_setup_pid=-1
 typeset -g  _zrush_worker_setup_req=
 typeset -gA _zrush_worker_pending=()
@@ -813,12 +815,7 @@ _zrush_worker_warn_once() {
   _zrush_worker_warned=1
 }
 
-_zrush_worker_disarm_retry() {
-  if (( _zrush_worker_retry_fd >= 0 )); then
-    zle -F $_zrush_worker_retry_fd 2>/dev/null
-    _zrush_close_internal_fd $_zrush_worker_retry_fd
-    _zrush_worker_retry_fd=-1
-  fi
+_zrush_worker_disarm_drain() {
   if (( _zrush_worker_drain_fd >= 0 )); then
     zle -F $_zrush_worker_drain_fd 2>/dev/null
     _zrush_close_internal_fd $_zrush_worker_drain_fd
@@ -842,10 +839,43 @@ _zrush_worker_terminate() {
   return 0
 }
 
+# Releases the notification fd of a writer child that has finished with the
+# frame it was handed; the child itself is never waited on (behavior.md
+# "worker ライフサイクル").
+_zrush_worker_release_writer() {
+  (( _zrush_worker_ack_fd >= 0 )) || return 0
+  zle -F $_zrush_worker_ack_fd 2>/dev/null
+  _zrush_close_internal_fd $_zrush_worker_ack_fd
+  _zrush_worker_ack_fd=-1
+  return 0
+}
+
 _zrush_worker_transport_teardown() {
   emulate -L zsh
   setopt localoptions no_bg_nice
-  _zrush_worker_disarm_retry
+  _zrush_worker_disarm_drain
+  _zrush_worker_txq=()
+  # _zrush_worker_writer_pid is >1 only while an ack fd exists, so signalling
+  # belongs inside this branch. Nothing readable after the bounded wait is the
+  # only state in which the child still owns that pid; once its single write is
+  # over the pid may already have been reused by an unrelated process.
+  if (( _zrush_worker_ack_fd >= 0 )); then
+    local ack=
+    local -i ack_st
+    zle -F $_zrush_worker_ack_fd 2>/dev/null
+    # The notification fd becomes readable on the ack byte and on the child's
+    # death alike, so this bounded wait cannot outlast the child.
+    zselect -t 1 -r $_zrush_worker_ack_fd >/dev/null 2>&1
+    sysread -t 0 -i $_zrush_worker_ack_fd ack; ack_st=$?
+    _zrush_worker_release_writer
+    if (( ack_st == 4 )); then
+      _zlog "worker: teardown terminating writer pid=$_zrush_worker_writer_pid"
+      _zrush_worker_terminate $_zrush_worker_writer_pid
+    else
+      _zlog "worker: teardown writer done pid=$_zrush_worker_writer_pid status=$ack_st"
+    fi
+  fi
+  _zrush_worker_writer_pid=-1
   if (( _zrush_worker_setup_fd >= 0 )); then
     zle -F $_zrush_worker_setup_fd 2>/dev/null
     _zrush_close_internal_fd $_zrush_worker_setup_fd
@@ -872,7 +902,6 @@ _zrush_worker_transport_teardown() {
   _zrush_worker_pid=-1
   _zrush_worker_ready=0
   _zrush_worker_rx=
-  _zrush_worker_tx=
   _zrush_worker_pending=()
   _zrush_current_request=0
   _zrush_sync_target=0 _zrush_sync_done=0 _zrush_sync_ok=0
@@ -926,9 +955,9 @@ _zrush_worker_start() {
   _zrush_worker_setup_fd=$fd
   _zrush_worker_setup_pid=${sysparams[procsubstpid]:--1}
   _zrush_worker_ready=0
-  _zrush_worker_rx= _zrush_worker_tx=
+  _zrush_worker_rx=
   _zrush_encode_message hello "$_ZRUSH_EXPECTED_PROTO"
-  _zrush_worker_tx=$REPLY
+  _zrush_worker_txq=( "$REPLY" )
   if ! zle -F -w $fd _zrush-worker-on-setup 2>/dev/null; then
     _zrush_worker_session_fail "setup fd registration failed"
     return 1
@@ -945,7 +974,7 @@ _zrush_worker_finish_start() {
   local -i failed=0
   if ! sysopen -rw -o cloexec -u req_anchor "$req" ||
      ! sysopen -r -o cloexec -u child_in "$req" ||
-     ! sysopen -w -o nonblock,cloexec -u _zrush_worker_wfd "$req"; then
+     ! sysopen -w -o cloexec -u _zrush_worker_wfd "$req"; then
     failed=1
   else
     # The substitution forks before sysopen runs, so record the pid whether or not
@@ -1006,73 +1035,63 @@ _zrush_worker_consume_setup_checked() {
   _zrush_worker_session_fail "pipe setup failed"
 }
 
-_zrush_worker_arm_retry() {
-  (( _zrush_worker_retry_fd < 0 )) || return 0
-  local fd
-  exec {fd}< <( zselect -t 1; print )
-  _zrush_worker_retry_fd=$fd
-  zle -F -w $fd _zrush-worker-on-write 2>/dev/null || {
-    _zrush_close_internal_fd $fd
-    _zrush_worker_retry_fd=-1
-    _zrush_worker_session_fail "write retry fd registration failed"
-    return 1
-  }
-  return 0
-}
-
+# Hands the head frame to a short-lived writer child and returns to ZLE at
+# once; the interactive shell itself never writes to the request FIFO.
+# `--` keeps syswrite's option parser away from the frame's bytes, and the
+# child inherits the cloexec write fd because cloexec acts at exec, not fork.
 _zrush_worker_flush() {
   emulate -L zsh
+  setopt localoptions no_monitor no_notify no_bg_nice
   local LC_ALL=C
-  [[ -n $_zrush_worker_tx ]] || { _zrush_worker_disarm_retry; return 0 }
+  (( $#_zrush_worker_txq )) || return 0
+  (( _zrush_worker_ack_fd >= 0 )) && return 0
   if (( _zrush_worker_wfd < 0 )); then
     (( _zrush_worker_setup_fd >= 0 )) && return 0
     return 1
   fi
-  local -i wrote=0 st
-  local write_errno=
-  syswrite -c wrote -o $_zrush_worker_wfd -- "$_zrush_worker_tx"
-  st=$? write_errno=$ERRNO
-  (( wrote > 0 )) && _zrush_worker_tx=${_zrush_worker_tx[wrote+1,-1]}
-  if (( st == 0 )); then
-    if [[ -n $_zrush_worker_tx ]]; then
-      _zrush_worker_arm_retry || return 1
-    else
-      _zrush_worker_disarm_retry
-    fi
-    return 0
+  local frame=$_zrush_worker_txq[1] fd=
+  exec {fd}< <( syswrite -o $_zrush_worker_wfd -- "$frame" && print -rn -- 1 )
+  # An unset fd means no child exists; assigning it would leave the integer
+  # global at 0 and aim the watcher at the shell's own stdin.
+  if [[ -z $fd ]]; then
+    _zrush_worker_session_fail "writer child spawn failed"
+    return 1
   fi
-  if (( st == 2 )) && [[ $write_errno == 11 || $write_errno == 35 ]]; then
-    _zlog "worker: write backpressure errno=$write_errno wrote=$wrote remaining=${#_zrush_worker_tx}"
-    _zrush_worker_arm_retry || return 1
-    return 0
+  _zrush_worker_ack_fd=$fd
+  _zrush_worker_writer_pid=${sysparams[procsubstpid]:--1}
+  shift _zrush_worker_txq
+  if ! zle -F -w $fd _zrush-worker-on-ack 2>/dev/null; then
+    _zrush_worker_session_fail "ack fd registration failed"
+    return 1
   fi
-  if (( st == 2 )) && [[ -z $write_errno ]] && (( wrote > 0 )); then
-    _zlog "worker: macOS write backpressure wrote=$wrote remaining=${#_zrush_worker_tx}"
-    _zrush_worker_arm_retry || return 1
-    return 0
-  fi
-  if (( st == 2 )) && [[ -z $write_errno ]] && (( _zrush_worker_pid > 1 )) && \
-     kill -0 $_zrush_worker_pid 2>/dev/null; then
-    _zrush_worker_read async || return 1
-    (( _zrush_worker_wfd >= 0 && _zrush_worker_pid > 1 )) || return 1
-    kill -0 $_zrush_worker_pid 2>/dev/null || {
-      _zrush_worker_session_fail "worker died during zero-progress write"
-      return 1
-    }
-    _zlog "worker: macOS write backpressure wrote=0 remaining=${#_zrush_worker_tx}"
-    _zrush_worker_arm_retry || return 1
-    return 0
-  fi
-  _zrush_worker_session_fail "write error status=$st errno=${write_errno:-unknown} wrote=$wrote"
+  _zlog "worker: sending frame writer_pid=$_zrush_worker_writer_pid ackfd=$fd bytes=${#frame} queued=$#_zrush_worker_txq"
+  return 0
 }
 
-_zrush_worker_on_write() {
+# Shared by the ZLE callback and the synchronous history loop. The child's exit
+# status is never consulted: an ack byte means the frame reached the FIFO, EOF
+# without one means the write failed.
+_zrush_worker_consume_ack() {
   emulate -L zsh
-  local -i fd=$1
-  zle -F $fd 2>/dev/null
-  _zrush_close_internal_fd $fd
-  (( fd == _zrush_worker_retry_fd )) && _zrush_worker_retry_fd=-1
+  (( _zrush_worker_ack_fd >= 0 )) || return 0
+  local ack=
+  local -i st writer_pid=$_zrush_worker_writer_pid
+  sysread -t 0 -i $_zrush_worker_ack_fd ack; st=$?
+  (( st == 4 )) && return 0
+  _zrush_worker_release_writer
+  _zrush_worker_writer_pid=-1
+  if [[ $ack != 1 ]]; then
+    _zrush_worker_session_fail "frame write failed writer_pid=$writer_pid status=$st"
+    return 1
+  fi
+  _zlog "worker: frame sent writer_pid=$writer_pid queued=$#_zrush_worker_txq"
   _zrush_worker_flush
+}
+
+_zrush_worker_on_ack() {
+  emulate -L zsh
+  (( $1 == _zrush_worker_ack_fd )) || return 0
+  _zrush_worker_consume_ack
   return 0
 }
 
@@ -1229,6 +1248,13 @@ _zrush_worker_read() {  # async | sync [absolute-deadline]
 _zrush_worker_on_data() {
   emulate -L zsh
   (( $1 == _zrush_worker_rfd )) || return 0
+  # The ack is usually ready in the same wakeup as the response it precedes.
+  # Consuming it before the plan is painted leaves the ack watcher's own
+  # dispatch with nothing to do, because work running in a callback after a
+  # paint holds a SIGINT that zsh 5.9 defers onto the next input byte.
+  if (( _zrush_worker_ack_fd >= 0 )); then
+    _zrush_worker_consume_ack || return 0
+  fi
   _zrush_worker_read async
   return 0
 }
@@ -1273,8 +1299,8 @@ _zrush_request_plan() {  # payload producer query trailing-space
   fi
   _zrush_encode_message plan "$id" "$PWD" "$producer" "$query" \
     "$ZRUSH_CFG_MODE" "$ZRUSH_CFG_SMART_CASE" "$rows" "$width" "$tspace" "$payload"
-  _zrush_worker_tx+=$REPLY
-  _zlog "worker: queued request_id=$id producer=$producer bytes=${#REPLY}"
+  _zrush_worker_txq+=( "$REPLY" )
+  _zlog "worker: queued request_id=$id producer=$producer bytes=${#REPLY} queued=$#_zrush_worker_txq"
   _zrush_worker_flush || return 1
   typeset -g REPLY=$id
   return 0
@@ -1506,9 +1532,8 @@ _zrush_request_plan_sync() {
       _zrush_worker_consume_setup_checked || return 1
       continue
     fi
-    if [[ -n $_zrush_worker_tx ]]; then
-      zselect -t $cs -r $_zrush_worker_rfd -w $_zrush_worker_wfd >/dev/null 2>&1
-      _zrush_worker_flush || return 1
+    if (( _zrush_worker_ack_fd >= 0 )); then
+      zselect -t $cs -r $_zrush_worker_rfd -r $_zrush_worker_ack_fd >/dev/null 2>&1
     else
       zselect -t $cs -r $_zrush_worker_rfd >/dev/null 2>&1
     fi
@@ -1516,6 +1541,7 @@ _zrush_request_plan_sync() {
       _zrush_worker_session_fail "history deadline exceeded request_id=$target"
       return 1
     fi
+    _zrush_worker_consume_ack || return 1
     (( _zrush_worker_rfd >= 0 )) || return 1
     _zrush_worker_read sync "$deadline" || return 1
   done
@@ -2083,7 +2109,7 @@ _zrush_init() {
   zle -N _zrush-on-data _zrush_on_data
   zle -N _zrush-timer-fire _zrush_timer_fire
   zle -N _zrush-worker-on-data _zrush_worker_on_data
-  zle -N _zrush-worker-on-write _zrush_worker_on_write
+  zle -N _zrush-worker-on-ack _zrush_worker_on_ack
   zle -N _zrush-worker-on-drain _zrush_worker_on_drain
   zle -N _zrush-worker-on-setup _zrush_worker_on_setup
   zle -N _zrush-capture-entry _zrush_capture_entry

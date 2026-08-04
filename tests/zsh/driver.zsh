@@ -45,6 +45,10 @@ ng()  { out "FAIL: $1"; (( ++FAIL )) }
 
 typeset -g WORK=$(mktemp -d ${TMPDIR:-/tmp}/zrush-test.XXXXXX)
 export TERM=vt100
+# zsh links the vi keymap to main when $VISUAL/$EDITOR contains "vi"; the host
+# keys this driver sends (^U, ^P, ^V, ...) are emacs-keymap bindings, so the
+# invoking environment must not decide which keymap the host gets.
+unset EDITOR VISUAL
 export LC_ALL=en_US.UTF-8   # match POSTDISPLAY printability checks to real UTF-8 use
 export HOME=$PLAYGROUND     # isolated; never the real home
 export ZRUSH_REPO=$REPO
@@ -97,6 +101,21 @@ mkdir -p $PLAYGROUND/fx/longcol
 : >| $PLAYGROUND/fx/longcol/"item-${(l:90::x:)}-2.txt"
 : >| $PLAYGROUND/fx/longcol/"item-${(l:90::x:)}-3.txt"
 
+# fx/overflow: enough entries that a single compsys capture's candidate_payload
+# comfortably exceeds the request-FIFO buffer on either platform this driver
+# runs on -- 8192 bytes on macOS, 65536 on Linux (behavior.md worker-lifecycle
+# "フレームは不可分な送信単位") -- regardless of what this playground happens to
+# already contain. 0000-marker.txt sorts before every item-*.txt entry (macOS
+# default glob order), so it is always the first candidate and lands in the
+# rendered listing no matter how the grid clips. This many entries put the
+# frame around 112 KB, i.e. ~1.7x the larger of the two capacities. The entries
+# are created in a loop rather than one touch(1) call: that many absolute paths
+# can outgrow ARG_MAX for a deeply nested playground.
+mkdir -p $PLAYGROUND/fx/overflow
+: >| $PLAYGROUND/fx/overflow/0000-marker.txt
+for OVERFLOW_ITEM in $PLAYGROUND/fx/overflow/item-{0001..7000}.txt; do : >| $OVERFLOW_ITEM; done
+unset OVERFLOW_ITEM
+
 typeset -gi HOSTFD=-1
 typeset -g TRANSCRIPT= EXPECT_BUF= STDIO_BASELINE=
 
@@ -132,7 +151,12 @@ drain() {  # $1=seconds to wait while reading the pty
 }
 
 clear_line() { send_keys $'\C-u'; drain 0.2 }
-sync_prompt() { expect '*HP>*' ${1:-5} >/dev/null; drain 0.1 }
+sync_prompt() {  # $1=timeout(s); returns expect's status (drain still always runs)
+  expect '*HP>*' ${1:-5} >/dev/null
+  local -i st=$?
+  drain 0.1
+  return st
+}
 press() { send_keys $1; drain 0.3 }
 
 log_count() {  # $1=fixed string -> REPLY: occurrence count in ZRUSH_LOG
@@ -272,12 +296,12 @@ start_hist_host() {  # $1=zdotdir $2=xdg-config-home $3=logfile
   assert_host_stdio "(fd-1a) source leaves host fd 0/1/2 attached and writable"
 
   if dump_get $'\C-xj' TESTAUX \
-     && [[ $REPLY == 'closed=1 retry=-1 drain=-1 timer=-1' ]]; then
-    ok "(fd-1b) timer/retry/drain descriptors close through shared teardown"
+     && [[ $REPLY == 'closed=1 ack=-1 drain=-1 timer=-1' ]]; then
+    ok "(fd-1b) timer/ack/drain descriptors close through shared teardown"
   else
     ng "(fd-1b) auxiliary fd teardown mismatch: ${REPLY:-<none>}"
   fi
-  assert_host_stdio "(fd-1c) timer/retry/drain teardown preserves host fd 0/1/2"
+  assert_host_stdio "(fd-1c) timer/ack/drain teardown preserves host fd 0/1/2"
 
   # ================================================================ (1) Capture fork -> candidate records
   # (cap-1a) A real compsys fork collects candidates, ships candidate records
@@ -336,7 +360,7 @@ start_hist_host() {  # $1=zdotdir $2=xdg-config-home $3=logfile
   local -i seq_before_resource=${${worker_after_successive#*seq=}%% *}
   send_line "source $REPO/zsh/zrush.zsh"
   sync_prompt
-  if dump_get $'\C-xw' TESTWORKER && [[ $REPLY == "pid=-1 ready=0 seq=$seq_before_resource "* && $REPLY == *'rfd=-1 wfd=-1 retry=-1 pending=0' ]]; then
+  if dump_get $'\C-xw' TESTWORKER && [[ $REPLY == "pid=-1 ready=0 seq=$seq_before_resource "* && $REPLY == *'rfd=-1 wfd=-1 ack=-1 pending=0' ]]; then
     ok "(worker-1d) re-source tears down transport while preserving the request counter"
   else
     ng "(worker-1d) bad post-resource state: ${REPLY:-<none>}"
@@ -387,6 +411,34 @@ start_hist_host() {  # $1=zdotdir $2=xdg-config-home $3=logfile
     ok "(cap-2b) a normal completion right after a zero-candidate one still works (compsys/tail-call state intact)"
   else
     ng "(cap-2b) completion broke after a zero-candidate collection"
+  fi
+  clear_line
+  drain 0.3
+
+  # ================================================================ FIFO-capacity frame delegation
+  # (fifo-1a/b) fx/overflow's candidate_payload is well over the request-FIFO
+  # buffer on either platform (8192 bytes on macOS, 65536 on Linux), so it can
+  # only reach the worker if the writer child actually delegates the whole
+  # frame in one syswrite (behavior.md worker-lifecycle "1 フレームの送信は...
+  # 委譲する"); a naive blocking write from the parent would deadlock instead
+  # of rendering.
+  log_count 'worker: queued request_id='; local -i overflow_queued_before=$REPLY
+  send_keys 'ls fx/overflow/'
+  if expect '*0000-marker.txt*' 15; then
+    ok "(fifo-1a) a candidate_payload larger than the FIFO buffer still crosses in one delegated write and renders"
+  else
+    ng "(fifo-1a) list not displayed for an over-capacity payload"
+  fi
+  if wait_log 'worker: queued request_id=' $overflow_queued_before 5; then
+    local overflow_queued_line=$(grep -F 'worker: queued request_id=' $ZRUSH_LOG 2>/dev/null | tail -1)
+    local -i overflow_frame_bytes=${${overflow_queued_line##*bytes=}%% *}
+    if (( overflow_frame_bytes > 65536 )); then
+      ok "(fifo-1b) the queued frame's byte count ($overflow_frame_bytes) actually exceeded the FIFO buffer on both platforms (8192 macOS / 65536 Linux)"
+    else
+      ng "(fifo-1b) queued frame was not actually over-capacity (need > 65536): bytes=$overflow_frame_bytes line=${overflow_queued_line:-<none>}"
+    fi
+  else
+    ng "(fifo-1b) no 'worker: queued request_id=' log line for the overflow request"
   fi
   clear_line
   drain 0.3
@@ -1534,6 +1586,115 @@ start_hist_host() {  # $1=zdotdir $2=xdg-config-home $3=logfile
     fi
   else
     ng "(worker-job-table) dedicated exit host failed to start"
+  fi
+
+  # ================================================================ Teardown while a frame is in flight
+  # Dedicated host (same exit pattern as "Worker job-table isolation" above)
+  # so exiting mid-request doesn't disturb any other case. fx/overflow (added
+  # above for (fifo-1a/b)) makes the writer child's single syswrite take long
+  # enough to plausibly still be delegated -- unacked, possibly still writing
+  # -- when we tear down; (inflight-1c) reports (OBSV, non-failing) whether
+  # this run actually won that race, since the exact window isn't guaranteed.
+  #
+  # The previous case just let its own dedicated "host" pty session exit for
+  # real (as opposed to every other transition in this driver, which deletes
+  # a still-live session via `zpty -d host`). start_hist_host always issues
+  # its own `zpty -d host 2>/dev/null` before spawning anew; issuing that
+  # exact call -- with stderr redirected -- as the *first* deletion of an
+  # already-dead real-worker session reproducibly kills this outer zsh
+  # process outright (a zpty/job-control interaction, not a zrush bug).
+  # Reaping it here first, without redirecting stderr, avoids the crash;
+  # start_hist_host's own redundant delete of the now-already-gone session
+  # is then a harmless no-op.
+  zpty -d host
+  mkdir -p $WORK/zdot-inflight $WORK/xdg-inflight/zrush
+  print "source $REPO/tests/zsh/rc/minimal.zshrc" > $WORK/zdot-inflight/.zshrc
+  if start_hist_host $WORK/zdot-inflight $WORK/xdg-inflight $WORK/host-inflight.log; then
+    send_line '[[ -o checkjobs && -o checkrunningjobs ]] && print CHECK-JOBS-ENABLED'
+    if expect '*CHECK-JOBS-ENABLED*HP>*' 5; then
+      # Warm the persistent worker up on a small request first so handshake/
+      # startup latency cannot masquerade as "frame in flight" below.
+      send_keys 'ls fx/basic/al'
+      expect '*alpha.txt*' 10 >/dev/null
+      clear_line
+      drain 0.3
+      log_count 'worker: sending frame'; local -i inflight_sending_before=$REPLY
+      log_count 'worker: frame sent'; local -i inflight_sent_before=$REPLY
+      send_keys 'ls fx/overflow/'
+      if wait_log 'worker: sending frame' $inflight_sending_before 15; then
+        local inflight_sending_line=$(grep -F 'worker: sending frame' $ZRUSH_LOG 2>/dev/null | tail -1)
+        local -i inflight_writer_pid=${${inflight_sending_line##*writer_pid=}%% *}
+        log_count 'worker: frame sent'; local -i inflight_sent_at_dispatch=$REPLY
+        # No drain here: the whole point is to tear down as close as possible
+        # to the writer-child spawn, before its ack can land. ^U
+        # (kill-whole-line) only discards the still-uncommitted
+        # 'ls fx/overflow/' buffer text so that `exit` runs on an empty line;
+        # the capture already finished -- that's how the frame got queued --
+        # and an empty buffer collects nothing (behavior.md 候補収集), so no
+        # new request races the exit. The transport is untouched (only
+        # _zrush_worker_transport_teardown touches it).
+        #
+        # ^C would clear the buffer just as well but must not be used here:
+        # zsh 5.9 defers a SIGINT that arrives while a `zle -F` watcher
+        # callback is running -- precisely the window this case aims at --
+        # until the next input byte, and the deferred send-break then swallows
+        # that byte, eating the 'e' of the following `exit`. kill-whole-line
+        # is a plain widget keystroke with no such hazard.
+        send_keys $'\C-u'
+        send_line exit
+        local -F inflight_exit_deadline=$(( SECONDS + 5 ))
+        local -i inflight_exit_eof=0 inflight_exit_status=0
+        local inflight_exit_output= inflight_exit_chunk=
+        while (( SECONDS < inflight_exit_deadline )); do
+          if zselect -t 20 -r $HOSTFD 2>/dev/null; then
+            inflight_exit_chunk=
+            zpty -r host inflight_exit_chunk 2>/dev/null; inflight_exit_status=$?
+            (( inflight_exit_status == 0 )) && inflight_exit_output+=$inflight_exit_chunk
+            if (( inflight_exit_status == 2 )); then
+              inflight_exit_eof=1
+              break
+            fi
+          fi
+        done
+        local inflight_visible_output=${inflight_exit_output//$'\e['[0-9;]#m/}
+        if (( inflight_exit_eof )) \
+           && [[ $inflight_visible_output != *'zsh: you have running jobs.'* ]] \
+           && [[ $inflight_visible_output != *'Terminated'* && $inflight_visible_output != *'Done'* ]]; then
+          ok "(inflight-1a) exit while the writer child is still delegated produces no job-control output"
+        else
+          ng "(inflight-1a) job-control output leaked during in-flight teardown: eof=$inflight_exit_eof output=${(qqqq)inflight_visible_output}"
+        fi
+        if (( inflight_writer_pid > 1 )); then
+          local -F inflight_gone_deadline=$(( SECONDS + 2 ))
+          local -i inflight_writer_gone=0
+          while (( SECONDS < inflight_gone_deadline )); do
+            if ! kill -0 $inflight_writer_pid 2>/dev/null; then
+              inflight_writer_gone=1
+              break
+            fi
+            zselect -t 5 2>/dev/null
+          done
+          if (( inflight_writer_gone )); then
+            ok "(inflight-1b) the delegated writer child (pid=$inflight_writer_pid) is gone after teardown"
+          else
+            ng "(inflight-1b) writer child pid=$inflight_writer_pid still alive after teardown"
+          fi
+        else
+          ng "(inflight-1b) could not parse a writer_pid from: ${inflight_sending_line:-<none>}"
+        fi
+        if (( inflight_sent_at_dispatch == inflight_sent_before )); then
+          out "OBSV: (inflight-1c) teardown was dispatched before this frame's ack was consumed (writer child genuinely still delegated)"
+        else
+          out "OBSV: (inflight-1c) this frame's ack had already landed before teardown; (inflight-1a/b) still ran but not against a strictly unacked frame"
+        fi
+      else
+        ng "(inflight-1) dedicated host never delegated a writer child for the overflow request"
+      fi
+    else
+      ng "(inflight-1) dedicated host did not enable CHECK_JOBS and CHECK_RUNNING_JOBS"
+    fi
+  else
+    ng "(inflight-1) dedicated in-flight-teardown host failed to start"
   fi
 
   out "SUMMARY: PASS=$PASS FAIL=$FAIL"
