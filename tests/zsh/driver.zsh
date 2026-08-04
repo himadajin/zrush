@@ -569,7 +569,7 @@ start_hist_host() {  # $1=zdotdir $2=xdg-config-home $3=logfile
     ng "(sel-1a) selection did not start"
   fi
   if dump_get $'\C-xh' TESTRH; then
-    if [[ $REPLY == *'memo=zrush-sel'* || ( ! HAVE_MEMO && $REPLY == *standout* ) ]]; then
+    if [[ $REPLY == *'memo=zrush-sel'* ]] || { (( ! HAVE_MEMO )) && [[ $REPLY == *standout* ]] }; then
       ok "(sel-1b) pos=1's own decoration (standout/selected) replaces its match highlight"
     else
       ng "(sel-1b) selected-cell decoration not found: ${REPLY:-<none>}"
