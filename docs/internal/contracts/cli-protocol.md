@@ -47,9 +47,11 @@ zrush.zsh(zsh 側)と `zrush` バイナリ(Rust 側)の入出力仕様。
    直して `cargo test` が green になることを確認する。
 3. ワイヤ形式も変えた場合はゴールデンを再生成する:
    `UPDATE_GOLDEN=1 cargo test`(`tests/vectors/plan/` の worker セッション応答列)、
-   `UPDATE_GOLDEN=1 zsh -f tests/zsh/vectors.zsh`(`tests/vectors/encode/` の `expected.bin`)。
+   `UPDATE_GOLDEN=1 zsh -f tests/zsh/vectors.zsh`(`tests/vectors/encode/` の `expected`)。
    どちらも更新が生じると更新一覧を添えて**わざと失敗する**ので、差分をレビューしてから同じコマンドを再実行し、
    何も更新されない(= green になる)ことを確認する。
+   ベクタはエスケープされたテキストで、プランのゴールデンは 1 フィールド 1 行なので、差分はそのまま読める
+   (形式は `tests/vectors/README.md`)。
    `tests/vectors/reject-plan/` は生成物ではないので手で書く。
 4. zsh 側のランナーと E2E ドライバを通す:
    `zsh -f tests/zsh/vectors.zsh` と、`cargo build --release` の後に

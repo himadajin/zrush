@@ -1,0 +1,11 @@
+b\0
+w\1git status\2
+n\1110\0
+w\1git checkout main\2
+n\1109\0
+w\1sudo git push\2
+n\1108\0
+w\1echo gh issue\2
+n\1107\0
+w\1gh pr view\2
+n\1106\0

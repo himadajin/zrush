@@ -1,0 +1,7 @@
+b\0
+w\1echo xfoo\2
+n\1105\0
+w\1unrelated\2
+n\1104\0
+w\1foo\2
+n\199\0

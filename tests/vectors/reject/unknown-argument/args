@@ -1,2 +1,2 @@
---bogus
-x
+--bogus\0
+x\0
