@@ -21,6 +21,8 @@ use std::cmp::Reverse;
 
 use nucleo_matcher::{Config as NucleoConfig, Matcher, Utf32Str};
 
+use crate::span::CharSpan;
+
 /// Matching strength, cumulative.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -264,14 +266,13 @@ impl QueryMatcher {
     /// `hit` `classify` returned for that same candidate (passing another
     /// candidate's hit is a caller bug). For the stdout match-spans field
     /// (cli-protocol.md): char offsets over the lossy UTF-8 reading,
-    /// 0-based end-exclusive, sorted and merged; empty = no position
-    /// info (empty query).
+    /// 0-based, sorted and merged; empty = no position info (empty query).
     ///
     /// Second pass by design: callers run this only on the top-ranked
     /// (at most max-lines) candidates, so the fuzzy tier's re-match --
     /// the one thing the hit cannot carry -- stays cheap, and `classify`
     /// stays allocation-free for the full set.
-    pub fn spans(&mut self, cand_raw: &[u8], hit: TierHit) -> Vec<(usize, usize)> {
+    pub fn spans(&mut self, cand_raw: &[u8], hit: TierHit) -> Vec<CharSpan> {
         let q_len = self.query.bytes.len();
         if q_len == 0 {
             return Vec::new();
@@ -280,15 +281,15 @@ impl QueryMatcher {
         // so the offsets in `hit` index `cand_raw` identically; only the
         // fuzzy re-match needs the folded form again.
         match hit {
-            TierHit::Prefix { .. } => vec![(0, char_count(&cand_raw[..q_len]))],
-            TierHit::Substring { pos } => vec![(
+            TierHit::Prefix { .. } => vec![CharSpan::new(0, char_count(&cand_raw[..q_len]))],
+            TierHit::Substring { pos } => vec![CharSpan::new(
                 char_count(&cand_raw[..pos]),
                 char_count(&cand_raw[..pos + q_len]),
             )],
             TierHit::Edit(em) => {
                 // The aligned (corrected-query) prefix of the candidate.
                 let consumed = cand_raw.len() - em.suffix_len;
-                vec![(0, char_count(&cand_raw[..consumed]))]
+                vec![CharSpan::new(0, char_count(&cand_raw[..consumed]))]
             }
             TierHit::Fuzzy { .. } => {
                 let cand = fold_hay(&mut self.hay, &self.query, cand_raw);
@@ -296,12 +297,12 @@ impl QueryMatcher {
                 self.fuzzy.indices(&self.query, cand, &mut indices);
                 indices.sort_unstable();
                 indices.dedup();
-                let mut out: Vec<(usize, usize)> = Vec::new();
+                let mut out: Vec<CharSpan> = Vec::new();
                 for i in indices {
                     let i = i as usize;
                     match out.last_mut() {
-                        Some(last) if last.1 == i => last.1 = i + 1,
-                        _ => out.push((i, i + 1)),
+                        Some(last) if last.end == i => last.end = i + 1,
+                        _ => out.push(CharSpan::new(i, i + 1)),
                     }
                 }
                 out
@@ -452,12 +453,15 @@ mod tests {
         classify(q.as_bytes(), cand.as_bytes(), mode, true).map(TierHit::tier)
     }
 
+    /// Spans as `(start, end)` pairs, so the cases below read as the
+    /// char ranges they are.
     fn spans(q: &[u8], cand: &[u8], mode: Mode) -> Vec<(usize, usize)> {
         let mut qm = QueryMatcher::new(q, mode, true);
-        match qm.classify(cand) {
+        let spans = match qm.classify(cand) {
             Some(hit) => qm.spans(cand, hit),
             None => Vec::new(),
-        }
+        };
+        spans.into_iter().map(|s| (s.start, s.end)).collect()
     }
 
     #[test]

@@ -6,13 +6,13 @@
 //! module owns grouping, the column-major grid, cell truncation/padding,
 //! and every offset computed against the listing text; it does not know
 //! about matching -- match spans (char offsets over a candidate's
-//! match-text, from matching::QueryMatcher::spans) are supplied by the
-//! caller and only get clipped/repositioned here. The caller also supplies
-//! the producer-selected layout style defined by the same contract.
+//! match-text) are supplied by the caller and only get clipped/
+//! repositioned here. The caller also supplies the producer-selected
+//! layout style defined by the same contract.
 //!
 //! Mixing char counts and display widths is a recurring source of offset
 //! bugs, which is why the contract spells out the split explicitly:
-//! highlight/cell-range `start`/`len` are always char counts over the
+//! every char interval this module computes is a [`CharSpan`] over the
 //! lossy-UTF-8 reading of the listing text, while cell padding/truncation
 //! is always display width (unicode-width). The two are computed from the
 //! same lossy decoding pass (`lossy_chars`) so they can never drift apart
@@ -24,6 +24,7 @@ use std::ops::Range;
 use unicode_width::UnicodeWidthChar;
 
 use crate::record::{Batch, Candidate};
+use crate::span::CharSpan;
 
 /// Column cap and gutter width: Rust-internal constants, not part of the
 /// protocol (cli-protocol.md "列数").
@@ -70,14 +71,14 @@ impl Role {
     }
 }
 
-/// One "role pos start len" render-plan entry. `start`/`len` are char offsets
-/// over the full listing text (rows joined by `\n`, no leading newline).
+/// One "role pos start len" render-plan entry. `span` is a char range
+/// over the full listing text (rows joined by `\n`, no leading newline);
+/// plan.rs's serializer turns it into the wire's `start len`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Highlight {
     pub role: Role,
     pub pos: usize,
-    pub start: usize,
-    pub len: usize,
+    pub span: CharSpan,
 }
 
 /// One "next prev left right" render-plan entry, absolute position numbers
@@ -99,9 +100,9 @@ pub(crate) struct Plan {
     pub rows: Vec<Vec<u8>>,
     /// H highlight entries.
     pub highlights: Vec<Highlight>,
-    /// P entries: (start, len) char range of the position's real (post-
-    /// truncation, pre-padding) cell text within the listing text.
-    pub cell_ranges: Vec<(usize, usize)>,
+    /// P entries: char range of the position's real (post-truncation,
+    /// pre-padding) cell text within the listing text.
+    pub cell_ranges: Vec<CharSpan>,
     /// P entries: navigation targets.
     pub nav: Vec<Nav>,
     /// P entries: index into the `candidates` slice passed to `build`,
@@ -113,16 +114,16 @@ pub(crate) struct Plan {
 ///
 /// `candidates` must already be in rank order (matching.rs + ranking.rs);
 /// this module does not re-sort. `spans[i]` are `matching::QueryMatcher::
-/// spans()`'s (start, end) 0-based end-exclusive char ranges (NOT
-/// (start, len)) over `candidates[i].match_text()`, aligned by index; a
-/// missing or empty entry means no match decoration for that candidate.
+/// spans()`'s char ranges over `candidates[i].match_text()`, aligned by
+/// index; a missing or empty entry means no match decoration for that
+/// candidate.
 /// `row_budget`/`width` are `--rows`/`--width` (cli-protocol.md
 /// "起動"), assumed >= 1 by the caller but handled gracefully at 0 too.
 /// `style` is the producer-specific geometry from the contract.
 pub(crate) fn build(
     candidates: &[Candidate<'_>],
     batches: &[Batch<'_>],
-    spans: &[Vec<(usize, usize)>],
+    spans: &[Vec<CharSpan>],
     row_budget: usize,
     width: usize,
     style: Style,
@@ -176,7 +177,7 @@ pub(crate) fn build(
     // both char offsets within the composed source. The history profile
     // guarantees ASCII digits, padding and delimiter, so their byte and char
     // lengths coincide.
-    let mut number_ranges: Vec<Option<(usize, usize)>> = Vec::with_capacity(candidates.len());
+    let mut number_ranges: Vec<Option<CharSpan>> = Vec::with_capacity(candidates.len());
     let mut match_offsets: Vec<usize> = Vec::with_capacity(candidates.len());
     let sources: Vec<Vec<u8>> = candidates
         .iter()
@@ -194,7 +195,7 @@ pub(crate) fn build(
             source.extend_from_slice(number);
             source.extend_from_slice(b"  ");
             source.extend_from_slice(&base);
-            number_ranges.push(Some((pad, number.len())));
+            number_ranges.push(Some(CharSpan::new(pad, pad + number.len())));
             match_offsets.push(width + 2);
             source
         })
@@ -349,47 +350,45 @@ pub(crate) fn build(
             highlights.push(Highlight {
                 role: Role::Heading,
                 pos: 0,
-                start: row_start[h.row],
-                len: h.len,
+                span: CharSpan::new(row_start[h.row], row_start[h.row] + h.len),
             });
         }
     }
-    let mut cell_ranges = vec![(0usize, 0usize); positions.len()];
+    let mut cell_ranges = vec![CharSpan::default(); positions.len()];
     for cm in &cell_marks {
+        // Cell-local char spans become listing-wide ones by shifting past
+        // everything before the cell; both are clipped to the cell's real
+        // (post-truncation) content first.
         let start = row_start[cm.row] + cm.in_row_start;
-        cell_ranges[cm.pos - 1] = (start, cm.content_chars);
-        if let Some(&(number_start, number_len)) = number_ranges[cm.candidate].as_ref() {
-            let ns = number_start.min(cm.content_chars);
-            let ne = (number_start + number_len).min(cm.content_chars);
-            if ne > ns {
+        cell_ranges[cm.pos - 1] = CharSpan::new(start, start + cm.content_chars);
+        if let Some(number) = number_ranges[cm.candidate] {
+            let span = number.clip(cm.content_chars).shift(start);
+            if !span.is_empty() {
                 highlights.push(Highlight {
                     role: Role::HistoryNumber,
                     pos: cm.pos,
-                    start: start + ns,
-                    len: ne - ns,
+                    span,
                 });
             }
         }
         // Match decoration only on cells showing match-text verbatim
-        // (contract: "display-text 表示セルには発行されない").
+        // (contract: "display-text 表示セルには発行されない"). The
+        // candidate's spans index its match-text, which starts after the
+        // history-number prefix when present.
         if candidates[cm.candidate].d.is_none()
             && let Some(cand_spans) = spans.get(cm.candidate)
         {
-            // matching.rs `spans()`: (start, end), 0-based end-exclusive
-            // char range -- NOT (start, len). Clip both ends to the
-            // visible command-text char count, after the history-number
-            // prefix when present.
             let match_offset = match_offsets[cm.candidate];
             let visible_match_chars = cm.content_chars.saturating_sub(match_offset);
-            for &(s, e) in cand_spans {
-                let cs = s.min(visible_match_chars);
-                let ce = e.min(visible_match_chars);
-                if ce > cs {
+            for &cand_span in cand_spans {
+                let span = cand_span
+                    .clip(visible_match_chars)
+                    .shift(start + match_offset);
+                if !span.is_empty() {
                     highlights.push(Highlight {
                         role: Role::Match,
                         pos: cm.pos,
-                        start: start + match_offset + cs,
-                        len: ce - cs,
+                        span,
                     });
                 }
             }
@@ -626,7 +625,7 @@ mod tests {
     fn build(
         candidates: &[Candidate<'_>],
         batches: &[Batch<'_>],
-        spans: &[Vec<(usize, usize)>],
+        spans: &[Vec<CharSpan>],
         row_budget: usize,
         width: usize,
     ) -> Plan {
@@ -715,8 +714,13 @@ mod tests {
         assert_eq!((cols, grows, gcount), (1, 5, 5));
     }
 
-    fn spans_none(n: usize) -> Vec<Vec<(usize, usize)>> {
+    fn spans_none(n: usize) -> Vec<Vec<CharSpan>> {
         vec![Vec::new(); n]
+    }
+
+    /// A `[start, end)` char range, the shape every offset in a plan has.
+    fn span(start: usize, end: usize) -> CharSpan {
+        CharSpan::new(start, end)
     }
 
     // ---- grouping ----
@@ -779,7 +783,7 @@ mod tests {
             .unwrap();
         // Offset is char count (2), not display width (4) -- same
         // char/width split as cell offsets.
-        assert_eq!((h.start, h.len), (0, 2));
+        assert_eq!(h.span, span(0, 2));
     }
 
     // ---- budget: heading omission and group drop ----
@@ -834,9 +838,9 @@ mod tests {
         // Row 1: "ab" padded to width 6 -> "ab" + 4 spaces.
         assert_eq!(plan.rows[1], b"ab    ");
         // Cell range length is CHAR count (3), not display width (6).
-        assert_eq!(plan.cell_ranges[0], (0, 3));
+        assert_eq!(plan.cell_ranges[0], span(0, 3));
         // Row 1 starts after "日本語" (3 chars) + 1 newline = char offset 4.
-        assert_eq!(plan.cell_ranges[1], (4, 2));
+        assert_eq!(plan.cell_ranges[1], span(4, 6));
     }
 
     #[test]
@@ -868,10 +872,10 @@ mod tests {
         assert_eq!(
             plan.cell_ranges,
             vec![
-                (4, 1),  // 日: row2, col1
-                (9, 1),  // 本: row3, col1
-                (7, 1),  // 語: row2, col2 (after "日  ")
-                (12, 1), // 字: row3, col2 (after "本  ")
+                span(4, 5),   // 日: row2, col1
+                span(9, 10),  // 本: row3, col1
+                span(7, 8),   // 語: row2, col2 (after "日  ")
+                span(12, 13), // 字: row3, col2 (after "本  ")
             ]
         );
     }
@@ -925,7 +929,7 @@ mod tests {
         assert_eq!(plan.rows[0], raw); // bytes preserved verbatim, never re-encoded
         // "a", "b", one replacement char for all 3 trailing bytes = 3
         // chars -- not 5 (if each trailing byte were its own U+FFFD).
-        assert_eq!(plan.cell_ranges[0], (0, 3));
+        assert_eq!(plan.cell_ranges[0], span(0, 3));
     }
 
     // ---- highlight span clipping ----
@@ -934,10 +938,9 @@ mod tests {
     fn match_span_is_clipped_to_truncated_cell() {
         let batches = [batch(b"", b"")];
         let cands = [cand(b"abcdef", None, None, 0)];
-        // matching::spans() tuples are (start, end), 0-based
-        // end-exclusive -- chars [1,5) = "bcde", reaching past the
-        // truncation point (width budget 3).
-        let spans = vec![vec![(1usize, 5usize)]];
+        // chars [1,5) = "bcde", reaching past the truncation point
+        // (width budget 3).
+        let spans = vec![vec![span(1, 5)]];
         let plan = build(&cands, &batches, &spans, 10, 3);
         assert_eq!(plan.rows[0], b"abc");
         let m = plan
@@ -946,22 +949,24 @@ mod tests {
             .find(|h| h.role == Role::Match)
             .unwrap();
         // Clipped to the 3 retained chars: [1,3) = "bc".
-        assert_eq!((m.start, m.len), (1, 2));
+        assert_eq!(m.span, span(1, 3));
     }
 
     #[test]
     fn match_span_uses_end_exclusive_semantics_not_start_len() {
-        // Regression: layout.rs once misread matching::spans()'s (start,
-        // end) tuples as (start, len), which happened to be
-        // indistinguishable whenever start == 0. "cargo" matched by "g"
-        // (substring, found at char index 3) produces the real span
-        // matching.rs::spans() would emit: (3, 4) = chars [3,4) = "g"
-        // alone, i.e. len 1 -- not len 4 (mistaken as start=3,len=4) and
-        // not len 2 (the bug actually observed: end misread as start+len
-        // saturating past the candidate).
+        // Regression: layout.rs once misread matching::spans()'s
+        // end-exclusive ranges as (start, len), which happened to be
+        // indistinguishable whenever start == 0. CharSpan now makes that
+        // misreading unspellable, and this pins the arithmetic that
+        // survives it. "cargo" matched by "g" (substring, found at char
+        // index 3) produces the real span matching.rs::spans() would
+        // emit: chars [3,4) = "g" alone, i.e. wire len 1 -- not len 4
+        // (mistaken as start=3,len=4) and not len 2 (the bug actually
+        // observed: end misread as start+len saturating past the
+        // candidate).
         let batches = [batch(b"", b"")];
         let cands = [cand(b"cargo", None, None, 0)];
-        let spans = vec![vec![(3usize, 4usize)]];
+        let spans = vec![vec![span(3, 4)]];
         let plan = build(&cands, &batches, &spans, 10, 40); // no truncation
         assert_eq!(plan.rows[0], b"cargo");
         let m = plan
@@ -969,7 +974,8 @@ mod tests {
             .iter()
             .find(|h| h.role == Role::Match)
             .unwrap();
-        assert_eq!((m.start, m.len), (3, 1));
+        assert_eq!(m.span, span(3, 4));
+        assert_eq!(m.span.len(), 1); // the wire's `len` field
     }
 
     #[test]
@@ -978,7 +984,7 @@ mod tests {
         let cands = [cand(b"raw", None, Some(b"shown"), 0)];
         // Non-zero start: a d-tag cell must suppress match decoration
         // regardless of what the (otherwise unused) span would resolve to.
-        let spans = vec![vec![(1usize, 3usize)]];
+        let spans = vec![vec![span(1, 3)]];
         let plan = build(&cands, &batches, &spans, 10, 40);
         assert_eq!(plan.rows[0], b"shown");
         assert!(plan.highlights.iter().all(|h| h.role != Role::Match));
@@ -992,7 +998,7 @@ mod tests {
             history_cand(b"two", b"123"),
             history_cand(b"three", b"123456"),
         ];
-        let spans = vec![Vec::new(), vec![(1, 3)], Vec::new()];
+        let spans = vec![Vec::new(), vec![span(1, 3)], Vec::new()];
         let plan = build(&cands, &batches, &spans, 10, 13);
         assert_eq!(
             plan.rows,
@@ -1002,21 +1008,27 @@ mod tests {
                 b"123456  three".to_vec(),
             ]
         );
-        assert_eq!(plan.cell_ranges, vec![(0, 11), (14, 11), (28, 13)]);
+        assert_eq!(
+            plan.cell_ranges,
+            vec![span(0, 11), span(14, 25), span(28, 41)]
+        );
         let numbers: Vec<_> = plan
             .highlights
             .iter()
             .filter(|h| h.role == Role::HistoryNumber)
-            .map(|h| (h.pos, h.start, h.len))
+            .map(|h| (h.pos, h.span))
             .collect();
-        assert_eq!(numbers, vec![(1, 5, 1), (2, 17, 3), (3, 28, 6)]);
+        assert_eq!(
+            numbers,
+            vec![(1, span(5, 6)), (2, span(17, 20)), (3, span(28, 34))]
+        );
         let m = plan
             .highlights
             .iter()
             .find(|h| h.role == Role::Match)
             .unwrap();
         // Row 2 starts at 14; its command starts after 6 columns + 2 spaces.
-        assert_eq!((m.pos, m.start, m.len), (2, 23, 2));
+        assert_eq!((m.pos, m.span), (2, span(23, 25)));
     }
 
     #[test]
@@ -1025,11 +1037,11 @@ mod tests {
         let cands = [history_cand(b"command", b"9")];
         let plan = build(&cands, &batches, &spans_none(1), 10, 5);
         assert_eq!(plan.rows, vec![b"    9".to_vec()]);
-        assert_eq!(plan.cell_ranges, vec![(0, 5)]);
+        assert_eq!(plan.cell_ranges, vec![span(0, 5)]);
         assert!(
             plan.highlights
                 .iter()
-                .any(|h| { (h.role, h.pos, h.start, h.len) == (Role::HistoryNumber, 1, 4, 1) })
+                .any(|h| { (h.role, h.pos, h.span) == (Role::HistoryNumber, 1, span(4, 5)) })
         );
     }
 
@@ -1145,11 +1157,11 @@ mod tests {
         assert_eq!(
             plan.cell_ranges,
             vec![
-                (0, 1),  // a: row0, col1
-                (8, 1),  // b: row1, col1
-                (3, 1),  // c: row0, col2 (after "a  ")
-                (11, 1), // d: row1, col2 (after "b  ")
-                (6, 1),  // e: row0, col3 (after "a  c  ")
+                span(0, 1),   // a: row0, col1
+                span(8, 9),   // b: row1, col1
+                span(3, 4),   // c: row0, col2 (after "a  ")
+                span(11, 12), // d: row1, col2 (after "b  ")
+                span(6, 7),   // e: row0, col3 (after "a  c  ")
             ]
         );
         // nav: next/prev walk positions 1..=5 sequentially; left/right
@@ -1216,7 +1228,7 @@ mod tests {
         assert_eq!(plan.positions, vec![0, 1, 2, 3, 4]);
         assert_eq!(
             plan.cell_ranges,
-            vec![(8, 1), (6, 1), (4, 1), (2, 1), (0, 1)]
+            vec![span(8, 9), span(6, 7), span(4, 5), span(2, 3), span(0, 1)]
         );
         assert_eq!(
             plan.nav,
