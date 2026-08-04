@@ -273,8 +273,13 @@ assert_host_stdio() {  # $1=label; compare fd targets and stdout/stderr delivery
 # buffer, so those scenarios need a real line abandon + resync instead.
 # The generous bound matches the other send-break sites: a loaded host has
 # been observed to spend >5s inside pty-^C interrupt handling before the new
-# prompt appears (#47).
-reset_line() { send_keys $'\C-c'; drain 0.3; sync_prompt 15 }
+# prompt appears (#47). A resync that never happens leaves every following
+# case running against a desynced host, so it is reported rather than dropped.
+reset_line() {
+  send_keys $'\C-c'
+  drain 0.3
+  sync_prompt 15 || ng "reset_line: no prompt after send-break"
+}
 
 # Stop whatever is running as the "host" pty and start a fresh one under a
 # given ZDOTDIR/XDG_CONFIG_HOME/log file. Used by the history-menu section
