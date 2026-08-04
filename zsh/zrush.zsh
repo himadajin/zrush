@@ -978,7 +978,7 @@ _zrush_worker_finish_start() {
   else
     # The substitution forks before sysopen runs, so record the pid whether or not
     # sysopen succeeded: a failure here still has a worker to terminate.
-    sysopen -r -o nonblock,cloexec -u _zrush_worker_rfd \
+    sysopen -r -o cloexec -u _zrush_worker_rfd \
       <( exec "$ZRUSH_BIN" worker <&$child_in 2>>| "${ZRUSH_LOG:-/dev/null}" ) || failed=1
     _zrush_worker_pid=${sysparams[procsubstpid]:--1}
   fi
