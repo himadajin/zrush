@@ -45,6 +45,10 @@ ng()  { out "FAIL: $1"; (( ++FAIL )) }
 
 typeset -g WORK=$(mktemp -d ${TMPDIR:-/tmp}/zrush-test.XXXXXX)
 export TERM=vt100
+# zsh links the vi keymap to main when $VISUAL/$EDITOR contains "vi"; the host
+# keys this driver sends (^U, ^P, ^V, ...) are emacs-keymap bindings, so the
+# invoking environment must not decide which keymap the host gets.
+unset EDITOR VISUAL
 export LC_ALL=en_US.UTF-8   # match POSTDISPLAY printability checks to real UTF-8 use
 export HOME=$PLAYGROUND     # isolated; never the real home
 export ZRUSH_REPO=$REPO
@@ -98,14 +102,19 @@ mkdir -p $PLAYGROUND/fx/longcol
 : >| $PLAYGROUND/fx/longcol/"item-${(l:90::x:)}-3.txt"
 
 # fx/overflow: enough entries that a single compsys capture's candidate_payload
-# comfortably exceeds the 8192-byte macOS request-FIFO buffer (behavior.md
-# worker-lifecycle "フレームは不可分な送信単位"), regardless of what this
-# playground happens to already contain. 0000-marker.txt sorts before every
-# item-*.txt entry (macOS default glob order), so it is always the first
-# candidate and lands in the rendered listing no matter how the grid clips.
+# comfortably exceeds the request-FIFO buffer on either platform this driver
+# runs on -- 8192 bytes on macOS, 65536 on Linux (behavior.md worker-lifecycle
+# "フレームは不可分な送信単位") -- regardless of what this playground happens to
+# already contain. 0000-marker.txt sorts before every item-*.txt entry (macOS
+# default glob order), so it is always the first candidate and lands in the
+# rendered listing no matter how the grid clips. This many entries put the
+# frame around 112 KB, i.e. ~1.7x the larger of the two capacities. The entries
+# are created in a loop rather than one touch(1) call: that many absolute paths
+# can outgrow ARG_MAX for a deeply nested playground.
 mkdir -p $PLAYGROUND/fx/overflow
 : >| $PLAYGROUND/fx/overflow/0000-marker.txt
-touch $PLAYGROUND/fx/overflow/item-{0001..2000}.txt
+for OVERFLOW_ITEM in $PLAYGROUND/fx/overflow/item-{0001..7000}.txt; do : >| $OVERFLOW_ITEM; done
+unset OVERFLOW_ITEM
 
 typeset -gi HOSTFD=-1
 typeset -g TRANSCRIPT= EXPECT_BUF= STDIO_BASELINE=
@@ -407,11 +416,12 @@ start_hist_host() {  # $1=zdotdir $2=xdg-config-home $3=logfile
   drain 0.3
 
   # ================================================================ FIFO-capacity frame delegation
-  # (fifo-1a/b) fx/overflow's candidate_payload is well over the 8192-byte
-  # macOS request-FIFO buffer, so it can only reach the worker if the writer
-  # child actually delegates the whole frame in one syswrite (behavior.md
-  # worker-lifecycle "1 フレームの送信は... 委譲する"); a naive blocking write
-  # from the parent would deadlock instead of rendering.
+  # (fifo-1a/b) fx/overflow's candidate_payload is well over the request-FIFO
+  # buffer on either platform (8192 bytes on macOS, 65536 on Linux), so it can
+  # only reach the worker if the writer child actually delegates the whole
+  # frame in one syswrite (behavior.md worker-lifecycle "1 フレームの送信は...
+  # 委譲する"); a naive blocking write from the parent would deadlock instead
+  # of rendering.
   log_count 'worker: queued request_id='; local -i overflow_queued_before=$REPLY
   send_keys 'ls fx/overflow/'
   if expect '*0000-marker.txt*' 15; then
@@ -422,10 +432,10 @@ start_hist_host() {  # $1=zdotdir $2=xdg-config-home $3=logfile
   if wait_log 'worker: queued request_id=' $overflow_queued_before 5; then
     local overflow_queued_line=$(grep -F 'worker: queued request_id=' $ZRUSH_LOG 2>/dev/null | tail -1)
     local -i overflow_frame_bytes=${${overflow_queued_line##*bytes=}%% *}
-    if (( overflow_frame_bytes > 8192 )); then
-      ok "(fifo-1b) the queued frame's byte count ($overflow_frame_bytes) actually exceeded the FIFO buffer"
+    if (( overflow_frame_bytes > 65536 )); then
+      ok "(fifo-1b) the queued frame's byte count ($overflow_frame_bytes) actually exceeded the FIFO buffer on both platforms (8192 macOS / 65536 Linux)"
     else
-      ng "(fifo-1b) queued frame was not actually over-capacity: bytes=$overflow_frame_bytes line=${overflow_queued_line:-<none>}"
+      ng "(fifo-1b) queued frame was not actually over-capacity (need > 65536): bytes=$overflow_frame_bytes line=${overflow_queued_line:-<none>}"
     fi
   else
     ng "(fifo-1b) no 'worker: queued request_id=' log line for the overflow request"
@@ -1616,12 +1626,21 @@ start_hist_host() {  # $1=zdotdir $2=xdg-config-home $3=logfile
         local -i inflight_writer_pid=${${inflight_sending_line##*writer_pid=}%% *}
         log_count 'worker: frame sent'; local -i inflight_sent_at_dispatch=$REPLY
         # No drain here: the whole point is to tear down as close as possible
-        # to the writer-child spawn, before its ack can land. ^C only
-        # abandons the still-uncommitted 'ls fx/overflow/' buffer text (the
-        # capture already finished -- that's how the frame got queued -- so
-        # there is nothing left for it to cancel); it does not touch the
-        # transport itself (only _zrush_worker_transport_teardown does).
-        send_keys $'\C-c'
+        # to the writer-child spawn, before its ack can land. ^U
+        # (kill-whole-line) only discards the still-uncommitted
+        # 'ls fx/overflow/' buffer text so that `exit` runs on an empty line;
+        # the capture already finished -- that's how the frame got queued --
+        # and an empty buffer collects nothing (behavior.md 候補収集), so no
+        # new request races the exit. The transport is untouched (only
+        # _zrush_worker_transport_teardown touches it).
+        #
+        # ^C would clear the buffer just as well but must not be used here:
+        # zsh 5.9 defers a SIGINT that arrives while a `zle -F` watcher
+        # callback is running -- precisely the window this case aims at --
+        # until the next input byte, and the deferred send-break then swallows
+        # that byte, eating the 'e' of the following `exit`. kill-whole-line
+        # is a plain widget keystroke with no such hazard.
+        send_keys $'\C-u'
         send_line exit
         local -F inflight_exit_deadline=$(( SECONDS + 5 ))
         local -i inflight_exit_eof=0 inflight_exit_status=0
