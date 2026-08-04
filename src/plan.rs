@@ -74,18 +74,18 @@ pub(crate) fn run(
     let parsed = record::parse(payload).map_err(|_| Error::Framing)?;
 
     let mut qm = QueryMatcher::new(&params.query, params.mode, params.smart_case);
-    let mut scored: Vec<(usize, crate::matching::MatchScore)> = Vec::new();
+    let mut matched: Vec<(usize, crate::matching::TierHit)> = Vec::new();
     // Prefix-tier match-texts, pre-truncation: common-prefix must reflect
     // every match, not just the ones the grid ends up displaying
     // (cli-protocol.md "common-prefix の意味論").
     let mut prefix_texts: Vec<&[u8]> = Vec::new();
     for (idx, cand) in parsed.candidates.iter().enumerate() {
         let text = cand.match_text();
-        if let Some(ms) = qm.score(text) {
-            if ms.tier == Tier::Prefix {
+        if let Some(hit) = qm.classify(text) {
+            if hit.tier() == Tier::Prefix {
                 prefix_texts.push(text);
             }
-            scored.push((idx, ms));
+            matched.push((idx, hit));
         }
     }
     let common_prefix = crate::matching::common_prefix(prefix_texts.into_iter());
@@ -95,14 +95,18 @@ pub(crate) fn run(
     // top of this coarse cap.
     let style = params.producer.layout_style();
     let cap = params.rows.saturating_mul(style.max_cols());
-    let ranked = ranking::rank(&scored, cap, params.producer.order());
-    let candidates: Vec<record::Candidate<'_>> =
-        ranked.iter().map(|&i| parsed.candidates[i]).collect();
+    let ranked = ranking::rank(&matched, cap, params.producer.order());
+    let candidates: Vec<record::Candidate<'_>> = ranked
+        .iter()
+        .map(|&(idx, _)| parsed.candidates[idx])
+        .collect();
     // spans() is a second pass by design (matching.rs docs): only run it
-    // on the ranked subset that actually reaches layout.
+    // on the ranked subset that actually reaches layout, and derive it
+    // from the hit that candidate was already classified by.
     let spans: Vec<Vec<(usize, usize)>> = candidates
         .iter()
-        .map(|c| qm.spans(c.match_text()))
+        .zip(&ranked)
+        .map(|(c, &(_, hit))| qm.spans(c.match_text(), hit))
         .collect();
 
     let built = layout::build(

@@ -17,6 +17,8 @@
 //! and all four tiers derive input from the same byte sequence; nucleo
 //! keeps ignore_case=false and normalize=false.
 
+use std::cmp::Reverse;
+
 use nucleo_matcher::{Config as NucleoConfig, Matcher, Utf32Str};
 
 /// Matching strength, cumulative.
@@ -47,9 +49,9 @@ impl Mode {
     }
 }
 
-/// How a candidate matched. Discriminant order = rank tier order
-/// (better first); ranking.rs sorts by (tier, intra-tier score).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+/// How a candidate matched, without the evidence: the tier name a
+/// [`TierHit`] carries. Ordering lives in [`MatchRank`], not here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tier {
     Prefix,
     Substring,
@@ -74,28 +76,101 @@ pub enum TierGroup {
     Approximate,
 }
 
-/// Match result for one candidate.
+/// How one candidate matched, with the evidence the tier was decided on.
+/// A candidate is classified exactly once ([`QueryMatcher::classify`]);
+/// its tier, its rank key, and its spans are all read off this single
+/// value, so they cannot disagree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct MatchScore {
-    pub tier: Tier,
-    /// Higher is better; only comparable within the same tier.
-    pub score: u32,
+pub enum TierHit {
+    /// The candidate starts with the query; `exact` = it *is* the query.
+    Prefix { exact: bool },
+    /// The query occurs at byte offset `pos` (never 0 -- that is Prefix).
+    Substring { pos: usize },
+    /// Some prefix of the candidate is within one edit of the query.
+    Edit(EditMatch),
+    /// nucleo strict-subsequence match, with its raw score.
+    Fuzzy { score: u32 },
 }
 
-/// Per-invocation matcher: holds the prepared query and scratch buffers,
-/// scores one candidate at a time.
-pub struct QueryMatcher {
+impl TierHit {
+    pub fn tier(self) -> Tier {
+        match self {
+            Self::Prefix { .. } => Tier::Prefix,
+            Self::Substring { .. } => Tier::Substring,
+            Self::Edit(_) => Tier::Edit,
+            Self::Fuzzy { .. } => Tier::Fuzzy,
+        }
+    }
+
+    /// This hit's place in the result order (ranking.rs sorts by it).
+    pub fn rank(self) -> MatchRank {
+        match self {
+            Self::Prefix { exact } => MatchRank::Prefix { proper: !exact },
+            Self::Substring { pos } => MatchRank::Substring { pos },
+            Self::Edit(em) => MatchRank::Edit(em),
+            Self::Fuzzy { score } => MatchRank::Fuzzy {
+                score: Reverse(score),
+            },
+        }
+    }
+}
+
+/// Total order over match quality, ascending = better: variant order is
+/// the tier order (prefix > substring > edit > fuzzy), each payload
+/// ordering its own tier. The intra-tier policy is exactly what the
+/// payload's own `Ord` says -- exact before proper prefix, earlier
+/// substring occurrence first, shorter edit suffix (then kind) first,
+/// higher nucleo score first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum MatchRank {
+    Prefix { proper: bool },
+    Substring { pos: usize },
+    Edit(EditMatch),
+    Fuzzy { score: Reverse<u32> },
+}
+
+/// Prepared query state; fixed for the matcher's lifetime.
+struct Query {
     mode: Mode,
     /// true => case-insensitive (ASCII fold both sides).
     fold: bool,
     /// Query bytes, folded when `fold`.
-    query: Vec<u8>,
-    /// Lossy string form of `query` for nucleo.
-    query_str: String,
-    nucleo: Matcher,
-    hay_fold_buf: Vec<u8>,
-    hay_char_buf: Vec<char>,
-    query_char_buf: Vec<char>,
+    bytes: Vec<u8>,
+    /// Lossy string form of `bytes` for nucleo.
+    lossy: String,
+}
+
+/// nucleo and the char buffers it decodes into, reused per candidate.
+struct Fuzzy {
+    matcher: Matcher,
+    hay_chars: Vec<char>,
+    query_chars: Vec<char>,
+}
+
+impl Fuzzy {
+    fn score(&mut self, query: &Query, cand: &[u8]) -> Option<u32> {
+        let lossy = String::from_utf8_lossy(cand);
+        let hay = Utf32Str::new(&lossy, &mut self.hay_chars);
+        let needle = Utf32Str::new(&query.lossy, &mut self.query_chars);
+        self.matcher.fuzzy_match(hay, needle).map(u32::from)
+    }
+
+    /// Char indices of the matched candidate chars, unsorted.
+    fn indices(&mut self, query: &Query, cand: &[u8], out: &mut Vec<u32>) {
+        let lossy = String::from_utf8_lossy(cand);
+        let hay = Utf32Str::new(&lossy, &mut self.hay_chars);
+        let needle = Utf32Str::new(&query.lossy, &mut self.query_chars);
+        let _ = self.matcher.fuzzy_indices(hay, needle, out);
+    }
+}
+
+/// Per-invocation matcher: holds the prepared query and the scratch
+/// buffers, classifies one candidate at a time.
+pub struct QueryMatcher {
+    query: Query,
+    /// Case-folded candidate bytes (see `fold_hay`).
+    hay: Vec<u8>,
+    fuzzy: Fuzzy,
 }
 
 impl QueryMatcher {
@@ -113,7 +188,7 @@ impl QueryMatcher {
         } else {
             query_raw.to_vec()
         };
-        let query_str = String::from_utf8_lossy(&query).into_owned();
+        let lossy = String::from_utf8_lossy(&query).into_owned();
         let mut ncfg = NucleoConfig::DEFAULT;
         // Case and normalization are handled on our side so every tier
         // sees identical bytes; keep nucleo strictly literal.
@@ -121,69 +196,48 @@ impl QueryMatcher {
         ncfg.normalize = false;
         ncfg.prefer_prefix = false; // tier ordering handles prefix preference
         QueryMatcher {
-            mode,
-            fold,
-            query,
-            query_str,
-            nucleo: Matcher::new(ncfg),
-            hay_fold_buf: Vec::new(),
-            hay_char_buf: Vec::new(),
-            query_char_buf: Vec::new(),
+            query: Query {
+                mode,
+                fold,
+                bytes: query,
+                lossy,
+            },
+            hay: Vec::new(),
+            fuzzy: Fuzzy {
+                matcher: Matcher::new(ncfg),
+                hay_chars: Vec::new(),
+                query_chars: Vec::new(),
+            },
         }
     }
 
-    /// Score one candidate's match-text. None = no match under the mode.
-    pub fn score(&mut self, cand_raw: &[u8]) -> Option<MatchScore> {
+    /// Classify one candidate's match-text: the single tier cascade, run
+    /// once per candidate. None = no match under the mode.
+    pub fn classify(&mut self, cand_raw: &[u8]) -> Option<TierHit> {
+        let query = &self.query;
         // Empty query: every candidate is a top-tier tie (contract);
         // ranking's stable sort then preserves stdin order.
-        if self.query.is_empty() {
-            return Some(MatchScore {
-                tier: Tier::Prefix,
-                score: 0,
-            });
+        if query.bytes.is_empty() {
+            return Some(TierHit::Prefix { exact: false });
         }
-        let QueryMatcher {
-            mode,
-            fold,
-            query,
-            query_str,
-            nucleo,
-            hay_fold_buf,
-            hay_char_buf,
-            query_char_buf,
-        } = self;
-        let q: &[u8] = query;
-        let cand: &[u8] = if *fold {
-            hay_fold_buf.clear();
-            hay_fold_buf.extend(cand_raw.iter().map(u8::to_ascii_lowercase));
-            hay_fold_buf
-        } else {
-            cand_raw
-        };
+        let q: &[u8] = &query.bytes;
+        let cand = fold_hay(&mut self.hay, query, cand_raw);
 
         if cand.starts_with(q) {
-            // Exact equality outranks a proper prefix; further ties keep
-            // stdin order.
-            let exact = cand.len() == q.len();
-            return Some(MatchScore {
-                tier: Tier::Prefix,
-                score: u32::from(exact),
+            return Some(TierHit::Prefix {
+                exact: cand.len() == q.len(),
             });
         }
-        if *mode == Mode::Prefix {
+        if query.mode == Mode::Prefix {
             return None;
         }
 
         if q.len() <= cand.len()
             && let Some(pos) = cand.windows(q.len()).position(|w| w == q)
         {
-            // Earlier occurrence ranks higher within the tier.
-            return Some(MatchScore {
-                tier: Tier::Substring,
-                score: u32::MAX - pos as u32,
-            });
+            return Some(TierHit::Substring { pos });
         }
-        if *mode == Mode::Substring {
+        if query.mode == Mode::Substring {
             return None;
         }
 
@@ -197,98 +251,76 @@ impl QueryMatcher {
         if q.len() >= 2
             && let Some(em) = prefix_edit_within_one(q, cand)
         {
-            return Some(MatchScore {
-                tier: Tier::Edit,
-                score: edit_score(em),
-            });
+            return Some(TierHit::Edit(em));
         }
 
         // Fuzzy tier: nucleo strict-subsequence match.
-        let cand_lossy = String::from_utf8_lossy(cand);
-        let hay = Utf32Str::new(&cand_lossy, hay_char_buf);
-        let needle = Utf32Str::new(query_str, query_char_buf);
-        if let Some(s) = nucleo.fuzzy_match(hay, needle) {
-            return Some(MatchScore {
-                tier: Tier::Fuzzy,
-                score: u32::from(s),
-            });
-        }
-        None
+        self.fuzzy
+            .score(query, cand)
+            .map(|score| TierHit::Fuzzy { score })
     }
 
-    /// Matched spans in one candidate's match-text, for the stdout
-    /// match-spans field (cli-protocol.md). Char offsets over the
-    /// lossy UTF-8 reading, 0-based end-exclusive, sorted and merged;
-    /// empty = no position info (empty query or no match).
+    /// Matched spans in one candidate's match-text, derived from the
+    /// `hit` `classify` returned for that same candidate (passing another
+    /// candidate's hit is a caller bug). For the stdout match-spans field
+    /// (cli-protocol.md): char offsets over the lossy UTF-8 reading,
+    /// 0-based end-exclusive, sorted and merged; empty = no position
+    /// info (empty query).
     ///
     /// Second pass by design: callers run this only on the top-ranked
-    /// (at most max-lines) candidates, so the per-candidate re-match is
-    /// cheap and `score()` stays allocation-free for the full set.
-    pub fn spans(&mut self, cand_raw: &[u8]) -> Vec<(usize, usize)> {
-        if self.query.is_empty() {
+    /// (at most max-lines) candidates, so the fuzzy tier's re-match --
+    /// the one thing the hit cannot carry -- stays cheap, and `classify`
+    /// stays allocation-free for the full set.
+    pub fn spans(&mut self, cand_raw: &[u8], hit: TierHit) -> Vec<(usize, usize)> {
+        let q_len = self.query.bytes.len();
+        if q_len == 0 {
             return Vec::new();
         }
-        let QueryMatcher {
-            mode,
-            fold,
-            query,
-            query_str,
-            nucleo,
-            hay_fold_buf,
-            hay_char_buf,
-            query_char_buf,
-        } = self;
-        let q: &[u8] = query;
-        let cand: &[u8] = if *fold {
-            hay_fold_buf.clear();
-            hay_fold_buf.extend(cand_raw.iter().map(u8::to_ascii_lowercase));
-            hay_fold_buf
-        } else {
-            cand_raw
-        };
-
-        // ASCII folding preserves byte offsets, so byte positions found
-        // on the folded form index the raw form identically.
-        if cand.starts_with(q) {
-            return vec![(0, char_count(&cand[..q.len()]))];
-        }
-        if *mode == Mode::Prefix {
-            return Vec::new();
-        }
-        if q.len() <= cand.len()
-            && let Some(pos) = cand.windows(q.len()).position(|w| w == q)
-        {
-            return vec![(char_count(&cand[..pos]), char_count(&cand[..pos + q.len()]))];
-        }
-        if *mode == Mode::Substring {
-            return Vec::new();
-        }
-        if q.len() >= 2
-            && let Some(em) = prefix_edit_within_one(q, cand)
-        {
-            // The aligned (corrected-query) prefix of the candidate.
-            let consumed = cand.len() - em.suffix_len;
-            return vec![(0, char_count(&cand[..consumed]))];
-        }
-        let cand_lossy = String::from_utf8_lossy(cand);
-        let hay = Utf32Str::new(&cand_lossy, hay_char_buf);
-        let needle = Utf32Str::new(query_str, query_char_buf);
-        let mut indices: Vec<u32> = Vec::new();
-        if nucleo.fuzzy_indices(hay, needle, &mut indices).is_none() {
-            return Vec::new();
-        }
-        indices.sort_unstable();
-        indices.dedup();
-        let mut out: Vec<(usize, usize)> = Vec::new();
-        for i in indices {
-            let i = i as usize;
-            match out.last_mut() {
-                Some(last) if last.1 == i => last.1 = i + 1,
-                _ => out.push((i, i + 1)),
+        // ASCII folding preserves byte offsets and lossy char boundaries,
+        // so the offsets in `hit` index `cand_raw` identically; only the
+        // fuzzy re-match needs the folded form again.
+        match hit {
+            TierHit::Prefix { .. } => vec![(0, char_count(&cand_raw[..q_len]))],
+            TierHit::Substring { pos } => vec![(
+                char_count(&cand_raw[..pos]),
+                char_count(&cand_raw[..pos + q_len]),
+            )],
+            TierHit::Edit(em) => {
+                // The aligned (corrected-query) prefix of the candidate.
+                let consumed = cand_raw.len() - em.suffix_len;
+                vec![(0, char_count(&cand_raw[..consumed]))]
+            }
+            TierHit::Fuzzy { .. } => {
+                let cand = fold_hay(&mut self.hay, &self.query, cand_raw);
+                let mut indices: Vec<u32> = Vec::new();
+                self.fuzzy.indices(&self.query, cand, &mut indices);
+                indices.sort_unstable();
+                indices.dedup();
+                let mut out: Vec<(usize, usize)> = Vec::new();
+                for i in indices {
+                    let i = i as usize;
+                    match out.last_mut() {
+                        Some(last) if last.1 == i => last.1 = i + 1,
+                        _ => out.push((i, i + 1)),
+                    }
+                }
+                out
             }
         }
-        out
     }
+}
+
+/// The candidate bytes every tier reads: ASCII-folded into `buf` when the
+/// query is case-insensitive, the raw bytes otherwise. Folding maps only
+/// A-Z, so byte offsets and the lossy UTF-8 char boundaries are the same
+/// on both forms.
+fn fold_hay<'a>(buf: &'a mut Vec<u8>, query: &Query, cand_raw: &'a [u8]) -> &'a [u8] {
+    if !query.fold {
+        return cand_raw;
+    }
+    buf.clear();
+    buf.extend(cand_raw.iter().map(u8::to_ascii_lowercase));
+    buf
 }
 
 /// Char count of a byte slice under the lossy UTF-8 reading (the span
@@ -302,10 +334,10 @@ fn char_count(bytes: &[u8]) -> usize {
 /// transposition carries the strongest signal (both correct characters
 /// were typed), then substitution, insertion (the user missed one
 /// candidate character), deletion (the query has one extra character).
-/// Exact only arises on distance-0 direct calls (`score()` routes those
-/// to the prefix tier first).
+/// Exact only arises on distance-0 direct calls (`classify()` routes
+/// those to the prefix tier first).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum EditKind {
+pub enum EditKind {
     Exact,
     Transposition,
     Substitution,
@@ -313,13 +345,15 @@ enum EditKind {
     Deletion,
 }
 
-/// Best reading of a <=1-edit prefix match.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct EditMatch {
-    kind: EditKind,
+/// Best reading of a <=1-edit prefix match. Field order is the edit
+/// tier's intra-tier order (ascending = better): shorter unmatched
+/// candidate suffix first, then the `EditKind` preference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct EditMatch {
     /// Candidate bytes after the aligned (corrected-query) prefix.
     /// 0 = the whole candidate is the corrected query.
-    suffix_len: usize,
+    pub suffix_len: usize,
+    pub kind: EditKind,
 }
 
 /// Does some prefix of `cand` lie within one edit (optimal string
@@ -360,7 +394,7 @@ fn prefix_edit_within_one(q: &[u8], cand: &[u8]) -> Option<EditMatch> {
             kind,
             suffix_len: total - consumed,
         };
-        if best.is_none_or(|cur| (em.suffix_len, em.kind) < (cur.suffix_len, cur.kind)) {
+        if best.is_none_or(|cur| em < cur) {
             best = Some(em);
         }
     };
@@ -390,17 +424,6 @@ fn prefix_edit_within_one(q: &[u8], cand: &[u8]) -> Option<EditMatch> {
     best
 }
 
-/// Pack an EditMatch into the intra-tier score (higher = better):
-/// shorter unmatched suffix first, then the EditKind preference.
-fn edit_score(em: EditMatch) -> u32 {
-    const SUFFIX_MAX: u32 = 0x0FFF_FFFF; // 28 bits
-    let suffix = u32::try_from(em.suffix_len)
-        .unwrap_or(SUFFIX_MAX)
-        .min(SUFFIX_MAX);
-    let kind_rank = em.kind as u32; // Exact=0 .. Deletion=4, lower = better
-    ((SUFFIX_MAX - suffix) << 4) | (0xF - kind_rank)
-}
-
 /// Byte-wise longest common prefix over the matched candidates'
 /// match-texts (for the stdout common-prefix field).
 pub fn common_prefix<'a>(mut texts: impl Iterator<Item = &'a [u8]>) -> &'a [u8] {
@@ -421,12 +444,20 @@ pub fn common_prefix<'a>(mut texts: impl Iterator<Item = &'a [u8]>) -> &'a [u8] 
 mod tests {
     use super::*;
 
-    fn score(q: &[u8], cand: &[u8], mode: Mode, smart_case: bool) -> Option<MatchScore> {
-        QueryMatcher::new(q, mode, smart_case).score(cand)
+    fn classify(q: &[u8], cand: &[u8], mode: Mode, smart_case: bool) -> Option<TierHit> {
+        QueryMatcher::new(q, mode, smart_case).classify(cand)
     }
 
     fn tier(q: &str, cand: &str, mode: Mode) -> Option<Tier> {
-        score(q.as_bytes(), cand.as_bytes(), mode, true).map(|m| m.tier)
+        classify(q.as_bytes(), cand.as_bytes(), mode, true).map(TierHit::tier)
+    }
+
+    fn spans(q: &[u8], cand: &[u8], mode: Mode) -> Vec<(usize, usize)> {
+        let mut qm = QueryMatcher::new(q, mode, true);
+        match qm.classify(cand) {
+            Some(hit) => qm.spans(cand, hit),
+            None => Vec::new(),
+        }
     }
 
     #[test]
@@ -481,21 +512,44 @@ mod tests {
     }
 
     #[test]
-    fn exact_prefix_match_outscores_proper_prefix() {
-        let exact = score(b"git", b"git", Mode::Typo, true).unwrap();
-        let proper = score(b"git", b"gitk", Mode::Typo, true).unwrap();
-        assert_eq!(exact.tier, Tier::Prefix);
-        assert_eq!(proper.tier, Tier::Prefix);
-        assert!(exact.score > proper.score);
+    fn exact_prefix_match_outranks_proper_prefix() {
+        let exact = classify(b"git", b"git", Mode::Typo, true).unwrap();
+        let proper = classify(b"git", b"gitk", Mode::Typo, true).unwrap();
+        assert_eq!(exact, TierHit::Prefix { exact: true });
+        assert_eq!(proper, TierHit::Prefix { exact: false });
+        assert!(exact.rank() < proper.rank());
     }
 
     #[test]
-    fn earlier_substring_occurrence_scores_higher() {
-        let early = score(b"doc", b"mydocs", Mode::Typo, true).unwrap();
-        let late = score(b"doc", b"my-old-docs", Mode::Typo, true).unwrap();
-        assert_eq!(early.tier, Tier::Substring);
-        assert_eq!(late.tier, Tier::Substring);
-        assert!(early.score > late.score);
+    fn earlier_substring_occurrence_ranks_higher() {
+        let early = classify(b"doc", b"mydocs", Mode::Typo, true).unwrap();
+        let late = classify(b"doc", b"my-old-docs", Mode::Typo, true).unwrap();
+        assert_eq!(early, TierHit::Substring { pos: 2 });
+        assert_eq!(late, TierHit::Substring { pos: 7 });
+        assert!(early.rank() < late.rank());
+    }
+
+    /// Tier order dominates every intra-tier difference.
+    #[test]
+    fn rank_orders_tiers_before_evidence() {
+        let worst_prefix = TierHit::Prefix { exact: false }.rank();
+        let best_substring = TierHit::Substring { pos: 0 }.rank();
+        let worst_substring = TierHit::Substring { pos: usize::MAX }.rank();
+        let best_edit = TierHit::Edit(EditMatch {
+            suffix_len: 0,
+            kind: EditKind::Exact,
+        })
+        .rank();
+        let worst_edit = TierHit::Edit(EditMatch {
+            suffix_len: usize::MAX,
+            kind: EditKind::Deletion,
+        })
+        .rank();
+        let best_fuzzy = TierHit::Fuzzy { score: u32::MAX }.rank();
+        assert!(worst_prefix < best_substring);
+        assert!(worst_substring < best_edit);
+        assert!(worst_edit < best_fuzzy);
+        assert!(best_fuzzy < TierHit::Fuzzy { score: 0 }.rank());
     }
 
     #[test]
@@ -504,21 +558,21 @@ mod tests {
         assert_eq!(tier("read", "README.md", Mode::Typo), Some(Tier::Prefix));
         // uppercase in query: sensitive
         assert_eq!(tier("READ", "README.md", Mode::Typo), Some(Tier::Prefix));
-        assert_eq!(score(b"READ", b"readme", Mode::Typo, true), None);
+        assert_eq!(classify(b"READ", b"readme", Mode::Typo, true), None);
         // smart_case=false: always insensitive
         assert_eq!(
-            score(b"READ", b"readme", Mode::Typo, false).map(|m| m.tier),
+            classify(b"READ", b"readme", Mode::Typo, false).map(TierHit::tier),
             Some(Tier::Prefix)
         );
         // case folding applies to the edit tier too
         assert_eq!(tier("gti", "GIT", Mode::Typo), Some(Tier::Edit));
-        assert_eq!(score(b"GTI", b"git", Mode::Typo, true), None);
+        assert_eq!(classify(b"GTI", b"git", Mode::Typo, true), None);
     }
 
     #[test]
     fn empty_query_matches_everything_equally() {
-        let a = score(b"", b"anything", Mode::Prefix, true).unwrap();
-        let b = score(b"", b"", Mode::Typo, true).unwrap();
+        let a = classify(b"", b"anything", Mode::Prefix, true).unwrap();
+        let b = classify(b"", b"", Mode::Typo, true).unwrap();
         assert_eq!(a, b);
     }
 
@@ -534,18 +588,18 @@ mod tests {
     fn non_utf8_candidates_are_matchable_and_never_dropped() {
         // byte-exact prefix works regardless of encoding
         assert_eq!(
-            score(b"caf", b"caf\xe9.txt", Mode::Prefix, true).map(|m| m.tier),
+            classify(b"caf", b"caf\xe9.txt", Mode::Prefix, true).map(TierHit::tier),
             Some(Tier::Prefix)
         );
         // fuzzy tier goes through lossy conversion without dropping
         // ("cfx" is a subsequence of caf\xe9x but not within one edit)
         assert_eq!(
-            score(b"cfx", b"caf\xe9x", Mode::Typo, true).map(|m| m.tier),
+            classify(b"cfx", b"caf\xe9x", Mode::Typo, true).map(TierHit::tier),
             Some(Tier::Fuzzy)
         );
         // edit tier is byte-based
         assert_eq!(
-            score(b"cfa\xe9", b"caf\xe9", Mode::Typo, true).map(|m| m.tier),
+            classify(b"cfa\xe9", b"caf\xe9", Mode::Typo, true).map(TierHit::tier),
             Some(Tier::Edit)
         );
     }
@@ -560,7 +614,7 @@ mod tests {
         assert_eq!(em(b"gir", b"git"), hit(EditKind::Substitution, 0));
         assert_eq!(em(b"installl", b"install"), hit(EditKind::Deletion, 0));
         assert_eq!(em(b"dcs", b"docs"), hit(EditKind::Insertion, 0));
-        // "instal" is a plain prefix of "install" (score() never reaches
+        // "instal" is a plain prefix of "install" (classify() never reaches
         // the edit tier for it, but the direct call reports Exact)
         assert_eq!(em(b"instal", b"install"), hit(EditKind::Exact, 1));
         // "gt" vs "grep": substitution g[t/r]+"ep" (suffix 2) beats the
@@ -575,51 +629,61 @@ mod tests {
     }
 
     #[test]
-    fn edit_scores_rank_by_suffix_then_kind() {
-        let s = |q: &[u8], c: &[u8]| score(q, c, Mode::Typo, true).unwrap();
+    fn edit_hits_rank_by_suffix_then_kind() {
+        let s = |q: &[u8], c: &[u8]| classify(q, c, Mode::Typo, true).unwrap();
         // all Edit tier for query "gti"
         let git = s(b"gti", b"git"); // transposition, suffix 0
         let gtsort = s(b"gti", b"gtsort"); // substitution,  suffix 3
         let glibtool = s(b"gti", b"glibtool"); // substitution,  suffix 5
         let gif2webp = s(b"gti", b"gif2webp"); // deletion,      suffix 6
         for m in [git, gtsort, glibtool, gif2webp] {
-            assert_eq!(m.tier, Tier::Edit);
+            assert_eq!(m.tier(), Tier::Edit);
         }
-        assert!(git.score > gtsort.score);
-        assert!(gtsort.score > glibtool.score);
-        assert!(glibtool.score > gif2webp.score);
+        assert!(git.rank() < gtsort.rank());
+        assert!(gtsort.rank() < glibtool.rank());
+        assert!(glibtool.rank() < gif2webp.rank());
         // equal suffix: kind breaks the tie (insertion beats deletion)
         let docs = s(b"dcs", b"docs"); // insertion, suffix 0
         let dash = s(b"dcs", b"dash"); // substitution, suffix 1
-        assert_eq!(docs.tier, Tier::Edit);
-        assert_eq!(dash.tier, Tier::Edit);
-        assert!(docs.score > dash.score);
+        assert_eq!(docs.tier(), Tier::Edit);
+        assert_eq!(dash.tier(), Tier::Edit);
+        assert!(docs.rank() < dash.rank());
         // kind preference at equal suffix: transposition > substitution
-        let transp = edit_score(EditMatch {
-            kind: EditKind::Transposition,
-            suffix_len: 2,
-        });
-        let subst = edit_score(EditMatch {
-            kind: EditKind::Substitution,
-            suffix_len: 2,
-        });
-        let insert = edit_score(EditMatch {
-            kind: EditKind::Insertion,
-            suffix_len: 2,
-        });
-        let delete = edit_score(EditMatch {
-            kind: EditKind::Deletion,
-            suffix_len: 2,
-        });
-        assert!(transp > subst);
-        assert!(subst > insert);
-        assert!(insert > delete);
+        let rank = |kind, suffix_len| TierHit::Edit(EditMatch { kind, suffix_len }).rank();
+        assert!(rank(EditKind::Transposition, 2) < rank(EditKind::Substitution, 2));
+        assert!(rank(EditKind::Substitution, 2) < rank(EditKind::Insertion, 2));
+        assert!(rank(EditKind::Insertion, 2) < rank(EditKind::Deletion, 2));
         // suffix dominates kind
-        let far_transp = edit_score(EditMatch {
-            kind: EditKind::Transposition,
-            suffix_len: 3,
-        });
-        assert!(delete > far_transp);
+        assert!(rank(EditKind::Deletion, 2) < rank(EditKind::Transposition, 3));
+    }
+
+    /// Every tier's spans come from the same hit `classify` produced, so
+    /// they can only describe that tier's own evidence.
+    #[test]
+    fn spans_derive_from_the_classified_tier() {
+        // prefix: the query-length prefix
+        assert_eq!(spans(b"doc", b"docs", Mode::Typo), vec![(0, 3)]);
+        // substring: the occurrence, in chars
+        assert_eq!(spans(b"doc", b"my-docs", Mode::Typo), vec![(3, 6)]);
+        // edit: the aligned (corrected-query) prefix
+        assert_eq!(spans(b"gti", b"git-lfs", Mode::Typo), vec![(0, 3)]);
+        assert_eq!(spans(b"dcs", b"docs", Mode::Typo), vec![(0, 4)]);
+        // fuzzy: the matched chars, adjacent ones merged into one run
+        assert_eq!(
+            spans(b"dcf", b"dot-config", Mode::Typo),
+            vec![(0, 1), (4, 5), (7, 8)]
+        );
+        assert_eq!(
+            spans(b"dcon", b"dot-config", Mode::Typo),
+            vec![(0, 1), (4, 7)]
+        );
+        // char offsets, not byte offsets
+        assert_eq!(
+            spans(b"doc", "ああdocs".as_bytes(), Mode::Typo),
+            vec![(2, 5)]
+        );
+        // no query = no position info
+        assert_eq!(spans(b"", b"docs", Mode::Typo), Vec::new());
     }
 
     /// Cross-check the O(|q|) case analysis against a straightforward
