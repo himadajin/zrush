@@ -37,6 +37,7 @@ typeset -g REPO=${HERE:h:h}
 typeset -g PLAYGROUND=${1:?usage: driver.zsh <playground-dir>}
 [[ -d $PLAYGROUND ]] || { print -u2 "FATAL: invalid playground: $PLAYGROUND"; exit 1 }
 [[ -x $REPO/target/release/zrush ]] || { print -u2 "FATAL: zrush binary not found (cargo build --release)"; exit 1 }
+[[ $REPO/zsh/zrush.zsh -nt $REPO/target/release/zrush ]] && { print -u2 "FATAL: zsh/zrush.zsh is newer than the built binary; run cargo build --release"; exit 1 }
 
 typeset -gi PASS=0 FAIL=0
 out() { print -r -u2 -- "$@" }
@@ -51,7 +52,6 @@ export TERM=vt100
 unset EDITOR VISUAL
 export LC_ALL=en_US.UTF-8   # match POSTDISPLAY printability checks to real UTF-8 use
 export HOME=$PLAYGROUND     # isolated; never the real home
-export ZRUSH_REPO=$REPO
 export ZRUSH_TEST_TMP=$WORK
 export ZDOTDIR=$WORK/zdot
 export XDG_CONFIG_HOME=$WORK/xdg   # no config.toml is written: every test runs on defaults
@@ -369,7 +369,7 @@ start_hist_host() {  # $1=zdotdir $2=xdg-config-home $3=logfile
   fi
 
   local -i seq_before_resource=${${worker_after_successive#*seq=}%% *}
-  send_line "source $REPO/zsh/zrush.zsh"
+  send_line "source <($ZRUSH_REAL_BIN init zsh)"
   sync_prompt
   if dump_get $'\C-xw' TESTWORKER && [[ $REPLY == "pid=-1 ready=0 seq=$seq_before_resource "* && $REPLY == *'rfd=-1 wfd=-1 ack=-1 pending=0' ]]; then
     ok "(worker-1d) re-source tears down transport while preserving the request counter"

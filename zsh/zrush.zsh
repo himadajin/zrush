@@ -1,7 +1,9 @@
 # zrush.zsh — ZLE integration for asynchronous completion
 #
 # Requirements: zsh 5.8+, source after compinit, after zsh-abbr, and before
-# zsh-syntax-highlighting. $ZRUSH_BIN overrides ../target/release/zrush.
+# zsh-syntax-highlighting. This file is embedded into the `zrush` binary and
+# loaded via `source <(zrush init zsh)` (cli-protocol.md "zrush init"), which
+# injects $ZRUSH_BIN ahead of this file; an already-set $ZRUSH_BIN overrides it.
 #
 # zsh captures compsys candidates in a forked shell and hands the raw
 # capture stream to the persistent Rust worker, which performs matching,
@@ -14,9 +16,6 @@
 # See docs/internal/contracts/cli-protocol.md for the zsh/Rust boundary.
 #
 # Set ZRUSH_LOG=<file> to append timestamped debug traces; unset is a no-op.
-
-# Capture the source directory; re-sourcing is allowed and reinitializes state.
-typeset -g _zrush_source_dir=${${(%):-%N}:A:h}
 
 # ---------------------------------------------------------------- Re-source teardown
 # This runs while the previous definitions and ledgers are still available.
@@ -52,7 +51,7 @@ if (( ${_zrush_installed:-0} || ( ${+_zrush_bound} && $#_zrush_bound ) )); then
 fi
 
 # ---------------------------------------------------------------- Global state
-typeset -g  ZRUSH_BIN=${ZRUSH_BIN:-$_zrush_source_dir/../target/release/zrush}
+typeset -g  ZRUSH_BIN=${ZRUSH_BIN:-}
 typeset -gi _zrush_enabled=0
 typeset -gi _ZRUSH_EXPECTED_PROTO=6
 typeset -g  _zrush_cfg_path= _zrush_cfg_mtime=
@@ -2074,7 +2073,7 @@ _zrush_init() {
   emulate -L zsh
 
   if [[ ! -x $ZRUSH_BIN ]]; then
-    _zrush_warn "binary not found or not executable: $ZRUSH_BIN (set \$ZRUSH_BIN or run 'cargo build --release'); zrush disabled"
+    _zrush_warn "binary not found or not executable: $ZRUSH_BIN (load via 'source <(zrush init zsh)' or set \$ZRUSH_BIN); zrush disabled"
     return 1
   fi
 

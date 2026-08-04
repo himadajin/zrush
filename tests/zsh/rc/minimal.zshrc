@@ -1,9 +1,9 @@
 # Host rc for headless regression tests, loaded by tests/zsh/driver.zsh through ZDOTDIR
-# Required environment: ZRUSH_REPO (repository root), ZRUSH_TEST_TMP (isolated tmp)
+# Required environment: ZRUSH_REAL_BIN (built zrush binary), ZRUSH_TEST_TMP (isolated tmp)
 PS1='HP> '
 autoload -Uz compinit
 compinit -u -d ${ZRUSH_TEST_TMP:-${TMPDIR:-/tmp}}/zcompdump-zrush-test
-source $ZRUSH_REPO/zsh/zrush.zsh
+source <($ZRUSH_REAL_BIN init zsh)
 
 # Test-only dump widgets that write internal state to ZRUSH_LOG so drivers can
 # assert on it precisely. Not production code.

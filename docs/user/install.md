@@ -14,10 +14,18 @@ cd ~/path/to/zrush
 cargo build --release
 ```
 
+`target/release/zrush` を `$PATH` の通ったディレクトリに置く(シンボリックリンクでも可)。
+
 `.zshrc` に以下を追加する:
 
 ```sh
-source ~/path/to/zrush/zsh/zrush.zsh
+source <(zrush init zsh)
+```
+
+`zrush` を `$PATH` に置かない場合は、ビルドツリーの絶対パスで直接呼び出す:
+
+```sh
+source <(~/path/to/zrush/target/release/zrush init zsh)
 ```
 
 ### source の位置
@@ -27,8 +35,9 @@ source ~/path/to/zrush/zsh/zrush.zsh
 - zsh-abbr より後、zsh-syntax-highlighting より前に置く。
 - zsh-autocomplete とは併用しない(置き換え)。
 
-バイナリは zrush.zsh の位置から `../target/release/zrush` を自動解決する。
-別の場所に置く場合は `$ZRUSH_BIN` で明示する。
+`zrush init zsh` は自身の絶対パスを `$ZRUSH_BIN` として埋め込んで出力する。
+テストや特殊な配置で別のバイナリを使わせたい場合は、source する前に `$ZRUSH_BIN` を設定すれば、
+埋め込まれたパスより優先される。
 
 ## 更新
 
@@ -37,9 +46,10 @@ git pull
 cargo build --release
 ```
 
-zsh スクリプトとバイナリの版がずれると、source 時または最初の補完時に警告が出て、
-そのシェルでは zrush が無効になる。警告が出たら rebuild し、新しいシェルを起動する
-(実行中の worker は rebuild だけでは置き換わらない)。複数環境(SSH 先など)ではそれぞれの環境でビルドする。
+zsh スクリプトはバイナリに埋め込まれているため、スクリプトとバイナリの版がずれることは構造的に起きない。
+ただし既に起動中のシェルは rebuild 前の古いスクリプトと、それが起動した常駐 worker を保持し続ける。
+版番号の照合はその古い worker(または古い読み込み済みスクリプト)を検知するためのものであり、
+警告が出たら新しいシェルを起動する。複数環境(SSH 先など)ではそれぞれの環境でビルドする。
 
 ## デバッグ
 

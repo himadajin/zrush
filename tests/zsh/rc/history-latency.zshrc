@@ -1,5 +1,5 @@
 # Host rc for the history-menu latency cases in tests/zsh/driver-latency.zsh.
-# Required environment: ZRUSH_REPO, ZRUSH_TEST_TMP, and:
+# Required environment: ZRUSH_REAL_BIN, ZRUSH_TEST_TMP, and:
 #   ZRUSH_HIST_N     number of fixture history entries to generate (default 5000)
 #   ZRUSH_HIST_LONG  1 = pad each entry to a long single line; 0 = short entries
 # Isolated HISTFILE + SAVEHIST=0, same as tests/zsh/rc/history.zshrc.
@@ -11,7 +11,7 @@ HISTSIZE=$(( _zrt_n + 100 ))
 SAVEHIST=0
 autoload -Uz compinit
 compinit -u -d ${ZRUSH_TEST_TMP:-${TMPDIR:-/tmp}}/zcompdump-zrush-histlat
-source $ZRUSH_REPO/zsh/zrush.zsh
+source <($ZRUSH_REAL_BIN init zsh)
 
 # Bulk-generate fixture history rather than writing thousands of literal
 # print -s lines; behavior.md "履歴メニュー" measures against realistic

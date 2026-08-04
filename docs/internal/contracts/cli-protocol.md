@@ -20,8 +20,11 @@ zrush.zsh(zsh 側)と `zrush` バイナリ(Rust 側)の入出力仕様。
 
 - **PROTOCOL_VERSION = 6**
 - `zrush config` の出力に `ZRUSH_PROTOCOL_VERSION` が含まれる。
-  zrush.zsh は自身が期待する版番号と照合し、不一致なら警告を 1 回表示して zrush を無効化する
-  (git pull 後の rebuild し忘れ検知)。
+  zrush.zsh は自身が期待する版番号と照合し、不一致なら警告を 1 回表示して zrush を無効化する。
+  zrush.zsh はバイナリに埋め込まれて配布される(「zrush init」節)ため、
+  読み込んだスクリプトとバイナリの版がずれることは構造的に無い。
+  この照合が検知するのは、既に起動中のシェルが rebuild 前の古いスクリプトを読み込んだままで、
+  かつ古い版の常駐 worker を保持している状況である。
 - 照合の機会を保証するため、zrush.zsh は **source 時に無条件で `zrush config` を 1 回実行**する
   (config.toml の mtime 変化だけをトリガにすると、バイナリのみ更新された場合に照合されない)。
 - 互換性が壊れる変更(フィールドの追加・削除・意味変更、キー記法の変更)で版番号を上げる。
@@ -62,7 +65,8 @@ zrush.zsh(zsh 側)と `zrush` バイナリ(Rust 側)の入出力仕様。
 
 - 対話シェルごとに `zrush worker` を最大 1 プロセス常駐させ、複数のプラン要求を同じ
   stdin/stdout セッションで処理する。ワーカーは最初の実要求まで起動しない。
-  `zrush config` だけは設定の読み込みごとに one-shot で起動する。
+  `zrush config` は設定の読み込みごとに、`zrush init` はシェル起動(source)時に、
+  それぞれ one-shot で起動する。
 - 文字列はバイト列として扱い、エンコーディング変換をしない(ファイル名は任意バイト列であり得る)。
   マッチング・レイアウト計算の内部で lossy な UTF-8 解釈を行うのは構わないが、
   それはオフセット計算(文字数の数え上げ)のためだけに用いる。
@@ -78,12 +82,13 @@ zrush.zsh(zsh 側)と `zrush` バイナリ(Rust 側)の入出力仕様。
 
 > 検証: `zrush worker` の in-band エラー応答 — `tests/vectors/plan/`(ランナーは `tests/vectors.rs`)。
 > `--help` の exit 0、未知サブコマンドと `zrush config` への余計な引数の exit 2 — `tests/cli.rs`。
+> `zrush init` の未指定・未知シェル・余計な引数の exit 2 — `tests/cli.rs`。
 > exit 1 と、`-h` / `help` サブコマンドを固定するテストは無い。
 
 | コード | 意味 |
 |---|---|
-| 0 | 成功。worker は frame 境界での stdin EOF、`zrush config` は設定ファイルの問題があっても既定値と警告を出力して成功する |
-| 1 | worker の session-fatal framing/I/O/内部エラー、または `zrush config` の内部エラー |
+| 0 | 成功。worker は frame 境界での stdin EOF、`zrush config` は設定ファイルの問題があっても既定値と警告を出力して成功する。`zrush init` は自身の絶対パス解決とスクリプト出力に成功する |
+| 1 | worker の session-fatal framing/I/O/内部エラー、`zrush config` の内部エラー、または `zrush init` の自身のパス解決失敗を含む内部エラー |
 | 2 | usage エラー(未知・不足・不正な引数、未知または未指定のサブコマンド) |
 
 `--help` / `-h`、および `help` サブコマンドは使用方法を表示して exit 0 する。
@@ -679,9 +684,49 @@ typeset -ga ZRUSH_CFG_WARNINGS=()
   (フック・キーバインドを登録しない。既定値表を zsh 側へ複製すると真実の二重化になるため)。
 - `zrush config` の stderr は端末に流さない(警告は `ZRUSH_CFG_WARNINGS` 経由が唯一の経路)。
 
+## zrush init
+
+> 検証: 起動パースと exit 2(未指定・未知シェル・余計な引数)、prelude 行の形とその後に続く
+> 埋め込みスクリプト本体がリポジトリの `zsh/zrush.zsh` とバイト一致すること — `tests/cli.rs`。
+> `$ZRUSH_BIN` が既に設定されている場合に prelude の `${ZRUSH_BIN:-...}` 展開が
+> それを優先して使う規範自体は通常の zsh パラメータ展開であり、`tests/cli.rs` は固定しない
+> (`tests/zsh/driver.zsh` がテスト用ランチャーを `$ZRUSH_BIN` に指定してこの経路を通しで使う)。
+
+zsh 側の `.zshrc` が source する zle 統合スクリプトを標準出力へ書き出す。
+スクリプト本体はビルド時にバイナリへ埋め込まれる。
+
+### 起動
+
+```
+zrush init zsh
+```
+
+- 受け付けるシェル値は `zsh` のみ。シェル引数の未指定・`zsh` 以外の値・余計な引数は
+  起動前に exit 2 で拒否する。
+
+### stdout
+
+1 行目は `ZRUSH_BIN` の prelude:
+
+```zsh
+typeset -g ZRUSH_BIN=${ZRUSH_BIN:-'<自身の絶対パス>'}
+```
+
+- `<自身の絶対パス>` の既定値は、この `zrush init` を実行したプロセス自身の絶対パス
+  (`current_exe` 相当)。クォート規律は「zrush config」節と同じ(`'...'` で囲み、値中の `'` を `'\''` に
+  エスケープする)。パスは非 UTF-8 バイト列であり得るため、バイト単位でクォートする。
+- 既に `$ZRUSH_BIN` が設定されている呼び出し元シェルでは、上記の zsh パラメータ展開
+  `${ZRUSH_BIN:-...}` によりその値が優先される(prelude 側は常にこの展開形で出力するのみで、
+  Rust 側で環境変数を分岐しない)。
+- 2 行目以降は、ビルド時に埋め込んだ `zsh/zrush.zsh` の内容をそのまま出力する。
+
+自身の絶対パスの解決、または標準出力への書き込みに失敗した場合は exit 1
+(`zrush config` の内部エラーと同じ扱い)。
+
 ## 想定シーケンス(参考・規範ではない)
 
-1. source 時: `zrush config` を実行して source、版番号を照合、キーバインドを適用。
+1. source 時: `.zshrc` の `source <(zrush init zsh)` が `$ZRUSH_BIN` prelude と埋め込みスクリプトを読み込む。
+   埋め込みスクリプト自身の source 時処理として `zrush config` を実行し、版番号を照合してキーバインドを適用する。
 2. プロンプト表示ごと: config.toml の mtime を確認し、変化していれば
    `zrush config` を再実行して source、キーバインドを再適用、警告があれば表示。
 3. 最初の実要求時: `zrush worker` を起動して `hello` / `ready` を交換する。

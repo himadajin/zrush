@@ -44,6 +44,7 @@ if [[ ! -r $ABBR_SRC || ! -r $ZSYH_SRC || ! -x $TMUX_BIN ]]; then
   exit 0
 fi
 [[ -x $REPO/target/release/zrush ]] || { print -u2 "FATAL: zrush binary not found"; exit 1 }
+[[ $REPO/zsh/zrush.zsh -nt $REPO/target/release/zrush ]] && { print -u2 "FATAL: zsh/zrush.zsh is newer than the built binary; run cargo build --release"; exit 1 }
 
 # The memo=zrush region_highlight tag (used to distinguish this plugin's own
 # entries from z-sy-h's) only exists on zsh 5.9+; the coexistence check below
@@ -70,7 +71,7 @@ export TERM=xterm-256color
 export LC_ALL=en_US.UTF-8
 export HOME=$PLAYGROUND
 export XDG_CONFIG_HOME=$WORK/xdg
-export ZRUSH_REPO=$REPO
+export ZRUSH_REAL_BIN=$REPO/target/release/zrush
 mkdir -p $WORK/xdg
 
 # Idempotent fixtures for full-width and resize checks
@@ -142,12 +143,12 @@ export ABBR_USER_ABBREVIATIONS_FILE=\$ZRUSH_TEST_TMP/abbr-user
 touch \$ABBR_USER_ABBREVIATIONS_FILE
 source $ABBR_SRC
 abbr -S zzz='print ABBR-EXPANDED-OK' >/dev/null
-source $REPO/zsh/zrush.zsh
+source <($REPO/target/release/zrush init zsh)
 $DUMPW
 print MARK-RC-DONE")
 
 typeset -g ZDOT_ZSYH=$(mk_zdot zsyh "$RC_COMMON
-source $REPO/zsh/zrush.zsh
+source <($REPO/target/release/zrush init zsh)
 $DUMPW
 source $ZSYH_SRC
 print MARK-RC-DONE")
@@ -157,7 +158,7 @@ export ABBR_USER_ABBREVIATIONS_FILE=\$ZRUSH_TEST_TMP/abbr-user
 touch \$ABBR_USER_ABBREVIATIONS_FILE
 source $ABBR_SRC
 abbr -S zzz='print ABBR-EXPANDED-OK' >/dev/null
-source $REPO/zsh/zrush.zsh
+source <($REPO/target/release/zrush init zsh)
 $DUMPW
 source $ZSYH_SRC
 print MARK-RC-DONE")
@@ -364,7 +365,7 @@ basic_flow() {  # $1=label prefix
     # Re-source while z-sy-h owns wrappers above zrush. The transport and
     # zrush registrations are rebuilt, but third-party wrappers/predecessors
     # must remain in the chain.
-    send_line "source $REPO/zsh/zrush.zsh"
+    send_line "source <($REPO/target/release/zrush init zsh)"
     sync_prompt
     send_keys 'qqqqxx'
     if expect '*'$'\e''\[31m*' 8; then
@@ -481,7 +482,7 @@ basic_flow() {  # $1=label prefix
   local TLOG=$WORK/tmux.log
   local TMERR=$WORK/tmux-start.err
   tm new-session -d -s coex -x 100 -y 30 \
-    "ZDOTDIR=$ZDOT_MIN XDG_CONFIG_HOME=$WORK/xdg HOME=$PLAYGROUND ZRUSH_REPO=$REPO ZRUSH_TEST_TMP=$WORK/t-tmux ZRUSH_LOG=$TLOG exec zsh -d -i" 2>$TMERR
+    "ZDOTDIR=$ZDOT_MIN XDG_CONFIG_HOME=$WORK/xdg HOME=$PLAYGROUND ZRUSH_REAL_BIN=$REPO/target/release/zrush ZRUSH_TEST_TMP=$WORK/t-tmux ZRUSH_LOG=$TLOG exec zsh -d -i" 2>$TMERR
   if tm_wait '*HP>*' 15; then
     ok "(4) host started inside tmux (TERM=$(tm display-message -p -t coex '#{client_termname}' 2>/dev/null || print '?'))"
     tm send-keys -t coex -l ' print -r -- TERM-INSIDE-$TERM'

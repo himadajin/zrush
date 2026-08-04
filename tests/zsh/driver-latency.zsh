@@ -40,6 +40,7 @@ typeset -g REPO=${HERE:h:h}
 typeset -g PLAYGROUND=${1:?usage: driver-latency.zsh <playground-dir>}
 [[ -d $PLAYGROUND/docs ]] || { print -u2 "FATAL: invalid playground: $PLAYGROUND"; exit 1 }
 [[ -x $REPO/target/release/zrush ]] || { print -u2 "FATAL: zrush binary not found"; exit 1 }
+[[ $REPO/zsh/zrush.zsh -nt $REPO/target/release/zrush ]] && { print -u2 "FATAL: zsh/zrush.zsh is newer than the built binary; run cargo build --release"; exit 1 }
 typeset -g ZAC_SRC=~/.zsh/zsh-autocomplete/zsh-autocomplete.plugin.zsh
 
 typeset -g WORK=$(mktemp -d ${TMPDIR:-/tmp}/zrush-lat.XXXXXX)
@@ -228,7 +229,7 @@ EOF
 
 start_min_zrush() {  # $1=host label $2=XDG directory with configuration
   HOST=$1 HOSTLOG=$WORK/$1.log CURXDG=$2
-  export ZRUSH_REPO=$REPO ZRUSH_TEST_TMP=$WORK/t-$1 ZDOTDIR=$WORK/zdot-$1
+  export ZRUSH_REAL_BIN=$REPO/target/release/zrush ZRUSH_TEST_TMP=$WORK/t-$1 ZDOTDIR=$WORK/zdot-$1
   export XDG_CONFIG_HOME=$2 ZRUSH_LOG=$HOSTLOG
   mkdir -p $ZDOTDIR $ZRUSH_TEST_TMP $2/zrush
   print "source $REPO/tests/zsh/rc/minimal.zshrc" > $ZDOTDIR/.zshrc
@@ -291,7 +292,7 @@ stop_host() { zpty -d $HOST 2>/dev/null; HOSTFD=-1 }
 # (config-schema.md "[history]", max 20000).
 start_hist_latency() {  # $1=host label $2=N fixture entries $3=long(0/1) [$4=history.limit override]
   HOST=$1 HOSTLOG=$WORK/$1.log CURXDG=$WORK/xdg-$1
-  export ZRUSH_REPO=$REPO ZRUSH_TEST_TMP=$WORK/t-$1 ZDOTDIR=$WORK/zdot-$1
+  export ZRUSH_REAL_BIN=$REPO/target/release/zrush ZRUSH_TEST_TMP=$WORK/t-$1 ZDOTDIR=$WORK/zdot-$1
   export XDG_CONFIG_HOME=$CURXDG ZRUSH_LOG=$HOSTLOG
   export ZRUSH_HIST_N=$2 ZRUSH_HIST_LONG=$3
   mkdir -p $ZDOTDIR $ZRUSH_TEST_TMP $CURXDG/zrush
