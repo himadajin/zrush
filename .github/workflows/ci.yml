@@ -9,12 +9,8 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  test:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
+  lint:
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust (stable)
@@ -25,11 +21,17 @@ jobs:
         run: cargo fmt --check
       - name: cargo clippy
         run: cargo clippy --all-targets -- -D warnings
+
+  test-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust (stable)
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
       - name: cargo build (release)
         run: cargo build --release
-      - name: Install zsh (Linux)
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y zsh
       - name: cargo test
         run: cargo test
       - name: zle driver
@@ -38,3 +40,14 @@ jobs:
         run: zsh -f tests/zsh/vectors.zsh
       - name: zsh worker transport
         run: zsh -f tests/zsh/transport.zsh
+
+  test-linux:
+    strategy:
+      fail-fast: false
+      matrix:
+        zsh-version: ["5.8.1", "5.9"]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test suite in container (zsh ${{ matrix.zsh-version }})
+        run: tests/docker/run.sh ${{ matrix.zsh-version }}
