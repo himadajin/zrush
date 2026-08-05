@@ -2,13 +2,21 @@
 # Headless zle-integration smoke driver for zrush.zsh.
 #
 # Usage:
-#   zsh -f tests/zsh/driver.zsh <playground-dir>
+#   zsh -f tests/zsh/driver.zsh <playground-dir> [section ...]
 #     The playground only needs to exist and be writable; it is used as an
 #     isolated $HOME. Every fixture this driver needs (small file/directory
 #     trees, a filename containing a space, a slow fake completion) is
 #     created under $PLAYGROUND/fx by this script -- no pre-populated docs
 #     tree or external "huge" directory is required.
+#     With no section arguments every section runs. Naming sections runs just
+#     those, always in the canonical order of the SECTIONS array below (host
+#     startup and its baseline checks run regardless). Each section owns its
+#     prerequisites and starts from a clean prompt, so any subset is valid.
 #   Prerequisite: the zrush binary has been built with cargo build --release.
+#
+# Failure evidence: when any check fails or is skipped (or ZRUSH_DRIVER_KEEP
+# is set), $WORK is kept and its path plus a tail of the active ZRUSH_LOG are
+# printed, instead of the silent cleanup a green run performs.
 #
 # Scope (docs/internal/contracts/cli-protocol.md and behavior.md are the
 # source of truth for everything below): matching, ranking, grid layout,
@@ -45,13 +53,36 @@ typeset -g HERE=${${(%):-%N}:A:h}
 typeset -g REPO=${HERE:h:h}
 typeset -g PLAYGROUND=${1:?usage: driver.zsh <playground-dir>}
 [[ -d $PLAYGROUND ]] || { print -u2 "FATAL: invalid playground: $PLAYGROUND"; exit 1 }
+
+# Canonical execution order of the test sections. Any sections named on the
+# command line run in this order, never in argument order; an empty selection
+# means every section.
+typeset -ga SECTIONS=( capture fifo async apply select confirm dismiss cache tab sendbreak death hist jobtable inflight )
+typeset -gA PICKED=()
+for SECTION_ARG in "${@[2,-1]}"; do
+  (( ${SECTIONS[(I)$SECTION_ARG]} )) || { print -u2 "FATAL: unknown section '$SECTION_ARG' (valid: $SECTIONS)"; exit 1 }
+  PICKED[$SECTION_ARG]=1
+done
+unset SECTION_ARG
+
 [[ -x $REPO/target/release/zrush ]] || { print -u2 "FATAL: zrush binary not found (cargo build --release)"; exit 1 }
 [[ $REPO/zsh/zrush.zsh -nt $REPO/target/release/zrush ]] && { print -u2 "FATAL: zsh/zrush.zsh is newer than the built binary; run cargo build --release"; exit 1 }
 
 typeset -gi PASS=0 FAIL=0
-out() { print -r -u2 -- "$@" }
+# Report through a private duplicate of stderr, not fd 2 itself: the final
+# `zpty -d host 2>/dev/null` in the always block below does not get its fd 2
+# restored (the zpty module closes the descriptor zsh stashed the real stderr
+# in), so anything printed to fd 2 after it -- exactly this driver's failure
+# evidence -- would silently go to /dev/null.
+typeset -gi ERRFD=-1
+exec {ERRFD}>&2
+out() { print -r -u $ERRFD -- "$@" }
 ok()  { out "PASS: $1"; (( ++PASS )) }
 ng()  { out "FAIL: $1"; (( ++FAIL )) }
+# SKIP: a check this environment could not run; OBSV: a non-failing observation.
+typeset -gi SKIP=0 OBSV=0
+skip() { out "SKIP: $1"; (( ++SKIP )) }
+obsv() { out "OBSV: $1"; (( ++OBSV )) }
 
 typeset -g WORK=$(mktemp -d ${TMPDIR:-/tmp}/zrush-test.XXXXXX)
 export TERM=vt100
@@ -737,7 +768,7 @@ start_hist_host() {  # $1=zdotdir $2=xdg-config-home $3=logfile
       ng "(sb-1b) plan-state dump did not run"
     fi
   else
-    out "SKIP: (sb-1) send-break did not produce a new prompt in this environment; skipping the plan-state check"
+    skip "(sb-1) send-break did not produce a new prompt in this environment; skipping the plan-state check"
   fi
   clear_line
   drain 0.3
@@ -1732,9 +1763,9 @@ start_hist_host() {  # $1=zdotdir $2=xdg-config-home $3=logfile
           ng "(inflight-1b) could not parse a writer_pid from: ${inflight_sending_line:-<none>}"
         fi
         if (( inflight_sent_at_dispatch == inflight_sent_before )); then
-          out "OBSV: (inflight-1c) teardown was dispatched before this frame's ack was consumed (writer child genuinely still delegated)"
+          obsv "(inflight-1c) teardown was dispatched before this frame's ack was consumed (writer child genuinely still delegated)"
         else
-          out "OBSV: (inflight-1c) this frame's ack had already landed before teardown; (inflight-1a/b) still ran but not against a strictly unacked frame"
+          obsv "(inflight-1c) this frame's ack had already landed before teardown; (inflight-1a/b) still ran but not against a strictly unacked frame"
         fi
       else
         ng "(inflight-1) dedicated host never delegated a writer child for the overflow request"
@@ -1746,9 +1777,22 @@ start_hist_host() {  # $1=zdotdir $2=xdg-config-home $3=logfile
     ng "(inflight-1) dedicated in-flight-teardown host failed to start"
   fi
 
-  out "SUMMARY: PASS=$PASS FAIL=$FAIL"
+  out "SUMMARY: PASS=$PASS FAIL=$FAIL SKIP=$SKIP OBSV=$OBSV"
 } always {
   zpty -d host 2>/dev/null
-  [[ -n $WORK && $WORK == */zrush-test.* ]] && rm -rf $WORK
+  # Anything short of a fully green run keeps its evidence: the work directory
+  # (host logs, fake-worker state) and a tail of the log the run ended on.
+  if (( FAIL || SKIP )) || [[ -n $ZRUSH_DRIVER_KEEP ]]; then
+    out "kept: $WORK"
+    typeset -a KEPT_LOGS=( $WORK/host*.log(N) )
+    (( $#KEPT_LOGS )) && out "logs: $KEPT_LOGS"
+    if [[ -r $ZRUSH_LOG ]]; then
+      out "---- tail -80 $ZRUSH_LOG ----"
+      tail -n 80 -- $ZRUSH_LOG >&$ERRFD
+      out "---- end of $ZRUSH_LOG ----"
+    fi
+  else
+    [[ -n $WORK && $WORK == */zrush-test.* ]] && rm -rf $WORK
+  fi
 }
 (( FAIL == 0 ))
