@@ -2,13 +2,21 @@
 # Headless zle-integration smoke driver for zrush.zsh.
 #
 # Usage:
-#   zsh -f tests/zsh/driver.zsh <playground-dir>
+#   zsh -f tests/zsh/driver.zsh <playground-dir> [section ...]
 #     The playground only needs to exist and be writable; it is used as an
 #     isolated $HOME. Every fixture this driver needs (small file/directory
 #     trees, a filename containing a space, a slow fake completion) is
 #     created under $PLAYGROUND/fx by this script -- no pre-populated docs
 #     tree or external "huge" directory is required.
+#     With no section arguments every section runs. Naming sections runs just
+#     those, always in the canonical order of the SECTIONS array below (host
+#     startup and its baseline checks run regardless). Each section owns its
+#     prerequisites and starts from a clean prompt, so any subset is valid.
 #   Prerequisite: the zrush binary has been built with cargo build --release.
+#
+# Failure evidence: when any check fails or is skipped (or ZRUSH_DRIVER_KEEP
+# is set), $WORK is kept and its path plus a tail of the active ZRUSH_LOG are
+# printed, instead of the silent cleanup a green run performs.
 #
 # Scope (docs/internal/contracts/cli-protocol.md and behavior.md are the
 # source of truth for everything below): matching, ranking, grid layout,
@@ -43,15 +51,38 @@ autoload -Uz is-at-least
 typeset -F SECONDS
 typeset -g HERE=${${(%):-%N}:A:h}
 typeset -g REPO=${HERE:h:h}
-typeset -g PLAYGROUND=${1:?usage: driver.zsh <playground-dir>}
+typeset -g PLAYGROUND=${1:?usage: driver.zsh <playground-dir> [section ...]}
 [[ -d $PLAYGROUND ]] || { print -u2 "FATAL: invalid playground: $PLAYGROUND"; exit 1 }
+
+# Canonical execution order of the test sections. Any sections named on the
+# command line run in this order, never in argument order; an empty selection
+# means every section.
+typeset -ga SECTIONS=( capture fifo async apply select confirm dismiss cache tab sendbreak death hist jobtable inflight )
+typeset -gA PICKED=()
+for SECTION_ARG in "${@[2,-1]}"; do
+  (( ${SECTIONS[(I)$SECTION_ARG]} )) || { print -u2 "FATAL: unknown section '$SECTION_ARG' (valid: $SECTIONS)"; exit 1 }
+  PICKED[$SECTION_ARG]=1
+done
+unset SECTION_ARG
+
 [[ -x $REPO/target/release/zrush ]] || { print -u2 "FATAL: zrush binary not found (cargo build --release)"; exit 1 }
 [[ $REPO/zsh/zrush.zsh -nt $REPO/target/release/zrush ]] && { print -u2 "FATAL: zsh/zrush.zsh is newer than the built binary; run cargo build --release"; exit 1 }
 
 typeset -gi PASS=0 FAIL=0
-out() { print -r -u2 -- "$@" }
+# Report through a private duplicate of stderr, not fd 2 itself: the final
+# `zpty -d host 2>/dev/null` in the always block below does not get its fd 2
+# restored (the zpty module closes the descriptor zsh stashed the real stderr
+# in), so anything printed to fd 2 after it -- exactly this driver's failure
+# evidence -- would silently go to /dev/null.
+typeset -gi ERRFD=-1
+exec {ERRFD}>&2
+out() { print -r -u $ERRFD -- "$@" }
 ok()  { out "PASS: $1"; (( ++PASS )) }
 ng()  { out "FAIL: $1"; (( ++FAIL )) }
+# SKIP: a check this environment could not run; OBSV: a non-failing observation.
+typeset -gi SKIP=0 OBSV=0
+skip() { out "SKIP: $1"; (( ++SKIP )) }
+obsv() { out "OBSV: $1"; (( ++OBSV )) }
 
 typeset -g WORK=$(mktemp -d ${TMPDIR:-/tmp}/zrush-test.XXXXXX)
 export TERM=vt100
@@ -337,7 +368,7 @@ start_hist_host() {  # $1=zdotdir $2=xdg-config-home $3=logfile
   return 0
 }
 
-{
+sec_boot() {
   # ---------------- Host startup ----------------
   cd $PLAYGROUND || exit 1
   local REPLY=
@@ -367,7 +398,9 @@ start_hist_host() {  # $1=zdotdir $2=xdg-config-home $3=logfile
     ng "(fd-1b) auxiliary fd teardown mismatch: ${REPLY:-<none>}"
   fi
   assert_host_stdio "(fd-1c) timer/ack/drain teardown preserves host fd 0/1/2"
+}
 
+sec_capture() {
   # ================================================================ (1) Capture fork -> candidate records
   # (cap-1a) A real compsys fork collects candidates, ships candidate records
   # (b header + w/d), and the worker round trip renders a list.
@@ -475,7 +508,9 @@ start_hist_host() {  # $1=zdotdir $2=xdg-config-home $3=logfile
   fi
   clear_line
   drain 0.3
+}
 
+sec_fifo() {
   # ================================================================ FIFO-capacity frame delegation
   # (fifo-1a/b) fx/overflow's candidate_payload is well over the request-FIFO
   # buffer on either platform (8192 bytes on macOS, 65536 on Linux), so it can
@@ -503,7 +538,9 @@ start_hist_host() {  # $1=zdotdir $2=xdg-config-home $3=logfile
   fi
   clear_line
   drain 0.3
+}
 
+sec_async() {
   # ================================================================ (2) Async plumbing does not block input
   # A fake completion function that sleeps inside the fork; the parent shell
   # must keep echoing keystrokes while it runs.
@@ -530,7 +567,9 @@ start_hist_host() {  # $1=zdotdir $2=xdg-config-home $3=logfile
   fi
   clear_line
   drain 0.3
+}
 
+sec_apply() {
   # ================================================================ (3) Plan application: POSTDISPLAY + region_highlight
   send_keys_wait_plan nonempty 'ls fx/basic/al'
   if dump_get $'\C-xp' TESTPOST; then
@@ -559,7 +598,9 @@ start_hist_host() {  # $1=zdotdir $2=xdg-config-home $3=logfile
   fi
   clear_line
   drain 0.3
+}
 
+sec_select() {
   # ================================================================ (4) Selection: nav table + highlight swap
   send_keys_wait_plan nonempty 'ls fx/basic/al'
   press $'\e[B'   # Down: select-next with nothing selected -> select-start (pos=1)
@@ -609,7 +650,9 @@ start_hist_host() {  # $1=zdotdir $2=xdg-config-home $3=logfile
   press $'\C-g'
   clear_line
   drain 0.3
+}
 
+sec_confirm() {
   # ================================================================ (5) Confirm: insertion text + RBUFFER preserved
   send_keys_wait_plan nonempty 'ls fx/basic/subd'
   press $'\e[B'
@@ -629,7 +672,9 @@ start_hist_host() {  # $1=zdotdir $2=xdg-config-home $3=logfile
   assert_buffer 'ls fx/basic/alpha.txt END' "(cfm-2) RBUFFER ('END') is preserved verbatim after confirming mid-word"
   clear_line
   drain 0.3
+}
 
+sec_dismiss() {
   # ================================================================ (6) dismiss / accept-line
   send_keys_wait_plan nonempty 'ls fx/basic/'
   log_count 'dismiss: closing list'; local -i c_dis=$REPLY
@@ -674,7 +719,9 @@ start_hist_host() {  # $1=zdotdir $2=xdg-config-home $3=logfile
   fi
   sync_prompt
   wait_log 'line-finish: cleared' $c_fin 3 && ok "(acc-1b) accept-line resets zrush state (line-finish)" || ng "(acc-1b) line-finish not logged after accept-line"
+}
 
+sec_cache() {
   # ================================================================ (7) Empty-word collection cache: no fork on hit
   clear_line
   drain 0.5
@@ -698,7 +745,9 @@ start_hist_host() {  # $1=zdotdir $2=xdg-config-home $3=logfile
   fi
   clear_line
   drain 0.3
+}
 
+sec_tab() {
   # ================================================================ (8) Tab pending
   # Default [insert].tab=menu, so a Tab that lands before candidates arrive
   # must, once they arrive, start selection -- not change the buffer.
@@ -714,7 +763,9 @@ start_hist_host() {  # $1=zdotdir $2=xdg-config-home $3=logfile
   press $'\C-g'
   clear_line
   drain 0.3
+}
 
+sec_sendbreak() {
   # ================================================================ Regression: send-break leaves a clean new prompt (fix 3)
   # An exit that bypasses _zrush_line_finish (send-break and similar) must
   # not leak the previous session's plan state into the next one. A
@@ -737,13 +788,15 @@ start_hist_host() {  # $1=zdotdir $2=xdg-config-home $3=logfile
       ng "(sb-1b) plan-state dump did not run"
     fi
   else
-    out "SKIP: (sb-1) send-break did not produce a new prompt in this environment; skipping the plan-state check"
+    skip "(sb-1) send-break did not produce a new prompt in this environment; skipping the plan-state check"
   fi
   clear_line
   drain 0.3
   send_line 'bindkey -r "^Xy"; zle -D _zrt-dump-plan; unfunction _zrt_dump_plan'
   sync_prompt
+}
 
+sec_death() {
   # ================================================================ (9) Active persistent-worker death
   # Sanity: the delegated real worker behaves normally first.
   send_keys 'ls fx/basic/al'
@@ -890,6 +943,12 @@ start_hist_host() {  # $1=zdotdir $2=xdg-config-home $3=logfile
   # No sync_prompt here: the expect above already covers this command's prompt.
   drain 0.2
 
+  # Hand the fake worker back to proxy mode: the sections after this one
+  # need a working worker even when (10) below is filtered out.
+  print -r -- proxy > $ZRUSH_FAKE_CONTROL
+}
+
+sec_hist() {
   # ================================================================ (10) History menu (issue #9)
   # docs/internal/specs/behavior.md "履歴メニュー" and cli-protocol.md
   # "history profile" are the source of truth. This section runs on its own
@@ -1594,7 +1653,9 @@ start_hist_host() {  # $1=zdotdir $2=xdg-config-home $3=logfile
   else
     ng "(h20-0) select-prev=[\"up\"] host failed to start"
   fi
+}
 
+sec_jobtable() {
   # ================================================================ Worker job-table isolation
   # This host must exit during the assertion, so give it dedicated rc/config/log
   # state rather than reusing any host needed by the preceding cases.
@@ -1637,7 +1698,9 @@ start_hist_host() {  # $1=zdotdir $2=xdg-config-home $3=logfile
   else
     ng "(worker-job-table) dedicated exit host failed to start"
   fi
+}
 
+sec_inflight() {
   # ================================================================ Teardown while a frame is in flight
   # Dedicated host (same exit pattern as "Worker job-table isolation" above)
   # so exiting mid-request doesn't disturb any other case. fx/overflow (added
@@ -1732,9 +1795,9 @@ start_hist_host() {  # $1=zdotdir $2=xdg-config-home $3=logfile
           ng "(inflight-1b) could not parse a writer_pid from: ${inflight_sending_line:-<none>}"
         fi
         if (( inflight_sent_at_dispatch == inflight_sent_before )); then
-          out "OBSV: (inflight-1c) teardown was dispatched before this frame's ack was consumed (writer child genuinely still delegated)"
+          obsv "(inflight-1c) teardown was dispatched before this frame's ack was consumed (writer child genuinely still delegated)"
         else
-          out "OBSV: (inflight-1c) this frame's ack had already landed before teardown; (inflight-1a/b) still ran but not against a strictly unacked frame"
+          obsv "(inflight-1c) this frame's ack had already landed before teardown; (inflight-1a/b) still ran but not against a strictly unacked frame"
         fi
       else
         ng "(inflight-1) dedicated host never delegated a writer child for the overflow request"
@@ -1745,10 +1808,32 @@ start_hist_host() {  # $1=zdotdir $2=xdg-config-home $3=logfile
   else
     ng "(inflight-1) dedicated in-flight-teardown host failed to start"
   fi
+}
 
-  out "SUMMARY: PASS=$PASS FAIL=$FAIL"
+# Host startup always runs; every other section runs only when it was named
+# on the command line (or when nothing was named), in canonical order.
+{
+  sec_boot
+  local s
+  for s in $SECTIONS; do
+    (( $#PICKED == 0 || ${+PICKED[$s]} )) && sec_$s
+  done
+  out "SUMMARY: PASS=$PASS FAIL=$FAIL SKIP=$SKIP OBSV=$OBSV"
 } always {
   zpty -d host 2>/dev/null
-  [[ -n $WORK && $WORK == */zrush-test.* ]] && rm -rf $WORK
+  # Anything short of a fully green run keeps its evidence: the work directory
+  # (host logs, fake-worker state) and a tail of the log the run ended on.
+  if (( FAIL || SKIP )) || [[ -n $ZRUSH_DRIVER_KEEP ]]; then
+    out "kept: $WORK"
+    typeset -a KEPT_LOGS=( $WORK/host*.log(N) )
+    (( $#KEPT_LOGS )) && out "logs: $KEPT_LOGS"
+    if [[ -r $ZRUSH_LOG ]]; then
+      out "---- tail -80 $ZRUSH_LOG ----"
+      tail -n 80 -- $ZRUSH_LOG >&$ERRFD
+      out "---- end of $ZRUSH_LOG ----"
+    fi
+  else
+    [[ -n $WORK && $WORK == */zrush-test.* ]] && rm -rf $WORK
+  fi
 }
 (( FAIL == 0 ))
