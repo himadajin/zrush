@@ -131,6 +131,13 @@ mkdir -p $PLAYGROUND/fx/basic/subdir
 mkdir -p $PLAYGROUND/fx/spacey
 : >| $PLAYGROUND/fx/spacey/"has space.txt"
 
+# fx/hidden: dot-prefixed entries next to a visible one. The names share the
+# "dotted" stem so a dotless listing can be checked for their absence.
+mkdir -p $PLAYGROUND/fx/hidden
+: >| $PLAYGROUND/fx/hidden/.dotted-alpha.txt
+: >| $PLAYGROUND/fx/hidden/.dotted-beta.txt
+: >| $PLAYGROUND/fx/hidden/visible.txt
+
 # fx/headed: a plain file so _files' "file" tag heading appears in the plan.
 mkdir -p $PLAYGROUND/fx/headed
 : >| $PLAYGROUND/fx/headed/plainfile.txt
@@ -507,6 +514,36 @@ sec_capture() {
     ok "(cap-2b) a normal completion right after a zero-candidate one still works (compsys/tail-call state intact)"
   else
     ng "(cap-2b) completion broke after a zero-candidate collection"
+  fi
+  clear_line
+  drain 0.3
+
+  # (cap-3) Hidden files: the fork collects them unconditionally (globdots,
+  # behavior.md "候補収集") and the matcher keeps them out until the query
+  # starts with a dot (cli-protocol.md "隠し候補の除外").
+  send_keys_wait_plan nonempty 'ls fx/hidden/'
+  if dump_get $'\C-xp' TESTPOST && [[ ${(Q)REPLY} == *visible.txt* && ${(Q)REPLY} != *dotted* ]]; then
+    ok "(cap-3a) a dotless query lists only the visible entry"
+  else
+    ng "(cap-3a) hidden entries leaked into a dotless listing: ${REPLY:-<none>}"
+  fi
+  clear_line
+  drain 0.3
+  send_keys_wait_plan nonempty 'ls fx/hidden/.'
+  if dump_get $'\C-xp' TESTPOST \
+     && [[ ${(Q)REPLY} == *.dotted-alpha.txt* && ${(Q)REPLY} == *.dotted-beta.txt* ]]; then
+    ok "(cap-3b) typing the dot lists every hidden entry"
+  else
+    ng "(cap-3b) hidden entries missing after the dot: ${REPLY:-<none>}"
+  fi
+  clear_line
+  drain 0.3
+  send_keys_wait_plan nonempty 'ls fx/hidden/.dotted-be'
+  if dump_get $'\C-xp' TESTPOST \
+     && [[ ${(Q)REPLY} == *.dotted-beta.txt* && ${(Q)REPLY} != *alpha* ]]; then
+    ok "(cap-3c) the dot-prefixed query filters the hidden entries"
+  else
+    ng "(cap-3c) hidden entries not filtered: ${REPLY:-<none>}"
   fi
   clear_line
   drain 0.3

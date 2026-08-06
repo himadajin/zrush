@@ -486,6 +486,9 @@ _zrush_capture_worker() {
   done
   builtin unset HISTFILE 2>/dev/null
   SAVEHIST=0
+  # behavior.md "候補収集": generate dotfile candidates unconditionally; keeping
+  # them out of the listing until the query opts in is the matcher's rule.
+  setopt globdots
   _zlog "fork: start wfd=$_zrush_wfd"
   # The inherited read-side copy is not needed, nor is the self-pipe.
   _zrush_close_internal_fd $_zrush_rfd

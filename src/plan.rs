@@ -1,8 +1,9 @@
 //! Orchestration for worker plan requests (cli-protocol.md "`zrush worker`",
 //! source of truth for the whole pipeline and render-plan wire format).
 //!
-//! Pipeline: record::parse -> matching::QueryMatcher (score every parsed
-//! candidate + common-prefix over the *untruncated* prefix-tier matches)
+//! Pipeline: record::parse -> hidden-file exclusion -> matching::QueryMatcher
+//! (score every remaining candidate + common-prefix over the *untruncated*
+//! prefix-tier matches)
 //! -> ranking::rank (suppress approximate tiers when a literal exists,
 //! then use the producer's ordering and absolute layout capacity: rows*8
 //! for compsys, rows for history)
@@ -80,8 +81,14 @@ pub(crate) fn run(
     // every match, not just the ones the grid ends up displaying
     // (cli-protocol.md "common-prefix の意味論").
     let mut prefix_texts: Vec<&[u8]> = Vec::new();
+    // cli-protocol.md "隠し候補の除外": excluded before tier classification, so
+    // hidden files reach neither the listing nor common-prefix.
+    let hidden_opt_in = params.query.first() == Some(&b'.');
     for (idx, cand) in parsed.candidates.iter().enumerate() {
         let text = cand.match_text();
+        if !hidden_opt_in && text.starts_with(b".") && parsed.batches[cand.batch].f == b"1" {
+            continue;
+        }
         if let Some(hit) = qm.classify(text) {
             if hit.tier() == Tier::Prefix {
                 prefix_texts.push(text);
@@ -535,6 +542,46 @@ mod tests {
         };
         let out = run(&params("zzz", Mode::Typo, 10, 40, true), &stdin, &no_dir).unwrap();
         assert_eq!(out, b"\x000\x000\x000\x00");
+    }
+
+    /// cli-protocol.md "隠し候補の除外".
+    #[test]
+    fn hidden_file_candidates_are_excluded_until_the_query_opts_in() {
+        let stdin = {
+            let mut s = header(&[("f", "1")]);
+            s.extend(word(".hidden"));
+            s.extend(word("visible"));
+            s
+        };
+
+        // Empty query: the dot candidate reaches neither the listing nor
+        // common-prefix, which is computed over the survivors alone.
+        let p = parse_wire(&run(&params("", Mode::Typo, 10, 40, false), &stdin, &no_dir).unwrap());
+        assert_eq!(p.rows, vec![b"visible".to_vec()]);
+        assert_eq!(p.common_prefix, b"visible");
+
+        // A query matching it as a substring is not an opt-in.
+        let out = run(&params("h", Mode::Typo, 10, 40, false), &stdin, &no_dir).unwrap();
+        assert_eq!(out, b"\x000\x000\x000\x00");
+
+        // A leading dot opts in; "visible" then matches no tier.
+        let p =
+            parse_wire(&run(&params(".h", Mode::Typo, 10, 40, false), &stdin, &no_dir).unwrap());
+        assert_eq!(p.rows, vec![b".hidden".to_vec()]);
+        assert_eq!(p.common_prefix, b".hidden");
+    }
+
+    /// The exclusion mirrors what `globdots` adds in the capture fork, so it is
+    /// limited to file batches (cli-protocol.md "隠し候補の除外").
+    #[test]
+    fn hidden_exclusion_is_limited_to_file_batches() {
+        let stdin = {
+            let mut s = header(&[]);
+            s.extend(word(".PHONY"));
+            s
+        };
+        let p = parse_wire(&run(&params("", Mode::Typo, 10, 40, false), &stdin, &no_dir).unwrap());
+        assert_eq!(p.rows, vec![b".PHONY".to_vec()]);
     }
 
     #[test]
