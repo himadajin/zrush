@@ -77,6 +77,7 @@ typeset -gi _zrush_rfd=-1 _zrush_wfd=-1 _zrush_gen=0 _zrush_timer_fd=-1
 typeset -g  _zrush_pending_buffer=
 typeset -g  _zrush_last_buffer=
 typeset -gi _zrush_last_cursor=-1
+typeset -gi _zrush_kick_fd=${_zrush_kick_fd:--1}  # shell-session permanent; see "Watcher self-repair"
 
 # Persistent Rust worker transport.
 typeset -gi _zrush_worker_rfd=-1 _zrush_worker_wfd=-1
@@ -146,6 +147,51 @@ _zrush_close_internal_fd() {  # $1=owned fd; idempotent best-effort close
   { exec {fd}>&- } 2>/dev/null
   local -i st=$?
   (( st == 0 )) || _zlog "fd: close failed fd=$fd status=$st"
+  return 0
+}
+
+# ---------------------------------------------------------------- Watcher self-repair
+# zsh's zle event loop stops polling a watcher (`events = 0`, "Don't poll
+# this" in Src/Zle/zle_main.c raw_getbyte) when one handler-dispatch round
+# removes a watcher and registers a new one that reuses the removed fd's
+# number and slot while that slot still holds POLLHUP/POLLERR revents. The
+# slot recovers on the next dispatch round -- but nothing forces one when the
+# silenced fd is the only pending event, and zrush's disposable fds (timer,
+# ack, setup, drain, capture) all read from short-lived children whose final
+# readiness usually carries exactly that POLLHUP. Writing one byte to this
+# permanent self-pipe right after a registration forces the extra round, so a
+# silenced watcher never survives the poll that silenced it. Invariant:
+# every `zle -F -w` registration is followed by _zrush_kick.
+_zrush_kick_init() {  # ZLE widget context; idempotent
+  emulate -L zsh
+  (( _zrush_kick_fd >= 0 )) && return 0
+  local fifo=${TMPDIR:-/tmp}/zrush-kick-$$-$RANDOM
+  mkfifo $fifo 2>/dev/null || return 1
+  if ! sysopen -rw -o cloexec -u _zrush_kick_fd $fifo; then
+    _zrush_kick_fd=-1
+    command rm -f $fifo 2>/dev/null
+    return 1
+  fi
+  command rm -f $fifo 2>/dev/null
+  if ! zle -F -w $_zrush_kick_fd _zrush-kick-drain 2>/dev/null; then
+    _zrush_close_internal_fd $_zrush_kick_fd
+    _zrush_kick_fd=-1
+    return 1
+  fi
+  return 0
+}
+
+_zrush_kick() {
+  (( _zrush_kick_fd >= 0 )) || return 0
+  syswrite -o $_zrush_kick_fd -- k 2>/dev/null
+  return 0
+}
+
+_zrush_kick_drain() {  # zle -F -w handler ($1=fd)
+  emulate -L zsh
+  (( $1 == _zrush_kick_fd )) || return 0
+  local junk=
+  sysread -t 0 -i $_zrush_kick_fd junk
   return 0
 }
 
@@ -441,8 +487,10 @@ _zrush_capture_worker() {
   builtin unset HISTFILE 2>/dev/null
   SAVEHIST=0
   _zlog "fork: start wfd=$_zrush_wfd"
-  # The inherited read-side copy is not needed.
+  # The inherited read-side copy is not needed, nor is the self-pipe.
   _zrush_close_internal_fd $_zrush_rfd
+  _zrush_close_internal_fd $_zrush_kick_fd
+  _zrush_kick_fd=-1
   # Report the real pid first so the parent can SIGINT its process group on cancellation.
   print -rn -u $_zrush_wfd -- "pid"$'\1'"$sysparams[pid]"$'\0' 2>/dev/null
   # The fork inherits active ZLE state, so it can invoke the widget directly.
@@ -665,6 +713,7 @@ _zrush_start_request() {
   _zrush_wfd=-1
 
   zle -F -w $_zrush_rfd _zrush-on-data
+  _zrush_kick
   _zlog "request: collecting on fd $_zrush_rfd (pty $_zrush_pty)"
   return 0
 }
@@ -961,6 +1010,7 @@ _zrush_worker_start() {
     _zrush_worker_session_fail "setup fd registration failed"
     return 1
   fi
+  _zrush_kick
   _zlog "worker: asynchronous pipe setup pid=$_zrush_worker_setup_pid fd=$fd"
   return 0
 }
@@ -1001,6 +1051,7 @@ _zrush_worker_finish_start() {
     _zrush_worker_session_fail "data fd registration failed"
     return 1
   fi
+  _zrush_kick
   _zlog "worker: started pid=$_zrush_worker_pid rfd=$_zrush_worker_rfd wfd=$_zrush_worker_wfd"
   _zrush_worker_flush
 }
@@ -1063,6 +1114,7 @@ _zrush_worker_flush() {
     _zrush_worker_session_fail "ack fd registration failed"
     return 1
   fi
+  _zrush_kick
   _zlog "worker: sending frame writer_pid=$_zrush_worker_writer_pid ackfd=$fd bytes=${#frame} queued=$#_zrush_worker_txq"
   return 0
 }
@@ -1196,6 +1248,7 @@ _zrush_worker_arm_drain() {
     _zrush_worker_session_fail "read continuation fd registration failed"
     return 1
   }
+  _zrush_kick
   return 0
 }
 
@@ -1594,6 +1647,7 @@ _zrush_arm_timer() {  # ZLE widget context
   exec {tfd}< <( zselect -t $cs; print )
   _zrush_timer_fd=$tfd
   zle -F -w $tfd _zrush-timer-fire
+  _zrush_kick
   return 0
 }
 
@@ -1661,6 +1715,7 @@ _zrush_line_pre_redraw() {
 
 _zrush_line_init() {
   emulate -L zsh
+  _zrush_kick_init
   _zrush_last_buffer=
   _zrush_last_cursor=-1
   # A new ZLE session can follow an exit that bypassed _zrush_line_finish
@@ -2105,6 +2160,7 @@ _zrush_init() {
   fi
 
   # Register widgets; _zrush-capture-* are invoked only inside the fork.
+  zle -N _zrush-kick-drain _zrush_kick_drain
   zle -N _zrush-on-data _zrush_on_data
   zle -N _zrush-timer-fire _zrush_timer_fire
   zle -N _zrush-worker-on-data _zrush_worker_on_data
