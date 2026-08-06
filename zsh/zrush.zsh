@@ -1561,7 +1561,7 @@ _zrush_history_payload() {  # -> REPLY = candidate payload bytes
 _zrush_request_plan_sync() {
   emulate -L zsh
   local payload=$1 producer=$2 query=$3 tspace=$4
-  local -F deadline=$(( EPOCHREALTIME + 0.100 )) remaining
+  local -F deadline=$(( EPOCHREALTIME + ${ZRUSH_HISTORY_DEADLINE_MS:-100} / 1000.0 )) remaining
   _zrush_request_plan "$payload" "$producer" "$query" "$tspace" || return 1
   local -i target=$REPLY cs
   _zrush_sync_target=$target _zrush_sync_done=0 _zrush_sync_ok=0

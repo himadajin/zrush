@@ -107,6 +107,8 @@ export ZRUSH_BIN=$WORK/bin/zrush
 export ZRUSH_REAL_BIN=$REPO/target/release/zrush
 export ZRUSH_FAKE_CONTROL=$WORK/fake-control
 export ZRUSH_FAKE_STATE=$WORK/fake-state
+# Test seam: 5000 ms matches the driver's other bounded waits.
+export ZRUSH_HISTORY_DEADLINE_MS=5000
 
 print "source $REPO/tests/zsh/rc/minimal.zshrc" > $ZDOTDIR/.zshrc
 
