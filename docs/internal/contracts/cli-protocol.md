@@ -537,10 +537,14 @@ zsh は一覧を消す。
 > 検証: モードの累積性・ティアの序列と literal / approximate グループ分類・smart-case の真偽両方・誤字許容の範囲(候補の接頭辞に対する 1 編集、1 文字クエリでは不適用)・非 UTF-8 バイト列でもマッチすること —
 > `src/matching.rs` の単体テスト(小さなアルファベット上での DP 参照実装との網羅照合を含む)。
 > literal の存在による approximate の抑止・approximate だけが存在する場合の保持・両 producer の結果順・ティア順のソートと同点時の candidate payload 順保存 — `src/ranking.rs`。
-> `producer = history` がマッチ品質で並べ替えないこと — `src/plan.rs`。
+> `producer = history` がマッチ品質で並べ替えないこと・隠し候補の除外(空クエリと非ドットのクエリで落ちること、`.` 始まりのクエリで残ること、`f = 1` でないバッチには掛からないこと、common-prefix に入らないこと)— `src/plan.rs`。
 > worker セッション越しの producer ごとの結果順と common-prefix — `tests/cli.rs`。`producer = history` のプラン全体 — `tests/vectors/plan/`。
 > 大文字小文字の畳み込みを ASCII に限る規範は、どのテストも固定していない。
 
+- **隠し候補の除外**: クエリの先頭バイトが `.` でないとき、`f = 1` のバッチに属し match-text が `.` で始まる候補を、ティア判定より前に除外する(空クエリも「`.` で始まらない」に含む)。
+  除外した候補は一覧にも common-prefix にも入らない。
+  捕獲 fork が `globdots` でドットファイル候補を無条件に生成する(behavior.md「候補収集」)ため、隠しファイルをドット入力まで伏せる判断はこの規則が一手に担う。
+  除外を `f = 1` に限るのは、`globdots` が増やすのが glob 由来のファイル候補だけであり、ドット始まりでもファイル候補でないものの見え方を変えないため。
 - モードは累積的に広がる: `typo` ⊇ `substring` ⊇ `prefix`。
   - `prefix`: match-text がクエリで始まる。
   - `substring`: match-text がクエリを部分文字列として含む。
