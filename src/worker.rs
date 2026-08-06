@@ -1,6 +1,7 @@
 //! Persistent worker session for plan requests.
 
 use std::ffi::OsStr;
+use std::fmt;
 use std::io::{Read, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
@@ -15,9 +16,29 @@ const REQUEST_FIELD_COUNT: usize = 11;
 
 #[derive(Debug)]
 pub(crate) enum Error {
-    Framing,
+    Framing(framing::Error),
     Protocol,
-    Io,
+    Io(std::io::Error),
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Framing(error) => write!(f, "framing failure: {error}"),
+            Self::Protocol => f.write_str("protocol violation"),
+            Self::Io(error) => write!(f, "I/O failure: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Framing(error) => Some(error),
+            Self::Io(error) => Some(error),
+            Self::Protocol => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,9 +76,9 @@ pub(crate) fn run<R: Read, W: Write>(mut input: R, mut output: W) -> Result<End,
     let mut buffer = [0; READ_BUFFER_SIZE];
 
     loop {
-        let read = input.read(&mut buffer).map_err(|_| Error::Io)?;
+        let read = input.read(&mut buffer).map_err(Error::Io)?;
         if read == 0 {
-            decoder.finish().map_err(|_| Error::Framing)?;
+            decoder.finish().map_err(Error::Framing)?;
             return Ok(End::Eof);
         }
 
@@ -79,7 +100,7 @@ pub(crate) fn run<R: Read, W: Write>(mut input: R, mut output: W) -> Result<End,
                         return Ok(End::Incompatible);
                     }
                 }
-                return Err(Error::Framing);
+                return Err(Error::Framing(feed_error.error));
             }
         }
     }
@@ -228,8 +249,10 @@ fn parse_canonical_u64(value: &[u8]) -> Option<u64> {
 
 fn decode_fields(message: &[u8]) -> Result<Vec<Vec<u8>>, Error> {
     let mut decoder = Decoder::new();
-    let fields = decoder.feed(message).map_err(|_| Error::Framing)?;
-    decoder.finish().map_err(|_| Error::Framing)?;
+    let fields = decoder
+        .feed(message)
+        .map_err(|feed_error| Error::Framing(feed_error.error))?;
+    decoder.finish().map_err(Error::Framing)?;
     Ok(fields)
 }
 
@@ -240,8 +263,8 @@ fn write_message<W: Write>(output: &mut W, fields: &[&[u8]]) -> Result<(), Error
         .collect();
     output
         .write_all(&framing::encode(&payload))
-        .map_err(|_| Error::Io)?;
-    output.flush().map_err(|_| Error::Io)
+        .map_err(Error::Io)?;
+    output.flush().map_err(Error::Io)
 }
 
 fn is_dir_from(cwd: &[u8], path: &[u8]) -> bool {
@@ -277,6 +300,32 @@ mod tests {
             .iter()
             .map(|frame| decode_fields(frame).unwrap())
             .collect()
+    }
+
+    struct FailingReader;
+
+    impl Read for FailingReader {
+        fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "read failed",
+            ))
+        }
+    }
+
+    struct FailingWriter;
+
+    impl Write for FailingWriter {
+        fn write(&mut self, _buffer: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "write failed",
+            ))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
     }
 
     fn request<'a>(id: &'a [u8], cwd: &'a [u8], payload: &'a [u8]) -> Vec<&'a [u8]> {
@@ -370,10 +419,10 @@ mod tests {
         ]
         .concat();
         let mut output = Vec::new();
-        assert!(matches!(
-            run(Cursor::new(input), &mut output),
-            Err(Error::Framing)
-        ));
+        let Err(Error::Framing(error)) = run(Cursor::new(input), &mut output) else {
+            panic!("expected a framing error");
+        };
+        assert_eq!(error, framing::Error::InvalidTrailingComma);
         assert_eq!(messages(&output).len(), 2);
     }
 
@@ -382,11 +431,25 @@ mod tests {
         let malformed_nested = framing::encode(b"4:plan,1:1");
         let input = [message(&[b"hello", b"6"]), malformed_nested].concat();
         let mut output = Vec::new();
-        assert!(matches!(
-            run(Cursor::new(input), &mut output),
-            Err(Error::Framing)
-        ));
+        let Err(Error::Framing(error)) = run(Cursor::new(input), &mut output) else {
+            panic!("expected a framing error");
+        };
+        assert_eq!(error, framing::Error::TruncatedFrame);
         assert_eq!(messages(&output).len(), 1);
+    }
+
+    #[test]
+    fn stream_io_failures_carry_their_source() {
+        let Err(Error::Io(error)) = run(FailingReader, &mut Vec::new()) else {
+            panic!("expected an I/O error");
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+
+        let Err(Error::Io(error)) = run(Cursor::new(message(&[b"hello", b"6"])), FailingWriter)
+        else {
+            panic!("expected an I/O error");
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
     }
 
     #[test]
