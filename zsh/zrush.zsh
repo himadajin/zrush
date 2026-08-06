@@ -1271,6 +1271,10 @@ _zrush_worker_read() {  # async | sync [absolute-deadline]
       _zrush_worker_rx=$REPLY_REST
       (( ++frames ))
       _zrush_worker_handle_message "$message" "$deadline" || return 1
+      # Returning rather than continuing keeps the rest of the buffer off the
+      # keystroke path -- the deadline is sync mode's only bound -- and keeps
+      # the loop-top check from tripping on a result already committed.
+      [[ $mode == sync ]] && (( _zrush_sync_done )) && return 0
       continue
     fi
     if (( st == 2 )); then
@@ -1599,6 +1603,10 @@ _zrush_request_plan_sync() {
   done
   local -i ok=$_zrush_sync_ok
   _zrush_sync_target=0 _zrush_sync_done=0 _zrush_sync_ok=0
+  # Only once the synchronous state is cleared, and never propagating the
+  # status: arming fails by failing the session, which tears the transport down
+  # and would take this exchange's committed result with it.
+  [[ -n $_zrush_worker_rx ]] && _zrush_worker_arm_drain
   (( ok ))
 }
 

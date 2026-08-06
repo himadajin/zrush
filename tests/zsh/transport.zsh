@@ -1,7 +1,9 @@
 #!/bin/zsh -f
-# Non-pty unit tests for the zsh-side worker transport write path: the outbound
-# frame queue, the short-lived writer child that _zrush_worker_flush forks, and
-# the ack/EOF notification fd that _zrush_worker_consume_ack reads.
+# Non-pty unit tests for the zsh-side worker transport. The write path: the
+# outbound frame queue, the short-lived writer child that _zrush_worker_flush
+# forks, and the ack/EOF notification fd that _zrush_worker_consume_ack reads.
+# The read path: how _zrush_worker_read walks the receive buffer, in the
+# synchronous mode the history menu drives it in.
 #
 # Usage:
 #   zsh -f tests/zsh/transport.zsh
@@ -16,11 +18,14 @@
 # Scope: vectors.zsh covers the capture encoder and the plan decoder; this file
 # is the home for non-pty unit tests of the zsh-side worker transport instead.
 # The behavior under test is specified in docs/internal/specs/behavior.md,
-# section "worker ライフサイクル".
+# sections "worker ライフサイクル" and "履歴メニュー".
 #
 # Test seams used here, none of which touch zsh/zrush.zsh:
 #   - _zrush_warn is replaced by a recorder, so warnings are asserted instead of
 #     printed into the runner's output.
+#   - _zrush_worker_deadline_expired is replaced, for one case, by an oracle
+#     that reports expiry from the state of the exchange rather than from the
+#     clock, so the moment a deadline trips is fixed instead of measured.
 #   - The ZLE callback never runs headless, so the shared consume path
 #     (_zrush_worker_consume_ack) is called directly, exactly as the synchronous
 #     history loop calls it.
@@ -499,6 +504,100 @@ mkdir -p $HOME $XDG_CONFIG_HOME
   peek_close
   fifo_teardown
   verdict "teardown: a child already at EOF is never signalled"
+
+  # ------------------------------------------------------ read-path fixtures
+  # A read fd that never carries data: sysread -t 0 on it always reports EAGAIN,
+  # so _zrush_worker_read can only make progress from what the case put into
+  # _zrush_worker_rx, and no worker process is needed behind it.
+  typeset -g RFIFO=
+  sync_setup() {  # $1=case name; a session waiting synchronously for request 1
+    emulate -L zsh
+    transport_reset
+    RFIFO=$WORK/rx-$1.fifo
+    command mkfifo $RFIFO || { out "FATAL: mkfifo $RFIFO"; exit 1 }
+    sysopen -rw -o cloexec -u _zrush_worker_rfd $RFIFO || { out "FATAL: rx open"; exit 1 }
+    _zrush_worker_ready=1
+    typeset -gi _zrush_current_request=0
+    _zrush_worker_pending=( 1 history 2 compsys 3 compsys )
+    typeset -gi _zrush_sync_target=1 _zrush_sync_done=0 _zrush_sync_ok=0
+  }
+  sync_teardown() {
+    emulate -L zsh
+    (( _zrush_worker_rfd > 2 )) && { exec {_zrush_worker_rfd}>&- } 2>/dev/null
+    _zrush_worker_rfd=-1
+    [[ -n $RFIFO ]] && command rm -f $RFIFO
+    RFIFO=
+  }
+
+  # An outer frame carrying an `ok` response whose render plan is the smallest
+  # one _zrush_parse_plan accepts: no rows, no highlights, no positions.
+  msg_ok() {  # $1=request_id -> REPLY
+    emulate -L zsh
+    setopt localoptions nomultibyte
+    local LC_ALL=C
+    _zrush_encode_message ok "$1" $'\0'"0"$'\0'"0"$'\0'"0"$'\0'
+  }
+
+  # ============================================================ case 8
+  # The target's terminal response ends the synchronous exchange.
+  sync_setup lone
+  msg_ok 1; _zrush_worker_rx=$REPLY
+  typeset -gF DEADLINE=$(( EPOCHREALTIME + 5 ))
+  _zrush_worker_read sync $DEADLINE; st=$?
+  eq "read status" $st 0
+  eq "exchange finished" $_zrush_sync_done 1
+  eq "exchange succeeded" $_zrush_sync_ok 1
+  eq "target no longer pending" ${+_zrush_worker_pending[1]} 0
+  eq "receive buffer consumed" ${#_zrush_worker_rx} 0
+  eq "session failures" $_zrush_worker_failures 0
+  eq "warnings" $#WARNINGS 0
+  sync_teardown
+  verdict "sync read: the target's terminal response commits the exchange"
+
+  # ============================================================ case 9
+  # Same response, now followed by responses for other request_ids that arrived
+  # in the same read. The exchange ends at the target; the rest stays buffered
+  # for the asynchronous path instead of being processed inside the sync window.
+  sync_setup trailing
+  msg_ok 1; typeset -g TARGET=$REPLY
+  msg_ok 2; typeset -g TRAILING=$REPLY
+  msg_ok 3; TRAILING+=$REPLY
+  _zrush_worker_rx=$TARGET$TRAILING
+  DEADLINE=$(( EPOCHREALTIME + 5 ))
+  _zrush_worker_read sync $DEADLINE; st=$?
+  eq "read status" $st 0
+  eq "exchange finished" $_zrush_sync_done 1
+  eq "exchange succeeded" $_zrush_sync_ok 1
+  eq "trailing bytes left buffered" ${#_zrush_worker_rx} ${#TRAILING}
+  eq "trailing bytes left untouched" "$_zrush_worker_rx" "$TRAILING"
+  eq "trailing requests still pending" $#_zrush_worker_pending 2
+  eq "session failures" $_zrush_worker_failures 0
+  eq "warnings" $#WARNINGS 0
+  sync_teardown
+  verdict "sync read: trailing responses are left to the asynchronous path"
+
+  # ============================================================ case 10
+  # The same buffer under a deadline that trips the instant the target's
+  # response is committed -- the worst moment there is, and the one a clock
+  # cannot be aimed at. A success already committed is never withdrawn.
+  sync_setup expiring
+  msg_ok 1; TARGET=$REPLY
+  msg_ok 2; TRAILING=$REPLY
+  msg_ok 3; TRAILING+=$REPLY
+  _zrush_worker_rx=$TARGET$TRAILING
+  typeset -g DEADLINE_FN=$functions[_zrush_worker_deadline_expired]
+  _zrush_worker_deadline_expired() { [[ -n $1 ]] && (( _zrush_sync_done )) }
+  DEADLINE=$(( EPOCHREALTIME + 5 ))   # the oracle, not this value, decides expiry
+  _zrush_worker_read sync $DEADLINE; st=$?
+  functions[_zrush_worker_deadline_expired]=$DEADLINE_FN
+  eq "read status" $st 0
+  eq "exchange finished" $_zrush_sync_done 1
+  eq "exchange succeeded" $_zrush_sync_ok 1
+  eq "trailing bytes left buffered" ${#_zrush_worker_rx} ${#TRAILING}
+  eq "session failures" $_zrush_worker_failures 0
+  eq "warnings" $#WARNINGS 0
+  sync_teardown
+  verdict "sync read: a deadline expiring after the commit cannot undo it"
 
   out "SUMMARY: PASS=$PASS FAIL=$FAIL"
 } always {

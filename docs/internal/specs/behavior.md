@@ -259,6 +259,8 @@ zsh は zle 統合・compsys 呼び出しによる捕獲・プランの適用
   要求送信・完全な応答受信をすべて同じ 100ms に含める。deadline は固定方針であり設定項目にしない。
   環境変数 `ZRUSH_HISTORY_DEADLINE_MS`(ミリ秒、未設定時は 100)で deadline を上書きできるが、これは `zsh/zrush.zsh` の `ZRUSH_BIN` と `ZRUSH_NO_INIT` に倣ったテストドライバ専用の seam である。
   payload 合成に費やす時間はこの deadline に含めない。
+- 対象 request_id の完全な終端応答を受信した時点で同期待ちは終了する。
+  受信済みで未処理の後続応答は同期待ちの中では処理せず、非同期経路が引き取る。
 - 同期待ちの間に先行する非同期要求の応答を受けた場合も通常どおり終端まで読み、stale なら破棄して
   対象 request_id を待ち続ける。先行要求の outbound queue 送信と直列処理に費やす時間も同じ deadline を消費する。
   deadline を要求ごと・write/read ごとに延長しない。超過時は worker プロセスを終了させて消滅を確認し、
