@@ -399,6 +399,33 @@ fn worker_protocol_mismatch_exits_after_incompatible_response() {
     );
 }
 
+/// The line's content is outside the contract (cli-protocol.md), so only its
+/// existence and single-line shape are pinned here.
+#[test]
+fn worker_session_fatal_failure_emits_one_diagnostic_line_on_stderr() {
+    let mut child = zrush()
+        .arg("worker")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut input = msg(&[b"hello", b"6"]);
+    input.extend_from_slice(b"1:x!");
+    child.stdin.take().unwrap().write_all(&input).unwrap();
+
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(
+        out.stderr.last(),
+        Some(&b'\n'),
+        "diagnostic line is complete"
+    );
+    let line = &out.stderr[..out.stderr.len() - 1];
+    assert!(!line.is_empty(), "diagnostic line is not empty");
+    assert!(!line.contains(&b'\n'), "exactly one diagnostic line");
+}
+
 // ---- zrush config ----
 
 /// Isolated XDG_CONFIG_HOME, removed on drop so runs don't litter TMPDIR.

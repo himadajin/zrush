@@ -77,7 +77,10 @@ pub fn run() -> ExitCode {
 fn cmd_worker() -> ExitCode {
     match worker::run(std::io::stdin().lock(), std::io::stdout().lock()) {
         Ok(worker::End::Eof | worker::End::Incompatible) => ExitCode::SUCCESS,
-        Err(_) => ExitCode::from(EXIT_INTERNAL),
+        Err(error) => {
+            let _ = writeln!(std::io::stderr().lock(), "zrush worker: {error}");
+            ExitCode::from(EXIT_INTERNAL)
+        }
     }
 }
 
