@@ -297,7 +297,7 @@ zpty 内で compsys を駆動して得る payload(behavior.md「候補収集」�
   zsh が受信中に取り除いてから plan 要求の `candidate_payload` へ入れる。
   空語収集キャッシュ(behavior.md)に保存する payload も pid を取り除いた形が契約である。
   Rust 側でのスキップは保険であり、通常の入力では発生しない。
-- plan 要求のフィールド値: `producer` は `compsys`、`query` は広げ規則で削った末尾
+- plan 要求のフィールド値: `producer` は `compsys`、`query` は広げ規則が定めるクエリ
   (behavior.md「候補収集」節)、`trailing_space` は `[insert].trailing-space` の設定値。
 
 #### history profile
@@ -523,7 +523,7 @@ zsh は一覧を消す。
   マッチ 0 件・prefix 階層 0 件・共通部分なしのときは空フィールド。
   substring 以下の階層はクエリの接頭辞拡張になり得ないため計算に含めない。
 - `tab = "common-prefix"` の挙動(config-schema.md)のために返す。zsh 側の規範:
-  - クエリが common-prefix の真のバイト接頭辞である場合、削った末尾領域を
+  - クエリが common-prefix の真のバイト接頭辞である場合、現在語のクエリ領域を
     `${(q)}` でクォートした common-prefix で置き換える(as-typed の接頭辞拡張のみ。
     入力を縮める・別文字列に置き換える挿入はしない)。
   - それ以外(空・クエリと同一・バイト接頭辞でない。smart-case の大文字小文字差で
