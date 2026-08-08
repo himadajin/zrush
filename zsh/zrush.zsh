@@ -204,17 +204,19 @@ _zrush_widen() {  # $1=buffer through the cursor
   local buf=$1
   local word=${buf##*[[:space:]]}
   local pre=${buf[1,$#buf-$#word]}
-  local keep= query=
+  # run widens the collection string but stays in the query, so it is tracked
+  # apart from keep, which alone satisfies word == keep + query.
+  local keep= query= run=
   if [[ $word == *[/=]* ]]; then
     query=${word##*[/=]}
     keep=${word[1,$#word-$#query]}
   elif [[ $word == -* ]]; then
-    keep=${(M)word##-##}
-    query=${word[$#keep+1,-1]}
+    run=${(M)word##-##}
+    query=$word
   else
     query=$word
   fi
-  typeset -g REPLY_WIDENED=$pre$keep REPLY_QUERY=$query REPLY_KEEP=$keep REPLY_WORD=$word
+  typeset -g REPLY_WIDENED=$pre$keep$run REPLY_QUERY=$query REPLY_KEEP=$keep REPLY_WORD=$word
 }
 
 # ---------------------------------------------------------------- Configuration

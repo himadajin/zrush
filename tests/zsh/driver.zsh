@@ -802,6 +802,38 @@ sec_tab() {
   press $'\C-g'
   clear_line
   drain 0.3
+
+  # ---- (tab-2) [insert].tab=common-prefix over a leading dash run. The
+  # widening rule keeps the run in the collection string so compsys yields
+  # option candidates, and compsys returns those dash-included; the run must
+  # therefore stay in the query too, or the common-prefix insertion prepends a
+  # second dash (behavior.md "広げ規則"). A compdef fixture pins the candidate
+  # set: the real `ls -` option list differs per platform.
+  send_line '_zrushtestopt() { local -a m=(-alpha -alt); compadd -a m }'
+  sync_prompt
+  send_line 'compdef _zrushtestopt zrushtestopt'
+  sync_prompt
+  print -r -- $'[insert]\ntab = "common-prefix"' >| $XDG_CONFIG_HOME/zrush/config.toml
+  send_line ':'
+  sync_prompt
+  if send_keys_wait_plan nonempty 'zrushtestopt -'; then
+    log_count 'plan: applied'; local -i c_cp=$REPLY
+    press $'\t'
+    assert_buffer 'zrushtestopt -al' "(tab-2a) tab=common-prefix over a lone '-' inserts the common prefix without doubling the dash"
+    # The partial insertion is not a confirmation: it retriggers collection,
+    # and that second listing is what the Tab below acts on.
+    if wait_log 'plan: applied' $c_cp 5; then
+      press $'\t'
+      assert_buffer 'zrushtestopt -alpha ' "(tab-2b) a common-prefix that no longer grows falls back to confirming the top candidate"
+    else
+      ng "(tab-2b) the common-prefix insertion did not retrigger collection"
+    fi
+  fi
+  clear_line
+  rm -f $XDG_CONFIG_HOME/zrush/config.toml
+  send_line ':'
+  sync_prompt
+  drain 0.3
 }
 
 sec_sendbreak() {
