@@ -1545,25 +1545,27 @@ _zrush_apply_highlights() {
 _zrush_history_payload() {  # -> REPLY = candidate payload bytes
   emulate -L zsh
   local -i limit=$ZRUSH_CFG_HISTORY_LIMIT
-  local -a events=()
-  if (( limit > 0 )); then
-    events=( "${(@k)history}" )
-    (( $#events > limit )) && events=( "${(@)events[1,limit]}" )
-  fi
+  local -a kv=()
+  (( limit > 0 )) && kv=( "${(@kv)history}" )   # one bulk expansion: event/line pairs, newest first
   local -A seen=()
-  local event line
-  local -a recs=( b$'\1' )
-  for event in "${(@)events}"; do
-    line=$history[$event]
+  local event line block=b$'\1'
+  local -i pending=0
+  local -a blocks=()
+  for event line in "${(@)kv[1,2 * limit]}"; do   # two elements per entry
     # Within the raw scan window (nothing is pulled in from outside it to make
     # up for a drop), reject empty/framing-byte lines and retain only the
     # newest event number for each distinct line.
     [[ -n $line && $line != *$'\0'* && $line != *$'\1'* && $line != *$'\2'* ]] || continue
     (( ${+seen[$line]} )) && continue
     seen[$line]=1
-    recs+=( w$'\1'$line$'\2'n$'\1'$event )
+    block+=$'\0'w$'\1'$line$'\2'n$'\1'$event
+    # Appending to a zsh string or array copies everything it already holds, so
+    # growing either one record at a time is quadratic. Sealing the open block
+    # every 16 records bounds both copies and keeps the total linear.
+    (( ++pending < 16 )) || { blocks+=( "$block" ); block=; pending=0; }
   done
-  typeset -g REPLY=${(pj:\0:)recs}$'\0'
+  blocks+=( "$block" )
+  typeset -g REPLY=${(pj::)blocks}$'\0'
   return 0
 }
 
