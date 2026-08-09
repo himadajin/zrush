@@ -2,8 +2,10 @@
 
 use std::ffi::OsStr;
 use std::fmt;
+use std::fs::File;
 use std::io::{Read, Write};
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::Path;
 
 use crate::config::PROTOCOL_VERSION;
@@ -13,6 +15,89 @@ use crate::plan::{self, Producer};
 
 const READ_BUFFER_SIZE: usize = 8192;
 const REQUEST_FIELD_COUNT: usize = 11;
+const FIRST_APPLICATION_FD: RawFd = 3;
+
+pub(crate) fn start_watchdog(control_fd: RawFd) -> std::io::Result<()> {
+    let control = acquire_control_fd(control_fd)?;
+    set_close_on_exec(control.as_raw_fd())?;
+    set_close_on_exec(libc::STDOUT_FILENO)?;
+
+    std::thread::Builder::new()
+        .name("zrush-control-watchdog".into())
+        .spawn(move || watch_control(control))?;
+    Ok(())
+}
+
+fn acquire_control_fd(raw_fd: RawFd) -> std::io::Result<OwnedFd> {
+    if raw_fd < FIRST_APPLICATION_FD {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "--control-fd must be greater than 2",
+        ));
+    }
+
+    let status = fcntl_get(raw_fd, libc::F_GETFL)?;
+    if status & libc::O_ACCMODE == libc::O_WRONLY {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "--control-fd must be readable",
+        ));
+    }
+
+    // No threads exist yet, so the successful fcntl validation above and this
+    // ownership transfer cannot race with a close or descriptor replacement.
+    Ok(unsafe { OwnedFd::from_raw_fd(raw_fd) })
+}
+
+fn set_close_on_exec(raw_fd: RawFd) -> std::io::Result<()> {
+    let flags = fcntl_get(raw_fd, libc::F_GETFD)?;
+    fcntl_set(raw_fd, libc::F_SETFD, flags | libc::FD_CLOEXEC)
+}
+
+fn fcntl_get(raw_fd: RawFd, command: libc::c_int) -> std::io::Result<libc::c_int> {
+    loop {
+        // fcntl is called with a command that takes no third argument.
+        let result = unsafe { libc::fcntl(raw_fd, command) };
+        if result >= 0 {
+            return Ok(result);
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
+fn fcntl_set(raw_fd: RawFd, command: libc::c_int, value: libc::c_int) -> std::io::Result<()> {
+    loop {
+        // fcntl is called with the integer argument required by F_SETFD.
+        let result = unsafe { libc::fcntl(raw_fd, command, value) };
+        if result >= 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
+fn watch_control(control: OwnedFd) -> ! {
+    let mut control = File::from(control);
+    let mut byte = [0_u8; 1];
+    loop {
+        match control.read(&mut byte) {
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Ok(_) | Err(_) => immediate_failure_exit(),
+        }
+    }
+}
+
+fn immediate_failure_exit() -> ! {
+    // This deliberately bypasses destructors and stdio flushing from the
+    // watchdog thread; no Rust references cross the process exit.
+    unsafe { libc::_exit(1) }
+}
 
 #[derive(Debug)]
 pub(crate) enum Error {
@@ -336,7 +421,7 @@ mod tests {
 
     #[test]
     fn handshake_and_multiple_requests_share_one_session() {
-        let hello = message(&[b"hello", b"6"]);
+        let hello = message(&[b"hello", b"7"]);
         let first = request(b"1", b"/", b"");
         let second = request(b"2", b"/", b"");
         let input = [hello, message(&first), message(&second)].concat();
@@ -344,7 +429,7 @@ mod tests {
 
         assert_eq!(run(Cursor::new(input), &mut output).unwrap(), End::Eof);
         let decoded = messages(&output);
-        assert_eq!(decoded[0], [b"ready".to_vec(), b"6".to_vec()]);
+        assert_eq!(decoded[0], [b"ready".to_vec(), b"7".to_vec()]);
         assert_eq!(&decoded[1][..2], [b"ok".as_slice(), b"1".as_slice()]);
         assert_eq!(&decoded[2][..2], [b"ok".as_slice(), b"2".as_slice()]);
         assert_eq!(decoded[1][2], b"\0\x30\0\x30\0\x30\0");
@@ -359,13 +444,13 @@ mod tests {
         );
         assert_eq!(
             messages(&output),
-            [vec![b"incompatible".to_vec(), b"6".to_vec()]]
+            [vec![b"incompatible".to_vec(), b"7".to_vec()]]
         );
     }
 
     #[test]
     fn correlatable_shape_and_payload_errors_are_in_band() {
-        let hello = message(&[b"hello", b"6"]);
+        let hello = message(&[b"hello", b"7"]);
         let bad_shape = message(&[b"other", b"7"]);
         let bad_payload = message(&request(b"8", b"/", b"unterminated"));
         let mut output = Vec::new();
@@ -378,7 +463,7 @@ mod tests {
         assert_eq!(
             messages(&output),
             [
-                vec![b"ready".to_vec(), b"6".to_vec()],
+                vec![b"ready".to_vec(), b"7".to_vec()],
                 vec![
                     b"error".to_vec(),
                     b"7".to_vec(),
@@ -400,7 +485,7 @@ mod tests {
             vec![b"plan".as_slice(), b"01".as_slice()],
             vec![b"plan".as_slice(), b"9223372036854775808".as_slice()],
         ] {
-            let input = [message(&[b"hello", b"6"]), message(&fields)].concat();
+            let input = [message(&[b"hello", b"7"]), message(&fields)].concat();
             let mut output = Vec::new();
             assert!(matches!(
                 run(Cursor::new(input), &mut output),
@@ -413,7 +498,7 @@ mod tests {
     #[test]
     fn completed_prefix_is_written_before_later_outer_corruption() {
         let input = [
-            message(&[b"hello", b"6"]),
+            message(&[b"hello", b"7"]),
             message(&request(b"1", b"/", b"")),
             b"1:x!".to_vec(),
         ]
@@ -429,7 +514,7 @@ mod tests {
     #[test]
     fn nested_framing_corruption_is_fatal() {
         let malformed_nested = framing::encode(b"4:plan,1:1");
-        let input = [message(&[b"hello", b"6"]), malformed_nested].concat();
+        let input = [message(&[b"hello", b"7"]), malformed_nested].concat();
         let mut output = Vec::new();
         let Err(Error::Framing(error)) = run(Cursor::new(input), &mut output) else {
             panic!("expected a framing error");
@@ -445,7 +530,7 @@ mod tests {
         };
         assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
 
-        let Err(Error::Io(error)) = run(Cursor::new(message(&[b"hello", b"6"])), FailingWriter)
+        let Err(Error::Io(error)) = run(Cursor::new(message(&[b"hello", b"7"])), FailingWriter)
         else {
             panic!("expected an I/O error");
         };

@@ -3,6 +3,9 @@
 
 use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::io::AsRawFd;
+use std::os::unix::net::UnixStream;
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
@@ -10,6 +13,28 @@ use zrush::wire;
 
 fn zrush() -> Command {
     Command::new(env!("CARGO_BIN_EXE_zrush"))
+}
+
+fn worker_command() -> (Command, UnixStream, UnixStream) {
+    let (read, write) = UnixStream::pair().expect("create control channel");
+    let control_fd = read.as_raw_fd();
+    let mut command = zrush();
+    command
+        .arg("worker")
+        .arg("--control-fd")
+        .arg(control_fd.to_string());
+    // UnixStream descriptors are CLOEXEC. Only the intended control read end
+    // is made inheritable in the forked child, without exposing unrelated
+    // parallel-test descriptors across exec.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::fcntl(control_fd, libc::F_SETFD, 0) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    (command, read, write)
 }
 
 // ---- zrush worker ----
@@ -70,18 +95,19 @@ fn run_plan(extra: &[&str], stdin: &[u8]) -> (i32, Vec<u8>) {
         value("--trailing-space").as_bytes(),
         stdin,
     ]);
-    let mut child = zrush()
-        .arg("worker")
+    let (mut command, control_read, _control_write) = worker_command();
+    let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
         .expect("spawn zrush worker");
+    drop(control_read);
     child
         .stdin
         .take()
         .expect("stdin")
-        .write_all(&[msg(&[b"hello", b"6"]), req].concat())
+        .write_all(&[msg(&[b"hello", b"7"]), req].concat())
         .expect("write stdin");
     let out = child.wait_with_output().expect("wait");
     let frames = decode_frames(&out.stdout);
@@ -355,14 +381,15 @@ fn worker_handshake_and_multiple_requests_share_one_process() {
             &payload,
         ])
     };
-    let mut child = zrush()
-        .arg("worker")
+    let (mut command, control_read, _control_write) = worker_command();
+    let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
         .unwrap();
+    drop(control_read);
     let mut input = Vec::new();
-    input.extend(msg(&[b"hello", b"6"]));
+    input.extend(msg(&[b"hello", b"7"]));
     input.extend(request(b"1"));
     input.extend(request(b"2"));
     let mut stdin = child.stdin.take().unwrap();
@@ -373,18 +400,19 @@ fn worker_handshake_and_multiple_requests_share_one_process() {
     let out = child.wait_with_output().unwrap();
     let frames = decode_frames(&out.stdout);
     assert_eq!(frames.len(), 3, "ready plus two terminal responses");
-    assert_eq!(fields(&frames[0]), vec![b"ready".to_vec(), b"6".to_vec()]);
+    assert_eq!(fields(&frames[0]), vec![b"ready".to_vec(), b"7".to_vec()]);
     assert!(fields(&frames[1])[0] == b"ok" && fields(&frames[2])[0] == b"ok");
 }
 
 #[test]
 fn worker_protocol_mismatch_exits_after_incompatible_response() {
-    let mut child = zrush()
-        .arg("worker")
+    let (mut command, control_read, _control_write) = worker_command();
+    let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
         .unwrap();
+    drop(control_read);
     child
         .stdin
         .take()
@@ -395,7 +423,7 @@ fn worker_protocol_mismatch_exits_after_incompatible_response() {
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(
         fields(&decode_frames(&out.stdout)[0]),
-        vec![b"incompatible".to_vec(), b"6".to_vec()]
+        vec![b"incompatible".to_vec(), b"7".to_vec()]
     );
 }
 
@@ -403,14 +431,15 @@ fn worker_protocol_mismatch_exits_after_incompatible_response() {
 /// existence and single-line shape are pinned here.
 #[test]
 fn worker_session_fatal_failure_emits_one_diagnostic_line_on_stderr() {
-    let mut child = zrush()
-        .arg("worker")
+    let (mut command, control_read, _control_write) = worker_command();
+    let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    let mut input = msg(&[b"hello", b"6"]);
+    drop(control_read);
+    let mut input = msg(&[b"hello", b"7"]);
     input.extend_from_slice(b"1:x!");
     child.stdin.take().unwrap().write_all(&input).unwrap();
 
@@ -477,7 +506,7 @@ fn config_without_file_prints_contract_default_output() {
     let (code, out) = run_config(&dir);
     assert_eq!(code, 0);
     let expected = "\
-typeset -g  ZRUSH_PROTOCOL_VERSION='6'
+typeset -g  ZRUSH_PROTOCOL_VERSION='7'
 typeset -g  ZRUSH_CFG_MAX_LINES='10'
 typeset -g  ZRUSH_CFG_DELAY_MS='30'
 typeset -g  ZRUSH_CFG_MIN_INPUT='0'

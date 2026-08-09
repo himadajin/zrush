@@ -26,82 +26,132 @@ zsh は zle 統合・compsys 呼び出しによる捕獲・プランの適用
   (規範は `../contracts/cli-protocol.md`「適用」節)。
 - **入力は決してブロックしない**: 候補収集は非同期で行う。
   収集が遅い場合も「一覧が遅れて出る」だけで、打鍵は常に即応する。
-  ただし履歴メニュー(後述)はユーザーの明示操作であり、同期実行を許す:
-  走査する履歴エントリ数は `[history].limit` 件までに限り、worker 交換には固定の絶対 100ms deadline を置く。
+  この原則に対する同期的な例外は、ユーザーが明示した履歴メニュー(後述)と、
+  process の重複・frame 途中の EOF・fd の取り違えを防ぐための worker lifecycle 停止だけである。
+  履歴メニューで走査する履歴エントリ数は `[history].limit` 件までに限り、worker 交換には
+  固定の絶対 100ms deadline を置く。lifecycle 停止も後述の 1 本の絶対 100ms deadline 内だけ
+  同期待機を許し、正常 shutdown から異常 abort へ移っても更新しない。超過後は入力へ戻して
+  readiness-driven cleanup を続けるため、入力を無期限に止めない。
 - **確定は挿入のみ**: コマンドは実行しない(実行はもう一度 Enter)。
 - zrush は compinit を実行しない。compsys 未初期化を検知したら警告のみ表示する。
 
 ## worker ライフサイクル
 
-- 対話シェルごとに `zrush worker` を最大 1 プロセス持つ。source 時には `zrush config` だけを one-shot で実行し、
-  worker は最初の plan 要求が生じた時点で遅延起動する。worker は config.toml と `HISTFILE` を読まず、
-  候補キャッシュ・履歴 payload 合成・デバウンス/収集キャンセルの状態も持たない。
-- worker の stdin/stdout は pty ではなく専用 pipe へ接続する。zsh は stdout の read fd を `zle -F` で監視し、
-  通常の補完 plan 応答を非同期に読む。セッションの nested-netstring 形式と `hello` / `ready` 握手は
-  `../contracts/cli-protocol.md` が定める。
-- worker は対話シェルの job table に登録せず、動作中でもシェルの `exit` を妨げない。
-- 通常の補完経路では、worker の cold start と握手を待たない。起動処理は ZLE へ直ちに制御を返し、
-  `hello` も outbound queue の先頭フレームとして、他の plan 要求と同じく後述の writer child 経由で送る。
-  `ready` の受信は worker stdout の既存の `zle -F` callback で進める。
-  握手中に生じた plan 要求は `hello` より後ろの outbound queue に置く。
-  同期的に worker を待ってよいのは履歴メニューだけであり、その待機も後述の 1 本の絶対 100ms deadline 内に限る。
-- worker stdin への送信はフレーム単位で行う。
-  フレームは不可分な送信単位であり、outbound queue は完成済みフレームのリストを持つだけで、
-  対話シェル側に送信オフセットは存在しない。
-  対話シェルは worker stdin(request FIFO)への blocking な write fd を worker 起動時に確保し、
-  FIFO パスの unlink 前に開いた上で cloexec を付けて worker には継承させない
-  (fork した子は cloexec の性質上、exec するまで fd を引き継ぐ)。
-  1 フレームの送信は、この blocking fd を渡して fork した短命な writer child に委譲する。
-  writer child は 1 回の `syswrite` でフレーム全体を書き切り、書き終えたら通知用パイプへ
-  ack バイトを 1 個書く。
-  writer child は worker と同じく対話シェルの job table に登録しない。
-  対話シェルは通知 fd を `zle -F` で監視し、blocking write を一切行わず
-  ZLE callback 内で書き込み完了を待たない。
-  ack の消費は通知 fd の readiness を確認したうえで行い、通知 fd の `zle -F` callback・
-  worker 応答の受信時・同期履歴ループのいずれから行ってもよい。
-  in-flight の writer child は常に高々 1 個であり、次のフレームは直前の child が
-  ack バイトを書いた時点で送る。
-  worker は受信した plan を直列に処理するため、この直列送信によって queue も request_id 順を保つ。
-  busy loop は行わない。
-- queue に入った通常の補完要求は、新しい要求で coalesce・置換・除去しない。
-  送信時点ですでに stale でも同じ session 上で順に送り、worker の終端応答まで読み取って UI への適用だけを捨てる。
-  request FIFO の backpressure が及ぶのは writer child の `syswrite` だけであり、ZLE を止める理由にはならない。
-  queue の残りは、writer child からの ack を受けてから次のフレームとして送る。
-- `request_id` は zsh が所有し、実 plan 要求ごとに増やす。同じシェルセッションでは worker の再起動後も
-  リセット・再利用しない。新しい実要求を開始した後に古い request_id の正常応答が届いても stale として捨て、
-  表示には適用しない。worker は受け取った各要求へ `ok` / `error` を 1 個返し、zsh 側の stale 判定を理由に
-  応答を省略させない。
-- 外側/nested framing の破損、stdout の EOF/read error、writer child の通知 fd が ack バイトなしで
-  EOF に達すること(stdin の write 失敗)、予期しない終了、要求と対応しない応答、
-  仕様を満たさない `ok` の描画プラン、履歴交換の deadline 超過は **worker セッション失敗**である。
-  stdin の write 失敗は通知 fd の EOF/ack のみで判定し、writer child の終了ステータスからは
-  一切推測しない。
-  その session に割り当て済みで終端応答のない要求を、writer child に渡して送信中のフレーム・
-  outbound queue 内のフレーム・送信済みの要求の区別なくすべて破棄し、既存一覧も消す。
-  いずれも自動 replay しない。
-  in-flight の writer child がいれば、未送信のフレームを queue から破棄したうえで
-  その child の終了を有界時間だけ待ち、なお終了しなければ TERM してから KILL する。
-  フレーム送信の途中で kill された child は request FIFO に不完全なフレームを残すが、
-  これは worker がフレーミングエラーとして検出する想定内の abort 挙動であり、正常な EOF とは区別できる。
-  worker プロセスが残っていれば終了させて消滅を確認し、`zle -F` watcher を解除して
-  stdin/stdout pipe fd と通知 fd を閉じ、head-of-line blocking を残さない。
-  この cleanup が完了するまで代替 worker を起動せず、worker を重複させない。
-- 連続 worker セッション失敗回数は、正常に形成された終端 `ok` / `error` を受けたときだけ 0 に戻す。
-  握手成功だけでは戻さない。1 回目の失敗後は worker 不在のままにし、**次の実要求**で 1 個だけ代替 worker を
-  遅延起動する。終端応答を 1 個も受けないまま 2 回目のセッション失敗が起きたら、そのシェルでは zrush を無効化する。
-  無限 respawn や one-shot plan への fallback は行わない。
-- `hello` / `ready` の版不一致または worker の `incompatible` 応答は、失敗回数による再起動を介さず
-  即座に zrush を無効化する。source 時の `zrush config` 版照合も同じく不一致なら無効化する。
-- worker 障害のユーザー向け警告は、種類や再発回数によらず同じシェルセッションで高々 1 回表示する。
-  `ZRUSH_LOG` が設定されている場合、ユーザー向け警告を抑止した後も各障害の診断を追記する。
-- worker の起動・通常終了・異常終了・再起動・re-source・無効化を含む全 lifecycle で、zsh が所有する
-  内部 fd の操作は対話シェル自身の fd 0 / 1 / 2 の open / closed 状態と接続先を変更しない。
-  内部 fd の close error を抑止するときも、その抑止を対話シェルの標準エラーへ恒久適用しない。
-- 同じシェルで zrush.zsh を re-source するときは、既存 worker プロセスを終了させて消滅を確認し、`zle -F` watcher を解除して
-  stdin/stdout pipe fd を閉じてからフックとキーバインドを再構築する。cleanup 中に新旧 worker を重複させない。
-  re-source は同じシェルセッションの request_id 単調性・警告済み状態・連続失敗回数・無効化状態を巻き戻さない。
-  `zshexit` でも worker プロセスを終了させて消滅を確認し、watcher を解除して pipe fd を閉じる。
-  worker が既に終了していることはエラーにしない。
+- zsh script の source generation ごとに、mode 0700 の private runtime directory を 1 個同期的に作り、
+  その中に mode 0600 の request / response / abort-control FIFO を 1 個ずつ持つ。
+  request は worker stdin、response は worker stdout、abort-control は watchdog の入力に使う。
+  runtime directory と FIFO の path はその generation だけが所有し、設定項目にはしない。
+  runtime の作成は source 時だけに行い、遅延 worker 起動は既存の path を開くだけで同期的な directory/FIFO 作成を
+  行わない。通常の worker session 交換では taint されていない同じ directory を再利用し、re-source の handoff
+  完了時または shell exit 時に所有する正確な path だけを unlink して directory を破棄する。
+- runtime directory/FIFO の作成、worker spawn 前の各 endpoint fd 取得、cloexec の設定、active state の公開は
+  transaction として行う。spawn 前の失敗は local な fd/path を rollback し、部分的な session を公開しない。
+  未設定/割り当て失敗の fd を 0 と解釈せず、fd 0 / 1 / 2 を internal state へ格納したり stdin を監視したり、
+  worker 起動/交換を部分的に active にしたりしない。source 時の同期 setup に失敗した generation は
+  hook/keybind/worker transport を有効化しない。
+- worker を spawn した後の parent endpoint allocation・cloexec・active-state 公開の失敗は、spawn 前の rollback には
+  戻せない。local response/request/control fd を rollback 専用 state として公開して stopping gate を立て、control
+  byte/EOF と request close で fail-closed abort を開始する。worker が ownership を持つ response stream の read fd は
+  completion oracle として保持して raw drain し、response EOF と存在する writer gate の解決までは新しい worker を
+  許可しないため、部分公開や worker overlap を起こさない。
+- spawn 後の response watcher 登録に失敗した runtime は taint し、所有する 3 つの FIFO 名を直ちに unlink して
+  既に開いた inode へ old worker/parent を閉じ込める。runtime directory/path の ownership ledger は source cleanup
+  まで保持し、response EOF まで上記の rollback quarantine を続ける。readiness cleanup を保証できない場合は
+  fail-closed のまま direct な明示 cleanup または shell exit に委ねてよい。EOF finalization 後も taint は残り、
+  同じ source generation で worker を交換しない。
+- worker は最初の実 plan 要求で遅延起動し、対話シェルごとに高々 1 個とする。
+  stdin/stdout は request/response FIFO に接続し、abort-control FIFO の read fd を
+  `zrush worker --control-fd N` で渡す(詳細は `../contracts/cli-protocol.md`)。
+  worker と短命な writer child は対話シェルの job table に登録せず、zsh は両者の numeric PID を
+  lifecycle state に記録せず、signal / `wait` / exit status で終了を判定しない。supervisor process も設けない。
+- worker は通常の request 処理より先に watchdog thread を起動する。zsh は正常 session 中、
+  abort-control FIFO の write fd を open のまま保持する。watchdog は control byte を 1 個でも受けた場合、
+  control EOF、または retry 不能な read error の場合に process 全体を `_exit(1)` させる。
+  正常な frame 境界の request EOF だけは worker の通常 exit 0 を生じさせる。
+  worker は response FIFO に接続した fd 1 を自身の lifetime 全体で所有し、起動時に cloexec を付けて
+  descendant へ継承させない。したがって raw drain 後の response EOF だけを worker completion の oracle とし、
+  control channel や request FIFO の EOF、job/exit status から完了を推測しない。
+- request/response の nested-netstring と `hello` / `ready` は
+  `../contracts/cli-protocol.md` が定める。通常の補完経路は cold start・握手・応答を同期的に待たず、
+  response fd の `zle -F` callback で進める。同期的に起動/plan 応答を待てるのは履歴メニューだけで、
+  その 1 本の絶対 100ms deadline に起動・握手・先行 request・対象応答をすべて含める。
+- worker stdin への送信単位は完成済み frame 1 個で、outbound queue に send offset を持たない。
+  対話シェル自身は request FIFO へ blocking write せず、cloexec 付き request write fd を fork した
+  短命な writer child に渡す。fork した child は request と通知以外の transport fd copy を直ちに閉じ、
+  control/response EOF を保持しない。writer は 1 回の `syswrite` で frame 全体を書き、直後に自身の request fd を
+  閉じてから通知 pipe へ ack byte 1 個を書く。ack は full-frame delivery を証明し、その時点で writer の
+  通知 watcher/fd、transport ownership、sole writer slot を解放するため、通常送信では writer process の
+  通知 EOF を待たず次 frame を渡してよい。ack 前の通知 EOF は write failure であり、通常 session を失敗にする。
+  停止中の unacked writer は ack または通知 EOF のどちらかを観測するまで replacement gate として残るが、
+  numeric PID や writer process の消滅確認は必要としない。
+- writer を spawn した後に notification fd の取得、watcher 登録、または slot 公開が失敗した場合は、frame が
+  request FIFO へ部分的に届いた可能性を否定できないため、その 3-FIFO runtime generation 全体を taint する。
+  所有する 3 つの FIFO 名を直ちに unlink して open 済み inode へ old writer/worker を閉じ込め、worker を異常 abort
+  する。取得済みの notification fd があれば ack/EOF まで gate として保持し、response EOF まで raw drain する。
+  runtime directory/path の ledger は source cleanup まで保持するが、taint された FIFO inode/runtime は replacement に
+  再利用しない。cleanup 後も同じ source generation では worker を再開せず、新しい source generation の同期 runtime
+  setup が成功した後だけ transport を再び有効化する。notification watcher 登録に失敗した場合は direct な明示
+  cleanup まで fail-closed でよい。
+- 通常の queue は coalesce・置換・除去せず request_id 順に直列送信する。送信時に stale でも worker の
+  終端応答まで読み、UI 適用だけを捨てる。backpressure を受けるのは writer の `syswrite` だけで、
+  ZLE callback は ack を同期的に待たず busy loop もしない。
+- response / writer-ack / drain の callback 登録ごとに同じ shell session 内で単調増加する compact generation を
+  割り当て、callback は fd と generation が現在の登録に一致するときだけ state を変更する。response と ack の
+  watcher は停止開始時にも登録を保ち、callback 自身が stopping gate を見て通常の parse/send ではなく raw drain /
+  stop-progress へ分岐する。停止専用の別 callback kind へ登録し直さない。finalization・rollback は watcher より先に
+  registration generation を無効化するため、snapshot 済み callback や numeric fd 再利用後の stale callback は
+  何もしない。fd/watcher/generation/active state の公開と rollback も transaction とする。
+- transport の停止には、健全な session を手放す **正常 shutdown** と、session を信用できない
+  **異常 abort** がある。どちらも最初に stopping gate を立て、normal callback と新しい enqueue/send/start を止め、
+  unhanded frame と session の未完了 request をすべて破棄し、一覧を消して replay しない。
+  zrush の disable policy は stop mode と別に決める。
+- 正常 shutdown は unhanded frame を破棄し、unacked writer があれば full-frame ack を待つ。
+  ack を受けると writer が既に自身の request fd を閉じているため、対話シェルの request write fd を閉じて
+  frame 境界の EOF を作る。その後も abort-control write fd は閉じず、response FIFO を bytes のまま EOF まで
+  raw drain する。drain 中の `ready` / `ok` / `error` は parse も UI 適用もしない。
+  response EOF と、writer slot が ack または通知 EOF で解決して通知 watcher/fd も解放済みであることの
+  両方で停止完了とする。
+- 異常 abort は abort-control FIFO へ byte 1 個(値は任意)の送信を 1 回だけ試み、その write fd と
+  対話シェルの request write fd を閉じる。byte を送れなくても control EOF が watchdog を停止させる。
+  response FIFO は正常 shutdown と同じく raw drain し、response EOF を worker completion とする。
+  unacked writer は ack または通知 EOF まで replacement gate に残す。abort は request を replay せず、
+  response を通常応答として parse/apply しない。
+- 1 回の lifecycle stop が入力を同期的に止めてよいのは、開始時に定めた **1 本の絶対 100ms deadline** 内だけである。
+  正常 shutdown 中の ack failure や session failure は同じ deadline のまま abort へ遷移し、
+  deadline を更新しない。deadline までに停止 predicates が揃わなければ control byte/EOF による abort を確実に開始して
+  入力へ制御を戻し、runtime directory・endpoint・stopping gate を quarantine として保持する。
+  以後は generation 検証付きの既存 ack/response callback が stopping branch で readiness-driven に writer gate の解決と
+  raw response drain を続け、新しい deadline や同期 loop を開始しない。response EOF と writer gate 解決後にだけ
+  finalization が fd/session state を解放し、代替 worker を許可する。
+- 外側/nested framing の破損、通常処理中の response EOF/read error、ack なしの writer 通知 EOF、
+  予期しない終了、要求と対応しない応答、仕様を満たさない `ok`、履歴交換の deadline 超過は
+  **worker session failure** であり、異常 abort を開始する。その session の未完了 request は
+  queue/送信中/送信済みを区別せず破棄して replay しない。
+- 連続 worker session failure 回数は、正常に形成された終端 `ok` / `error` を受けたときだけ 0 に戻す。
+  握手成功だけでは戻さない。1 回目の失敗を finalization した後は worker 不在のままとし、次の実要求で
+  代替 worker を 1 個だけ遅延起動する。終端応答なしの 2 回目でその shell の zrush を無効化し、
+  無限 respawn や one-shot fallback は行わない。ただし taint された runtime generation はこの通常の 1 回交換の
+  対象外であり、cleanup 後も fresh re-source まで代替 worker を起動しない。
+- `hello` / `ready` の版不一致、worker の `incompatible`、source/config の protocol 版不一致は
+  失敗回数を介さず zrush を無効化する。認識済み `incompatible` や local request_id 枯渇のように
+  transport が健全なら正常 shutdown、壊れた handshake/session なら異常 abort を使う。
+  stopping/quarantine 中の re-source・config reload・protocol 照合は fail fast し、新しい deadline や stop を
+  自動開始せず、既存 generation の functions/hooks/runtime directory/endpoints/stopping gate を保持する。
+- 同じ shell で re-source するときは、旧 generation の hook/keybind を外す前に正常 shutdown を開始する。
+  同じ invocation の deadline 内に predicates が揃った場合だけ旧 fd/path/hook を finalization し、
+  private runtime directory を破棄してから新 generation の同期 setup と hook/keybind 導入へ進む。
+  deadline 超過時は re-source 自体を失敗させ、非同期 cleanup は旧 worker session の finalization だけを行う。
+  新 generation の導入は cleanup 完了後の次の re-source invocation に任せる。
+  旧 generation が quarantine 中の re-source は fail fast し、新旧 transport を重複させない。
+  request_id と callback generation の単調性・警告済み状態・連続失敗回数・無効化状態は巻き戻さない。
+- `zshexit` も同じ停止を開始し、同期待ちは 100ms を超えない。deadline で未完了でも shell exit を妨げず、
+  control/request/response を含む所有 fd を閉じ、所有する正確な FIFO path と runtime directory を unlink する。
+  control EOF により worker watchdog は abort し、この経路も numeric PID・`wait`・exit status を使わない。
+- worker 障害の user warning は同じ shell session で高々 1 回表示する。`ZRUSH_LOG` が設定されていれば
+  warning 抑止後も診断を追記する。worker stderr は端末へ流さない。
+- worker の起動・正常 shutdown・異常 abort・交換・quarantine・re-source・disable・exit の全経路で、
+  internal fd 操作は対話シェル自身の fd 0 / 1 / 2 の open/closed 状態と接続先を変えない。
+  internal close error の抑止を shell stderr へ恒久適用しない。
 
 ## 候補収集
 

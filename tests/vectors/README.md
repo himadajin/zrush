@@ -70,7 +70,7 @@ A generated `expected` is a proposal, not an answer -- read it against cli-proto
 
 ## Who checks what
 
-`cargo test` checks `plan/`, `reject/`, and `reject-plan/` against the Rust worker and the `wire` reference parser. Reject vectors structurally validate exactly `[ready,6]` plus one terminal in-band `error`; no process exit 2/3 compatibility is tested.
+`cargo test` checks `plan/`, `reject/`, and `reject-plan/` against the Rust worker and the `wire` reference parser. Reject vectors structurally validate exactly `[ready,7]` plus one terminal in-band `error`; no process exit 2/3 compatibility is tested.
 Both runners independently implement the file format above, check every corpus file for canonical spelling, and hold their own codec to a round trip over arbitrary byte strings.
 `zsh -f tests/zsh/vectors.zsh` checks `encode/` against the zsh encoder `_zrush_encode_batch`,
 the history sender's line/event-number pairing and filtering against `_zrush_history_payload`,

@@ -5,6 +5,9 @@ edition = "2024"
 rust-version = "1.88"
 
 [dependencies]
+# Unix fd validation and the watchdog's process-wide immediate exit. The
+# standard library exposes OwnedFd but not fcntl(2) or _exit(2).
+libc = "0.2"
 # CLI argument parsing (derive). Declarative parsing keeps subcommand,
 # --help, and usage-error behavior robust at the process boundary.
 clap = { version = "4.6", features = ["derive"] }

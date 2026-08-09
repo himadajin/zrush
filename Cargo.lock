@@ -571,6 +571,7 @@ name = "zrush"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "libc",
  "nucleo-matcher",
  "proptest",
  "toml",

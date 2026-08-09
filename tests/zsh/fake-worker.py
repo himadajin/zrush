@@ -3,6 +3,7 @@
 
 import os
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -11,6 +12,7 @@ REAL = os.environ["ZRUSH_REAL_BIN"]
 CONTROL = Path(os.environ["ZRUSH_FAKE_CONTROL"])
 STATE = Path(os.environ["ZRUSH_FAKE_STATE"])
 COUNT = STATE.with_suffix(".count")
+DRAIN_TAIL_BYTES = 8 * 1024 * 1024
 
 
 def mode() -> str:
@@ -80,13 +82,27 @@ def fail(reason: str):
     raise SystemExit(18)
 
 
-def worker() -> None:
+def watchdog(control_fd: int) -> None:
+    while True:
+        try:
+            os.read(control_fd, 1)
+        except InterruptedError:
+            continue
+        except OSError:
+            os._exit(1)
+        os._exit(1)
+
+
+def worker(control_fd: int) -> None:
+    os.set_inheritable(1, False)
+    thread = threading.Thread(target=watchdog, args=(control_fd,), daemon=True)
+    thread.start()
     session = next_session()
     note(f"start {session}")
     hello = read_netstring(sys.stdin.buffer)
-    if hello is None or fields(hello) != [b"hello", b"6"]:
+    if hello is None or fields(hello) != [b"hello", b"7"]:
         fail("bad hello")
-    sys.stdout.buffer.write(message(b"ready", b"6"))
+    sys.stdout.buffer.write(message(b"ready", b"7"))
     sys.stdout.buffer.flush()
     note(f"ready {session}")
 
@@ -94,6 +110,18 @@ def worker() -> None:
         payload = read_netstring(sys.stdin.buffer)
         if payload is None:
             note(f"eof {session}")
+            if mode() == "drain":
+                # Deliberately not a protocol frame. Healthy transport shutdown
+                # must keep stdout open and drain bytes without parsing them.
+                # Eight MiB is well above the largest default pipe capacity in
+                # the supported macOS/Linux matrix, including Linux systems
+                # with 64 KiB pages. Flush therefore cannot finish unless the
+                # parent actively drains stdout.
+                tail = b"x" * DRAIN_TAIL_BYTES
+                sys.stdout.buffer.write(tail)
+                sys.stdout.buffer.flush()
+                note(f"tail {session} {len(tail)}")
+            note(f"exit {session}")
             return
         request = fields(payload)
         request_id = request[1].decode("ascii") if len(request) > 1 else "missing"
@@ -107,12 +135,12 @@ def worker() -> None:
         if action == "die":
             note(f"die {session} {request_id}")
             os._exit(19)
-        if action == "error":
+        if action in ("error", "drain"):
             sys.stdout.buffer.write(
                 message(b"error", request_id.encode(), b"invalid-request")
             )
             sys.stdout.buffer.flush()
-            note(f"error {session} {request_id}")
+            note(f"{action} {session} {request_id}")
             continue
         fail("unknown control " + action)
 
@@ -121,4 +149,12 @@ if len(sys.argv) < 2:
     os.execv(REAL, [REAL, *sys.argv[1:]])
 if sys.argv[1] != "worker" or mode() == "proxy":
     os.execv(REAL, [REAL, *sys.argv[1:]])
-worker()
+if len(sys.argv) != 4 or sys.argv[2] != "--control-fd":
+    fail("bad worker argv")
+try:
+    control = int(sys.argv[3])
+except ValueError:
+    fail("bad control fd")
+if control <= 2:
+    fail("bad control fd")
+worker(control)

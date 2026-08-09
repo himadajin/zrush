@@ -58,7 +58,7 @@ bindkey '^Xt' _zrt-dump-fds
 
 # ^Xq: deterministic test-only transport teardown before replacing the private
 # binary. Unlike typing an internal function call, this does not pollute history.
-_zrt_teardown_worker() { _zrush_worker_transport_teardown test }
+_zrt_teardown_worker() { _zrush_worker_shutdown }
 zle -N _zrt-teardown-worker _zrt_teardown_worker
 bindkey '^Xq' _zrt-teardown-worker
 
