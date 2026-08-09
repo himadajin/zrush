@@ -79,8 +79,8 @@ pub(crate) struct Parsed<'a> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct FramingError;
 
-/// Parse one complete candidate payload per cli-protocol.md. Mapping a
-/// `FramingError` to the worker response belongs to plan.rs/worker.rs.
+/// Parse one complete candidate payload per cli-protocol.md.
+/// Mapping a `FramingError` to the worker response belongs to worker.rs.
 pub(crate) fn parse(input: &[u8]) -> Result<Parsed<'_>, FramingError> {
     // NUL-terminated records: a non-empty stream must end with NUL, and
     // stripping it yields exactly the record list.

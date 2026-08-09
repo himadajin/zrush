@@ -11,6 +11,7 @@ use std::path::Path;
 use crate::framing::{self, Decoder};
 use crate::matching::Mode;
 use crate::plan::{self, Producer};
+use crate::record;
 use crate::wire::{BUILD_STAMP, parse_canonical_u64};
 
 const READ_BUFFER_SIZE: usize = 8192;
@@ -243,7 +244,7 @@ fn process_request<W: Write>(fields: &[Vec<u8>], output: &mut W) -> Result<(), E
             let is_dir = |path: &[u8]| is_dir_from(cwd, path);
             match plan::run(&params, payload, &is_dir) {
                 Ok(render_plan) => write_message(output, &[b"ok", request_id, &render_plan]),
-                Err(plan::Error::Framing) => {
+                Err(record::FramingError) => {
                     write_message(output, &[b"error", request_id, b"invalid-payload"])
                 }
             }
