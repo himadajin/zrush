@@ -537,6 +537,78 @@ sec_capture() {
     ng "(worker-1c) worker was not reused: first=$worker_after_first now=$worker_after_successive"
   fi
 
+  # A config process from a newer build causes the loaded generation to
+  # re-source the current binary once. The replacement is silent, preserves
+  # shell-session counters, and immediately restarts the previously-live worker.
+  local -i seq_before_auto=${${worker_after_successive#*seq=}%% *}
+  log_count 'build: automatic re-source completed'; local -i auto_config0=$REPLY
+  # Exercise the successful handoff rather than scheduler variance in the
+  # separately-covered 100 ms quarantine guard.
+  send_line '_ZRUSH_WORKER_SHUTDOWN_MS=5000'
+  sync_prompt
+  send_line '_ZRUSH_EXPECTED_BUILD_STAMP=deadbeef'
+  sync_prompt
+  print -r -- $'[display]\nmax-lines = 10' >| $XDG_CONFIG_HOME/zrush/config.toml
+  send_line ':'
+  sync_prompt
+  local -i auto_config_ready=1
+  wait_worker_state 10 ready=1 disabled=0 stale=0 buildwarned=0 following=0 verifying=0 \
+    stopping=0 tainted=0 pending=0 || auto_config_ready=0
+  local auto_config_state= auto_config_runtime=
+  dump_get $'\C-xw' TESTWORKER && auto_config_state=$REPLY
+  auto_config_runtime=${${auto_config_state#*runtime=}%% *}
+  local -i auto_config_rfd=${${auto_config_state#*rfd=}%% *}
+  if (( auto_config_ready && auto_config_rfd > 2 )) \
+     && wait_log 'build: automatic re-source completed' $auto_config0 5 \
+     && worker_state_has "$auto_config_state" ready=1 seq=$seq_before_auto disabled=0 stale=0 \
+          buildwarned=0 following=0 verifying=0 stopping=0 tainted=0 pending=0 \
+     && [[ $auto_config_runtime != '<none>' && $auto_config_runtime != $successive_runtime \
+           && ! -e $successive_runtime ]]; then
+    ok "(build-1a) config stamp mismatch silently re-sources and restarts the live worker"
+  else
+    ng "(build-1a) automatic config follow failed: state=${auto_config_state:-<none>} old=$successive_runtime"
+  fi
+  rm -f $XDG_CONFIG_HOME/zrush/config.toml
+  send_line ':'
+  sync_prompt
+
+  # The async worker-handshake path uses the same transition. Its pending
+  # request is not replayed (one keystroke misses), then a later input starts
+  # the replacement worker normally.
+  send_line '_ZRUSH_WORKER_SHUTDOWN_MS=5000'
+  sync_prompt
+  send_keys $'\C-xq'
+  wait_worker_state 10 ready=0 stopping=0 rfd=-1 wfd=-1 control=-1 ack=-1 pending=0 || \
+    ng "(build-1b setup) could not stop the prior worker"
+  print -r -- mismatch > $ZRUSH_FAKE_CONTROL
+  log_count 'build: automatic re-source completed'; local -i auto_worker0=$REPLY
+  send_keys 'ls fx/basic/al'
+  local -i auto_worker_followed=1
+  wait_log 'build: automatic re-source completed' $auto_worker0 10 || auto_worker_followed=0
+  wait_worker_state 10 ready=1 disabled=0 stale=0 buildwarned=0 following=0 verifying=0 \
+    stopping=0 tainted=0 pending=0 || auto_worker_followed=0
+  local auto_worker_state= auto_worker_runtime=
+  dump_get $'\C-xw' TESTWORKER && auto_worker_state=$REPLY
+  auto_worker_runtime=${${auto_worker_state#*runtime=}%% *}
+  if (( auto_worker_followed )) \
+     && worker_state_has "$auto_worker_state" ready=1 disabled=0 stale=0 buildwarned=0 \
+          following=0 verifying=0 stopping=0 tainted=0 pending=0 \
+     && [[ $auto_worker_runtime != '<none>' && $auto_worker_runtime != $auto_config_runtime \
+           && ! -e $auto_config_runtime ]]; then
+    ok "(build-1b) incompatible worker silently re-sources, restarts, and discards the in-flight request"
+  else
+    ng "(build-1b) automatic worker follow failed: state=${auto_worker_state:-<none>} old=$auto_config_runtime"
+  fi
+  print -r -- proxy > $ZRUSH_FAKE_CONTROL
+  if send_keys_wait_plan nonempty 'p' 10; then
+    ok "(build-1c) input after the missed stroke is served by the compatible replacement worker"
+  fi
+  clear_line
+  drain 0.3
+
+  dump_get $'\C-xw' TESTWORKER && worker_after_successive=$REPLY
+  successive_runtime=${${worker_after_successive#*runtime=}%% *}
+
   local -i seq_before_resource=${${worker_after_successive#*seq=}%% *}
   log_count 'worker: transport stopped'; local -i resource_stopped0=$REPLY
   # This case tests the completed handoff, not the separately-covered 100 ms
@@ -552,16 +624,16 @@ sec_capture() {
   post_resource_runtime=${${post_resource_state#*runtime=}%% *}
   if worker_state_has "$post_resource_state" ready=0 seq=$seq_before_resource stopping=0 tainted=0 \
        rfd=-1 wfd=-1 control=-1 ack=-1 pending=0 \
-     && [[ $post_resource_runtime != '<none>' && $post_resource_runtime != $first_runtime ]]; then
+     && [[ $post_resource_runtime != '<none>' && $post_resource_runtime != $successive_runtime ]]; then
     ok "(worker-1d) re-source tears down transport while preserving the request counter"
   else
     ng "(worker-1d) bad post-resource state: ${post_resource_state:-<none>}"
   fi
   if wait_log 'worker: transport stopped' $resource_stopped0 5 \
-     && [[ ! -e $first_runtime ]]; then
+     && [[ ! -e $successive_runtime ]]; then
     ok "(worker-1e) re-source observes response EOF before replacing the old runtime generation"
   else
-    ng "(worker-1e) old completion/runtime cleanup missing: runtime=$first_runtime"
+    ng "(worker-1e) old completion/runtime cleanup missing: runtime=$successive_runtime"
   fi
   assert_host_stdio "(fd-3) re-source teardown preserves host fd 0/1/2"
 

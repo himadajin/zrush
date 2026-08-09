@@ -233,7 +233,8 @@ reserialize_plan() {  # -> REPLY=bytes, or return 1 with REPLY=reason
 }
 
 {
-  typeset -g ZRUSH_NO_INIT=1
+  typeset -g TEST_BUILD_STAMP=deadbeef
+  typeset -g _ZRUSH_EXPECTED_BUILD_STAMP=$TEST_BUILD_STAMP ZRUSH_NO_INIT=1
   source $REPO/zsh/zrush.zsh || { out "FATAL: cannot source zrush.zsh"; exit 1 }
   unset ZRUSH_NO_INIT
   (( $+functions[_zrush_parse_plan] )) || { out "FATAL: _zrush_parse_plan undefined after source"; exit 1 }
@@ -303,7 +304,7 @@ reserialize_plan() {  # -> REPLY=bytes, or return 1 with REPLY=reason
   # Exercise the same incremental loop as _zrush_worker_read without a process
   # or zle. Every byte boundary is tried, and two responses deliberately share
   # one stream so delivery cannot depend on read chunking.
-  _zrush_encode_message ready 7
+  _zrush_encode_message ready "$TEST_BUILD_STAMP"
   local ready_frame=$REPLY
   _zrush_encode_message error 41 invalid-request
   local error_frame=$REPLY
@@ -330,7 +331,7 @@ reserialize_plan() {  # -> REPLY=bytes, or return 1 with REPLY=reason
         fi
       done
     done
-    [[ -z $rx && $delivered == 2 && $got[1] == 'ready|7' \
+    [[ -z $rx && $delivered == 2 && $got[1] == "ready|$TEST_BUILD_STAMP" \
        && $got[2] == 'error|41|invalid-request' ]] || { framing_ok=0; break }
   done
   (( framing_ok )) \
@@ -465,13 +466,14 @@ reserialize_plan() {  # -> REPLY=bytes, or return 1 with REPLY=reason
   fi
   unset _zrt_settle_calls
 
-  # An explicit incompatible handshake opens the permanent shell-session
-  # disable immediately; it is not counted as the first retryable failure.
+  # A second mismatch while automatic re-source is already in progress hits
+  # the one-attempt guard and disables only the stale loaded generation.
   # Populate every active endpoint slot needed by a healthy stop. stdout is
   # already at EOF, so shutdown must raw-drain it before finalizing.
   zmodload zsh/system zsh/datetime || { out "FATAL: lifecycle modules"; exit 1 }
   _zrush_worker_ready=0 _zrush_worker_failures=0 _zrush_disabled=0 _zrush_enabled=1
-  _zrush_worker_warned=0 _zrush_worker_stopping=0
+  _zrush_worker_warned=0 _zrush_build_warned=0 _zrush_worker_stopping=0
+  _zrush_build_following=1 _zrush_stale_disabled=0
   local -i mismatch_rfd mismatch_wfd mismatch_control_fd mismatch_drain_fd
   exec {mismatch_rfd}< /dev/null
   exec {mismatch_wfd}> /dev/null
@@ -480,22 +482,24 @@ reserialize_plan() {  # -> REPLY=bytes, or return 1 with REPLY=reason
   _zrush_worker_rfd=$mismatch_rfd _zrush_worker_wfd=$mismatch_wfd
   _zrush_worker_control_wfd=$mismatch_control_fd
   _zrush_worker_ack_fd=-1 _zrush_worker_drain_fd=$mismatch_drain_fd
-  _zrush_encode_message incompatible 7
+  _zrush_encode_message incompatible cafebabe
   local mismatch_frame=$REPLY
   _zrush_netstring_take "$mismatch_frame"
   _zrush_worker_handle_message "$REPLY" 2>/dev/null
-  if (( _zrush_disabled && !_zrush_enabled && _zrush_worker_failures == 0 \
-        && _zrush_worker_warned && _zrush_worker_rfd == -1 && _zrush_worker_wfd == -1 \
+  if (( !_zrush_disabled && _zrush_stale_disabled && !_zrush_enabled \
+        && _zrush_worker_failures == 0 && _zrush_build_warned \
+        && _zrush_worker_rfd == -1 && _zrush_worker_wfd == -1 \
         && _zrush_worker_control_wfd == -1 && _zrush_worker_ack_fd == -1 \
         && _zrush_worker_drain_fd == -1 )) \
      && [[ ! -e /dev/fd/$mismatch_rfd && ! -e /dev/fd/$mismatch_wfd \
            && ! -e /dev/fd/$mismatch_control_fd \
            && ! -e /dev/fd/$mismatch_drain_fd ]]; then
-    ok "worker lifecycle: protocol mismatch disables immediately and closes every transport fd"
+    ok "worker lifecycle: repeated build mismatch trips the one-shot guard and closes every transport fd"
   else
-    ng "worker lifecycle: mismatch state enabled=$_zrush_enabled disabled=$_zrush_disabled failures=$_zrush_worker_failures warned=$_zrush_worker_warned fds=$_zrush_worker_rfd,$_zrush_worker_wfd,$_zrush_worker_control_wfd,$_zrush_worker_ack_fd,$_zrush_worker_drain_fd"
+    ng "worker lifecycle: mismatch state enabled=$_zrush_enabled disabled=$_zrush_disabled stale=$_zrush_stale_disabled failures=$_zrush_worker_failures warned=$_zrush_build_warned fds=$_zrush_worker_rfd,$_zrush_worker_wfd,$_zrush_worker_control_wfd,$_zrush_worker_ack_fd,$_zrush_worker_drain_fd"
   fi
-  _zrush_disabled=0 _zrush_enabled=0 _zrush_worker_warned=0
+  _zrush_build_following=0 _zrush_stale_disabled=0
+  _zrush_disabled=0 _zrush_enabled=0 _zrush_worker_warned=0 _zrush_build_warned=0
 
   # Two failed sessions without an intervening terminal response open the
   # circuit breaker. The user-facing warning latch remains set after the first

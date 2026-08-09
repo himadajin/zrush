@@ -74,8 +74,9 @@ zrush が入力を勝手に書き換えることはない。`~` は展開され�
 
 - `command not found: compdef` が出る → compinit より前に zrush や他ツールの補完設定を
   source している。`.zshrc` の順序を見直す(`install.md`)。
-- source 時または最初の補完時に「protocol version」の警告が出る → `git pull` 後の rebuild 忘れ。
-  `cargo build --release` を実行して新しいシェルを起動する(版が合わないシェルでは zrush が無効になる)。
+- source 時または最初の補完時に「build stamp」の警告が出る → 通常の rebuild 後は自動追従するため、
+  `$ZRUSH_BIN init zsh` の再 source が失敗した状態。`ZRUSH_BIN` が現行の zrush を指すことを確認して
+  `cargo build --release` 後に明示的に re-source する。
 - worker の障害を示す警告が出て一覧が止まる → 次の要求で 1 回だけ worker を再起動する。
   再度失敗すると、そのシェルでは zrush が無効になる。新しいシェルで再試行し、必要なら
   `ZRUSH_LOG=<ファイル>` で診断ログを確認する。

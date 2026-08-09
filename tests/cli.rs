@@ -11,6 +11,8 @@ use std::process::{Command, Stdio};
 
 use zrush::wire;
 
+const BUILD_STAMP: &[u8] = env!("ZRUSH_BUILD_STAMP").as_bytes();
+
 fn zrush() -> Command {
     Command::new(env!("CARGO_BIN_EXE_zrush"))
 }
@@ -107,7 +109,7 @@ fn run_plan(extra: &[&str], stdin: &[u8]) -> (i32, Vec<u8>) {
         .stdin
         .take()
         .expect("stdin")
-        .write_all(&[msg(&[b"hello", b"7"]), req].concat())
+        .write_all(&[msg(&[b"hello", BUILD_STAMP]), req].concat())
         .expect("write stdin");
     let out = child.wait_with_output().expect("wait");
     let frames = decode_frames(&out.stdout);
@@ -389,7 +391,7 @@ fn worker_handshake_and_multiple_requests_share_one_process() {
         .unwrap();
     drop(control_read);
     let mut input = Vec::new();
-    input.extend(msg(&[b"hello", b"7"]));
+    input.extend(msg(&[b"hello", BUILD_STAMP]));
     input.extend(request(b"1"));
     input.extend(request(b"2"));
     let mut stdin = child.stdin.take().unwrap();
@@ -400,7 +402,10 @@ fn worker_handshake_and_multiple_requests_share_one_process() {
     let out = child.wait_with_output().unwrap();
     let frames = decode_frames(&out.stdout);
     assert_eq!(frames.len(), 3, "ready plus two terminal responses");
-    assert_eq!(fields(&frames[0]), vec![b"ready".to_vec(), b"7".to_vec()]);
+    assert_eq!(
+        fields(&frames[0]),
+        vec![b"ready".to_vec(), BUILD_STAMP.to_vec()]
+    );
     assert!(fields(&frames[1])[0] == b"ok" && fields(&frames[2])[0] == b"ok");
 }
 
@@ -417,13 +422,13 @@ fn worker_protocol_mismatch_exits_after_incompatible_response() {
         .stdin
         .take()
         .unwrap()
-        .write_all(&msg(&[b"hello", b"5"]))
+        .write_all(&msg(&[b"hello", b"deadbeef"]))
         .unwrap();
     let out = child.wait_with_output().unwrap();
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(
         fields(&decode_frames(&out.stdout)[0]),
-        vec![b"incompatible".to_vec(), b"7".to_vec()]
+        vec![b"incompatible".to_vec(), BUILD_STAMP.to_vec()]
     );
 }
 
@@ -439,7 +444,7 @@ fn worker_session_fatal_failure_emits_one_diagnostic_line_on_stderr() {
         .spawn()
         .unwrap();
     drop(control_read);
-    let mut input = msg(&[b"hello", b"7"]);
+    let mut input = msg(&[b"hello", BUILD_STAMP]);
     input.extend_from_slice(b"1:x!");
     child.stdin.take().unwrap().write_all(&input).unwrap();
 
@@ -506,7 +511,7 @@ fn config_without_file_prints_contract_default_output() {
     let (code, out) = run_config(&dir);
     assert_eq!(code, 0);
     let expected = "\
-typeset -g  ZRUSH_PROTOCOL_VERSION='7'
+typeset -g  ZRUSH_BUILD_STAMP='<build-stamp>'
 typeset -g  ZRUSH_CFG_MAX_LINES='10'
 typeset -g  ZRUSH_CFG_DELAY_MS='30'
 typeset -g  ZRUSH_CFG_MIN_INPUT='0'
@@ -532,7 +537,8 @@ typeset -ga ZRUSH_CFG_KEYBINDS=(
   'dismiss'      'seq:^G'
 )
 typeset -ga ZRUSH_CFG_WARNINGS=()
-";
+"
+    .replace("<build-stamp>", env!("ZRUSH_BUILD_STAMP"));
     assert_eq!(out, expected);
 }
 
@@ -617,7 +623,7 @@ fn sq_bytes(s: &[u8]) -> Vec<u8> {
 }
 
 #[test]
-fn init_zsh_prelude_and_body_match_binary_and_source() {
+fn init_zsh_preludes_and_body_match_binary_and_source() {
     let bin = env!("CARGO_BIN_EXE_zrush");
     let out = zrush()
         .args(["init", "zsh"])
@@ -628,6 +634,9 @@ fn init_zsh_prelude_and_body_match_binary_and_source() {
     let mut expected = b"typeset -g ZRUSH_BIN=${ZRUSH_BIN:-".to_vec();
     expected.extend(sq_bytes(bin.as_bytes()));
     expected.extend_from_slice(b"}\n");
+    expected.extend_from_slice(b"typeset -g _ZRUSH_EXPECTED_BUILD_STAMP='");
+    expected.extend_from_slice(BUILD_STAMP);
+    expected.extend_from_slice(b"'\n");
     let script =
         std::fs::read(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("zsh/zrush.zsh"))
             .expect("read zsh/zrush.zsh");

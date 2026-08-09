@@ -11,7 +11,7 @@ use std::path::Path;
 use crate::framing::{self, Decoder};
 use crate::matching::Mode;
 use crate::plan::{self, Producer};
-use crate::wire::{PROTOCOL_VERSION, parse_canonical_u64};
+use crate::wire::{BUILD_STAMP, parse_canonical_u64};
 
 const READ_BUFFER_SIZE: usize = 8192;
 const REQUEST_FIELD_COUNT: usize = 11;
@@ -211,16 +211,16 @@ fn process_hello<W: Write>(
     handshake: &mut Handshake,
     output: &mut W,
 ) -> Result<MessageResult, Error> {
-    if fields.len() != 2 || fields[0] != b"hello" || !is_canonical_positive(&fields[1]) {
+    if fields.len() != 2 || fields[0] != b"hello" || !is_build_stamp(&fields[1]) {
         return Err(Error::Protocol);
     }
 
-    if fields[1] != PROTOCOL_VERSION.as_bytes() {
-        write_message(output, &[b"incompatible", PROTOCOL_VERSION.as_bytes()])?;
+    if fields[1] != BUILD_STAMP.as_bytes() {
+        write_message(output, &[b"incompatible", BUILD_STAMP.as_bytes()])?;
         return Ok(MessageResult::Incompatible);
     }
 
-    write_message(output, &[b"ready", PROTOCOL_VERSION.as_bytes()])?;
+    write_message(output, &[b"ready", BUILD_STAMP.as_bytes()])?;
     *handshake = Handshake::Ready;
     Ok(MessageResult::Continue)
 }
@@ -318,8 +318,11 @@ fn parse_positive_usize(value: &[u8]) -> Option<usize> {
     usize::try_from(parsed).ok().filter(|number| *number > 0)
 }
 
-fn is_canonical_positive(value: &[u8]) -> bool {
-    parse_canonical_u64(value).is_some_and(|number| number > 0)
+fn is_build_stamp(value: &[u8]) -> bool {
+    !value.is_empty()
+        && value
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
 }
 
 fn decode_fields(message: &[u8]) -> Result<Vec<Vec<u8>>, Error> {
@@ -411,7 +414,7 @@ mod tests {
 
     #[test]
     fn handshake_and_multiple_requests_share_one_session() {
-        let hello = message(&[b"hello", b"7"]);
+        let hello = message(&[b"hello", BUILD_STAMP.as_bytes()]);
         let first = request(b"1", b"/", b"");
         let second = request(b"2", b"/", b"");
         let input = [hello, message(&first), message(&second)].concat();
@@ -419,7 +422,10 @@ mod tests {
 
         assert_eq!(run(Cursor::new(input), &mut output).unwrap(), End::Eof);
         let decoded = messages(&output);
-        assert_eq!(decoded[0], [b"ready".to_vec(), b"7".to_vec()]);
+        assert_eq!(
+            decoded[0],
+            [b"ready".to_vec(), BUILD_STAMP.as_bytes().to_vec()]
+        );
         assert_eq!(&decoded[1][..2], [b"ok".as_slice(), b"1".as_slice()]);
         assert_eq!(&decoded[2][..2], [b"ok".as_slice(), b"2".as_slice()]);
         assert_eq!(decoded[1][2], b"\0\x30\0\x30\0\x30\0");
@@ -429,18 +435,21 @@ mod tests {
     fn mismatch_replies_once_and_exits() {
         let mut output = Vec::new();
         assert_eq!(
-            run(Cursor::new(message(&[b"hello", b"5"])), &mut output).unwrap(),
+            run(Cursor::new(message(&[b"hello", b"deadbeef"])), &mut output).unwrap(),
             End::Incompatible
         );
         assert_eq!(
             messages(&output),
-            [vec![b"incompatible".to_vec(), b"7".to_vec()]]
+            [vec![
+                b"incompatible".to_vec(),
+                BUILD_STAMP.as_bytes().to_vec()
+            ]]
         );
     }
 
     #[test]
     fn correlatable_shape_and_payload_errors_are_in_band() {
-        let hello = message(&[b"hello", b"7"]);
+        let hello = message(&[b"hello", BUILD_STAMP.as_bytes()]);
         let bad_shape = message(&[b"other", b"7"]);
         let bad_payload = message(&request(b"8", b"/", b"unterminated"));
         let mut output = Vec::new();
@@ -453,7 +462,7 @@ mod tests {
         assert_eq!(
             messages(&output),
             [
-                vec![b"ready".to_vec(), b"7".to_vec()],
+                vec![b"ready".to_vec(), BUILD_STAMP.as_bytes().to_vec()],
                 vec![
                     b"error".to_vec(),
                     b"7".to_vec(),
@@ -475,7 +484,11 @@ mod tests {
             vec![b"plan".as_slice(), b"01".as_slice()],
             vec![b"plan".as_slice(), b"9223372036854775808".as_slice()],
         ] {
-            let input = [message(&[b"hello", b"7"]), message(&fields)].concat();
+            let input = [
+                message(&[b"hello", BUILD_STAMP.as_bytes()]),
+                message(&fields),
+            ]
+            .concat();
             let mut output = Vec::new();
             assert!(matches!(
                 run(Cursor::new(input), &mut output),
@@ -488,7 +501,7 @@ mod tests {
     #[test]
     fn completed_prefix_is_written_before_later_outer_corruption() {
         let input = [
-            message(&[b"hello", b"7"]),
+            message(&[b"hello", BUILD_STAMP.as_bytes()]),
             message(&request(b"1", b"/", b"")),
             b"1:x!".to_vec(),
         ]
@@ -504,7 +517,11 @@ mod tests {
     #[test]
     fn nested_framing_corruption_is_fatal() {
         let malformed_nested = framing::encode(b"4:plan,1:1");
-        let input = [message(&[b"hello", b"7"]), malformed_nested].concat();
+        let input = [
+            message(&[b"hello", BUILD_STAMP.as_bytes()]),
+            malformed_nested,
+        ]
+        .concat();
         let mut output = Vec::new();
         let Err(Error::Framing(error)) = run(Cursor::new(input), &mut output) else {
             panic!("expected a framing error");
@@ -520,8 +537,10 @@ mod tests {
         };
         assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
 
-        let Err(Error::Io(error)) = run(Cursor::new(message(&[b"hello", b"7"])), FailingWriter)
-        else {
+        let Err(Error::Io(error)) = run(
+            Cursor::new(message(&[b"hello", BUILD_STAMP.as_bytes()])),
+            FailingWriter,
+        ) else {
             panic!("expected an I/O error");
         };
         assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);

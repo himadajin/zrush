@@ -5,6 +5,25 @@ use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
+const BUILD_STAMP: &[u8] = env!("ZRUSH_BUILD_STAMP").as_bytes();
+
+fn netstring(payload: &[u8]) -> Vec<u8> {
+    let mut out = payload.len().to_string().into_bytes();
+    out.push(b':');
+    out.extend_from_slice(payload);
+    out.push(b',');
+    out
+}
+
+fn message(fields: &[&[u8]]) -> Vec<u8> {
+    netstring(
+        &fields
+            .iter()
+            .flat_map(|field| netstring(field))
+            .collect::<Vec<_>>(),
+    )
+}
+
 fn zrush() -> Command {
     Command::new(env!("CARGO_BIN_EXE_zrush"))
 }
@@ -38,20 +57,22 @@ fn spawn_worker() -> (Child, UnixStream) {
 }
 
 fn complete_handshake(child: &mut Child) {
+    let hello = message(&[b"hello", BUILD_STAMP]);
     child
         .stdin
         .as_mut()
         .expect("request stdin")
-        .write_all(b"12:5:hello,1:7,,")
+        .write_all(&hello)
         .expect("write hello");
-    let mut ready = [0_u8; 16];
+    let expected = message(&[b"ready", BUILD_STAMP]);
+    let mut ready = vec![0_u8; expected.len()];
     child
         .stdout
         .as_mut()
         .expect("response stdout")
         .read_exact(&mut ready)
         .expect("read ready");
-    assert_eq!(&ready, b"12:5:ready,1:7,,");
+    assert_eq!(ready, expected);
 }
 
 fn wait_bounded(child: &mut Child) -> ExitStatus {

@@ -65,14 +65,23 @@ fi
 # ---------------------------------------------------------------- Global state
 typeset -g  ZRUSH_BIN=${ZRUSH_BIN:-}
 typeset -gi _zrush_enabled=0
-typeset -gi _ZRUSH_EXPECTED_PROTO=7
 typeset -g  _zrush_cfg_path= _zrush_cfg_mtime=
 # Shell-session state intentionally survives a manual re-source.
 typeset -gi _zrush_request_seq=${_zrush_request_seq:-0}
 typeset -gi _zrush_worker_warned=${_zrush_worker_warned:-0}
-typeset -gi _zrush_proto_warned=${_zrush_proto_warned:-0}
+typeset -gi _zrush_build_warned=${_zrush_build_warned:-0}
 typeset -gi _zrush_worker_failures=${_zrush_worker_failures:-0}
 typeset -gi _zrush_disabled=${_zrush_disabled:-0}
+typeset -gi _zrush_build_following=${_zrush_build_following:-0}
+if (( _zrush_build_following )); then
+  typeset -gi _zrush_build_verifying=${_zrush_build_verifying:-0}
+else
+  # An explicit source is a fresh stale-build recovery attempt.
+  typeset -gi _zrush_build_verifying=0
+fi
+# A stale-build guard failure disables only this loaded generation. A later
+# explicit re-source starts a fresh attempt; fault-policy disable above survives.
+typeset -gi _zrush_stale_disabled=0
 typeset -gi _zrush_worker_stopping=${_zrush_worker_stopping:-0}
 typeset -gi _zrush_installed=0
 # Variables this script consumes from `zrush config` output (validation and rollback)
@@ -252,8 +261,82 @@ _zrush_config_mtime() {  # -> REPLY (numeric mtime or 'absent')
   return 0
 }
 
+# A generated build stamp is lowercase hex ASCII (cli-protocol.md).
+_zrush_valid_build_stamp() {
+  emulate -L zsh
+  setopt localoptions extendedglob
+  [[ -n $1 && $1 == [0-9a-f]## ]]
+}
+
+_zrush_build_follow_fail() {
+  emulate -L zsh
+  local why=$1
+  _zlog "build: automatic re-source failed: $why"
+  if (( !_zrush_build_warned )); then
+    _zrush_warn "build stamp mismatch: automatic re-source failed ($why); zrush disabled"
+    _zrush_build_warned=1
+  fi
+  _zrush_stale_disabled=1
+  _zrush_build_verifying=0
+  _zrush_enabled=0
+  (( $+functions[_zrush_worker_shutdown] )) && _zrush_worker_shutdown
+  (( $+functions[_zrush_teardown] )) && _zrush_teardown
+  return 1
+}
+
+# Load and evaluate the current binary's init output. Return 2 after a
+# successful generation replacement so callers from the old generation stop
+# immediately instead of continuing into duplicate setup or teardown.
+_zrush_follow_build() {  # diagnostic reason
+  emulate -L zsh
+  local why=$1 out init_file
+  local -i restart_worker=$(( ${_zrush_worker_rfd:--1} >= 0 ))
+  if (( _zrush_build_following || _zrush_build_verifying )); then
+    _zrush_build_follow_fail "stamp still mismatched after re-source"
+    return 1
+  fi
+  _zrush_build_following=1
+  _zlog "build: stamp mismatch ($why); re-sourcing $ZRUSH_BIN init zsh"
+  if ! out=$("$ZRUSH_BIN" init zsh 2>/dev/null); then
+    _zrush_build_following=0
+    _zrush_build_follow_fail "'$ZRUSH_BIN init zsh' failed"
+    return 1
+  fi
+  # A process-substitution writer would inherit the live worker transport FDs
+  # and could keep them open while the replacement tears the worker down.
+  init_file=$(command mktemp "${TMPDIR:-/tmp}/zrush-init-${UID}.XXXXXX" 2>/dev/null) || {
+    _zrush_build_following=0
+    _zrush_build_follow_fail "could not create a temporary init file"
+    return 1
+  }
+  if ! print -rn -- "$out" >| "$init_file"; then
+    command rm -f -- "$init_file"
+    _zrush_build_following=0
+    _zrush_build_follow_fail "could not write the temporary init file"
+    return 1
+  fi
+  source "$init_file"
+  local -i st=$?
+  command rm -f -- "$init_file"
+  _zrush_build_following=0
+  if (( st == 0 && _zrush_enabled && !_zrush_stale_disabled )); then
+    if (( restart_worker )); then
+      _zrush_build_verifying=1
+      if ! _zrush_worker_start; then
+        _zrush_build_verifying=0
+        _zlog "build: replacement worker start deferred after session failure"
+      fi
+    fi
+    _zlog "build: automatic re-source completed stamp=$_ZRUSH_EXPECTED_BUILD_STAMP"
+    return 2
+  fi
+  (( _zrush_stale_disabled )) || _zrush_build_follow_fail "re-sourced initialization failed"
+  return 1
+}
+
 # Run and source `zrush config`. $1=initial|reload
-# Returns 0 on success after updating global ZRUSH_CFG_* / ZRUSH_PROTOCOL_VERSION.
+# Returns 0 on a normal load, 2 when automatic re-source installed a new
+# generation, or 1 on failure.
 _zrush_load_config() {
   emulate -L zsh
   (( !${_zrush_worker_stopping:-0} )) || return 1
@@ -262,22 +345,16 @@ _zrush_load_config() {
   # eval assigns the globals in place, so snapshot the previous values first;
   # a failed load rolls back (a failed reload keeps the previous configuration).
   local rollback=
-  (( $+ZRUSH_PROTOCOL_VERSION )) && \
-    rollback=$(typeset -p ZRUSH_PROTOCOL_VERSION "${(@)_ZRUSH_CFG_VARS}" 2>/dev/null)
+  (( $+ZRUSH_BUILD_STAMP )) && \
+    rollback=$(typeset -p ZRUSH_BUILD_STAMP "${(@)_ZRUSH_CFG_VARS}" 2>/dev/null)
   # The protocol restricts output to static typeset assignments; evaluate in this controlled scope.
   if ! eval "$out" 2>/dev/null || ! _zrush_validate_config; then
     [[ -n $rollback ]] && eval "$rollback"
     return 1
   fi
-  if [[ $ZRUSH_PROTOCOL_VERSION != $_ZRUSH_EXPECTED_PROTO ]]; then
-    if (( ! _zrush_proto_warned )); then
-      _zrush_warn "protocol version mismatch: zsh expects $_ZRUSH_EXPECTED_PROTO, binary reports $ZRUSH_PROTOCOL_VERSION (rebuild zrush?); zrush disabled"
-      _zrush_proto_warned=1
-    fi
-    _zrush_disabled=1
-    _zrush_enabled=0
-    (( $+functions[_zrush_worker_shutdown] )) && _zrush_worker_shutdown
-    return 1
+  if [[ $ZRUSH_BUILD_STAMP != $_ZRUSH_EXPECTED_BUILD_STAMP ]]; then
+    _zrush_follow_build "zsh expects ${(qqqq)_ZRUSH_EXPECTED_BUILD_STAMP}, config reports ${(qqqq)ZRUSH_BUILD_STAMP}"
+    return $?
   fi
   _zrush_config_mtime
   _zrush_cfg_mtime=$REPLY
@@ -289,7 +366,7 @@ _zrush_load_config() {
 # even-length keybind array (cli-protocol.md); anything less fails the load.
 _zrush_validate_config() {
   emulate -L zsh
-  [[ -n $ZRUSH_PROTOCOL_VERSION ]] || return 1
+  _zrush_valid_build_stamp "$ZRUSH_BUILD_STAMP" || return 1
   local v
   for v in "${(@)_ZRUSH_CFG_VARS}"; do
     (( ${(P)+v} )) || return 1
@@ -315,12 +392,15 @@ _zrush_precmd() {
   _zrush_config_mtime
   if [[ $REPLY != $_zrush_cfg_mtime ]]; then
     _zlog "precmd: config mtime changed ($_zrush_cfg_mtime -> $REPLY); reloading"
-    if _zrush_load_config reload; then
-      _zrush_apply_keybinds    # reapply without capturing this layer as its own predecessor
-    else
-      _zlog "precmd: config reload failed; keeping previous values"
-      # Keep the previous configuration after a failed reload; see cli-protocol.md.
-    fi
+    _zrush_load_config reload
+    case $? in
+      0) _zrush_apply_keybinds ;; # reapply without capturing this layer as its own predecessor
+      2) return 0 ;;               # the replacement generation is already fully initialized
+      *)
+        _zlog "precmd: config reload failed; keeping previous values"
+        # Keep the previous configuration after a failed reload; see cli-protocol.md.
+        ;;
+    esac
   fi
   return 0
 }
@@ -1318,7 +1398,7 @@ _zrush_worker_start() {
   _zrush_worker_control_wfd=$parent_ctl
   _zrush_worker_ready=0
   _zrush_worker_rx=
-  _zrush_encode_message hello "$_ZRUSH_EXPECTED_PROTO"
+  _zrush_encode_message hello "$_ZRUSH_EXPECTED_BUILD_STAMP"
   _zrush_worker_txq=( "$REPLY" )
   _zrush_kick
   _zlog "worker: started rfd=$_zrush_worker_rfd wfd=$_zrush_worker_wfd controlfd=$_zrush_worker_control_wfd"
@@ -1410,15 +1490,15 @@ _zrush_worker_handle_message() {  # message [absolute-deadline]
   local -a f=( "${(@)reply}" )
 
   if (( !_zrush_worker_ready )); then
-    if (( $#f == 2 )) && [[ $f[1] == ready && $f[2] == $_ZRUSH_EXPECTED_PROTO ]]; then
+    if (( $#f == 2 )) && [[ $f[1] == ready && $f[2] == $_ZRUSH_EXPECTED_BUILD_STAMP ]]; then
       _zrush_worker_ready=1
+      _zrush_build_verifying=0
       _zlog "worker: handshake ready"
       return 0
     fi
-    if (( $#f == 2 )) && [[ $f[1] == incompatible && $f[2] == [1-9][0-9]# ]]; then
-      _zrush_worker_disable_policy "incompatible worker version ${(qqqq)f[2]}"
-      _zrush_worker_shutdown
-      _zrush_teardown
+    if (( $#f == 2 )) && _zrush_valid_build_stamp "$f[2]" \
+       && [[ $f[1] == incompatible || $f[1] == ready ]]; then
+      _zrush_follow_build "$f[1] worker stamp ${(qqqq)f[2]}"
       return 1
     fi
     _zrush_worker_disable_policy "invalid handshake response"
@@ -2440,12 +2520,18 @@ _zrush_init() {
   is-at-least 5.9 $ZSH_VERSION && _zrush_hl_memo=' memo=zrush'
 
   _zrush_config_path
-  # Always load config once at source time to guarantee protocol-version comparison.
-  if ! _zrush_load_config initial; then
-    (( _zrush_disabled )) || _zrush_warn "initial 'zrush config' failed; zrush disabled"
-    return 1
-  fi
-  (( _zrush_disabled )) && return 1
+  # Always load config once at source time to guarantee build-stamp comparison.
+  _zrush_load_config initial
+  case $? in
+    0) ;;
+    2) return 0 ;; # the replacement generation is already fully initialized
+    *)
+      (( _zrush_disabled || _zrush_stale_disabled )) || \
+        _zrush_warn "initial 'zrush config' failed; zrush disabled"
+      return 1
+      ;;
+  esac
+  (( _zrush_disabled || _zrush_stale_disabled )) && return 1
 
   _zrush_worker_runtime_prepare || {
     _zrush_warn "worker runtime FIFO setup failed; zrush disabled"
@@ -2481,7 +2567,7 @@ _zrush_init() {
 
   _zrush_enabled=1
   _zrush_installed=1
-  _zlog "init: enabled (bin=$ZRUSH_BIN proto=$ZRUSH_PROTOCOL_VERSION)"
+  _zlog "init: enabled (bin=$ZRUSH_BIN stamp=$ZRUSH_BUILD_STAMP)"
   return 0
 }
 

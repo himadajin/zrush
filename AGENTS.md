@@ -48,7 +48,7 @@ One-line titles — issue titles, PR titles, commit messages — are concise Eng
 A change is titled once: the issue names it, and the PR reuses that title — written as the commit message for the whole change, so that it can land on `main` unedited.
 Never write the ` (#N)` suffix by hand; GitHub appends it on squash merge.
 Omit the scope when the affected component is not yet known.
-Mark the type with `!` only for breakage the user sees — configuration, keybindings, observable behavior; a zsh ↔ Rust protocol version bump is internal and does not qualify.
+Mark the type with `!` only for breakage the user sees — configuration, keybindings, observable behavior; an internal zsh ↔ Rust wire-contract change does not qualify by itself.
 Bodies may be English or Japanese.
 
 Issue bodies must be self-contained for a reader who was not part of the conversation that spawned them:
@@ -73,7 +73,7 @@ zrush is alpha software developed by dogfooding; simplicity outranks continuity.
 
 - No backward compatibility.
   When behavior, config, protocol, or data formats change, replace the old form and delete the old code path in the same change — no deprecation shims, migration code, legacy aliases, or versioned fallbacks.
-  (The protocol version check stays: it detects a stale build, it is not a compat layer.)
+  (The build-stamp check detects a stale build; it is not a compat layer.)
 - Prefer a few principled rules over many ad-hoc ones.
   Growing special cases, conditionals, or implementation size relative to the goal is a sign of a wrong approach: step back and restructure so a general rule covers the cases, instead of patching case by case.
   If a requested change would require such growth, propose the simpler restructuring first.

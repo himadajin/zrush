@@ -25,7 +25,7 @@ bindkey '^Xh' _zrt-dump-rh
 # ^Xw: persistent-worker lifecycle state. This exposes only stable invariants
 # needed by driver.zsh (lazy start, reuse, monotonic ids, and clean teardown).
 _zrt_dump_worker() {
-  _zlog "TESTWORKER=ready=$_zrush_worker_ready seq=$_zrush_request_seq failures=$_zrush_worker_failures disabled=$_zrush_disabled warned=$_zrush_worker_warned stopping=$_zrush_worker_stopping tainted=$_zrush_worker_runtime_tainted rfd=$_zrush_worker_rfd wfd=$_zrush_worker_wfd control=$_zrush_worker_control_wfd ack=$_zrush_worker_ack_fd pending=$#_zrush_worker_pending runtime=${_zrush_worker_runtime_dir:-<none>}"
+  _zlog "TESTWORKER=ready=$_zrush_worker_ready seq=$_zrush_request_seq failures=$_zrush_worker_failures disabled=$_zrush_disabled stale=$_zrush_stale_disabled warned=$_zrush_worker_warned buildwarned=$_zrush_build_warned following=$_zrush_build_following verifying=$_zrush_build_verifying stopping=$_zrush_worker_stopping tainted=$_zrush_worker_runtime_tainted rfd=$_zrush_worker_rfd wfd=$_zrush_worker_wfd control=$_zrush_worker_control_wfd ack=$_zrush_worker_ack_fd pending=$#_zrush_worker_pending runtime=${_zrush_worker_runtime_dir:-<none>}"
 }
 zle -N _zrt-dump-worker _zrt_dump_worker
 bindkey '^Xw' _zrt-dump-worker

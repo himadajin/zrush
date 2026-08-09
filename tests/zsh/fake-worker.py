@@ -100,9 +100,21 @@ def worker(control_fd: int) -> None:
     session = next_session()
     note(f"start {session}")
     hello = read_netstring(sys.stdin.buffer)
-    if hello is None or fields(hello) != [b"hello", b"7"]:
+    hello_fields = fields(hello) if hello is not None else []
+    if (
+        len(hello_fields) != 2
+        or hello_fields[0] != b"hello"
+        or not hello_fields[1]
+        or any(byte not in b"0123456789abcdef" for byte in hello_fields[1])
+    ):
         fail("bad hello")
-    sys.stdout.buffer.write(message(b"ready", b"7"))
+    if mode() == "mismatch":
+        CONTROL.write_text("proxy")
+        sys.stdout.buffer.write(message(b"incompatible", b"cafebabe"))
+        sys.stdout.buffer.flush()
+        note(f"mismatch {session}")
+        return
+    sys.stdout.buffer.write(message(b"ready", hello_fields[1]))
     sys.stdout.buffer.flush()
     note(f"ready {session}")
 
