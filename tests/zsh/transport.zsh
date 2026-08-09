@@ -95,7 +95,7 @@ unset ZDOTDIR
     _zrush_current_request=0 _zrush_sync_target=0 _zrush_sync_done=0 _zrush_sync_ok=0
     _zrush_worker_failures=0 _zrush_worker_warned=0 _zrush_build_warned=0
     _zrush_build_following=0 _zrush_build_verifying=0 _zrush_stale_disabled=0
-    _zrush_disabled=0 _zrush_enabled=0
+    _zrush_disabled=0 _zrush_disable_reason= _zrush_notice= _zrush_enabled=0
     _zrush_worker_callback_generation=( data 0 ack 0 drain 0 )
     _zrush_worker_callback_handler=()
     WARNINGS=()
@@ -591,21 +591,38 @@ unset ZDOTDIR
   unset ZRUSH_NO_INIT
   eq "explicit re-source after stale failure" $stale_resource_st 0
   eq "explicit re-source clears stale disable" $_zrush_stale_disabled 0
-  _zrush_disabled=1
+  _zrush_disabled=1 _zrush_disable_reason=session-failure _zrush_worker_failures=2 _zrush_build_following=1
+  typeset -g ZRUSH_NO_INIT=1
+  source $REPO/zsh/zrush.zsh; typeset -gi auto_fault_resource_st=$?
+  unset ZRUSH_NO_INIT
+  eq "automatic re-source with fault disable status" $auto_fault_resource_st 0
+  eq "automatic re-source preserves fault disable" $_zrush_disabled 1
+  eq "automatic re-source preserves fault counter" $_zrush_worker_failures 2
+  _zrush_build_following=0
+  _zrush_disabled=1 _zrush_disable_reason=session-failure
   typeset -g ZRUSH_NO_INIT=1
   source $REPO/zsh/zrush.zsh; typeset -gi fault_resource_st=$?
   unset ZRUSH_NO_INIT
   eq "fault-state test re-source status" $fault_resource_st 0
-  eq "explicit re-source preserves fault disable" $_zrush_disabled 1
-  _zrush_disabled=0
-  verdict "build follow: failed auto-source disables one generation while explicit source preserves only fault disable"
+  eq "explicit re-source clears session-failure disable" $_zrush_disabled 0
+  eq "explicit re-source clears session-failure reason" $_zrush_disable_reason ""
+  eq "explicit re-source clears session-failure counter" $_zrush_worker_failures 0
+  _zrush_disabled=1 _zrush_disable_reason=policy
+  typeset -g ZRUSH_NO_INIT=1
+  source $REPO/zsh/zrush.zsh; typeset -gi policy_resource_st=$?
+  unset ZRUSH_NO_INIT
+  eq "policy-state re-source status" $policy_resource_st 0
+  eq "explicit re-source preserves policy disable" $_zrush_disabled 1
+  eq "explicit re-source preserves policy reason" $_zrush_disable_reason policy
+  _zrush_disabled=0 _zrush_disable_reason=
+  verdict "build follow: explicit source clears only session-failure disable"
 
   # -------------------------------- config/re-source fail-fast during quarantine
   reset_transport
   _zrush_worker_runtime_prepare
   runtime=$_zrush_worker_runtime_dir
   _zrush_worker_stopping=1 _zrush_installed=1
-  _zrush_worker_failures=7 _zrush_disabled=1 _zrush_enabled=0
+  _zrush_worker_failures=7 _zrush_disabled=1 _zrush_disable_reason=session-failure _zrush_enabled=0
   typeset -g old_read_body=$functions[_zrush_worker_read]
   typeset -g old_runtime=$runtime
   ZRUSH_BIN=/definitely/not/invoked

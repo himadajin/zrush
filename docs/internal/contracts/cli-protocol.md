@@ -28,7 +28,9 @@ zrush.zsh(zsh 側)と `zrush` バイナリ(Rust 側)の入出力仕様。
   既に worker が起動していた場合は新 generation の worker も直ちに起動し直す。まだ遅延起動前なら lazy 状態を保つ。
   試行は 1 回だけで、成功時は警告せず `ZRUSH_LOG` にだけ記録する。re-source 自体の失敗、または
   re-source 中の再度の不一致は警告を 1 回表示して zrush を無効化する。後の明示的 re-source は
-  この stale-build 無効化を巻き戻せるが、障害起因の shell-session 無効化は巻き戻さない。
+  この stale-build 無効化を巻き戻せる。session failure の circuit breaker は、旧 worker の停止が完了した
+  後の明示的 re-source でだけ解除できる。自動 re-source、quarantine 中の re-source、その他の disable reason は
+  解除しない。
 - 未知の引数を渡された `zrush` は exit 2 で拒否する(前方互換より誤用の早期検出を優先する意図的選択。
   build 不整合は上記のスタンプ照合で検知される)。
 

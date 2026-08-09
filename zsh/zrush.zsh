@@ -66,24 +66,38 @@ fi
 typeset -g  ZRUSH_BIN=${ZRUSH_BIN:-}
 typeset -gi _zrush_enabled=0
 typeset -g  _zrush_cfg_path= _zrush_cfg_mtime=
-# Shell-session state intentionally survives a manual re-source.
+# Shell-session identity/latches survive a manual re-source; the
+# session-failure breaker below is the explicit recovery exception.
 typeset -gi _zrush_request_seq=${_zrush_request_seq:-0}
 typeset -gi _zrush_worker_warned=${_zrush_worker_warned:-0}
 typeset -gi _zrush_build_warned=${_zrush_build_warned:-0}
 typeset -gi _zrush_worker_failures=${_zrush_worker_failures:-0}
 typeset -gi _zrush_disabled=${_zrush_disabled:-0}
+typeset -g  _zrush_disable_reason=${_zrush_disable_reason:-}
+typeset -g  _zrush_notice=${_zrush_notice:-}
 typeset -gi _zrush_build_following=${_zrush_build_following:-0}
 if (( _zrush_build_following )); then
   typeset -gi _zrush_build_verifying=${_zrush_build_verifying:-0}
 else
   # An explicit source is a fresh stale-build recovery attempt.
   typeset -gi _zrush_build_verifying=0
+  if (( _zrush_disabled )) && [[ $_zrush_disable_reason == session-failure ]]; then
+    # A user-requested re-source starts a new recovery epoch. Automatic build
+    # following keeps this state latched; see behavior.md "worker ライフサイクル".
+    _zrush_disabled=0
+    _zrush_disable_reason=
+    _zrush_worker_failures=0
+    typeset -g _zrush_notice=
+    zle -R 2>/dev/null
+  fi
 fi
 # A stale-build guard failure disables only this loaded generation. A later
-# explicit re-source starts a fresh attempt; fault-policy disable above survives.
+# explicit re-source starts a fresh attempt; fault-policy disable above survives
+# unless it is the session-failure breaker handled above.
 typeset -gi _zrush_stale_disabled=0
 typeset -gi _zrush_worker_stopping=${_zrush_worker_stopping:-0}
 typeset -gi _zrush_installed=0
+typeset -gi _zrush_status_rendering=0
 # Variables this script consumes from `zrush config` output (validation and rollback)
 typeset -ga _ZRUSH_CFG_VARS=(
   ZRUSH_CFG_MAX_LINES ZRUSH_CFG_DELAY_MS ZRUSH_CFG_MIN_INPUT
@@ -164,6 +178,30 @@ typeset -gi _zrush_dsp_n=${_zrush_dsp_n:-0}
 _zlog() { [[ -n $ZRUSH_LOG ]] && print -r -- "[$$ ${EPOCHREALTIME:-0}] $1" >>| $ZRUSH_LOG; return 0 }
 
 _zrush_warn() { print -ru2 -- "zrush: $1" }
+
+# Display worker state through ZLE's redraw-safe status line. `zle -R` is a
+# no-op outside an active editor, which keeps source-time and headless tests
+# free of a terminal dependency. The hook calls this again on every redraw so
+# a latched notice remains visible while the state lasts.
+_zrush_status_refresh() {
+  emulate -L zsh
+  [[ -n $_zrush_notice ]] || return 0
+  (( _zrush_status_rendering )) && return 0
+  _zrush_status_rendering=1
+  zle -R "$_zrush_notice" 2>/dev/null
+  _zrush_status_rendering=0
+  return 0
+}
+
+_zrush_status_set() {
+  emulate -L zsh
+  typeset -g _zrush_notice=$1
+  if [[ -n $_zrush_notice ]]; then
+    _zrush_status_refresh
+  else
+    zle -R 2>/dev/null
+  fi
+}
 
 _zrush_close_internal_fd() {  # $1=owned fd; idempotent best-effort close
   emulate -L zsh
@@ -965,8 +1003,8 @@ _zrush_encode_message() {
 
 _zrush_worker_warn_once() {
   (( _zrush_worker_warned )) && return 0
-  _zrush_warn "worker transport failed; suppressing further warnings this session"
   _zrush_worker_warned=1
+  _zrush_status_set "zrush: worker transport failed; retrying once"
 }
 
 _zrush_worker_invalidate_callback() {  # data|ack|drain fd
@@ -1291,9 +1329,11 @@ _zrush_worker_shutdown() {
 _zrush_worker_disable_policy() {
   emulate -L zsh
   _zlog "worker: disabling: $1"
-  _zrush_worker_warn_once
+  (( _zrush_worker_warned )) || _zrush_worker_warned=1
+  _zrush_disable_reason=policy
   _zrush_disabled=1
   _zrush_enabled=0
+  _zrush_status_set "zrush: worker disabled ($1); start a new shell"
 }
 
 _zrush_worker_fail_session() {
@@ -1305,8 +1345,10 @@ _zrush_worker_fail_session() {
   _zrush_teardown
   (( ++_zrush_worker_failures ))
   if (( _zrush_worker_failures >= 2 )); then
+    _zrush_disable_reason=session-failure
     _zrush_disabled=1
     _zrush_enabled=0
+    _zrush_status_set "zrush: worker disabled after repeated failures; source <(zrush init zsh) to retry"
     _zlog "worker: circuit breaker opened"
   fi
   return 1
@@ -1530,6 +1572,7 @@ _zrush_worker_handle_message() {  # message [absolute-deadline]
     fi
     unset "_zrush_worker_pending[$id]"
     _zrush_worker_failures=0
+    _zrush_status_set ""
     if (( id == _zrush_sync_target )); then
       _zrush_sync_done=1 _zrush_sync_ok=0
     elif (( id == _zrush_current_request )); then
@@ -1552,6 +1595,7 @@ _zrush_worker_handle_message() {  # message [absolute-deadline]
   fi
   unset "_zrush_worker_pending[$id]"
   _zrush_worker_failures=0
+  _zrush_status_set ""
   if (( id == _zrush_sync_target )); then
     _zrush_plan_kind=$producer
     _zrush_sync_done=1 _zrush_sync_ok=1
@@ -2024,6 +2068,7 @@ _zrush_timer_fire() {  # zle -F -w handler ($1=fd)
 # ---------------------------------------------------------------- ZLE hooks
 _zrush_line_pre_redraw() {
   emulate -L zsh
+  _zrush_status_refresh
   (( _zrush_enabled )) || return 0
   [[ -n $ZRUSH_INTERNAL ]] && return 0
   [[ $BUFFER == "$_zrush_last_buffer" ]] && (( CURSOR == _zrush_last_cursor )) && return 0
@@ -2081,6 +2126,7 @@ _zrush_line_init() {
   _zrush_disarm_timer
   _zrush_cancel_collection
   _zrush_teardown
+  _zrush_status_refresh
   return 0
 }
 
@@ -2535,7 +2581,9 @@ _zrush_init() {
 
   _zrush_worker_runtime_prepare || {
     _zrush_warn "worker runtime FIFO setup failed; zrush disabled"
+    _zrush_disable_reason=runtime
     _zrush_disabled=1 _zrush_enabled=0
+    _zrush_notice="zrush: worker disabled (runtime setup failed); start a new shell"
     return 1
   }
 

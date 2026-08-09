@@ -132,6 +132,11 @@ zsh は zle 統合・compsys 呼び出しによる捕獲・プランの適用
   代替 worker を 1 個だけ遅延起動する。終端応答なしの 2 回目でその shell の zrush を無効化し、
   無限 respawn や one-shot fallback は行わない。ただし taint された runtime generation はこの通常の 1 回交換の
   対象外であり、cleanup 後も fresh re-source まで代替 worker を起動しない。
+- 2 回目の session failure による circuit breaker は `session-failure` の disable reason を持つ。
+  worker が健全に finalization された後、ユーザーが明示的に re-source した場合だけ、この reason と
+  failure counter を 0 に戻して新しい worker 起動を許可する。request_id、callback generation、warning latch は
+  戻さず、未完了 request の replay もしない。自動 build-stamp re-source はこの解除を行わない。
+  invalid handshake、request_id 枯渇、runtime setup failure など別の disable reason はこの操作で解除しない。
 - 正しい形の `incompatible`、stamp の異なる `ready`、source/config の build-stamp 不一致は stale build として
   失敗回数を介さず `$ZRUSH_BIN init zsh` の自動 re-source を 1 回だけ試みる。成功時は警告せず診断ログだけを残し、
   検出時点の未完了 request はすべて破棄して replay しない。re-source の失敗または re-source 中の再不一致だけが
@@ -146,13 +151,16 @@ zsh は zle 統合・compsys 呼び出しによる捕獲・プランの適用
   deadline 超過時は re-source 自体を失敗させ、非同期 cleanup は旧 worker session の finalization だけを行う。
   新 generation の導入は cleanup 完了後の次の re-source invocation に任せる。
   旧 generation が quarantine 中の re-source は fail fast し、新旧 transport を重複させない。
-  request_id と callback generation の単調性・警告済み状態・連続失敗回数・障害起因の無効化状態は巻き戻さない。
-  stale build のガード失敗による無効化だけは、後の明示的 re-source が新しい追従試行として巻き戻せる。
+  request_id と callback generation の単調性・警告済み状態は巻き戻さない。session-failure の disable reason と
+  連続失敗回数だけは、旧 generation の停止が完了した後の明示的 re-source で新しい recovery epoch として
+  巻き戻せる。自動 re-source、quarantine 中の re-source、その他の disable reason は巻き戻さない。
 - `zshexit` も同じ停止を開始し、同期待ちは 100ms を超えない。deadline で未完了でも shell exit を妨げず、
   control/request/response を含む所有 fd を閉じ、所有する正確な FIFO path と runtime directory を unlink する。
   control EOF により worker watchdog は abort し、この経路も numeric PID・`wait`・exit status を使わない。
-- worker 障害の user warning は同じ shell session で高々 1 回表示する。`ZRUSH_LOG` が設定されていれば
-  warning 抑止後も診断を追記する。worker stderr は端末へ流さない。
+- worker 障害の user notice は同じ shell session で高々 1 回表示し、ZLE の status line を使う。
+  最初の失敗では次の要求で 1 回だけ retry することを示し、circuit breaker が開いた後は
+  `source <(zrush init zsh)` による recovery 方法を disable 中の status line に表示し続ける。
+  `ZRUSH_LOG` が設定されていれば notice 抑止後も診断を追記する。worker stderr は端末へ流さない。
 - worker の起動・正常 shutdown・異常 abort・交換・quarantine・re-source・disable・exit の全経路で、
   internal fd 操作は対話シェル自身の fd 0 / 1 / 2 の open/closed 状態と接続先を変えない。
   internal close error の抑止を shell stderr へ恒久適用しない。

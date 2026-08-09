@@ -77,8 +77,9 @@ zrush が入力を勝手に書き換えることはない。`~` は展開され�
 - source 時または最初の補完時に「build stamp」の警告が出る → 通常の rebuild 後は自動追従するため、
   `$ZRUSH_BIN init zsh` の再 source が失敗した状態。`ZRUSH_BIN` が現行の zrush を指すことを確認して
   `cargo build --release` 後に明示的に re-source する。
-- worker の障害を示す警告が出て一覧が止まる → 次の要求で 1 回だけ worker を再起動する。
-  再度失敗すると、そのシェルでは zrush が無効になる。新しいシェルで再試行し、必要なら
-  `ZRUSH_LOG=<ファイル>` で診断ログを確認する。
+- worker の障害を示す notice が出て一覧が止まる → 次の要求で 1 回だけ worker を再起動する。
+  再度失敗すると、そのシェルでは zrush が無効になり、status line に recovery 方法が表示される。
+  worker の停止が完了した後に `source <(zrush init zsh)` を明示的に実行すると、その shell 内で再試行できる。
+  必要なら `ZRUSH_LOG=<ファイル>` で診断ログを確認する。
 - 設定の警告が出る → メッセージに「どのキーが・なぜ・どの値に戻したか」が出ている。
   該当行を修正すれば次のプロンプトから反映される。
