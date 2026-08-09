@@ -49,10 +49,10 @@ _zrt_dump_cursor() { _zlog "TESTCUR=$CURSOR" }
 zle -N _zrt-dump-cursor _zrt_dump_cursor
 bindkey '^Xz' _zrt-dump-cursor
 
-# ^Xt: debounce timer / in-flight collection fd state, for confirming nothing
-# is leaked across a send-break (driver.zsh's (h26); the existing (sb-1)
-# regression in this driver only checks _zrush_plan_npos/_zrush_listing, not
-# the timer/collection fds).
+# ^Xt: debounce timer / in-flight collection fd state, for confirming that a
+# send-break leaves behind neither an armed timer nor a live collection.
+# Neither is observable through the plan state (_zrush_plan_npos/
+# _zrush_listing) that the other send-break scenarios read.
 _zrt_dump_fds() { _zlog "TESTFDS=timer=$_zrush_timer_fd rfd=$_zrush_rfd wfd=$_zrush_wfd pty=${_zrush_pty:-<none>}" }
 zle -N _zrt-dump-fds _zrt_dump_fds
 bindkey '^Xt' _zrt-dump-fds
@@ -75,19 +75,19 @@ _zrt_dump_newest_event() {
 zle -N _zrt-dump-newest-event _zrt_dump_newest_event
 bindkey '^Xe' _zrt-dump-newest-event
 
-# Slow fake completion (behavior.md "候補収集" cancellation semantics,
-# exercised by driver.zsh's (h17)). Defined here as plain script rather than
-# a typed command, so this definition and its compdef registration never
-# become history entries themselves (they would otherwise coincidentally
-# contain "zrushtestslow"/"slowcand" and confuse the very query that scenario
-# uses to open the history menu).
+# Slow fake completion, for the scenarios that act while a collection is still
+# in flight (behavior.md "候補収集" cancellation semantics). Defined here as
+# plain script rather than a typed command, so this definition and its compdef
+# registration never become history entries themselves (they would otherwise
+# coincidentally contain "zrushtestslow"/"slowcand" and confuse the very query
+# those scenarios use to open the history menu).
 _zrushtestslow() { local -a m=(slowcandA slowcandB); sleep 0.5; compadd -a m }
 compdef _zrushtestslow zrushtestslow
 
 # Fixture history, oldest to newest ($history itself reports newest first, so
 # the *last* print -s here is position 1 of an unfiltered history menu).
-# Each entry's role in the driver.zsh scenarios is noted alongside it; keep
-# this list and those scenarios in sync if either changes.
+# Each entry's role in the scenarios that consume it is noted alongside it;
+# keep this list and those scenarios in sync if either changes.
 print -sr -- 'echo oldest'
 print -sr -- 'zqxstatusfoo'                                    # prefix match for query 'zqx' (older)
 print -sr -- 'echo mid1'

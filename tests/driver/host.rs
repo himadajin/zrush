@@ -30,6 +30,8 @@ pub mod keys {
     pub const DUMP_KIND: &str = "\x18k";
     /// The `$history` event number of the newest fixture line (history rc only).
     pub const DUMP_EVENT: &str = "\x18e";
+    /// Debounce-timer and in-flight-collection fd state (history rc only).
+    pub const DUMP_FDS: &str = "\x18t";
     /// `backward-char`: a cursor movement zrush never binds, i.e. an external
     /// CURSOR-only change (history rc only).
     pub const BACKWARD_CHAR: &str = "\x18l";
@@ -115,6 +117,12 @@ impl Host {
     /// Like [`Host::boot`], but under `tests/zsh/rc/history.zshrc`.
     pub fn boot_history() -> Self {
         Self::boot_with(HostRc::History, |_home| {}, false)
+    }
+
+    /// [`Host::boot_history`] with [`Host::boot_fake`]'s launcher, for the
+    /// history cases that inject a worker failure.
+    pub fn boot_history_fake() -> Self {
+        Self::boot_with(HostRc::History, |_home| {}, true)
     }
 
     fn boot_with(rc: HostRc, extra_fixtures: impl FnOnce(&Path), fake: bool) -> Self {
@@ -403,6 +411,12 @@ impl Host {
     pub fn listing_kind(&mut self, label: &str) -> String {
         self.dump_get(keys::DUMP_KIND, "TESTKIND")
             .unwrap_or_else(|| panic!("{label} listing-kind dump did not run"))
+    }
+
+    /// The `^Xt` collection dump: `timer=<fd> rfd=<fd> wfd=<fd> pty=<name>`.
+    pub fn collection_fds(&mut self, label: &str) -> String {
+        self.dump_get(keys::DUMP_FDS, "TESTFDS")
+            .unwrap_or_else(|| panic!("{label} collection-fd dump did not run"))
     }
 
     /// The `^Xp` POSTDISPLAY dump, unquoted.
