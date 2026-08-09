@@ -1,4 +1,4 @@
-# Host rc for headless regression tests, loaded by tests/zsh/driver.zsh through ZDOTDIR
+# Host rc for headless regression tests, loaded through ZDOTDIR by the Rust pty harness (tests/driver/) and by tests/zsh/driver.zsh
 # Required environment: ZRUSH_REAL_BIN (built zrush binary), ZRUSH_TEST_TMP (isolated tmp)
 PS1='HP> '
 autoload -Uz compinit

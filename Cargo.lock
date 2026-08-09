@@ -574,6 +574,7 @@ dependencies = [
  "libc",
  "nucleo-matcher",
  "proptest",
+ "tempfile",
  "toml",
  "unicode-width",
 ]
