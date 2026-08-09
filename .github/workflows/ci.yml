@@ -36,6 +36,8 @@ jobs:
         run: cargo test
       - name: zle driver
         run: zsh -f tests/zsh/driver.zsh "$(mktemp -d)"
+      - name: zsh keybind ownership
+        run: zsh -f tests/zsh/keybinds.zsh
       - name: zsh plan-decoder vectors
         run: zsh -f tests/zsh/vectors.zsh
       - name: zsh worker transport

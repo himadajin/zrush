@@ -407,6 +407,10 @@ zsh は zle 統合・compsys 呼び出しによる捕獲・プランの適用
 
 - キーのフォールバックは前任者チェーン(builtin 直呼びはしない)。
   config リロードでの再適用時に自分自身を前任者として捕まえない。
+- config リロードまたは re-source で不要になった dispatch layer は、キーと widget の両方を
+  zrush が直接所有している場合に限り、キーを前任者へ戻して function/widget 登録を解放する。
+  第三者の binding または wrapper が上にある layer は上書きも解放もせず、非 active な
+  dispatcher として前任者へ委譲させ、第三者を含む既存チェーンを維持する。
 - `zle-line-pre-redraw` は `add-zle-hook-widget` で登録する。
 - fork 内で候補を収集するときは、他プラグイン(zsh-autosuggestions など)が定義した
   compadd ラッパーを除去してから compsys を呼ぶ。この変更は fork 内に限られ、
