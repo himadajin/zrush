@@ -493,8 +493,9 @@ NUL(`\0`)終端フィールドの平坦列。数値は ASCII 10 進表記。順�
 
 #### 適用(zsh 側の規範)
 
-> 検証: 実際の zle 配線に対するスモークテスト — `tests/zsh/driver.zsh`
-> (`POSTDISPLAY` の組み立て、補完一覧の確定時の `LBUFFER` 置換と `RBUFFER` 保持)。
+> 検証: いずれも実際の zle 配線に対するスモークテスト。
+> `POSTDISPLAY` の組み立て — `tests/zsh/driver.zsh`。
+> 補完一覧の確定時の `LBUFFER` 置換と `RBUFFER` 保持 — `tests/driver/confirm.rs`(`cargo test --test driver`)。
 
 - **表示**: `L > 0` なら `POSTDISPLAY` を「改行 1 個 + L 個の表示行テキストを改行で連結したもの」に
   置き換える(オフセット規律の `$#BUFFER + 1` 加算は、この先頭の改行 1 個に対応する)。

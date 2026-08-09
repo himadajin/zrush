@@ -1,0 +1,12 @@
+//! zle-integration tests driving a real host zsh on a pty.
+//!
+//! Scope is the same as the zsh driver these tests replace: everything Rust
+//! cannot verify on its own -- that the real zle/compsys wiring captures
+//! candidates, ships them to the persistent worker, and applies the returned
+//! plan to POSTDISPLAY/region_highlight/BUFFER under real key input.
+
+mod confirm;
+mod fixtures;
+mod host;
+mod pty;
+mod select;

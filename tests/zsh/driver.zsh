@@ -57,7 +57,7 @@ typeset -g PLAYGROUND=${1:?usage: driver.zsh <playground-dir> [section ...]}
 # Canonical execution order of the test sections. Any sections named on the
 # command line run in this order, never in argument order; an empty selection
 # means every section.
-typeset -ga SECTIONS=( capture fifo async apply select confirm dismiss cache tab sendbreak death hist jobtable inflight )
+typeset -ga SECTIONS=( capture fifo async apply dismiss cache tab sendbreak death hist jobtable inflight )
 typeset -gA PICKED=()
 for SECTION_ARG in "${@[2,-1]}"; do
   (( ${SECTIONS[(I)$SECTION_ARG]} )) || { print -u2 "FATAL: unknown section '$SECTION_ARG' (valid: $SECTIONS)"; exit 1 }
@@ -150,14 +150,6 @@ mkdir -p $PLAYGROUND/fx/hidden
 # fx/headed: a plain file so _files' "file" tag heading appears in the plan.
 mkdir -p $PLAYGROUND/fx/headed
 : >| $PLAYGROUND/fx/headed/plainfile.txt
-
-# fx/longcol: candidate names wide enough to force a single-column grid
-# (gmaxw clamped to width => cols=1), so select-left/right jump deterministically
-# to the group's first/last position regardless of terminal width.
-mkdir -p $PLAYGROUND/fx/longcol
-: >| $PLAYGROUND/fx/longcol/"item-${(l:90::x:)}-1.txt"
-: >| $PLAYGROUND/fx/longcol/"item-${(l:90::x:)}-2.txt"
-: >| $PLAYGROUND/fx/longcol/"item-${(l:90::x:)}-3.txt"
 
 # fx/overflow: enough entries that a single compsys capture's candidate_payload
 # comfortably exceeds the request-FIFO buffer on either platform this driver
@@ -844,80 +836,6 @@ sec_apply() {
   else
     ng "(apl-1b/c) region_highlight dump did not run"
   fi
-  clear_line
-  drain 0.3
-}
-
-sec_select() {
-  # ================================================================ (4) Selection: nav table + highlight swap
-  send_keys_wait_plan nonempty 'ls fx/basic/al'
-  press $'\e[B'   # Down: select-next with nothing selected -> select-start (pos=1)
-  if wait_log 'select: start' -1 3; then
-    ok "(sel-1a) Down with a visible list starts selection (pos=1)"
-  else
-    ng "(sel-1a) selection did not start"
-  fi
-  if dump_get $'\C-xh' TESTRH; then
-    if [[ $REPLY == *'memo=zrush-sel'* ]] || { (( ! HAVE_MEMO )) && [[ $REPLY == *standout* ]] }; then
-      ok "(sel-1b) pos=1's own decoration (standout/selected) replaces its match highlight"
-    else
-      ng "(sel-1b) selected-cell decoration not found: ${REPLY:-<none>}"
-    fi
-  else
-    ng "(sel-1b) region_highlight dump did not run"
-  fi
-  log_count 'select: dir=next'; local -i c_next=$REPLY
-  press $'\e[B'
-  wait_log 'select: dir=next' $c_next 3 && ok "(sel-1c) Down again moves via the nav table (select-next)" || ng "(sel-1c) select-next did not fire"
-  log_count 'select: dir=prev'; local -i c_prev=$REPLY
-  press $'\e[A'
-  press $'\e[A'   # second Up: pos 1's prev = 0 (deselect)
-  wait_log 'select: dir=prev' $c_prev 3 && ok "(sel-1d) Up moves via the nav table (select-prev)" || ng "(sel-1d) select-prev did not fire"
-  if dump_get $'\C-xh' TESTRH; then
-    if [[ $REPLY != *'-sel'* && $REPLY != *standout* ]]; then
-      ok "(sel-1e) Up at position 1 deselects (no selected-cell decoration remains)"
-    else
-      ng "(sel-1e) selection was not released: ${REPLY:-<none>}"
-    fi
-  else
-    ng "(sel-1e) region_highlight dump did not run"
-  fi
-  clear_line
-  drain 0.3
-
-  # select-left/right on a forced single-column grid jump to the group's
-  # first/last position (cli-protocol.md "ナビ": grows == member count when cols=1).
-  send_keys_wait_plan nonempty 'ls fx/longcol/item'
-  press $'\e[B'   # select-start at pos=1
-  log_count 'select: dir=right'; local -i c_right=$REPLY
-  press $'\e[C'
-  wait_log 'select: dir=right' $c_right 3 && ok "(sel-2a) Right jumps toward the group's last position" || ng "(sel-2a) select-right did not fire"
-  log_count 'select: dir=left'; local -i c_left=$REPLY
-  press $'\e[D'
-  wait_log 'select: dir=left' $c_left 3 && ok "(sel-2b) Left jumps back toward the group's first position" || ng "(sel-2b) select-left did not fire"
-  press $'\C-g'
-  clear_line
-  drain 0.3
-}
-
-sec_confirm() {
-  # ================================================================ (5) Confirm: insertion text + RBUFFER preserved
-  send_keys_wait_plan nonempty 'ls fx/basic/subd'
-  press $'\e[B'
-  press $'\r'
-  assert_buffer 'ls fx/basic/subdir/' "(cfm-1) confirm inserts the plan's insertion text (directory '/' synthesis, no trailing space)"
-  clear_line
-  drain 0.3
-
-  # RBUFFER must survive confirmation untouched: type a word, move the cursor
-  # back inside it, and confirm what's before the cursor only.
-  send_keys_wait_plan zero 'ls fx/basic/alpEND'   # 'alpEND' matches nothing (case-sensitive: uppercase query)
-  # ^Xv (test helper): cursor lands between 'alp' and 'END'; the cursor move
-  # re-collects with the word 'alp', and that second plan is confirmed below.
-  send_keys_wait_plan nonempty $'\C-xv'
-  press $'\e[B'
-  press $'\r'
-  assert_buffer 'ls fx/basic/alpha.txt END' "(cfm-2) RBUFFER ('END') is preserved verbatim after confirming mid-word"
   clear_line
   drain 0.3
 }
