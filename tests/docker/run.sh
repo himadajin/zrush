@@ -6,7 +6,7 @@
 #
 # Builds tests/docker/Dockerfile (cached by the Docker daemon) and runs
 # tests/docker/suite.zsh inside it: cargo build/test plus the headless zsh
-# suites (driver.zsh, vectors.zsh, transport.zsh). CI's Linux matrix calls
+# suites (driver.zsh, keybinds.zsh, vectors.zsh, transport.zsh). CI's Linux matrix calls
 # exactly this script, so a CI failure reproduces locally with one command.
 #
 # bash, not zsh: this is the one script that must run on hosts whose zsh is

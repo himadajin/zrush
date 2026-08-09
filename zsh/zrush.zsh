@@ -38,7 +38,11 @@ if (( ${_zrush_installed:-0} || ${_zrush_worker_stopping:-0} ||
       # Do not overwrite a third-party binding installed above zrush.
       if [[ $cur == $w && ${widgets[$w]:-} == user:$w ]]; then
         prev=${_zrush_dsp_prev[$w]:-}
-        builtin bindkey -M main -- "$seq" ${prev:-undefined-key}
+        if builtin bindkey -M main -- "$seq" ${prev:-undefined-key}; then
+          zle -D $w 2>/dev/null
+          unfunction -- $w 2>/dev/null
+          unset "_zrush_dsp_prev[$w]"
+        fi
       fi
     done
     (( $+functions[add-zle-hook-widget] )) && {
@@ -2280,6 +2284,16 @@ _zrush_dispatch() {  # $1=action $2=predecessor $3=dispatcher name
 }
 
 # ---------------------------------------------------------------- Apply key bindings
+# behavior.md "プラグイン共存": caller has restored a directly owned layer.
+_zrush_release_dispatch() {  # $1=unbound dispatch widget name
+  emulate -L zsh
+  local w=$1
+  zle -D $w 2>/dev/null
+  unfunction -- $w 2>/dev/null
+  unset "_zrush_dsp_prev[$w]"
+  return 0
+}
+
 # Resolve key:<name> into bindable sequences using terminfo plus both CSI/SS3 arrows.
 _zrush_key_seqs() {  # $1=key:<name> -> reply=(sequences...)
   emulate -L zsh
@@ -2363,8 +2377,10 @@ _zrush_apply_keybinds() {
       local cur=${${(z)"$(builtin bindkey -M main -- "$seq" 2>/dev/null)"}[2]:-}
       if [[ $cur == $w && ${widgets[$w]:-} == user:$w ]]; then
         p=${_zrush_dsp_prev[$w]:-}
-        builtin bindkey -M main -- "$seq" ${p:-undefined-key}
-        _zlog "keybinds: restored ${(qqqq)seq} -> ${p:-undefined-key}"
+        if builtin bindkey -M main -- "$seq" ${p:-undefined-key}; then
+          _zrush_release_dispatch $w
+          _zlog "keybinds: restored ${(qqqq)seq} -> ${p:-undefined-key}; released $w"
+        fi
       fi
     fi
   done
