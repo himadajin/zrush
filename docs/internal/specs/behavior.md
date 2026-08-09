@@ -132,10 +132,13 @@ zsh は zle 統合・compsys 呼び出しによる捕獲・プランの適用
   代替 worker を 1 個だけ遅延起動する。終端応答なしの 2 回目でその shell の zrush を無効化し、
   無限 respawn や one-shot fallback は行わない。ただし taint された runtime generation はこの通常の 1 回交換の
   対象外であり、cleanup 後も fresh re-source まで代替 worker を起動しない。
-- `hello` / `ready` の版不一致、worker の `incompatible`、source/config の protocol 版不一致は
-  失敗回数を介さず zrush を無効化する。認識済み `incompatible` や local request_id 枯渇のように
+- 正しい形の `incompatible`、stamp の異なる `ready`、source/config の build-stamp 不一致は stale build として
+  失敗回数を介さず `$ZRUSH_BIN init zsh` の自動 re-source を 1 回だけ試みる。成功時は警告せず診断ログだけを残し、
+  検出時点の未完了 request はすべて破棄して replay しない。re-source の失敗または re-source 中の再不一致だけが
+  警告 1 回と無効化へ落ちる。旧 generation に worker がいた場合は replacement worker を直ちに起動して握手を検証し、
+  worker が未起動なら lazy 状態を保つ。認識済み `incompatible` や local request_id 枯渇のように
   transport が健全なら正常 shutdown、壊れた handshake/session なら異常 abort を使う。
-  stopping/quarantine 中の re-source・config reload・protocol 照合は fail fast し、新しい deadline や stop を
+  stopping/quarantine 中の re-source・config reload・build-stamp 照合は fail fast し、新しい deadline や stop を
   自動開始せず、既存 generation の functions/hooks/runtime directory/endpoints/stopping gate を保持する。
 - 同じ shell で re-source するときは、旧 generation の hook/keybind を外す前に正常 shutdown を開始する。
   同じ invocation の deadline 内に predicates が揃った場合だけ旧 fd/path/hook を finalization し、
@@ -143,7 +146,8 @@ zsh は zle 統合・compsys 呼び出しによる捕獲・プランの適用
   deadline 超過時は re-source 自体を失敗させ、非同期 cleanup は旧 worker session の finalization だけを行う。
   新 generation の導入は cleanup 完了後の次の re-source invocation に任せる。
   旧 generation が quarantine 中の re-source は fail fast し、新旧 transport を重複させない。
-  request_id と callback generation の単調性・警告済み状態・連続失敗回数・無効化状態は巻き戻さない。
+  request_id と callback generation の単調性・警告済み状態・連続失敗回数・障害起因の無効化状態は巻き戻さない。
+  stale build のガード失敗による無効化だけは、後の明示的 re-source が新しい追従試行として巻き戻せる。
 - `zshexit` も同じ停止を開始し、同期待ちは 100ms を超えない。deadline で未完了でも shell exit を妨げず、
   control/request/response を含む所有 fd を閉じ、所有する正確な FIFO path と runtime directory を unlink する。
   control EOF により worker watchdog は abort し、この経路も numeric PID・`wait`・exit status を使わない。
@@ -401,7 +405,8 @@ zsh は zle 統合・compsys 呼び出しによる捕獲・プランの適用
   (明示リロードなし。検証・フォールバック規則は config-schema.md)。
 - 設定警告は config を(再)読み込みしたプロンプトで stderr に 1 行ずつ表示する
   (再読み込みは mtime 変化時のみのため、変化のないプロンプトで再表示されない)。
-- zsh スクリプトとバイナリのプロトコル版が不一致の場合は警告を 1 回表示して zrush を無効化する。
+- zsh スクリプトとバイナリの build stamp が不一致の場合は自動 re-source を 1 回試みる。
+  成功時は警告せず、ガード失敗時だけ警告を 1 回表示して zrush を無効化する。
 
 ## プラグイン共存
 

@@ -14,52 +14,23 @@ zrush.zsh(zsh 側)と `zrush` バイナリ(Rust 側)の入出力仕様。
 検証行が挙げるのはテストの所在(ディレクトリまたはファイル)までで、個々のベクタ名は挙げない。
 ゴールデンベクタ群の構成・追加手順・カバー範囲は `tests/vectors/README.md`。
 
-## プロトコル版
+## ビルドスタンプ
 
-> 検証: 版番号のコピーの一致 — `src/wire.rs` のテスト `protocol_version_matches_docs_and_zsh`。
-
-- **PROTOCOL_VERSION = 7**
-- `zrush config` の出力に `ZRUSH_PROTOCOL_VERSION` が含まれる。
-  zrush.zsh は自身が期待する版番号と照合し、不一致なら警告を 1 回表示して zrush を無効化する。
-  zrush.zsh はバイナリに埋め込まれて配布される(「zrush init」節)ため、
-  読み込んだスクリプトとバイナリの版がずれることは構造的に無い。
-  この照合が検知するのは、既に起動中のシェルが rebuild 前の古いスクリプトを読み込んだままで、
-  かつ古い版の常駐 worker を保持している状況である。
+- `BUILD_STAMP` は Cargo build script が実際の package rebuild ごとに生成する一意な lowercase hex ASCII 値である。
+  同じバイナリに含まれる Rust worker、`zrush config`、`zrush init zsh` は必ず同じ値を使う。
+- `zrush init zsh` は期待値 `_ZRUSH_EXPECTED_BUILD_STAMP` を埋め込みスクリプトより前に注入し、
+  `zrush config` は実値 `ZRUSH_BUILD_STAMP` を出力する。zrush.zsh は source 時に両者を照合する。
+  worker 握手も同じスタンプを照合する。異なるビルド間の互換性は保証せず、単一規則
+  **同一 build stamp ⇔ 互換**を用いる。
 - 照合の機会を保証するため、zrush.zsh は **source 時に無条件で `zrush config` を 1 回実行**する
   (config.toml の mtime 変化だけをトリガにすると、バイナリのみ更新された場合に照合されない)。
-- 互換性が壊れる変更(フィールドの追加・削除・意味変更、worker の必須 CLI/control 契約、キー記法の変更)で
-  版番号を上げる。
+- スタンプ不一致を検出したシェルは `$ZRUSH_BIN init zsh` を自動で re-source し、現行ビルドへ追従する。
+  既に worker が起動していた場合は新 generation の worker も直ちに起動し直す。まだ遅延起動前なら lazy 状態を保つ。
+  試行は 1 回だけで、成功時は警告せず `ZRUSH_LOG` にだけ記録する。re-source 自体の失敗、または
+  re-source 中の再度の不一致は警告を 1 回表示して zrush を無効化する。後の明示的 re-source は
+  この stale-build 無効化を巻き戻せるが、障害起因の shell-session 無効化は巻き戻さない。
 - 未知の引数を渡された `zrush` は exit 2 で拒否する(前方互換より誤用の早期検出を優先する意図的選択。
-  版不整合は上記の警告で検知される)。
-
-### 版番号を上げる手順
-
-1. `src/wire.rs` の `PROTOCOL_VERSION` を上げる。
-2. `cargo test --no-fail-fast` を実行する。追従が必要な残りの箇所は、落ちたテストがすべて指す
-   (`--no-fail-fast` を付けないと最初に落ちたテストターゲットで止まり、`tests/cli.rs` の分は次の実行まで出てこない):
-   - `protocol_version_matches_docs_and_zsh`(`src/wire.rs`)が、この文書の 2 行
-     (この節の `- **PROTOCOL_VERSION = N**` と「zrush config」節の出力例の
-     `typeset -g  ZRUSH_PROTOCOL_VERSION='N'`)と `zsh/zrush.zsh` の
-     `typeset -gi _ZRUSH_EXPECTED_PROTO=N` のうち、追従できていないものを列挙する。
-   - `default_output_matches_contract_example`(`src/config.rs`)は「zrush config」節の出力例を読むので、
-     その例の版番号を直すまで落ちる(テスト側にコピーは無い。この文書を直せば追従する)。
-   - `config_without_file_prints_contract_default_output`(`tests/cli.rs`)は実プロセスの出力を
-     テスト内の独立したコピーと突き合わせるので、そのコピーも直す。
-   直して `cargo test` が green になることを確認する。
-3. ワイヤ形式も変えた場合はゴールデンを再生成する:
-   `UPDATE_GOLDEN=1 cargo test`(`tests/vectors/plan/` の worker セッション応答列)、
-   `UPDATE_GOLDEN=1 zsh -f tests/zsh/vectors.zsh`(`tests/vectors/encode/` の `expected`)。
-   どちらも更新が生じると更新一覧を添えて**わざと失敗する**ので、差分をレビューしてから同じコマンドを再実行し、
-   何も更新されない(= green になる)ことを確認する。
-   ベクタはエスケープされたテキストで、プランのゴールデンは 1 フィールド 1 行なので、差分はそのまま読める
-   (形式は `tests/vectors/README.md`)。
-   `tests/vectors/reject-plan/` は生成物ではないので手で書く。
-4. zsh 側のランナーと E2E ドライバを通す:
-   `zsh -f tests/zsh/vectors.zsh` と、`cargo build --release` の後に
-   `zsh -f tests/zsh/driver.zsh <playground-dir>`
-   (`zsh/` に触れる変更なので `tests/zsh/driver-coexist.zsh` も。AGENTS.md「Build and test」)。
-5. 版番号を名指ししている記述(`grep -rnE '\bv[0-9]+\b' src zsh tests docs`)を確認する。
-   どのテストも検出しないので、ここだけは手で追従させる。
+  build 不整合は上記のスタンプ照合で検知される)。
 
 ## 共通事項
 
@@ -160,23 +131,24 @@ message   = netstring(netstring(field-1) ... netstring(field-N))
   完成していたメッセージは先に処理し、OS の read 境界によって配送結果を変えない。
 - 候補レコードストリームと描画プランストリームは、それぞれ 1 個の opaque field として入れ子にする。
   その内側の NUL フレーミングは後述の規範を保つ。
-- kind・版番号・request_id・列挙値・真偽値・数値・error code は、以下に示す ASCII バイト列と
+- kind・build stamp・request_id・列挙値・真偽値・数値・error code は、以下に示す ASCII バイト列と
   完全一致しなければならない。前後空白、符号、別の大小文字表記を許さない。
 
-起動直後、zsh は最初の要求より前に `hello` を送り、worker はその版番号を照合して応答する。
-zsh は kind・フィールド数・版番号が完全一致する `ready` を受けたときだけセッションを利用する。
+起動直後、zsh は最初の要求より前に `hello` を送り、worker はその build stamp を照合して応答する。
+zsh は kind・フィールド数・build stamp が完全一致する `ready` を受けたときだけセッションを利用する。
+`build_stamp` は非空の lowercase hex ASCII (`[0-9a-f]+`)である。
 
 ```
-hello:        ["hello", "7"]
-ready:        ["ready", "7"]
-incompatible: ["incompatible", worker_version]
+hello:        ["hello", build_stamp]
+ready:        ["ready", build_stamp]
+incompatible: ["incompatible", worker_build_stamp]
 ```
 
-worker は `hello` の版番号が自身の版と一致しなければ、自身の canonical ASCII 版番号を
-`worker_version` に入れた `incompatible` を 1 個返して終了する。zsh は `incompatible`、版番号の異なる
-`ready`、または握手での別 kind・別フィールド数をプロトコル不一致として扱い、即座に zrush を無効化して
-同じシェル内で代替 worker を起動しない。EOF・I/O エラー・非 canonical framing は worker セッション失敗である。
-worker が受ける `hello` の kind・フィールド数・版番号表記自体が不正な場合は、応答せず終了する。
+worker は `hello` の build stamp が自身の値と一致しなければ、自身の stamp を
+`worker_build_stamp` に入れた `incompatible` を 1 個返して終了する。zsh は、正しい形の `incompatible` または
+stamp の異なる `ready` を stale build として扱い、自動 re-source を 1 回試みる。握手での別 kind・別フィールド数・
+不正な stamp は protocol failure、EOF・I/O エラー・非 canonical framing は worker session failure である。
+worker が受ける `hello` の kind・フィールド数・stamp 表記自体が不正な場合は、応答せず終了する。
 
 ### 要求と応答
 
@@ -295,7 +267,7 @@ Rust は zsh のクォート規則を一切実装しない
 (`${(Q)}` 復元・`${(q)}` クォートは zsh 側の責務)。
 
 Rust は重複候補(同一の match-text/display-text 組)を除去しない
-(送信側の発行順の情報を保つ。除去を導入する場合は版番号を上げる)。
+(送信側の発行順の情報を保つ。除去の導入は wire contract の変更である)。
 重複を送出してよいかは producer profile が定める。
 
 #### スキップ規律(規範)
@@ -554,7 +526,7 @@ zsh は一覧を消す。
     ずれるケースを含む)は**先頭候補(位置 1)を確定挿入**する(`tab = "insert"` と同じ確定動作)。
     候補 0 件なら何もしない。
 
-- 総マッチ件数は返さない(「+truncated 表示」を導入するときに版番号を上げて拡張する意図的保留)。
+- 総マッチ件数は返さない(「+truncated 表示」の導入は wire contract の拡張として意図的に保留する)。
 
 ### マッチング・ランキングの意味論
 
@@ -662,7 +634,7 @@ zrush config
 ### stdout(zsh source 形式)
 
 ```zsh
-typeset -g  ZRUSH_PROTOCOL_VERSION='7'
+typeset -g  ZRUSH_BUILD_STAMP='<build-stamp>'
 typeset -g  ZRUSH_CFG_MAX_LINES='10'
 typeset -g  ZRUSH_CFG_DELAY_MS='30'
 typeset -g  ZRUSH_CFG_MIN_INPUT='0'
@@ -719,7 +691,7 @@ typeset -ga ZRUSH_CFG_WARNINGS=()
 
 ## zrush init
 
-> 検証: 起動パースと exit 2(未指定・未知シェル・余計な引数)、prelude 行の形とその後に続く
+> 検証: 起動パースと exit 2(未指定・未知シェル・余計な引数)、2 本の prelude 行の形とその後に続く
 > 埋め込みスクリプト本体がリポジトリの `zsh/zrush.zsh` とバイト一致すること — `tests/cli.rs`。
 > `$ZRUSH_BIN` が既に設定されている場合に prelude の `${ZRUSH_BIN:-...}` 展開が
 > それを優先して使う規範自体は通常の zsh パラメータ展開であり、`tests/cli.rs` は固定しない
@@ -751,15 +723,21 @@ typeset -g ZRUSH_BIN=${ZRUSH_BIN:-'<自身の絶対パス>'}
 - 既に `$ZRUSH_BIN` が設定されている呼び出し元シェルでは、上記の zsh パラメータ展開
   `${ZRUSH_BIN:-...}` によりその値が優先される(prelude 側は常にこの展開形で出力するのみで、
   Rust 側で環境変数を分岐しない)。
-- 2 行目以降は、ビルド時に埋め込んだ `zsh/zrush.zsh` の内容をそのまま出力する。
+- 2 行目は同じバイナリの build stamp を注入する prelude。既存値を優先せず、re-source のたびに上書きする:
+
+```zsh
+typeset -g _ZRUSH_EXPECTED_BUILD_STAMP='<build-stamp>'
+```
+
+- 3 行目以降は、ビルド時に埋め込んだ `zsh/zrush.zsh` の内容をそのまま出力する。
 
 自身の絶対パスの解決、または標準出力への書き込みに失敗した場合は exit 1
 (`zrush config` の内部エラーと同じ扱い)。
 
 ## 想定シーケンス(参考・規範ではない)
 
-1. source 時: `.zshrc` の `source <(zrush init zsh)` が `$ZRUSH_BIN` prelude と埋め込みスクリプトを読み込む。
-   埋め込みスクリプト自身の source 時処理として `zrush config` を実行し、版番号を照合し、private runtime directory と
+1. source 時: `.zshrc` の `source <(zrush init zsh)` が `$ZRUSH_BIN` / build-stamp prelude と埋め込みスクリプトを読み込む。
+   埋め込みスクリプト自身の source 時処理として `zrush config` を実行し、build stamp を照合し、private runtime directory と
    request/response/abort-control FIFO を同期的・transactional に作成してからキーバインドを適用する。
 2. プロンプト表示ごと: config.toml の mtime を確認し、変化していれば
    `zrush config` を再実行して source、キーバインドを再適用、警告があれば表示。

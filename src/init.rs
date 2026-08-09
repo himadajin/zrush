@@ -1,6 +1,6 @@
 //! `zrush init zsh` (cli-protocol.md "zrush init").
 //!
-//! Emits a `ZRUSH_BIN` prelude line followed by the zle-integration script,
+//! Emits `ZRUSH_BIN` and build-stamp prelude lines followed by the zle-integration script,
 //! embedded into the binary at build time (`.zshrc` sources this command's
 //! output: `source <(zrush init zsh)`).
 
@@ -27,11 +27,14 @@ fn sq_bytes(s: &[u8]) -> Vec<u8> {
 
 /// Build the full `zrush init zsh` stdout: the `ZRUSH_BIN` prelude line
 /// (default = `bin_path`, overridable by an already-set `$ZRUSH_BIN`)
-/// followed by the embedded script.
+/// and the non-overridable build-stamp prelude followed by the embedded script.
 pub fn zsh_output(bin_path: &[u8]) -> Vec<u8> {
     let mut out = b"typeset -g ZRUSH_BIN=${ZRUSH_BIN:-".to_vec();
     out.extend(sq_bytes(bin_path));
     out.extend_from_slice(b"}\n");
+    out.extend_from_slice(b"typeset -g _ZRUSH_EXPECTED_BUILD_STAMP='");
+    out.extend_from_slice(crate::wire::BUILD_STAMP.as_bytes());
+    out.extend_from_slice(b"'\n");
     out.extend_from_slice(ZRUSH_ZSH.as_bytes());
     out
 }
@@ -63,8 +66,16 @@ mod tests {
     #[test]
     fn output_embeds_the_zsh_script_verbatim_after_the_prelude() {
         let out = zsh_output(b"/bin/zrush");
-        let mut lines = out.splitn(2, |&b| b == b'\n');
+        let mut lines = out.splitn(3, |&b| b == b'\n');
         lines.next().unwrap();
+        assert_eq!(
+            lines.next().unwrap(),
+            format!(
+                "typeset -g _ZRUSH_EXPECTED_BUILD_STAMP='{}'",
+                crate::wire::BUILD_STAMP
+            )
+            .as_bytes()
+        );
         assert_eq!(lines.next().unwrap(), ZRUSH_ZSH.as_bytes());
     }
 }

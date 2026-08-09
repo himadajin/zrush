@@ -40,6 +40,8 @@ unset ZDOTDIR
 
 {
   typeset -g ZRUSH_BIN=$REAL_BIN ZRUSH_NO_INIT=1
+  eval "$("$REAL_BIN" config)" || { out "FATAL: cannot read build stamp"; exit 1 }
+  typeset -g _ZRUSH_EXPECTED_BUILD_STAMP=$ZRUSH_BUILD_STAMP
   source $REPO/zsh/zrush.zsh || { out "FATAL: cannot source zrush.zsh"; exit 1 }
   unset ZRUSH_NO_INIT
   typeset -g LOGFILE=$WORK/zrush.log ZRUSH_LOG=$WORK/zrush.log
@@ -91,7 +93,9 @@ unset ZDOTDIR
     _zrush_worker_runtime_tainted=0
     _zrush_worker_txq=() _zrush_worker_pending=()
     _zrush_current_request=0 _zrush_sync_target=0 _zrush_sync_done=0 _zrush_sync_ok=0
-    _zrush_worker_failures=0 _zrush_worker_warned=0 _zrush_disabled=0 _zrush_enabled=0
+    _zrush_worker_failures=0 _zrush_worker_warned=0 _zrush_build_warned=0
+    _zrush_build_following=0 _zrush_build_verifying=0 _zrush_stale_disabled=0
+    _zrush_disabled=0 _zrush_enabled=0
     _zrush_worker_callback_generation=( data 0 ack 0 drain 0 )
     _zrush_worker_callback_handler=()
     WARNINGS=()
@@ -282,7 +286,7 @@ unset ZDOTDIR
   # ------------------------------------------------ real watchdog control byte
   reset_transport
   ZRUSH_BIN=$REAL_BIN
-  start_ready || note "real worker did not reach protocol-7 ready"
+  start_ready || note "real worker did not reach build-stamp ready"
   typeset -gi byte_rfd=$_zrush_worker_rfd
   _zrush_worker_abort $(( EPOCHREALTIME + 2.0 )); typeset -gi byte_st=$?
   eq "abort byte status" $byte_st 0
@@ -316,7 +320,7 @@ unset ZDOTDIR
   sysopen -rw -o cloexec -u HOLD_ANCHOR $HOLD_FIFO
   sysopen -r -o cloexec -u HOLD_R $HOLD_FIFO
   sysopen -w -o cloexec -u HOLD_W $HOLD_FIFO
-  _zrush_encode_message hello 7; typeset -g FRAME_A=$REPLY
+  _zrush_encode_message hello "$_ZRUSH_EXPECTED_BUILD_STAMP"; typeset -g FRAME_A=$REPLY
   _zrush_encode_message plan 1 / compsys q prefix false 1 1 false ''; typeset -g FRAME_B=$REPLY
   print -rn -- "$FRAME_A" >| $WORK/a.expected
   print -rn -- "$FRAME_B" >| $WORK/b.expected
@@ -570,6 +574,31 @@ unset ZDOTDIR
   exec {STALE_FD}>&-
   _zrush_worker_stopping=0
   verdict "callbacks: retained data/ack watchers branch on stopping and stale dispatch is inert"
+
+  # ----------------------------------------- build-follow guard and reset split
+  reset_transport
+  ZRUSH_BIN=/definitely/not/invoked
+  _zrush_enabled=1
+  _zrush_follow_build test; typeset -gi follow_fail_st=$?
+  eq "failed build follow status" $follow_fail_st 1
+  eq "failed build follow stale disable" $_zrush_stale_disabled 1
+  eq "failed build follow fault disable" $_zrush_disabled 0
+  eq "failed build follow warning latch" $_zrush_build_warned 1
+  eq "failed build follow warning count" $#WARNINGS 1
+  _zrush_build_following=0
+  typeset -g ZRUSH_NO_INIT=1
+  source $REPO/zsh/zrush.zsh; typeset -gi stale_resource_st=$?
+  unset ZRUSH_NO_INIT
+  eq "explicit re-source after stale failure" $stale_resource_st 0
+  eq "explicit re-source clears stale disable" $_zrush_stale_disabled 0
+  _zrush_disabled=1
+  typeset -g ZRUSH_NO_INIT=1
+  source $REPO/zsh/zrush.zsh; typeset -gi fault_resource_st=$?
+  unset ZRUSH_NO_INIT
+  eq "fault-state test re-source status" $fault_resource_st 0
+  eq "explicit re-source preserves fault disable" $_zrush_disabled 1
+  _zrush_disabled=0
+  verdict "build follow: failed auto-source disables one generation while explicit source preserves only fault disable"
 
   # -------------------------------- config/re-source fail-fast during quarantine
   reset_transport

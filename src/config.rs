@@ -9,7 +9,7 @@ use std::path::PathBuf;
 
 use crate::keybind;
 use crate::matching::Mode;
-use crate::wire::PROTOCOL_VERSION;
+use crate::wire::BUILD_STAMP;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TabBehavior {
@@ -351,7 +351,7 @@ pub fn to_zsh(result: &LoadResult) -> String {
     let c = &result.config;
     let mut o = String::new();
     let scalars: [(&str, String); 13] = [
-        ("ZRUSH_PROTOCOL_VERSION", PROTOCOL_VERSION.to_string()),
+        ("ZRUSH_BUILD_STAMP", BUILD_STAMP.to_string()),
         ("ZRUSH_CFG_MAX_LINES", c.max_lines.to_string()),
         ("ZRUSH_CFG_DELAY_MS", c.delay_ms.to_string()),
         ("ZRUSH_CFG_MIN_INPUT", c.min_input.to_string()),
@@ -749,8 +749,9 @@ mod tests {
 
     #[test]
     fn default_output_matches_contract_example() {
+        let actual = to_zsh(&LoadResult::default()).replace(BUILD_STAMP, "<build-stamp>");
         assert_eq!(
-            to_zsh(&LoadResult::default()),
+            actual,
             contract_default_output(),
             "default `zrush config` output disagrees with the example in {CONTRACT}, \
              which is the source of truth"

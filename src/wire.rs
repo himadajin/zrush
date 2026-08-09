@@ -5,9 +5,9 @@ use std::io::Write as _;
 
 use crate::layout;
 
-/// Protocol version shared by config output and the worker handshake
-/// (cli-protocol.md "プロトコル版").
-pub(crate) const PROTOCOL_VERSION: &str = "7";
+/// Per-build identity shared by init output, config output, and the worker
+/// handshake (cli-protocol.md "ビルドスタンプ").
+pub(crate) const BUILD_STAMP: &str = env!("ZRUSH_BUILD_STAMP");
 
 /// Incremental, overflow-checked ASCII decimal accumulation shared by the
 /// protocol's complete-field parsers and streaming netstring decoder.
@@ -466,51 +466,14 @@ fn tuple_parts(value: &[u8]) -> Vec<&[u8]> {
 mod tests {
     use super::*;
 
-    const CONTRACT: &str = "docs/internal/contracts/cli-protocol.md";
-
-    fn read_repo_file(relative_path: &str) -> String {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(relative_path);
-        std::fs::read_to_string(&path)
-            .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()))
-    }
-
-    /// PROTOCOL_VERSION is hand-written here, in two contract lines, and in
-    /// zsh/zrush.zsh. The tests/cli.rs config golden owns its remaining copy.
     #[test]
-    fn protocol_version_matches_docs_and_zsh() {
-        let expected: [(&str, String); 3] = [
-            (
-                CONTRACT,
-                format!("- **PROTOCOL_VERSION = {PROTOCOL_VERSION}**"),
-            ),
-            (
-                CONTRACT,
-                format!("typeset -g  ZRUSH_PROTOCOL_VERSION='{PROTOCOL_VERSION}'"),
-            ),
-            (
-                "zsh/zrush.zsh",
-                format!("typeset -gi _ZRUSH_EXPECTED_PROTO={PROTOCOL_VERSION}"),
-            ),
-        ];
-
-        let mismatches: Vec<String> = expected
-            .iter()
-            .filter(|(relative_path, expected_line)| {
-                !read_repo_file(relative_path)
-                    .lines()
-                    .any(|line| line.trim() == expected_line)
-            })
-            .map(|(relative_path, expected_line)| {
-                format!("{relative_path}: expected a line \"{expected_line}\"")
-            })
-            .collect();
-
+    fn build_stamp_is_lowercase_hex() {
+        assert!(!BUILD_STAMP.is_empty());
         assert!(
-            mismatches.is_empty(),
-            "PROTOCOL_VERSION mismatch: src/wire.rs::PROTOCOL_VERSION is \
-             {PROTOCOL_VERSION:?}, but the following locations disagree (or are \
-             missing the anchor line) and need to be updated to match:\n{}",
-            mismatches.join("\n")
+            BUILD_STAMP
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+            "invalid build stamp {BUILD_STAMP:?}"
         );
     }
 
