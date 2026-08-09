@@ -7,7 +7,7 @@
 
 use std::time::Duration;
 
-use crate::host::{Host, PlanShape, keys};
+use crate::host::{Host, PlanShape};
 
 #[test]
 fn send_break_resets_plan_state_for_the_next_prompt() {
@@ -21,9 +21,9 @@ fn send_break_resets_plan_state_for_the_next_prompt() {
     host.sync_prompt(Duration::from_secs(5));
 
     host.send_keys_wait_plan(PlanShape::Nonempty, "ls fx/basic/al"); // real, non-empty _zrush_plan_* now populated
-    host.send_keys(keys::SEND_BREAK); // send-break: abandon the line, bypassing line-finish
+    // send-break: abandon the line, bypassing line-finish
     assert!(
-        host.sync_prompt(Duration::from_secs(15)),
+        host.send_break_and_sync(Duration::from_secs(15)),
         "(sb-1a) no new prompt appeared after send-break"
     );
 

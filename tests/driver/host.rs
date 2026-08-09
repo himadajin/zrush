@@ -313,6 +313,42 @@ impl Host {
         ok
     }
 
+    /// Send `keys::SEND_BREAK` and wait for the prompt it produces, re-sending
+    /// about once a second until `deadline` elapses. zsh 5.9 defers a SIGINT
+    /// that arrives while the host is inside a `zle -F` callback until the
+    /// next input byte, then swallows that byte -- so a press landing in that
+    /// window can vanish without ever reaching the line editor, and no single
+    /// deadline is long enough to wait it out (#116). This mirrors the
+    /// dump-widget re-press already used by [`Host::dump_get`] (#47).
+    ///
+    /// At a call site whose send-break targets an already-idle prompt
+    /// (sb-1a, h26a) a re-press is unconditionally harmless: landing twice on
+    /// a clean prompt is indistinguishable from landing once. At a call site
+    /// whose following assertion depends on a premise that decays on its own
+    /// -- an in-flight collection that finishes unprompted after ~0.5s
+    /// (h26d), or a debounce timer that fires unprompted at `delay-ms`
+    /// (h26c) -- a swallowed first press followed by a retry landing after
+    /// that premise has already decayed makes the cleanup assertion pass
+    /// vacuously instead of exercising send-break's own cleanup path. That is
+    /// the same trade `dump_get` already makes for its own re-press (#47): a
+    /// rare flake traded for a rarer vacuous pass, accepted because the
+    /// alternative -- a single, unrepeated press -- is the flake this method
+    /// exists to fix.
+    ///
+    /// Returns whether a prompt appeared within `deadline`.
+    pub fn send_break_and_sync(&mut self, deadline: Duration) -> bool {
+        let end = Instant::now() + deadline;
+        loop {
+            self.send_keys(keys::SEND_BREAK);
+            if self.sync_prompt(Duration::from_secs(1)) {
+                return true;
+            }
+            if Instant::now() >= end {
+                return false;
+            }
+        }
+    }
+
     pub fn press(&mut self, keys: &str) {
         self.send_keys(keys);
         self.drain(Duration::from_millis(300));
