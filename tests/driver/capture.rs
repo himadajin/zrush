@@ -8,7 +8,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use crate::fake::{DRAIN_TAIL_BYTES, Mode};
-use crate::host::{Host, PlanShape, SHUTDOWN_SEAM, dump_field, keys, state_has, unquote};
+use crate::host::{Host, PlanShape, SHUTDOWN_SEAM, dump_field, keys, state_has};
 
 #[test]
 fn fork_capture_round_trip_reuses_one_worker() {
@@ -341,12 +341,10 @@ fn listing_shows_raw_text_and_confirming_inserts_the_quoted_form() {
     let mut host = Host::boot();
     host.send_keys_wait_plan(PlanShape::Nonempty, "ls fx/spacey/has");
 
-    let post = host
-        .dump_get(keys::DUMP_POSTDISPLAY, "TESTPOST")
-        .expect("(cap-1c) POSTDISPLAY dump did not run");
+    let post = host.postdisplay("(cap-1c)");
     assert!(
-        unquote(&post).contains("has space.txt"),
-        "(cap-1c) raw text not found in POSTDISPLAY dump: {post}"
+        post.contains("has space.txt"),
+        "(cap-1c) raw text not found in POSTDISPLAY dump: {post:?}"
     );
 
     host.press(keys::DOWN); // select the (only) candidate
@@ -364,12 +362,10 @@ fn listing_shows_raw_text_and_confirming_inserts_the_quoted_form() {
 fn a_zero_candidate_prefix_leaves_compsys_state_intact() {
     let mut host = Host::boot();
     host.send_keys_wait_plan(PlanShape::Zero, "ls fx/basic/ZZZNOMATCH");
-    let post = host
-        .dump_get(keys::DUMP_POSTDISPLAY, "TESTPOST")
-        .expect("(cap-2a) POSTDISPLAY dump did not run");
+    let post = host.postdisplay("(cap-2a)");
     assert!(
-        unquote(&post).is_empty(),
-        "(cap-2a) unexpected listing for a zero-candidate prefix: {post}"
+        post.is_empty(),
+        "(cap-2a) unexpected listing for a zero-candidate prefix: {post:?}"
     );
 
     host.clear_line();
@@ -389,11 +385,7 @@ fn hidden_entries_stay_out_until_the_query_starts_with_a_dot() {
     let mut host = Host::boot();
 
     host.send_keys_wait_plan(PlanShape::Nonempty, "ls fx/hidden/");
-    let post = unquote(
-        &host
-            .dump_get(keys::DUMP_POSTDISPLAY, "TESTPOST")
-            .expect("(cap-3a) POSTDISPLAY dump did not run"),
-    );
+    let post = host.postdisplay("(cap-3a)");
     assert!(
         post.contains("visible.txt") && !post.contains("dotted"),
         "(cap-3a) hidden entries leaked into a dotless listing: {post:?}"
@@ -402,11 +394,7 @@ fn hidden_entries_stay_out_until_the_query_starts_with_a_dot() {
     host.clear_line();
     host.drain(Duration::from_millis(300));
     host.send_keys_wait_plan(PlanShape::Nonempty, "ls fx/hidden/.");
-    let post = unquote(
-        &host
-            .dump_get(keys::DUMP_POSTDISPLAY, "TESTPOST")
-            .expect("(cap-3b) POSTDISPLAY dump did not run"),
-    );
+    let post = host.postdisplay("(cap-3b)");
     assert!(
         post.contains(".dotted-alpha.txt") && post.contains(".dotted-beta.txt"),
         "(cap-3b) hidden entries missing after the dot: {post:?}"
@@ -415,11 +403,7 @@ fn hidden_entries_stay_out_until_the_query_starts_with_a_dot() {
     host.clear_line();
     host.drain(Duration::from_millis(300));
     host.send_keys_wait_plan(PlanShape::Nonempty, "ls fx/hidden/.dotted-be");
-    let post = unquote(
-        &host
-            .dump_get(keys::DUMP_POSTDISPLAY, "TESTPOST")
-            .expect("(cap-3c) POSTDISPLAY dump did not run"),
-    );
+    let post = host.postdisplay("(cap-3c)");
     assert!(
         post.contains(".dotted-beta.txt") && !post.contains("alpha"),
         "(cap-3c) hidden entries not filtered: {post:?}"

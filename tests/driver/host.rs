@@ -26,6 +26,13 @@ pub mod keys {
     pub const DUMP_POSTDISPLAY: &str = "\x18p";
     pub const DUMP_RH: &str = "\x18h";
     pub const DUMP_WORKER: &str = "\x18w";
+    /// Listing kind, selection and position count (history rc only).
+    pub const DUMP_KIND: &str = "\x18k";
+    /// The `$history` event number of the newest fixture line (history rc only).
+    pub const DUMP_EVENT: &str = "\x18e";
+    /// `backward-char`: a cursor movement zrush never binds, i.e. an external
+    /// CURSOR-only change (history rc only).
+    pub const BACKWARD_CHAR: &str = "\x18l";
     pub const CURSOR_LEFT_THREE: &str = "\x18v";
     /// `_zrush_worker_shutdown` from a widget: an explicit healthy teardown.
     pub const WORKER_TEARDOWN: &str = "\x18q";
@@ -67,16 +74,34 @@ pub struct Host {
     boot: Duration,
 }
 
+/// Host rc file, loaded through the host's own `$ZDOTDIR`.
+#[derive(Clone, Copy)]
+enum HostRc {
+    Minimal,
+    /// Fixture history in memory (isolated HISTFILE, `SAVEHIST=0`) plus the
+    /// history-menu dump widgets.
+    History,
+}
+
+impl HostRc {
+    fn file(self) -> &'static str {
+        match self {
+            HostRc::Minimal => "tests/zsh/rc/minimal.zshrc",
+            HostRc::History => "tests/zsh/rc/history.zshrc",
+        }
+    }
+}
+
 impl Host {
     pub fn boot() -> Self {
-        Self::boot_with(|_home| {}, false)
+        Self::boot_with(HostRc::Minimal, |_home| {}, false)
     }
 
     /// Like [`Host::boot`], but symlinks the shared 7001-file overflow tree
     /// (built once per process, cached under `target/`) into `fx/overflow`
     /// under the host's home.
     pub fn boot_with_overflow() -> Self {
-        Self::boot_with(fixtures::link_overflow, false)
+        Self::boot_with(HostRc::Minimal, fixtures::link_overflow, false)
     }
 
     /// Like [`Host::boot`], but with `$ZRUSH_BIN` pointing at the failure-
@@ -84,10 +109,15 @@ impl Host {
     /// It starts in [`crate::fake::Mode::Proxy`], so the host behaves exactly
     /// as under the real binary until a test sets another mode.
     pub fn boot_fake() -> Self {
-        Self::boot_with(|_home| {}, true)
+        Self::boot_with(HostRc::Minimal, |_home| {}, true)
     }
 
-    fn boot_with(extra_fixtures: impl FnOnce(&Path), fake: bool) -> Self {
+    /// Like [`Host::boot`], but under `tests/zsh/rc/history.zshrc`.
+    pub fn boot_history() -> Self {
+        Self::boot_with(HostRc::History, |_home| {}, false)
+    }
+
+    fn boot_with(rc: HostRc, extra_fixtures: impl FnOnce(&Path), fake: bool) -> Self {
         let tmp = TempDir::new().expect("create work dir");
         let home = tmp.path().join("home");
         let work = tmp.path().join("work");
@@ -100,8 +130,7 @@ impl Host {
         fixtures::build(&home);
         extra_fixtures(&home);
 
-        let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let rc = repo.join("tests/zsh/rc/minimal.zshrc");
+        let rc = Path::new(env!("CARGO_MANIFEST_DIR")).join(rc.file());
         fs::write(zdot.join(".zshrc"), format!("source {}\n", rc.display())).expect("write .zshrc");
 
         let bin = env!("CARGO_BIN_EXE_zrush");
@@ -368,6 +397,20 @@ impl Host {
             .dump_get(keys::DUMP_BUFFER, "TESTBUF")
             .unwrap_or_else(|| panic!("{label}: BUFFER dump did not run"));
         assert_eq!(unquote(&dump), expected, "{label}");
+    }
+
+    /// The `^Xk` listing dump: `kind=<...> sel=<n> listing=<0|1> npos=<n>`.
+    pub fn listing_kind(&mut self, label: &str) -> String {
+        self.dump_get(keys::DUMP_KIND, "TESTKIND")
+            .unwrap_or_else(|| panic!("{label} listing-kind dump did not run"))
+    }
+
+    /// The `^Xp` POSTDISPLAY dump, unquoted.
+    pub fn postdisplay(&mut self, label: &str) -> String {
+        let raw = self
+            .dump_get(keys::DUMP_POSTDISPLAY, "TESTPOST")
+            .unwrap_or_else(|| panic!("{label} POSTDISPLAY dump did not run"));
+        unquote(&raw)
     }
 
     /// zsh tags its own region_highlight entries with `memo=` only from 5.9 on.
