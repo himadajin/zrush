@@ -283,9 +283,9 @@ fn worker_death_on_the_synchronous_history_path_leaves_a_clean_line() {
         "(h26-setup) history menu did not open after worker cleanup={worker_clean}: {kind}"
     );
 
-    host.send_keys(keys::SEND_BREAK); // abandon the line, bypassing confirm/dismiss/line-finish
+    // abandon the line, bypassing confirm/dismiss/line-finish
     assert!(
-        host.sync_prompt(Duration::from_secs(15)),
+        host.send_break_and_sync(Duration::from_secs(15)),
         "(h26a) send-break did not produce a new prompt"
     );
     assert_eq!(
@@ -313,9 +313,8 @@ fn send_break_during_an_in_flight_collection_clears_the_collection_fds() {
         "(h26d-pre) no in-flight collection detected before send-break:"
     );
 
-    host.send_keys(keys::SEND_BREAK);
     assert!(
-        host.sync_prompt(Duration::from_secs(15)),
+        host.send_break_and_sync(Duration::from_secs(15)),
         "(h26d-a) send-break did not produce a new prompt"
     );
     assert_eq!(

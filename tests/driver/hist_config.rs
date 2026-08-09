@@ -39,9 +39,8 @@ fn send_break_clears_a_merely_armed_debounce_timer() {
         "(h26c-pre) the debounce timer was not armed before send-break: {fds}"
     );
 
-    host.send_keys(keys::SEND_BREAK);
     assert!(
-        host.sync_prompt(Duration::from_secs(15)),
+        host.send_break_and_sync(Duration::from_secs(15)),
         "(h26c-a) send-break did not produce a new prompt during the debounce wait"
     );
     assert_eq!(
