@@ -14,7 +14,6 @@ use crate::plan::{self, Producer};
 use crate::wire::{BUILD_STAMP, parse_canonical_u64};
 
 const READ_BUFFER_SIZE: usize = 8192;
-const REQUEST_FIELD_COUNT: usize = 11;
 const FIRST_APPLICATION_FD: RawFd = 3;
 
 pub(crate) fn start_watchdog(control_fd: RawFd) -> std::io::Result<()> {
@@ -253,42 +252,58 @@ fn process_request<W: Write>(fields: &[Vec<u8>], output: &mut W) -> Result<(), E
 }
 
 fn parse_request<'a>(fields: &'a [Vec<u8>], request_id: &'a [u8]) -> Request<'a> {
-    if fields.len() != REQUEST_FIELD_COUNT || fields[0] != b"plan" {
+    let [
+        cmd,
+        _id,
+        cwd,
+        producer,
+        query,
+        mode,
+        smart_case,
+        rows,
+        width,
+        trailing_space,
+        payload,
+    ] = fields
+    else {
+        return Request::Invalid { request_id };
+    };
+    if cmd != b"plan" {
         return Request::Invalid { request_id };
     }
 
-    let Some(producer) = parse_producer(&fields[3]) else {
+    let Some(producer) = parse_producer(producer) else {
         return Request::Invalid { request_id };
     };
-    let Some(mode) = Mode::parse(std::str::from_utf8(&fields[5]).unwrap_or("")) else {
+    let Some(mode) = Mode::parse(std::str::from_utf8(mode).unwrap_or("")) else {
         return Request::Invalid { request_id };
     };
-    let Some(smart_case) = parse_bool(&fields[6]) else {
+    let Some(smart_case) = parse_bool(smart_case) else {
         return Request::Invalid { request_id };
     };
-    let Some(rows) = parse_positive_usize(&fields[7]) else {
+    let Some(rows) = parse_positive_usize(rows) else {
         return Request::Invalid { request_id };
     };
-    let Some(width) = parse_positive_usize(&fields[8]) else {
+    let Some(width) = parse_positive_usize(width) else {
         return Request::Invalid { request_id };
     };
-    let Some(trailing_space) = parse_bool(&fields[9]) else {
+    let Some(trailing_space) = parse_bool(trailing_space) else {
         return Request::Invalid { request_id };
     };
 
     Request::Valid {
         request_id,
-        cwd: &fields[2],
+        cwd,
         params: plan::Params {
             producer,
-            query: fields[4].clone(),
+            query: query.clone(),
             mode,
             smart_case,
             rows,
             width,
             trailing_space,
         },
-        payload: &fields[10],
+        payload,
     }
 }
 
