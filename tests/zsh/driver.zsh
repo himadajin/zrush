@@ -46,7 +46,6 @@ setopt extended_glob
 zmodload zsh/zpty    || { print -u2 FATAL: zpty; exit 1 }
 zmodload zsh/zselect || { print -u2 FATAL: zselect; exit 1 }
 zmodload zsh/system  || { print -u2 FATAL: system; exit 1 }
-autoload -Uz is-at-least
 
 typeset -F SECONDS
 typeset -g HERE=${${(%):-%N}:A:h}
@@ -57,7 +56,7 @@ typeset -g PLAYGROUND=${1:?usage: driver.zsh <playground-dir> [section ...]}
 # Canonical execution order of the test sections. Any sections named on the
 # command line run in this order, never in argument order; an empty selection
 # means every section.
-typeset -ga SECTIONS=( capture fifo async apply dismiss cache tab sendbreak death hist jobtable inflight )
+typeset -ga SECTIONS=( capture death hist jobtable inflight )
 typeset -gA PICKED=()
 for SECTION_ARG in "${@[2,-1]}"; do
   (( ${SECTIONS[(I)$SECTION_ARG]} )) || { print -u2 "FATAL: unknown section '$SECTION_ARG' (valid: $SECTIONS)"; exit 1 }
@@ -81,7 +80,6 @@ ok()  { out "PASS: $1"; (( ++PASS )) }
 ng()  { out "FAIL: $1"; (( ++FAIL )) }
 # SKIP: a check this environment could not run; OBSV: a non-failing observation.
 typeset -gi SKIP=0 OBSV=0
-skip() { out "SKIP: $1"; (( ++SKIP )) }
 obsv() { out "OBSV: $1"; (( ++OBSV )) }
 
 typeset -g WORK=$(mktemp -d ${TMPDIR:-/tmp}/zrush-test.XXXXXX)
@@ -120,13 +118,6 @@ typeset -gi FAKE_DRAIN_TAIL_BYTES=8388608
 export ZRUSH_HISTORY_DEADLINE_MS=5000
 
 print "source $REPO/tests/zsh/rc/minimal.zshrc" > $ZDOTDIR/.zshrc
-
-# Whether this zsh build can tag region_highlight entries with memo=zrush
-# (cli-protocol.md / behavior.md "region_highlight の自エントリ"); on 5.8 the
-# ^Xh dump still lists this plugin's own entries (via the internal _zrush_rh
-# ledger, not memo filtering), so only the memo-suffix assertion is gated.
-typeset -gi HAVE_MEMO=0
-is-at-least 5.9 $ZSH_VERSION && HAVE_MEMO=1
 
 # ---------------------------------------------------------------- Fixtures
 # fx/basic: two candidates sharing a prefix (for match-highlight/selection
@@ -748,250 +739,6 @@ sec_capture() {
   fi
   clear_line
   drain 0.3
-}
-
-sec_fifo() {
-  # ================================================================ FIFO-capacity frame delegation
-  # (fifo-1a/b) fx/overflow's candidate_payload is well over the request-FIFO
-  # buffer on either platform (8192 bytes on macOS, 65536 on Linux), so it can
-  # only reach the worker if the writer child actually delegates the whole
-  # frame in one syswrite (behavior.md worker-lifecycle "1 フレームの送信は...
-  # 委譲する"); a naive blocking write from the parent would deadlock instead
-  # of rendering.
-  log_count 'worker: queued request_id='; local -i overflow_queued_before=$REPLY
-  send_keys 'ls fx/overflow/'
-  if expect '*0000-marker.txt*' 15; then
-    ok "(fifo-1a) a candidate_payload larger than the FIFO buffer still crosses in one delegated write and renders"
-  else
-    ng "(fifo-1a) list not displayed for an over-capacity payload"
-  fi
-  if wait_log 'worker: queued request_id=' $overflow_queued_before 5; then
-    local overflow_queued_line=$(grep -F 'worker: queued request_id=' $ZRUSH_LOG 2>/dev/null | tail -1)
-    local -i overflow_frame_bytes=${${overflow_queued_line##*bytes=}%% *}
-    if (( overflow_frame_bytes > 65536 )); then
-      ok "(fifo-1b) the queued frame's byte count ($overflow_frame_bytes) actually exceeded the FIFO buffer on both platforms (8192 macOS / 65536 Linux)"
-    else
-      ng "(fifo-1b) queued frame was not actually over-capacity (need > 65536): bytes=$overflow_frame_bytes line=${overflow_queued_line:-<none>}"
-    fi
-  else
-    ng "(fifo-1b) no 'worker: queued request_id=' log line for the overflow request"
-  fi
-  clear_line
-  drain 0.3
-}
-
-sec_async() {
-  # ================================================================ (2) Async plumbing does not block input
-  # A fake completion function that sleeps inside the fork; the parent shell
-  # must keep echoing keystrokes while it runs.
-  send_line '_zrushtestslow() { local -a m=(slowcandA slowcandB slowcandC); sleep 0.5; compadd -a m }'
-  sync_prompt
-  send_line 'compdef _zrushtestslow zrushtestslow'
-  sync_prompt
-  send_keys 'zrushtestslow '
-  drain 0.4                     # let debounce elapse and the fork start (still sleeping)
-  local -F t0=$SECONDS
-  send_keys 'zzz'                # typed while the fork is asleep
-  if expect '*z*z*z*' 2; then
-    ok "(async-1a) input keeps echoing while a slow fork collection is in flight ($(( SECONDS - t0 ))s)"
-  else
-    ng "(async-1a) input blocked during slow collection"
-  fi
-  clear_line
-  drain 0.8                      # let the stale in-flight collection settle (cancelled)
-  send_keys 'zrushtestslow '
-  if expect '*slowcandA*' 5; then
-    ok "(async-1b) the pipeline completes end-to-end once the slow fork finishes"
-  else
-    ng "(async-1b) slow-completion candidates never rendered"
-  fi
-  clear_line
-  drain 0.3
-}
-
-sec_apply() {
-  # ================================================================ (3) Plan application: POSTDISPLAY + region_highlight
-  send_keys_wait_plan nonempty 'ls fx/basic/al'
-  if dump_get $'\C-xp' TESTPOST; then
-    local post=${(Q)REPLY}
-    if [[ $post == $'\n'* && $post == *alpha.txt* && $post == *alsoalpha.txt* ]]; then
-      ok "(apl-1a) POSTDISPLAY = leading newline + listing text for both candidates"
-    else
-      ng "(apl-1a) POSTDISPLAY malformed: ${(qqqq)post}"
-    fi
-  else
-    ng "(apl-1a) POSTDISPLAY dump did not run"
-  fi
-  if dump_get $'\C-xh' TESTRH; then
-    if [[ $REPLY == *underline* ]]; then
-      ok "(apl-1b) region_highlight carries a match-role entry mapped to the default 'underline' spec"
-    else
-      ng "(apl-1b) no match-role highlight found: ${REPLY:-<none>}"
-    fi
-    if (( ! HAVE_MEMO )) || [[ $REPLY == *memo=zrush* ]]; then
-      ok "(apl-1c) region_highlight entries are memo-tagged (or zsh<5.9, where memo is unavailable)"
-    else
-      ng "(apl-1c) memo=zrush missing on zsh >=5.9: ${REPLY:-<none>}"
-    fi
-  else
-    ng "(apl-1b/c) region_highlight dump did not run"
-  fi
-  clear_line
-  drain 0.3
-}
-
-sec_dismiss() {
-  # ================================================================ (6) dismiss / accept-line
-  send_keys_wait_plan nonempty 'ls fx/basic/'
-  log_count 'dismiss: closing list'; local -i c_dis=$REPLY
-  press $'\C-g'
-  wait_log 'dismiss: closing list' $c_dis 3 && ok "(dis-1a) dismiss closes the list" || ng "(dis-1a) dismiss did not work"
-  assert_buffer 'ls fx/basic/' "(dis-1b) buffer is unchanged after dismiss"
-  clear_line
-  drain 0.3
-
-  # Regression (dis-2): dismiss must cancel any still-armed debounce timer /
-  # in-flight collection for a newer keystroke, or a late-arriving result can
-  # silently reopen the list right after the user closed it. Reproduced with
-  # git's naturally slow (~150ms+) subcommand completion -- no extra fixture
-  # needed. The buffer edit below never goes through a blank state, so the
-  # first (broader) list stays visible (no-flash design) while the narrowing
-  # 'git chec' collection is armed/in flight; dismissing at that instant must
-  # win the race even though the narrower collection is still pending.
-  send_keys_wait_plan nonempty 'git c'   # first list applied; _zrush_listing=1
-  send_keys 'hec'                     # -> 'git chec': re-arms debounce/collection
-  send_keys $'\C-g'                   # dismiss immediately, no drain in between
-  drain 1.0                           # comfortably longer than 'git chec' compsys (~150-200ms)
-  if dump_get $'\C-xp' TESTPOST; then
-    local post_dis2=${(Q)REPLY}
-    if [[ -z $post_dis2 ]]; then
-      ok "(dis-2) dismiss cancels the in-flight collection; no late result reopens the list"
-    else
-      ng "(dis-2) list reappeared after dismiss (stale collection not cancelled): ${(qqqq)post_dis2}"
-    fi
-  else
-    ng "(dis-2) POSTDISPLAY dump did not run"
-  fi
-  clear_line
-  drain 0.3
-
-  log_count 'line-finish: cleared'; local -i c_fin=$REPLY
-  send_keys 'print HISTMARK-ACCEPT'
-  send_keys $'\r'
-  if expect '*HISTMARK-ACCEPT*' 5; then
-    ok "(acc-1a) Enter without a selection executes the command via the predecessor chain"
-  else
-    ng "(acc-1a) command did not execute"
-  fi
-  sync_prompt
-  wait_log 'line-finish: cleared' $c_fin 3 && ok "(acc-1b) accept-line resets zrush state (line-finish)" || ng "(acc-1b) line-finish not logged after accept-line"
-}
-
-sec_cache() {
-  # ================================================================ (7) Empty-word collection cache: no fork on hit
-  clear_line
-  drain 0.5
-  send_keys_wait_plan nonempty 'whic'
-  clear_line
-  drain 0.5
-  log_count 'cache: hit';          local -i cc_hit=$REPLY
-  log_count 'request: collecting'; local -i cc_col=$REPLY
-  send_keys 'whic'
-  if wait_log 'cache: hit' $cc_hit 5; then
-    ok "(cc-1a) second command-position query hits the empty-word cache"
-  else
-    ng "(cc-1a) cache hit not logged"
-  fi
-  drain 0.5
-  log_count 'request: collecting'; local -i cc_col2=$REPLY
-  if (( cc_col2 == cc_col )); then
-    ok "(cc-1b) no new fork is started on a cache hit ($cc_col -> $cc_col2)"
-  else
-    ng "(cc-1b) a fork ran despite the expected cache hit ($cc_col -> $cc_col2)"
-  fi
-  clear_line
-  drain 0.3
-}
-
-sec_tab() {
-  # ================================================================ (8) Tab pending
-  # Default [insert].tab=menu, so a Tab that lands before candidates arrive
-  # must, once they arrive, start selection -- not change the buffer.
-  log_count 'tab: pending'; local -i c_pend=$REPLY
-  log_count 'select: start'; local -i c_tstart=$REPLY
-  send_keys 'ls fx/basic/al'$'\t'   # Tab in the same burst, before debounce elapses
-  wait_log 'tab: pending' $c_pend 3 && ok "(tab-1a) Tab pressed before candidates arrive is recorded (pending)" || ng "(tab-1a) pending path not logged"
-  if wait_log 'select: start' $c_tstart 5; then
-    ok "(tab-1b) once candidates arrive, the pending Tab applies (menu -> selection starts)"
-  else
-    ng "(tab-1b) pending Tab was not applied on arrival"
-  fi
-  press $'\C-g'
-  clear_line
-  drain 0.3
-
-  # ---- (tab-2) [insert].tab=common-prefix over a leading dash run. The
-  # widening rule keeps the run in the collection string so compsys yields
-  # option candidates, and compsys returns those dash-included; the run must
-  # therefore stay in the query too, or the common-prefix insertion prepends a
-  # second dash (behavior.md "広げ規則"). A compdef fixture pins the candidate
-  # set: the real `ls -` option list differs per platform.
-  send_line '_zrushtestopt() { local -a m=(-alpha -alt); compadd -a m }'
-  sync_prompt
-  send_line 'compdef _zrushtestopt zrushtestopt'
-  sync_prompt
-  print -r -- $'[insert]\ntab = "common-prefix"' >| $XDG_CONFIG_HOME/zrush/config.toml
-  send_line ':'
-  sync_prompt
-  if send_keys_wait_plan nonempty 'zrushtestopt -'; then
-    log_count 'plan: applied'; local -i c_cp=$REPLY
-    press $'\t'
-    assert_buffer 'zrushtestopt -al' "(tab-2a) tab=common-prefix over a lone '-' inserts the common prefix without doubling the dash"
-    # The partial insertion is not a confirmation: it retriggers collection,
-    # and that second listing is what the Tab below acts on.
-    if wait_log 'plan: applied' $c_cp 5; then
-      press $'\t'
-      assert_buffer 'zrushtestopt -alpha ' "(tab-2b) a common-prefix that no longer grows falls back to confirming the top candidate"
-    else
-      ng "(tab-2b) the common-prefix insertion did not retrigger collection"
-    fi
-  fi
-  clear_line
-  rm -f $XDG_CONFIG_HOME/zrush/config.toml
-  send_line ':'
-  sync_prompt
-  drain 0.3
-}
-
-sec_sendbreak() {
-  # ================================================================ Regression: send-break leaves a clean new prompt (fix 3)
-  # An exit that bypasses _zrush_line_finish (send-break and similar) must
-  # not leak the previous session's plan state into the next one. A
-  # test-only widget dumps _zrush_plan_npos/_zrush_listing directly, since
-  # neither is observable through POSTDISPLAY/BUFFER alone once the new
-  # prompt's line-init has already cleared the display.
-  send_line '_zrt_dump_plan() { _zlog "TESTPLAN=npos=$_zrush_plan_npos listing=$_zrush_listing" }; zle -N _zrt-dump-plan _zrt_dump_plan; bindkey "^Xy" _zrt-dump-plan'
-  sync_prompt
-  send_keys_wait_plan nonempty 'ls fx/basic/al'   # real, non-empty _zrush_plan_* now populated
-  send_keys $'\C-c'                    # send-break: abandon the line, bypassing line-finish
-  if sync_prompt 15; then
-    ok "(sb-1a) a new prompt appears after send-break"
-    if dump_get $'\C-xy' TESTPLAN; then
-      if [[ $REPLY == *'npos=0'* && $REPLY == *'listing=0'* ]]; then
-        ok "(sb-1b) plan state is reset after send-break (npos=0, listing=0); no stale candidates leak into the new prompt"
-      else
-        ng "(sb-1b) stale plan state survived send-break: ${REPLY:-<none>}"
-      fi
-    else
-      ng "(sb-1b) plan-state dump did not run"
-    fi
-  else
-    skip "(sb-1) send-break did not produce a new prompt in this environment; skipping the plan-state check"
-  fi
-  clear_line
-  drain 0.3
-  send_line 'bindkey -r "^Xy"; zle -D _zrt-dump-plan; unfunction _zrt_dump_plan'
-  sync_prompt
 }
 
 sec_death() {

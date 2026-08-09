@@ -18,7 +18,11 @@ pub mod keys {
     pub const RIGHT: &str = "\x1b[C";
     pub const LEFT: &str = "\x1b[D";
     pub const ENTER: &str = "\r";
+    pub const TAB: &str = "\t";
+    pub const DISMISS: &str = "\x07";
+    pub const SEND_BREAK: &str = "\x03";
     pub const DUMP_BUFFER: &str = "\x18b";
+    pub const DUMP_POSTDISPLAY: &str = "\x18p";
     pub const DUMP_RH: &str = "\x18h";
     pub const CURSOR_LEFT_THREE: &str = "\x18v";
 }
@@ -29,12 +33,13 @@ const POLL: Duration = Duration::from_millis(50);
 /// Cadence at which log-watching loops re-read the log, draining in between.
 const LOG_POLL: Duration = Duration::from_millis(150);
 const DUMP_DEADLINE: Duration = Duration::from_secs(8);
-/// Set to print per-host startup timings; see tmp/issue-76-rust-driver.
+/// Set to make `Host::drop` print each host's boot/worker-ready timings.
 const TIMING_ENV: &str = "ZRUSH_DRIVER_TIMING";
 
 pub struct Host {
     tmp: Option<TempDir>,
     log: PathBuf,
+    xdg: PathBuf,
     pty: Pty,
     child: Child,
     /// Observation window (#63): everything the host has emitted since the
@@ -47,6 +52,17 @@ pub struct Host {
 
 impl Host {
     pub fn boot() -> Self {
+        Self::boot_with(|_home| {})
+    }
+
+    /// Like [`Host::boot`], but symlinks the shared 7001-file overflow tree
+    /// (built once per process, cached under `target/`) into `fx/overflow`
+    /// under the host's home.
+    pub fn boot_with_overflow() -> Self {
+        Self::boot_with(fixtures::link_overflow)
+    }
+
+    fn boot_with(extra_fixtures: impl FnOnce(&Path)) -> Self {
         let tmp = TempDir::new().expect("create work dir");
         let home = tmp.path().join("home");
         let work = tmp.path().join("work");
@@ -57,6 +73,7 @@ impl Host {
         fs::create_dir_all(&zdot).expect("create zdotdir");
         fs::create_dir_all(xdg.join("zrush")).expect("create config dir");
         fixtures::build(&home);
+        extra_fixtures(&home);
 
         let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
         let rc = repo.join("tests/zsh/rc/minimal.zshrc");
@@ -92,6 +109,7 @@ impl Host {
         let mut host = Self {
             tmp: Some(tmp),
             log,
+            xdg,
             pty,
             child,
             window: Vec::new(),
@@ -113,6 +131,19 @@ impl Host {
         self.pty
             .write_all(keys.as_bytes())
             .expect("write keys to host pty");
+    }
+
+    /// Send a line of shell source for the host to execute (a definition, a
+    /// `compdef`, a `:` no-op to force a config-mtime recheck, ...), followed
+    /// by its terminating newline.
+    pub fn send_line(&mut self, line: &str) {
+        self.send_keys(&format!("{line}\n"));
+    }
+
+    /// `^U`: discard the current physical line without executing it.
+    pub fn clear_line(&mut self) {
+        self.send_keys("\x15");
+        self.drain(Duration::from_millis(200));
     }
 
     /// Read the pty for `how_long`. Every wait loop calls this: a host that is
@@ -146,14 +177,33 @@ impl Host {
             || contains(&strip_sgr(&self.window), text.as_bytes())
     }
 
+    /// Like [`Host::expect`], but for callers that (like the zsh driver's
+    /// occasional `'*a*b*c*'` pattern) only need `needles` to appear in order,
+    /// not contiguously: a zle redraw between two keystrokes' echoes can
+    /// interleave escape sequences the caller does not care about.
+    pub fn expect_in_order(&mut self, needles: &[&str], timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if in_order(&self.window, needles) || in_order(&strip_sgr(&self.window), needles) {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            let chunk = self.pty.read_available(POLL);
+            self.window.extend_from_slice(&chunk);
+        }
+    }
+
     fn window_tail(&self) -> String {
         let start = self.window.len().saturating_sub(300);
         String::from_utf8_lossy(&self.window[start..]).into_owned()
     }
 
-    pub fn sync_prompt(&mut self, timeout: Duration) {
-        self.expect("HP>", timeout);
+    pub fn sync_prompt(&mut self, timeout: Duration) -> bool {
+        let ok = self.expect("HP>", timeout);
         self.drain(Duration::from_millis(100));
+        ok
     }
 
     pub fn press(&mut self, keys: &str) {
@@ -172,6 +222,15 @@ impl Host {
             .split(|&b| b == b'\n')
             .filter(|line| contains(line, needle.as_bytes()))
             .count()
+    }
+
+    /// The freshest log line containing `needle` (`grep -F | tail -1` semantics).
+    pub fn last_log_line(&self, needle: &str) -> Option<String> {
+        let bytes = fs::read(&self.log).ok()?;
+        bytes
+            .split(|&b| b == b'\n')
+            .rfind(|line| contains(line, needle.as_bytes()))
+            .map(|line| String::from_utf8_lossy(line).into_owned())
     }
 
     pub fn wait_log(&mut self, needle: &str, baseline: usize, timeout: Duration) -> bool {
@@ -241,12 +300,7 @@ impl Host {
         while Instant::now() < deadline {
             self.send_keys(key);
             if self.wait_log(&needle, baseline, Duration::from_secs(1)) {
-                let bytes = fs::read(&self.log).expect("read host log");
-                let last = bytes
-                    .split(|&b| b == b'\n')
-                    .rfind(|line| contains(line, needle.as_bytes()))
-                    .map(|line| String::from_utf8_lossy(line).into_owned())
-                    .expect("matching log line");
+                let last = self.last_log_line(&needle).expect("matching log line");
                 let value = last
                     .split_once(&needle)
                     .expect("log line carries the tag")
@@ -268,6 +322,19 @@ impl Host {
     /// zsh tags its own region_highlight entries with `memo=` only from 5.9 on.
     pub fn has_memo(&self) -> bool {
         zsh_version() >= (5, 9)
+    }
+
+    // ---- per-test config (tab: `[insert].tab` needs a non-default value) ----
+
+    /// Config lives solely at `$XDG_CONFIG_HOME/zrush/config.toml`
+    /// (docs/internal/specs/config-schema.md); write it directly rather than
+    /// exercising `zrush config`'s own CLI, since that path is `tests/cli.rs`'s.
+    pub fn write_config(&self, toml: &str) {
+        fs::write(self.config_path(), toml).expect("write config.toml");
+    }
+
+    fn config_path(&self) -> PathBuf {
+        self.xdg.join("zrush/config.toml")
     }
 
     // ---- failure evidence and measurement ----
@@ -351,6 +418,26 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
         && haystack.windows(needle.len()).any(|w| w == needle)
 }
 
+/// Whether every one of `needles` occurs in `haystack`, each strictly after
+/// the previous match ends.
+fn in_order(haystack: &[u8], needles: &[&str]) -> bool {
+    let mut pos = 0;
+    for needle in needles {
+        let bytes = needle.as_bytes();
+        if bytes.is_empty() {
+            return false;
+        }
+        match haystack
+            .get(pos..)
+            .and_then(|rest| rest.windows(bytes.len()).position(|w| w == bytes))
+        {
+            Some(offset) => pos += offset + bytes.len(),
+            None => return false,
+        }
+    }
+    true
+}
+
 /// Drop each SGR sequence together with the NUL run that follows it (some
 /// terminfo entries pad every SGR with NULs, #64). Unrelated literal NULs stay.
 fn strip_sgr(bytes: &[u8]) -> Vec<u8> {
@@ -383,7 +470,7 @@ fn strip_sgr(bytes: &[u8]) -> Vec<u8> {
 /// multibyte characters stay raw. Decoding builds a byte string and validates
 /// it once, so a dumped value that is not UTF-8 -- or an escape form zsh is not
 /// known to produce -- fails loudly instead of turning into plausible garbage.
-fn unquote(text: &str) -> String {
+pub(crate) fn unquote(text: &str) -> String {
     let body = text
         .strip_prefix("$'")
         .and_then(|rest| rest.strip_suffix('\''))
