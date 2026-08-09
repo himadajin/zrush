@@ -7,7 +7,6 @@ set -e
 print -r -- "== $(zsh --version) =="
 cargo build --release
 cargo test
-zsh -f tests/zsh/driver.zsh "$(mktemp -d)"
 zsh -f tests/zsh/keybinds.zsh
 zsh -f tests/zsh/vectors.zsh
 zsh -f tests/zsh/transport.zsh

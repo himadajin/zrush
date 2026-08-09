@@ -11,7 +11,7 @@ use tempfile::TempDir;
 
 use crate::fake::Fake;
 use crate::fixtures;
-use crate::pty::Pty;
+use crate::pty::{Chunk, Pty};
 
 pub mod keys {
     pub const UP: &str = "\x1b[A";
@@ -22,6 +22,9 @@ pub mod keys {
     pub const TAB: &str = "\t";
     pub const DISMISS: &str = "\x07";
     pub const SEND_BREAK: &str = "\x03";
+    /// `kill-whole-line`: discards the current line without executing it, and
+    /// without [`Host::clear_line`]'s drain for the cases that must not pause.
+    pub const KILL_WHOLE_LINE: &str = "\x15";
     /// `ctrl-p`: a default select-prev key, and the one a `[keybind]` variant
     /// can drop from the action's list.
     pub const CTRL_P: &str = "\x10";
@@ -52,6 +55,12 @@ pub mod keys {
     pub const WORKER_TEARDOWN: &str = "\x18q";
     /// Record the host's fd 0/1/2 targets and emit both stream sentinels.
     pub const STDIO_PROBE: &str = "\x18f";
+    /// Synthesize the timer/ack/drain descriptors and run their shared
+    /// teardown, without depending on timing or kernel backpressure.
+    pub const CLOSE_AUX_FDS: &str = "\x18j";
+    /// Arm a production-generated drain handler from a widget; the readiness
+    /// dispatch it provokes only happens back in the real ZLE event loop.
+    pub const GENERATED_CALLBACK: &str = "\x18g";
 }
 
 /// Poll slice for every read of the pty; the enclosing deadlines are what
@@ -249,8 +258,33 @@ impl Host {
 
     /// `^U`: discard the current physical line without executing it.
     pub fn clear_line(&mut self) {
-        self.send_keys("\x15");
+        self.send_keys(keys::KILL_WHOLE_LINE);
         self.drain(Duration::from_millis(200));
+    }
+
+    /// Read the pty until the host closes it -- the shell exited for real --
+    /// or `timeout` expires, and report what it emitted on the way out.
+    pub fn wait_for_exit(&mut self, timeout: Duration) -> Exit {
+        let deadline = Instant::now() + timeout;
+        let mut output = Vec::new();
+        let mut reached_eof = false;
+        while Instant::now() < deadline {
+            match self.pty.read_chunk(POLL) {
+                Chunk::Data(bytes) => {
+                    self.window.extend_from_slice(&bytes);
+                    output.extend_from_slice(&bytes);
+                }
+                Chunk::Idle => {}
+                Chunk::Eof => {
+                    reached_eof = true;
+                    break;
+                }
+            }
+        }
+        Exit {
+            reached_eof,
+            output: String::from_utf8_lossy(&strip_sgr(&output)).into_owned(),
+        }
     }
 
     /// Read the pty for `how_long`. Every wait loop calls this: a host that is
@@ -725,6 +759,14 @@ impl Drop for Host {
 pub enum PlanShape {
     Zero,
     Nonempty,
+}
+
+/// What a host emitted between the input that ended it and its pty hanging up.
+/// `output` has SGR sequences normalized away, since job-control notices are
+/// asserted against as plain text.
+pub struct Exit {
+    pub reached_eof: bool,
+    pub output: String,
 }
 
 // ---- `name=value` dump helpers ----

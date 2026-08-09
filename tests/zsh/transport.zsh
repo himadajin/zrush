@@ -13,7 +13,13 @@ zmodload zsh/system zsh/zselect zsh/datetime zsh/stat || {
 typeset -g HERE=${${(%):-%N}:A:h}
 typeset -g REPO=${HERE:h:h}
 typeset -g REAL_BIN=$REPO/target/release/zrush
-[[ -x $REAL_BIN ]] || { print -u2 "FATAL: build first: cargo build --release"; exit 1 }
+# The raw-drain case below runs the failure-injection launcher as $ZRUSH_BIN.
+# It is a [[bin]] of the same crate, so one release build produces both.
+typeset -g FAKE_BIN=$REPO/target/release/zrush-fake-worker
+[[ -x $REAL_BIN && -x $FAKE_BIN ]] || {
+  print -u2 "FATAL: build first: cargo build --release (needs zrush and zrush-fake-worker)"
+  exit 1
+}
 
 typeset -gi PASS=0 FAIL=0 WAIT_CS=500 IDLE_CS=10
 out() { print -r -u2 -- "$@" }
@@ -502,7 +508,7 @@ unset ZDOTDIR
   export ZRUSH_FAKE_CONTROL=$WORK/fake-control ZRUSH_FAKE_STATE=$WORK/fake-state
   : >| $ZRUSH_FAKE_STATE
   print -r -- drain >| $ZRUSH_FAKE_CONTROL
-  ZRUSH_BIN=$REPO/tests/zsh/fake-worker.py
+  ZRUSH_BIN=$FAKE_BIN
   start_ready || note "fake drain worker did not reach ready"
   typeset -gi old_shutdown_ms=$_ZRUSH_WORKER_SHUTDOWN_MS
   # Isolate the successful raw-drain path from scheduler/disk variance. The
