@@ -8,8 +8,8 @@
 //! `match_span_uses_end_exclusive_semantics_not_start_len` pins one).
 //!
 //! The end-exclusive form therefore travels as this type, and
-//! [`CharSpan::len`] is the single place the wire's `len` is derived from
-//! it.
+//! [`CharSpan::len`] is the single operation the wire serializer uses to
+//! derive `len` from it.
 
 /// A `[start, end)` range of chars over the lossy UTF-8 reading of some
 /// text -- the offset unit of cli-protocol.md "オフセット規律", never a

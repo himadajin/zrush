@@ -25,6 +25,7 @@ use unicode_width::UnicodeWidthChar;
 
 use crate::record::{Batch, Candidate};
 use crate::span::CharSpan;
+use crate::wire::{Navigation as Nav, Role};
 
 /// Column cap and gutter width: Rust-internal constants, not part of the
 /// protocol (cli-protocol.md "列数").
@@ -51,44 +52,14 @@ impl Style {
     }
 }
 
-/// Highlight role (cli-protocol.md "ハイライト"). `heading` entries carry
-/// `pos == 0`; `match` and `history-number` entries carry their position.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Role {
-    Match,
-    Heading,
-    HistoryNumber,
-}
-
-impl Role {
-    /// The render-plan wire token (cli-protocol.md "ハイライト").
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Role::Match => "match",
-            Role::Heading => "heading",
-            Role::HistoryNumber => "history-number",
-        }
-    }
-}
-
-/// One "role pos start len" render-plan entry. `span` is a char range
-/// over the full listing text (rows joined by `\n`, no leading newline);
-/// plan.rs's serializer turns it into the wire's `start len`.
+/// A computed highlight whose `span` is a char range over the full listing
+/// text (rows joined by `\n`, no leading newline). The wire boundary converts
+/// this end-exclusive range to its serialized form.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Highlight {
     pub role: Role,
     pub pos: usize,
     pub span: CharSpan,
-}
-
-/// One "next prev left right" render-plan entry, absolute position numbers
-/// (0 = unselected). cli-protocol.md "ナビ".
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub(crate) struct Nav {
-    pub next: usize,
-    pub prev: usize,
-    pub left: usize,
-    pub right: usize,
 }
 
 /// The rendered plan: display rows plus, for each of the `P` selectable

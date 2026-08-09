@@ -1,5 +1,4 @@
-//! Orchestration for worker plan requests (cli-protocol.md "`zrush worker`",
-//! source of truth for the whole pipeline and render-plan wire format).
+//! Orchestration for worker plan requests (cli-protocol.md "`zrush worker`").
 //!
 //! Pipeline: record::parse -> hidden-file exclusion -> matching::QueryMatcher
 //! (score every remaining candidate + common-prefix over the *untruncated*
@@ -12,18 +11,16 @@
 //! grouping/highlights/nav, further truncated to the real per-group row
 //! budget) -> insert::build per displayed position
 //! (this is where `-f` directory-synthesis stat happens, and only for
-//! positions layout actually kept) -> flat NUL-terminated serialization.
+//! positions layout actually kept) -> wire::serialize.
 //!
 //! `run` takes one complete candidate payload and an injected
 //! `is_dir` predicate, so it stays free of I/O and is directly testable.
 //! The only error this pipeline itself can produce is candidate framing
 //! violation (record.rs); session I/O belongs to worker.rs.
 
-use std::io::Write;
-
 use crate::matching::{Mode, QueryMatcher, Tier};
 use crate::span::CharSpan;
-use crate::{insert, layout, ranking, record};
+use crate::{insert, layout, ranking, record, wire};
 
 /// Snapshot of a plan request's scalar fields; producer selects result
 /// ordering and layout geometry.
@@ -138,61 +135,12 @@ pub(crate) fn run(
         })
         .collect();
 
-    Ok(serialize(common_prefix, &built, &insert_texts))
-}
-
-/// Flatten the plan into the render-plan wire format: NUL-terminated fields,
-/// fixed order, total count
-/// `4 + L + H + 3P`. A plan with `L == P == H == 0` (nothing matched)
-/// naturally serializes to exactly the "0 マッチ" 4-field form.
-fn serialize(common_prefix: &[u8], plan: &layout::Plan, insert_texts: &[Vec<u8>]) -> Vec<u8> {
-    let mut out = Vec::new();
-    push_bytes(&mut out, common_prefix);
-    let _ = write!(out, "{}", plan.rows.len());
-    out.push(0);
-    let _ = write!(out, "{}", plan.positions.len());
-    out.push(0);
-    for row in &plan.rows {
-        push_bytes(&mut out, row);
-    }
-    let _ = write!(out, "{}", plan.highlights.len());
-    out.push(0);
-    // The end-exclusive spans become the wire's `start len` here, and
-    // only here (span.rs).
-    for h in &plan.highlights {
-        let _ = write!(
-            out,
-            "{} {} {} {}",
-            h.role.as_str(),
-            h.pos,
-            h.span.start,
-            h.span.len()
-        );
-        out.push(0);
-    }
-    for cell in &plan.cell_ranges {
-        let _ = write!(out, "{} {}", cell.start, cell.len());
-        out.push(0);
-    }
-    for n in &plan.nav {
-        let _ = write!(out, "{} {} {} {}", n.next, n.prev, n.left, n.right);
-        out.push(0);
-    }
-    for text in insert_texts {
-        push_bytes(&mut out, text);
-    }
-    out
-}
-
-fn push_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
-    out.extend_from_slice(bytes);
-    out.push(0);
+    Ok(wire::serialize(common_prefix, &built, &insert_texts))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wire;
     use proptest::prelude::*;
 
     #[derive(Debug)]

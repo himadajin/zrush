@@ -8,10 +8,10 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::Path;
 
-use crate::config::PROTOCOL_VERSION;
 use crate::framing::{self, Decoder};
 use crate::matching::Mode;
 use crate::plan::{self, Producer};
+use crate::wire::{PROTOCOL_VERSION, parse_canonical_u64};
 
 const READ_BUFFER_SIZE: usize = 8192;
 const REQUEST_FIELD_COUNT: usize = 11;
@@ -320,16 +320,6 @@ fn parse_positive_usize(value: &[u8]) -> Option<usize> {
 
 fn is_canonical_positive(value: &[u8]) -> bool {
     parse_canonical_u64(value).is_some_and(|number| number > 0)
-}
-
-fn parse_canonical_u64(value: &[u8]) -> Option<u64> {
-    if value.is_empty() || (value.len() > 1 && value[0] == b'0') {
-        return None;
-    }
-    value.iter().try_fold(0_u64, |number, byte| {
-        let digit = byte.checked_sub(b'0').filter(|digit| *digit <= 9)?;
-        number.checked_mul(10)?.checked_add(u64::from(digit))
-    })
 }
 
 fn decode_fields(message: &[u8]) -> Result<Vec<Vec<u8>>, Error> {
