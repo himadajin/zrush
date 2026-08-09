@@ -15,6 +15,7 @@ mod dismiss;
 mod fake;
 mod fifo;
 mod fixtures;
+mod hist_lifecycle;
 mod host;
 mod pty;
 mod select;

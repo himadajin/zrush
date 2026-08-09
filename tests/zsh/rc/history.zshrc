@@ -1,5 +1,6 @@
-# Host rc for the headless history-menu regression scenarios in
-# tests/zsh/driver.zsh (issue #9: docs/internal/specs/behavior.md "履歴メニュー",
+# Host rc for the headless history-menu regression scenarios, loaded through
+# ZDOTDIR by the Rust pty harness (tests/driver/) and by tests/zsh/driver.zsh
+# (issue #9: docs/internal/specs/behavior.md "履歴メニュー",
 # docs/internal/contracts/cli-protocol.md "history profile").
 # Required environment: ZRUSH_REAL_BIN, ZRUSH_TEST_TMP (see tests/zsh/rc/minimal.zshrc).
 # Isolated HISTFILE + SAVEHIST=0: the fixture history below lives only in this
@@ -37,8 +38,8 @@ bindkey '^Xk' _zrt-dump-kind
 bindkey '^Xu' up-line-or-history
 
 # ^Xl: a plain cursor-movement widget zrush never binds (not one of the six
-# configurable actions), used to exercise a CURSOR-only external change while
-# a history menu is open (driver.zsh's (h23); h4 only covers a BUFFER-text change).
+# configurable actions), used to exercise an external change that moves CURSOR
+# while leaving BUFFER text alone.
 bindkey '^Xl' backward-char
 
 # ^Xz: CURSOR position, for scenarios that need to confirm a delegated widget

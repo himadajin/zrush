@@ -7,7 +7,7 @@
 use std::time::Duration;
 
 use crate::fake::Mode;
-use crate::host::{Host, PlanShape, SHUTDOWN_SEAM, dump_field, keys, state_has, unquote};
+use crate::host::{Host, PlanShape, SHUTDOWN_SEAM, dump_field, keys, state_has};
 
 /// Transport state after a stop has fully unwound.
 const STOPPED: &[&str] = &[
@@ -100,12 +100,10 @@ fn active_session_deaths_open_the_breaker_and_a_re_source_recovers() {
         .to_string();
 
     host.drain(Duration::from_millis(500));
-    let post = host
-        .dump_get(keys::DUMP_POSTDISPLAY, "TESTPOST")
-        .expect("(err-1b) POSTDISPLAY dump did not run");
+    let post = host.postdisplay("(err-1b)");
     assert!(
-        unquote(&post).is_empty(),
-        "(err-1b) a stale/unexpected listing was shown: {post}"
+        post.is_empty(),
+        "(err-1b) a stale/unexpected listing was shown: {post:?}"
     );
 
     host.clear_line();

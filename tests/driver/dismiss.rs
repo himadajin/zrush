@@ -5,7 +5,7 @@
 
 use std::time::Duration;
 
-use crate::host::{Host, PlanShape, keys, unquote};
+use crate::host::{Host, PlanShape, keys};
 
 #[test]
 fn dismiss_closes_the_list_without_changing_the_buffer() {
@@ -33,10 +33,7 @@ fn dismiss_cancels_an_in_flight_collection() {
     host.send_keys(keys::DISMISS); // dismiss immediately, no drain in between
     host.drain(Duration::from_secs(1)); // comfortably longer than 'git chec' compsys (~150-200ms)
 
-    let post = host
-        .dump_get(keys::DUMP_POSTDISPLAY, "TESTPOST")
-        .map(|raw| unquote(&raw))
-        .unwrap_or_else(|| panic!("(dis-2) POSTDISPLAY dump did not run"));
+    let post = host.postdisplay("(dis-2)");
     assert!(
         post.is_empty(),
         "(dis-2) list reappeared after dismiss (stale collection not cancelled): {post:?}"
