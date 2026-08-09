@@ -114,9 +114,16 @@ pub(crate) fn run(
         .map(|(c, &(_, hit))| qm.spans(c.match_text(), hit))
         .collect();
 
+    // Producer-specific display preprocessing belongs here, before layout
+    // applies grouping, geometry, offsets, and navigation. Build sources for
+    // every ranked candidate because group widths are based on full group
+    // membership, even when the row budget later drops some positions.
+    let sources = compose_cell_sources(&candidates);
+
     let built = layout::build(
         &candidates,
         &parsed.batches,
+        &sources,
         &spans,
         params.rows,
         params.width,
@@ -136,6 +143,52 @@ pub(crate) fn run(
         .collect();
 
     Ok(wire::serialize(common_prefix, &built, &insert_texts))
+}
+
+/// Compose the display source for every candidate before the layout phase.
+///
+/// The history profile's event-number field is display-only and uses one
+/// shared width across all numbered candidates. `match_offset` is optional so
+/// layout can distinguish match-text cells from `d` display-text cells
+/// without inspecting producer-specific candidate fields.
+pub(crate) fn compose_cell_sources(
+    candidates: &[record::Candidate<'_>],
+) -> Vec<layout::CellSource> {
+    let number_width = candidates
+        .iter()
+        .filter_map(|candidate| candidate.n.map(<[u8]>::len))
+        .max()
+        .map(|width| width.max(5));
+
+    candidates
+        .iter()
+        .map(|candidate| {
+            let base =
+                layout::normalize_control_bytes(candidate.d.unwrap_or(candidate.match_text()));
+            let matchable = candidate.d.is_none();
+            let Some(number) = candidate.n else {
+                return layout::CellSource {
+                    text: base.into_owned(),
+                    number_range: None,
+                    match_offset: matchable.then_some(0),
+                };
+            };
+
+            let width = number_width.expect("a numbered candidate establishes number width");
+            let padding = width - number.len();
+            let mut text = Vec::with_capacity(width + 2 + base.len());
+            text.resize(padding, b' ');
+            text.extend_from_slice(number);
+            text.extend_from_slice(b"  ");
+            text.extend_from_slice(&base);
+
+            layout::CellSource {
+                text,
+                number_range: Some(CharSpan::new(padding, padding + number.len())),
+                match_offset: matchable.then_some(width + 2),
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
