@@ -5,8 +5,15 @@
 //! candidates, ships them to the persistent worker, and applies the returned
 //! plan to POSTDISPLAY/region_highlight/BUFFER under real key input.
 
+mod apply;
+mod async_plumbing;
+mod cache;
 mod confirm;
+mod dismiss;
+mod fifo;
 mod fixtures;
 mod host;
 mod pty;
 mod select;
+mod sendbreak;
+mod tab;
