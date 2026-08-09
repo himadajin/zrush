@@ -588,7 +588,7 @@ zsh は一覧を消す。
 
 > 検証: プランの受理条件(下記の拒否条件)— `tests/vectors/reject-plan/` を、
 > Rust の参照パーサ `src/wire.rs`(`tests/vectors.rs`)と zsh の `_zrush_parse_plan`(`zsh -f tests/zsh/vectors.zsh`)の双方が拒否することを検査する。
-> 破棄と「セッション内 1 回警告」の実挙動 — `tests/zsh/driver.zsh` のスモークテスト。
+> 破棄と「セッション内 1 回警告」の実挙動 — 実際の zle 配線に対するスモークテスト `tests/driver/death.rs`(`cargo test --test driver`)。
 
 - zsh は応答の外側/nested netstring、固定フィールド数、kind、canonical な request_id、
   および request_id が未完了要求の 1 つに対応することを検証する。不正なら worker セッションを壊れたものとして終了する。

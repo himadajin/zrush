@@ -8,8 +8,11 @@
 mod apply;
 mod async_plumbing;
 mod cache;
+mod capture;
 mod confirm;
+mod death;
 mod dismiss;
+mod fake;
 mod fifo;
 mod fixtures;
 mod host;

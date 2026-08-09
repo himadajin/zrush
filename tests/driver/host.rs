@@ -9,6 +9,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use tempfile::TempDir;
 
+use crate::fake::Fake;
 use crate::fixtures;
 use crate::pty::Pty;
 
@@ -24,7 +25,12 @@ pub mod keys {
     pub const DUMP_BUFFER: &str = "\x18b";
     pub const DUMP_POSTDISPLAY: &str = "\x18p";
     pub const DUMP_RH: &str = "\x18h";
+    pub const DUMP_WORKER: &str = "\x18w";
     pub const CURSOR_LEFT_THREE: &str = "\x18v";
+    /// `_zrush_worker_shutdown` from a widget: an explicit healthy teardown.
+    pub const WORKER_TEARDOWN: &str = "\x18q";
+    /// Record the host's fd 0/1/2 targets and emit both stream sentinels.
+    pub const STDIO_PROBE: &str = "\x18f";
 }
 
 /// Poll slice for every read of the pty; the enclosing deadlines are what
@@ -36,6 +42,13 @@ const DUMP_DEADLINE: Duration = Duration::from_secs(8);
 /// Set to make `Host::drop` print each host's boot/worker-ready timings.
 const TIMING_ENV: &str = "ZRUSH_DRIVER_TIMING";
 
+/// Shell line that widens the worker shutdown budget, for the cases that
+/// assert a *completed* handoff. The production default is 100 ms, and its
+/// expiry/quarantine branch is asserted independently by
+/// `tests/zsh/transport.zsh`; without this seam scheduler variance alone could
+/// turn a healthy shutdown into that branch.
+pub const SHUTDOWN_SEAM: &str = "_ZRUSH_WORKER_SHUTDOWN_MS=5000";
+
 pub struct Host {
     tmp: Option<TempDir>,
     log: PathBuf,
@@ -46,23 +59,35 @@ pub struct Host {
     /// last input we sent it. Only sending input opens a new window, so output
     /// an intervening drain consumed is still visible to a later expect.
     window: Vec<u8>,
+    /// First `^Xf` fd signature this host reported; every later probe is
+    /// compared against it rather than against another host's.
+    stdio_baseline: Option<String>,
+    fake: Option<Fake>,
     spawned_at: SystemTime,
     boot: Duration,
 }
 
 impl Host {
     pub fn boot() -> Self {
-        Self::boot_with(|_home| {})
+        Self::boot_with(|_home| {}, false)
     }
 
     /// Like [`Host::boot`], but symlinks the shared 7001-file overflow tree
     /// (built once per process, cached under `target/`) into `fx/overflow`
     /// under the host's home.
     pub fn boot_with_overflow() -> Self {
-        Self::boot_with(fixtures::link_overflow)
+        Self::boot_with(fixtures::link_overflow, false)
     }
 
-    fn boot_with(extra_fixtures: impl FnOnce(&Path)) -> Self {
+    /// Like [`Host::boot`], but with `$ZRUSH_BIN` pointing at the failure-
+    /// injection launcher (`$ZRUSH_REAL_BIN` still being the real binary).
+    /// It starts in [`crate::fake::Mode::Proxy`], so the host behaves exactly
+    /// as under the real binary until a test sets another mode.
+    pub fn boot_fake() -> Self {
+        Self::boot_with(|_home| {}, true)
+    }
+
+    fn boot_with(extra_fixtures: impl FnOnce(&Path), fake: bool) -> Self {
         let tmp = TempDir::new().expect("create work dir");
         let home = tmp.path().join("home");
         let work = tmp.path().join("work");
@@ -87,10 +112,13 @@ impl Host {
         // send is an emacs-keymap binding.
         command.arg("-d").arg("-i").current_dir(&home).env_clear();
         command.env("PATH", std::env::var_os("PATH").unwrap_or_default());
-        if let Some(tmpdir) = std::env::var_os("TMPDIR") {
-            command.env("TMPDIR", tmpdir);
-        }
         command
+            // The worker runtime directory and the automatic re-source's init
+            // file are mktemp'd under $TMPDIR by the host itself, and its
+            // zshexit cleanup never runs because Drop kills it. Pointing
+            // $TMPDIR at this host's own work directory makes them go away
+            // with it instead of accumulating in the system temp dir.
+            .env("TMPDIR", &work)
             .env("TERM", "vt100")
             .env("LC_ALL", utf8_locale())
             .env("HOME", &home)
@@ -102,6 +130,7 @@ impl Host {
             .env("ZRUSH_REAL_BIN", bin)
             // Test seam: 5000 ms matches this harness's other bounded waits.
             .env("ZRUSH_HISTORY_DEADLINE_MS", "5000");
+        let fake = fake.then(|| Fake::install(&work, &mut command));
 
         let started = Instant::now();
         let spawned_at = SystemTime::now();
@@ -113,6 +142,8 @@ impl Host {
             pty,
             child,
             window: Vec::new(),
+            stdio_baseline: None,
+            fake,
             spawned_at,
             boot: Duration::ZERO,
         };
@@ -172,7 +203,7 @@ impl Host {
 
     /// Match the raw bytes, then again with SGR sequences stripped (#64):
     /// highlighting can split text the caller expects to be contiguous.
-    fn window_has(&self, text: &str) -> bool {
+    pub fn window_has(&self, text: &str) -> bool {
         contains(&self.window, text.as_bytes())
             || contains(&strip_sgr(&self.window), text.as_bytes())
     }
@@ -195,7 +226,7 @@ impl Host {
         }
     }
 
-    fn window_tail(&self) -> String {
+    pub fn window_tail(&self) -> String {
         let start = self.window.len().saturating_sub(300);
         String::from_utf8_lossy(&self.window[start..]).into_owned()
     }
@@ -231,6 +262,26 @@ impl Host {
             .split(|&b| b == b'\n')
             .rfind(|line| contains(line, needle.as_bytes()))
             .map(|line| String::from_utf8_lossy(line).into_owned())
+    }
+
+    /// Complete lines currently in the log (`wc -l` semantics), for callers
+    /// that need to count occurrences only in what a later step appends.
+    pub fn log_lines(&self) -> usize {
+        fs::read(&self.log)
+            .map(|bytes| bytes.iter().filter(|&&b| b == b'\n').count())
+            .unwrap_or(0)
+    }
+
+    /// Occurrences of `needle` among the log lines after the first `skip`.
+    pub fn log_count_after(&self, skip: usize, needle: &str) -> usize {
+        let Ok(bytes) = fs::read(&self.log) else {
+            return 0;
+        };
+        bytes
+            .split(|&b| b == b'\n')
+            .skip(skip)
+            .filter(|line| contains(line, needle.as_bytes()))
+            .count()
     }
 
     pub fn wait_log(&mut self, needle: &str, baseline: usize, timeout: Duration) -> bool {
@@ -324,6 +375,119 @@ impl Host {
         zsh_version() >= (5, 9)
     }
 
+    /// The `^Xw` persistent-worker dump.
+    pub fn worker_state(&mut self) -> String {
+        self.dump_get(keys::DUMP_WORKER, "TESTWORKER")
+            .expect("worker-state dump did not run")
+    }
+
+    /// Poll `^Xw` until the dump carries every one of `fields`, returning it;
+    /// on timeout, the last dump seen.
+    ///
+    /// Worker-stop cleanup is asynchronous, and a session failure is logged
+    /// before the lifecycle budget has necessarily reached response EOF -- so a
+    /// following request must not treat that log line alone as evidence that
+    /// replacement is allowed. This wait is that evidence.
+    pub fn wait_worker_state(
+        &mut self,
+        timeout: Duration,
+        fields: &[&str],
+    ) -> Result<String, String> {
+        let deadline = Instant::now() + timeout;
+        let mut last = String::new();
+        while Instant::now() < deadline {
+            last = self.worker_state();
+            if state_has(&last, fields) {
+                return Ok(last);
+            }
+            self.drain(Duration::from_millis(100));
+        }
+        Err(last)
+    }
+
+    /// Record the fd 0/1/2 targets of a pristine shell, before anything has
+    /// started a worker. Every later [`Host::assert_host_stdio`] compares
+    /// against this, so call it right after boot on any host that uses them:
+    /// a baseline seeded by the first assertion would have that assertion
+    /// comparing a signature against itself.
+    pub fn seed_stdio_baseline(&mut self) {
+        let signature = self.probe_stdio("stdio baseline");
+        self.stdio_baseline = Some(signature);
+    }
+
+    /// Compare the host's fd 0/1/2 targets against its pristine-shell baseline
+    /// and confirm both output streams still reach its pty.
+    pub fn assert_host_stdio(&mut self, label: &str) {
+        let signature = self.probe_stdio(label);
+        let expected = self
+            .stdio_baseline
+            .as_ref()
+            .expect("seed_stdio_baseline() must run on the pristine host first");
+        assert_eq!(&signature, expected, "{label}: fd targets changed");
+        assert!(
+            self.window_has("ZRUSH-STDOUT-SENTINEL") && self.window_has("ZRUSH-STDERR-SENTINEL"),
+            "{label}: a stream sentinel never reached the pty: {}",
+            self.window_tail()
+        );
+    }
+
+    /// Run `^Xf` once and return the fd signature it reported. The observation
+    /// window is left holding everything the probe emitted, sentinels included.
+    fn probe_stdio(&mut self, label: &str) -> String {
+        let baseline = self.log_count("TESTSTDIO=");
+        self.send_keys(keys::STDIO_PROBE);
+        assert!(
+            self.wait_log("TESTSTDIO=", baseline, Duration::from_secs(5)),
+            "{label}: stdio probe did not run"
+        );
+        self.drain(Duration::from_millis(200));
+        let latest = self
+            .last_log_line("TESTSTDIO=")
+            .expect("stdio probe log line vanished after wait_log succeeded");
+        latest
+            .split_once("fds=")
+            .unwrap_or_else(|| panic!("{label}: no fds= field in {latest:?}"))
+            .1
+            .to_string()
+    }
+
+    // ---- failure-injection launcher (tests/driver/fake.rs) ----
+
+    pub fn fake(&self) -> &Fake {
+        self.fake
+            .as_ref()
+            .expect("this host was not booted with Host::boot_fake()")
+    }
+
+    /// Wait for a fake state line containing `needle` to appear beyond
+    /// `baseline`, draining the pty as every wait loop must.
+    pub fn wait_fake(&mut self, needle: &str, baseline: usize, timeout: Duration) -> bool {
+        self.wait_fake_with(baseline, timeout, |fake| fake.count(needle))
+    }
+
+    /// [`Host::wait_fake`] against a whole state line rather than a substring.
+    pub fn wait_fake_line(&mut self, line: &str, baseline: usize, timeout: Duration) -> bool {
+        self.wait_fake_with(baseline, timeout, |fake| fake.count_line(line))
+    }
+
+    fn wait_fake_with(
+        &mut self,
+        baseline: usize,
+        timeout: Duration,
+        count: impl Fn(&Fake) -> usize,
+    ) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            self.drain(Duration::from_millis(100));
+            if count(self.fake()) > baseline {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+        }
+    }
+
     // ---- per-test config (tab: `[insert].tab` needs a non-default value) ----
 
     /// Config lives solely at `$XDG_CONFIG_HOME/zrush/config.toml`
@@ -331,6 +495,12 @@ impl Host {
     /// exercising `zrush config`'s own CLI, since that path is `tests/cli.rs`'s.
     pub fn write_config(&self, toml: &str) {
         fs::write(self.config_path(), toml).expect("write config.toml");
+    }
+
+    /// Drop back to defaults for the rest of a scenario whose later steps must
+    /// not keep re-reporting the fixture config's warnings.
+    pub fn remove_config(&self) {
+        fs::remove_file(self.config_path()).expect("remove config.toml");
     }
 
     fn config_path(&self) -> PathBuf {
@@ -408,6 +578,25 @@ impl Drop for Host {
 pub enum PlanShape {
     Zero,
     Nonempty,
+}
+
+// ---- `name=value` dump helpers ----
+
+/// Whether `dump` carries every one of `fields` as a whole whitespace-delimited
+/// token, so `reason=` does not match `reason=session-failure`.
+pub fn state_has(dump: &str, fields: &[&str]) -> bool {
+    fields
+        .iter()
+        .all(|field| dump.split_whitespace().any(|token| token == *field))
+}
+
+/// The value of a `name=value` token of a dump line.
+pub fn dump_field<'a>(dump: &'a str, name: &str) -> &'a str {
+    dump.split_whitespace()
+        .filter_map(|token| token.split_once('='))
+        .find(|(key, _)| *key == name)
+        .map(|(_, value)| value)
+        .unwrap_or_else(|| panic!("no {name}= field in {dump:?}"))
 }
 
 // ---- byte helpers ----
