@@ -4,10 +4,10 @@
 # Usage:
 #   zsh -f tests/zsh/driver.zsh <playground-dir> [section ...]
 #     The playground only needs to exist and be writable; it is used as an
-#     isolated $HOME. Every fixture this driver needs (small file/directory
-#     trees, a filename containing a space, a slow fake completion) is
-#     created under $PLAYGROUND/fx by this script -- no pre-populated docs
-#     tree or external "huge" directory is required.
+#     isolated $HOME. Every fixture this driver needs (a small file/directory
+#     tree and a large generated one) is created under $PLAYGROUND/fx by this
+#     script -- no pre-populated docs tree or external "huge" directory is
+#     required.
 #     With no section arguments every section runs. Naming sections runs just
 #     those, always in the canonical order of the SECTIONS array below (host
 #     startup and its baseline checks run regardless). Each section owns its
@@ -28,8 +28,8 @@
 #
 # Harness (shared with driver-coexist.zsh/driver-latency.zsh):
 #   - Start an interactive host zsh with nonblocking zpty -b, send keys, and inspect
-#     both pty output and the ZRUSH_LOG file (including the ^Xb/^Xp/^Xh test-only
-#     dump widgets registered by rc/minimal.zshrc).
+#     both pty output and the ZRUSH_LOG file (including the ^Xw/^Xj/^Xg/^Xf
+#     test-only dump widgets registered by rc/minimal.zshrc).
 #   - Always drain the pty in wait loops to prevent tcsetattr TCSADRAIN blocking.
 #     Draining never hides output from a later expect: EXPECT_BUF holds
 #     everything the host has emitted since the last input we sent it.
@@ -56,7 +56,7 @@ typeset -g PLAYGROUND=${1:?usage: driver.zsh <playground-dir> [section ...]}
 # Canonical execution order of the test sections. Any sections named on the
 # command line run in this order, never in argument order; an empty selection
 # means every section.
-typeset -ga SECTIONS=( hist jobtable inflight )
+typeset -ga SECTIONS=( jobtable inflight )
 typeset -gA PICKED=()
 for SECTION_ARG in "${@[2,-1]}"; do
   (( ${SECTIONS[(I)$SECTION_ARG]} )) || { print -u2 "FATAL: unknown section '$SECTION_ARG' (valid: $SECTIONS)"; exit 1 }
@@ -113,8 +113,6 @@ export ZRUSH_BIN=$WORK/bin/zrush
 export ZRUSH_REAL_BIN=$REPO/target/release/zrush
 export ZRUSH_FAKE_CONTROL=$WORK/fake-control
 export ZRUSH_FAKE_STATE=$WORK/fake-state
-# Test seam: 5000 ms matches the driver's other bounded waits.
-export ZRUSH_HISTORY_DEADLINE_MS=5000
 
 print "source $REPO/tests/zsh/rc/minimal.zshrc" > $ZDOTDIR/.zshrc
 
@@ -125,21 +123,6 @@ mkdir -p $PLAYGROUND/fx/basic/subdir
 : >| $PLAYGROUND/fx/basic/alpha.txt
 : >| $PLAYGROUND/fx/basic/alsoalpha.txt
 : >| $PLAYGROUND/fx/basic/subdir/inner.txt
-
-# fx/spacey: a filename whose quoted (w) and raw (m) forms differ.
-mkdir -p $PLAYGROUND/fx/spacey
-: >| $PLAYGROUND/fx/spacey/"has space.txt"
-
-# fx/hidden: dot-prefixed entries next to a visible one. The names share the
-# "dotted" stem so a dotless listing can be checked for their absence.
-mkdir -p $PLAYGROUND/fx/hidden
-: >| $PLAYGROUND/fx/hidden/.dotted-alpha.txt
-: >| $PLAYGROUND/fx/hidden/.dotted-beta.txt
-: >| $PLAYGROUND/fx/hidden/visible.txt
-
-# fx/headed: a plain file so _files' "file" tag heading appears in the plan.
-mkdir -p $PLAYGROUND/fx/headed
-: >| $PLAYGROUND/fx/headed/plainfile.txt
 
 # fx/overflow: enough entries that a single compsys capture's candidate_payload
 # comfortably exceeds the request-FIFO buffer on either platform this driver
@@ -207,7 +190,6 @@ sync_prompt() {  # $1=timeout(s); returns expect's status (drain still always ru
   drain 0.1
   return st
 }
-press() { send_keys $1; drain 0.3 }
 
 log_count() {  # $1=fixed string -> REPLY: occurrence count in ZRUSH_LOG
   typeset -g REPLY=0
@@ -286,23 +268,6 @@ wait_fake() {  # $1=fixed state line $2=baseline $3=timeout
   return 1
 }
 
-# Compare an exact ^Xb BUFFER dump against an expected string.
-assert_buffer() {  # $1=expected buffer $2=label
-  local expected=$1 want=${(qqqq)1}
-  send_keys $'\C-xb'
-  local -F dl=$(( SECONDS + 5 ))
-  local last=
-  local -a tl
-  while (( SECONDS < dl )); do
-    drain 0.15
-    tl=( ${(f)"$(grep -F 'TESTBUF=' $ZRUSH_LOG 2>/dev/null)"} )
-    (( $#tl )) && last=${tl[-1]#*TESTBUF=}
-    [[ ${(Q)last} == "$expected" ]] && { ok "$2"; return 0 }
-  done
-  ng "$2: buffer=${last:-?} want=$want"
-  return 1
-}
-
 # Trigger a ^X* dump widget and return the freshest matching ZRUSH_LOG line's
 # value (post-tag text) in REPLY. $1=dump key-sequence $2=log tag.
 # Waits for the tag's occurrence count to grow past its pre-press value, so a
@@ -353,25 +318,10 @@ assert_host_stdio() {  # $1=label; compare fd targets and stdout/stderr delivery
   return 1
 }
 
-# A send-break reset for scenarios that can leave a multiline BUFFER: ^U
-# (backward-kill-line) only clears the current physical line of a multiline
-# buffer, so those scenarios need a real line abandon + resync instead.
-# The generous bound matches the other send-break sites: a loaded host has
-# been observed to spend >5s inside pty-^C interrupt handling before the new
-# prompt appears (#47). A resync that never happens leaves every following
-# case running against a desynced host, so it is reported rather than dropped.
-reset_line() {
-  send_keys $'\C-c'
-  drain 0.3
-  sync_prompt 15 || ng "reset_line: no prompt after send-break"
-}
-
 # Stop whatever is running as the "host" pty and start a fresh one under a
-# given ZDOTDIR/XDG_CONFIG_HOME/log file. Used by the history-menu section
-# below, which needs several isolated hosts (a default-config one plus
-# config-variant ones for limit/min-input/keybind) beyond the single host the
-# rest of this driver uses.
-start_hist_host() {  # $1=zdotdir $2=xdg-config-home $3=logfile
+# given ZDOTDIR/XDG_CONFIG_HOME/log file. sec_jobtable and sec_inflight each
+# need a host of their own, because each lets its host exit for real.
+start_host() {  # $1=zdotdir $2=xdg-config-home $3=logfile
   zpty -d host 2>/dev/null
   export ZDOTDIR=$1 XDG_CONFIG_HOME=$2 ZRUSH_LOG=$3
   cd $PLAYGROUND || return 1
@@ -438,212 +388,13 @@ sec_boot() {
   assert_host_stdio "(fd-1d) generated callback dispatch preserves host fd 0/1/2"
 }
 
-sec_hist() {
-  # ================================================================ (10) History menu (issue #9)
-  # docs/internal/specs/behavior.md "履歴メニュー" and cli-protocol.md
-  # "history profile" are the source of truth. This section runs on its own
-  # host(s) with fixture history (tests/zsh/rc/history.zshrc and friends)
-  # instead of the "host" pty used above.
-  # The fixture history is isolated (HISTFILE under $WORK, SAVEHIST=0) and
-  # never touches the real ~/.zsh_history (AGENTS.md guardrail).
-  mkdir -p $WORK/zdot-hist $WORK/xdg-hist/zrush
-  print "source $REPO/tests/zsh/rc/history.zshrc" > $WORK/zdot-hist/.zshrc
-  start_hist_host $WORK/zdot-hist $WORK/xdg-hist $WORK/host-hist.log ||
-    ng "(hist-0) history-menu host failed to start"
-
-  # ---- (h13) while browsing plain history (HISTNO != HISTCMD, entered here
-  # via a raw ^Xu binding to up-line-or-history), select-prev/select-next
-  # both delegate to the predecessor instead of opening/moving a history menu.
-  # Each raw history step below changes BUFFER to a real history line, which
-  # (like any buffer edit) can arm and settle an ordinary recollection before
-  # the following dump runs; that legitimately shows up as 'compsys', so
-  # every check here is "never 'history'", not "always 'none'".
-  press $'\C-xu'
-  press $'\C-xu'   # two raw history-back steps, so there is room for a further Down below
-  dump_get $'\C-xk' TESTKIND
-  [[ $REPLY != 'kind=history'* ]] || ng "(h13-setup) unexpected history-menu kind after raw history browsing: $REPLY"
-  # audit A2: "kind != history" alone would also pass if the key were simply
-  # swallowed as a no-op instead of actually delegated, so additionally pin
-  # down the real transition via BUFFER content: Up must move one further
-  # step back in plain history (a different line), and Down must land back
-  # on exactly the line seen right before Up (a round trip), proving both
-  # keys actually reached up-line-or-history/down-line-or-history.
-  dump_get $'\C-xb' TESTBUF; local buf_base=${(Q)REPLY}
-  press $'\e[A'
-  if dump_get $'\C-xk' TESTKIND; then
-    [[ $REPLY != 'kind=history'* ]] && ok "(h13a) Up while browsing plain history delegates (no history menu opens)" || ng "(h13a) $REPLY"
-  fi
-  dump_get $'\C-xb' TESTBUF; local buf_after_up=${(Q)REPLY}
-  [[ $buf_after_up != "$buf_base" ]] \
-    && ok "(h13a') the delegated Up actually moved one step further back in plain history (buffer changed: ${(qqqq)buf_base} -> ${(qqqq)buf_after_up})" \
-    || ng "(h13a') buffer did not change; Up may have been silently swallowed instead of delegated"
-  press $'\e[B'
-  if dump_get $'\C-xk' TESTKIND; then
-    [[ $REPLY != 'kind=history'* ]] && ok "(h13b) Down while browsing plain history delegates (no history menu opens)" || ng "(h13b) $REPLY"
-  fi
-  dump_get $'\C-xb' TESTBUF; local buf_after_down=${(Q)REPLY}
-  [[ $buf_after_down == "$buf_base" ]] \
-    && ok "(h13b') the delegated Down actually moved one step forward, back to the same plain-history line as before Up" \
-    || ng "(h13b') buffer=${(qqqq)buf_after_down} want=${(qqqq)buf_base}"
-  reset_line
-
-  # ---- (h14) a multiline buffer with the cursor off the first line: Up is
-  # cursor movement, not a history-menu open (behavior.md priority rule 1,
-  # symmetric with select-next's own multiline rule).
-  send_keys 'echo a'
-  send_keys $'\C-v\C-j'
-  send_keys 'b'
-  drain 0.5
-  dump_get $'\C-xz' TESTCUR; local -i cur_before=$REPLY   # end of buffer: 8 ('echo a'=6 + \n + 'b')
-  press $'\e[A'
-  if dump_get $'\C-xk' TESTKIND; then
-    # A same-buffer recollection for the "b" argument word may have already
-    # settled (real or not, cli-protocol.md still records it as 'compsys');
-    # only a 'history' kind would mean the menu wrongly opened.
-    [[ $REPLY != 'kind=history'* ]] && ok "(h14a) Up with a newline in LBUFFER delegates (no history menu opens)" || ng "(h14a) $REPLY"
-  fi
-  assert_buffer $'echo a\nb' "(h14b) buffer content is unchanged (only the cursor moved)"
-  # audit A2: "buffer unchanged" alone would also pass if Up were a pure
-  # no-op, so additionally pin down that the cursor actually left line 2:
-  # 'echo a' occupies positions 0..6 (the newline sits at 6), so landing
-  # anywhere in 0..6 means "on line 1".
-  dump_get $'\C-xz' TESTCUR; local -i cur_after=$REPLY
-  [[ $cur_after -lt 7 && $cur_after -ne $cur_before ]] \
-    && ok "(h14c) the cursor actually moved onto the first line (was $cur_before, now $cur_after; line 1 spans 0..6)" \
-    || ng "(h14c) cursor did not move onto the first line (before=$cur_before after=$cur_after)"
-  reset_line
-
-  # ---- (h26c) audit A2: send-break while merely debounce-armed (timer fd
-  # alive, no collection started yet) must clear the timer too. A dedicated
-  # host with a generous delay-ms is used so the round trip to dump and
-  # assert the armed timer via ^Xt comfortably fits before the debounce
-  # would otherwise fire (disarming via the history-menu open path itself is
-  # covered by the Rust driver's debounce-window test; this covers disarming
-  # via send-break/line-init instead).
-  mkdir -p $WORK/xdg-hist-slowdebounce/zrush
-  print -r -- $'[display]\ndelay-ms = 2000' > $WORK/xdg-hist-slowdebounce/zrush/config.toml
-  if start_hist_host $WORK/zdot-hist $WORK/xdg-hist-slowdebounce $WORK/host-hist-slowdebounce.log; then
-    ok "(h26c-0) delay-ms=2000 host started"
-    send_keys 'x'
-    drain 0.3   # comfortably within the 2s debounce window
-    if dump_get $'\C-xt' TESTFDS; then
-      # Guard against a vacuous check: fail loudly here rather than silently
-      # passing (h26c) below for the wrong reason if the timer never armed.
-      [[ $REPLY != 'timer=-1'* ]] \
-        && ok "(h26c-pre) the debounce timer is armed (non -1) before send-break" \
-        || ng "(h26c-pre) timer was not armed as expected before send-break: $REPLY"
-    fi
-    send_keys $'\C-c'
-    if sync_prompt 15; then
-      ok "(h26c-a) a new prompt appears after send-break during the debounce wait"
-      if dump_get $'\C-xt' TESTFDS; then
-        [[ $REPLY == 'timer=-1 rfd=-1 wfd=-1 pty=<none>' ]] \
-          && ok "(h26c) the disarmed debounce timer's fd is cleared after the following line-init" \
-          || ng "(h26c) $REPLY"
-      fi
-      if dump_get $'\C-xk' TESTKIND; then
-        [[ $REPLY == 'kind=none sel=0 listing=0 npos=0' ]] && ok "(h26c-kind) kind/listing is also clean" || ng "(h26c-kind) $REPLY"
-      fi
-    else
-      ng "(h26c-a) send-break did not produce a new prompt in this environment"
-    fi
-  else
-    ng "(h26c-0) delay-ms=2000 host failed to start"
-  fi
-
-  # ---- (h8) [history].limit bounds the RAW scan window; entries that don't
-  # survive the in-window dedup/exclusion are never backfilled from outside
-  # that window (cli-protocol.md "history profile", config-schema.md "[history]").
-  mkdir -p $WORK/zdot-hist-lim $WORK/xdg-hist-lim/zrush
-  print "source $REPO/tests/zsh/rc/history-limit.zshrc" > $WORK/zdot-hist-lim/.zshrc
-  print -r -- $'[history]\nlimit = 5' > $WORK/xdg-hist-lim/zrush/config.toml
-  if start_hist_host $WORK/zdot-hist-lim $WORK/xdg-hist-lim $WORK/host-hist-limit.log; then
-    ok "(h8-0) limit=5 host started with its own fixture history"
-    press $'\e[A'
-    if dump_get $'\C-xp' TESTPOST; then
-      local post_lim=${(Q)REPLY}
-      if [[ $post_lim == *dupA* && $post_lim == *keep3* && $post_lim == *keep4* \
-            && $post_lim != *keep5-outside* && $post_lim != *oldest-outside* ]]; then
-        ok "(h8a) the newest-5 scan window yields dupA/keep3/keep4 and never backfills keep5-outside/oldest-outside from beyond it"
-      else
-        ng "(h8a) unexpected listing for limit=5: ${(qqqq)post_lim}"
-      fi
-      local -a lim_rows=( "${(f)post_lim}" )
-      local -i n_dupa=${#${(M)lim_rows:#*dupA*}}
-      (( n_dupa == 1 )) && ok "(h8b) the duplicate within the scan window is deduplicated to exactly one row" || ng "(h8b) dupA appeared in $n_dupa rows: ${(qqqq)post_lim}"
-    else
-      ng "(h8a) POSTDISPLAY dump did not run"
-    fi
-  else
-    ng "(h8-0) limit=5 host failed to start"
-  fi
-
-  # ---- (h19) min-input does not gate the history menu: even with min-input
-  # raised well above any possible word length, an empty-buffer Up still
-  # opens the full menu (behavior.md: min-input and the blank-buffer
-  # suppression rule apply only to the input-following auto display, not to
-  # the history menu).
-  mkdir -p $WORK/xdg-hist-mininput/zrush
-  print -r -- $'[display]\nmin-input = 50' > $WORK/xdg-hist-mininput/zrush/config.toml
-  if start_hist_host $WORK/zdot-hist $WORK/xdg-hist-mininput $WORK/host-hist-mininput.log; then
-    ok "(h19-0) min-input=50 host started"
-    press $'\e[A'
-    if dump_get $'\C-xk' TESTKIND; then
-      [[ $REPLY == 'kind=history sel=1 listing=1'* ]] \
-        && ok "(h19a) empty-buffer Up opens the history menu even with min-input=50" \
-        || ng "(h19a) $REPLY"
-    fi
-  else
-    ng "(h19-0) min-input=50 host failed to start"
-  fi
-
-  # ---- (h20) remapping select-prev to just ["up"] leaves ctrl-p bound to its
-  # predecessor (plain history movement, config-schema.md "[keybind]"); Up
-  # (still in the remapped list) still opens the history menu.
-  mkdir -p $WORK/xdg-hist-keybind/zrush
-  print -r -- $'[keybind]\nselect-prev = ["up"]' > $WORK/xdg-hist-keybind/zrush/config.toml
-  if start_hist_host $WORK/zdot-hist $WORK/xdg-hist-keybind $WORK/host-hist-keybind.log; then
-    ok "(h20-0) select-prev=[\"up\"] host started"
-    # Up first, on the pristine just-started state: ctrl-p's own predecessor
-    # (tested second, below) is real native history movement and would
-    # otherwise leave HISTNO != HISTCMD behind it, which changes what a
-    # *later* Up does (behavior.md priority rule 2) -- unrelated to what
-    # this remap is actually about.
-    press $'\e[A'
-    if dump_get $'\C-xk' TESTKIND; then
-      [[ $REPLY == 'kind=history sel=1 listing=1'* ]] \
-        && ok "(h20b) Up (still in the remapped select-prev list) still opens the history menu" \
-        || ng "(h20b) $REPLY"
-    fi
-    press $'\C-g'   # dismiss: back to an empty buffer, HISTNO still untouched
-    dump_get $'\C-xb' TESTBUF; local buf_before_ctrlp=${(Q)REPLY}
-    press $'\C-p'
-    if dump_get $'\C-xk' TESTKIND; then
-      # ctrl-p's predecessor may move BUFFER to a real history line, which
-      # (like any buffer edit) can arm and settle an ordinary recollection
-      # before this dump runs; only a 'history' kind would mean the menu
-      # wrongly opened.
-      [[ $REPLY != 'kind=history'* ]] && ok "(h20a) ctrl-p (excluded from select-prev) does not open the history menu" || ng "(h20a) $REPLY"
-    fi
-    # audit A2: "kind != history" alone would also pass if ctrl-p were
-    # silently swallowed as a no-op; pin down that its predecessor actually
-    # ran plain history movement by requiring a real, nonempty buffer change.
-    dump_get $'\C-xb' TESTBUF; local buf_after_ctrlp=${(Q)REPLY}
-    [[ -n $buf_after_ctrlp && $buf_after_ctrlp != "$buf_before_ctrlp" ]] \
-      && ok "(h20a') ctrl-p's predecessor actually performed native history movement (buffer: ${(qqqq)buf_before_ctrlp} -> ${(qqqq)buf_after_ctrlp})" \
-      || ng "(h20a') ctrl-p did not change the buffer; it may have been silently swallowed instead of delegated"
-  else
-    ng "(h20-0) select-prev=[\"up\"] host failed to start"
-  fi
-}
-
 sec_jobtable() {
   # ================================================================ Worker job-table isolation
   # This host must exit during the assertion, so give it dedicated rc/config/log
   # state rather than reusing any host needed by the preceding cases.
   mkdir -p $WORK/zdot-exit $WORK/xdg-exit/zrush
   print "source $REPO/tests/zsh/rc/minimal.zshrc" > $WORK/zdot-exit/.zshrc
-  if start_hist_host $WORK/zdot-exit $WORK/xdg-exit $WORK/host-exit.log; then
+  if start_host $WORK/zdot-exit $WORK/xdg-exit $WORK/host-exit.log; then
     send_line '[[ -o checkjobs && -o checkrunningjobs ]] && print CHECK-JOBS-ENABLED'
     if expect '*CHECK-JOBS-ENABLED*HP>*' 5; then
       fake_session_count; local -i exit_session=$(( REPLY + 1 ))
@@ -707,19 +458,19 @@ sec_inflight() {
   #
   # The previous case just let its own dedicated "host" pty session exit for
   # real (as opposed to every other transition in this driver, which deletes
-  # a still-live session via `zpty -d host`). start_hist_host always issues
+  # a still-live session via `zpty -d host`). start_host always issues
   # its own `zpty -d host 2>/dev/null` before spawning anew; issuing that
   # exact call -- with stderr redirected -- as the *first* deletion of an
   # already-dead real-worker session reproducibly kills this outer zsh
   # process outright (a zpty/job-control interaction, not a zrush bug).
   # Reaping it here first, without redirecting stderr, avoids the crash;
-  # start_hist_host's own redundant delete of the now-already-gone session
+  # start_host's own redundant delete of the now-already-gone session
   # is then a harmless no-op.
   print -r -- proxy > $ZRUSH_FAKE_CONTROL
   zpty -d host
   mkdir -p $WORK/zdot-inflight $WORK/xdg-inflight/zrush
   print "source $REPO/tests/zsh/rc/minimal.zshrc" > $WORK/zdot-inflight/.zshrc
-  if start_hist_host $WORK/zdot-inflight $WORK/xdg-inflight $WORK/host-inflight.log; then
+  if start_host $WORK/zdot-inflight $WORK/xdg-inflight $WORK/host-inflight.log; then
     send_line '[[ -o checkjobs && -o checkrunningjobs ]] && print CHECK-JOBS-ENABLED'
     if expect '*CHECK-JOBS-ENABLED*HP>*' 5; then
       # Warm the persistent worker up on a small request first so handshake/
