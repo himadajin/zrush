@@ -81,6 +81,69 @@ pub(crate) struct Plan {
     pub positions: Vec<usize>,
 }
 
+/// Display text and the char offsets that belong to the source candidate.
+///
+/// `text` is already composed and normalized by plan.rs. `number_range` is
+/// the optional history-number span inside that text. `match_offset` is
+/// `Some(offset)` when the text contains match-text and match highlights are
+/// allowed, and `None` when a display-text (`d`) value replaced match-text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CellSource {
+    pub text: Vec<u8>,
+    pub number_range: Option<CharSpan>,
+    pub match_offset: Option<usize>,
+}
+
+/// One group in first-occurrence order. Members are candidate indexes in
+/// rank order, not visual scan order.
+struct Group<'a> {
+    key: &'a [u8],
+    heading: &'a [u8],
+    members: Vec<usize>,
+}
+
+/// Group geometry associated with one logical position.
+#[derive(Debug, Clone, Copy)]
+struct GroupBounds {
+    start: usize,
+    end: usize,
+    grows: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct HeadingMark {
+    row: usize,
+    len: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CellMark {
+    row: usize,
+    in_row_start: usize,
+    content_chars: usize,
+    candidate: usize,
+    pos: usize,
+}
+
+/// The output of the grid phase. Offsets cannot be finalized until all row
+/// lengths are known, so this state keeps the local marks needed by the
+/// offset phase instead of passing parallel vectors between phases.
+#[derive(Debug, Default)]
+struct GridState {
+    rows: Vec<Vec<u8>>,
+    row_lens: Vec<usize>,
+    heading_marks: Vec<HeadingMark>,
+    cell_marks: Vec<CellMark>,
+    group_bounds: Vec<GroupBounds>,
+    positions: Vec<usize>,
+}
+
+#[derive(Debug)]
+struct OffsetState {
+    highlights: Vec<Highlight>,
+    cell_ranges: Vec<CharSpan>,
+}
+
 /// Build the render plan for a ranked candidate list.
 ///
 /// `candidates` must already be in rank order (matching.rs + ranking.rs);
@@ -94,30 +157,45 @@ pub(crate) struct Plan {
 pub(crate) fn build(
     candidates: &[Candidate<'_>],
     batches: &[Batch<'_>],
+    sources: &[CellSource],
     spans: &[Vec<CharSpan>],
     row_budget: usize,
     width: usize,
     style: Style,
 ) -> Plan {
-    // --- Group candidates by key, in first-occurrence order (contract:
-    // "グループの割り当ては候補の初出現順による"). A group's own row
-    // order is the incoming (rank) order restricted to its members.
-    struct Group<'a> {
-        key: &'a [u8],
-        heading: &'a [u8], // meaningless when key.is_empty()
-        members: Vec<usize>,
+    assert_eq!(
+        candidates.len(),
+        sources.len(),
+        "cell sources must align with candidates"
+    );
+
+    let groups = group_candidates(candidates, batches);
+    let grid = render_grid(&groups, sources, row_budget, width, style);
+    let offsets = compute_offsets(sources, spans, &grid);
+    let nav = build_navigation(&grid.group_bounds, grid.positions.len());
+
+    Plan {
+        rows: grid.rows,
+        highlights: offsets.highlights,
+        cell_ranges: offsets.cell_ranges,
+        nav,
+        positions: grid.positions,
     }
-    // Ordered groups plus a key -> index lookup, kept in sync: the Vec
-    // preserves first-occurrence display order, the map turns "does this
-    // key already have a group" from an O(groups) scan into O(1)
-    // (audit: linear scan measured 67ms at 30k all-unique-key candidates).
-    let mut groups: Vec<Group<'_>> = Vec::new();
+}
+
+/// Group candidates by key in first-occurrence order. A group's own member
+/// order remains the incoming rank order.
+fn group_candidates<'candidate, 'batch>(
+    candidates: &[Candidate<'candidate>],
+    batches: &[Batch<'batch>],
+) -> Vec<Group<'batch>> {
+    let mut groups: Vec<Group<'batch>> = Vec::new();
     let mut group_index: std::collections::HashMap<&[u8], usize> = std::collections::HashMap::new();
     for (idx, cand) in candidates.iter().enumerate() {
         let batch = &batches[cand.batch];
         let key = group_key(batch);
-        if let Some(&gi) = group_index.get(key) {
-            groups[gi].members.push(idx);
+        if let Some(&group) = group_index.get(key) {
+            groups[group].members.push(idx);
         } else {
             let heading = if key.is_empty() {
                 &b""[..]
@@ -132,69 +210,21 @@ pub(crate) fn build(
             });
         }
     }
+    groups
+}
 
-    // Per-candidate cell source text (contract "セルの表示テキストの決定
-    // 規則": `d` if present, else match-text), control-byte-normalized and,
-    // for history candidates, prefixed by a shared-width event-number field.
-    // Built for every candidate up front because gmaxw is defined over a
-    // group's *full* membership, not just what ends up displayed, and
-    // because width/padding/truncation all measure the normalized text.
-    let number_width = candidates
-        .iter()
-        .filter_map(|c| c.n.map(<[u8]>::len))
-        .max()
-        .map(|width| width.max(5));
-    // Parallel metadata over `sources`: digit range and command-text start,
-    // both char offsets within the composed source. The history profile
-    // guarantees ASCII digits, padding and delimiter, so their byte and char
-    // lengths coincide.
-    let mut number_ranges: Vec<Option<CharSpan>> = Vec::with_capacity(candidates.len());
-    let mut match_offsets: Vec<usize> = Vec::with_capacity(candidates.len());
-    let sources: Vec<Vec<u8>> = candidates
-        .iter()
-        .map(|c| {
-            let base = normalize_control_bytes(c.d.unwrap_or(c.match_text()));
-            let Some(number) = c.n else {
-                number_ranges.push(None);
-                match_offsets.push(0);
-                return base.into_owned();
-            };
-            let width = number_width.expect("a numbered candidate establishes number width");
-            let pad = width - number.len();
-            let mut source = Vec::with_capacity(width + 2 + base.len());
-            source.resize(pad, b' ');
-            source.extend_from_slice(number);
-            source.extend_from_slice(b"  ");
-            source.extend_from_slice(&base);
-            number_ranges.push(Some(CharSpan::new(pad, pad + number.len())));
-            match_offsets.push(width + 2);
-            source
-        })
-        .collect();
-
-    let mut rows: Vec<Vec<u8>> = Vec::new();
-    let mut row_lens: Vec<usize> = Vec::new(); // char length per row, parallel to `rows`
-    struct HeadingMark {
-        row: usize,
-        len: usize,
-    }
-    struct CellMark {
-        row: usize,
-        in_row_start: usize,
-        content_chars: usize,
-        candidate: usize,
-        pos: usize,
-    }
-    let mut heading_marks: Vec<HeadingMark> = Vec::new();
-    let mut cell_marks: Vec<CellMark> = Vec::new();
-    // Per-position group bounds, filled as groups are placed; used by
-    // the nav pass below (left/right are group-clamped).
-    let mut pos_group_start: Vec<usize> = Vec::new();
-    let mut pos_group_end: Vec<usize> = Vec::new();
-    let mut pos_group_grows: Vec<usize> = Vec::new();
-    let mut positions: Vec<usize> = Vec::new();
-
+/// Place groups into the producer-specific grid and retain the marks needed
+/// by the later offset phase.
+fn render_grid(
+    groups: &[Group<'_>],
+    sources: &[CellSource],
+    row_budget: usize,
+    width: usize,
+    style: Style,
+) -> GridState {
+    let mut grid = GridState::default();
     let mut remaining = row_budget;
+
     for (group_idx, group) in groups.iter().enumerate() {
         if remaining == 0 {
             break; // budget exhausted: this and every later group is dropped
@@ -204,11 +234,11 @@ pub(crate) fn build(
         let show_heading = if remaining >= required {
             wants_heading
         } else if group_idx == 0 && wants_heading && remaining >= 1 {
-            // Contract exception: only the *first* group may show its
-            // candidates without a heading when the budget can't fit both.
+            // Contract exception: only the first group may show its
+            // candidates without a heading when the budget cannot fit both.
             false
         } else {
-            break; // can't fit this group (heading or not): drop it and stop
+            break; // cannot fit this group: drop it and stop
         };
         let candidate_budget = if show_heading {
             remaining - 1
@@ -216,12 +246,12 @@ pub(crate) fn build(
             remaining
         };
 
-        // gmaxw = max(1, min(width, max member display width)) over the
-        // group's *full* membership (cli-protocol.md "セル幅").
+        // gmaxw is based on the group's full membership, not only the
+        // positions that survive the row budget.
         let max_member_width = group
             .members
             .iter()
-            .map(|&i| display_width(&sources[i]))
+            .map(|&i| display_width(&sources[i].text))
             .max()
             .unwrap_or(1);
         let gmaxw = group_gmaxw(width, max_member_width);
@@ -235,30 +265,22 @@ pub(crate) fn build(
 
         if show_heading {
             let heading = normalize_control_bytes(group.heading);
-            // Same truncation rule as cells (cli-protocol.md "見出し
-            // テキストが width を超える場合"): max original-byte prefix
-            // whose lossy display width fits `width`.
+            // Same truncation rule as cells: keep the maximal original-byte
+            // prefix whose lossy display width fits `width`.
             let (content, _w, chars) = truncate_to_width(&heading, width);
-            let row = rows.len();
-            rows.push(content.to_vec());
-            row_lens.push(chars);
-            heading_marks.push(HeadingMark { row, len: chars });
+            let row = grid.rows.len();
+            grid.rows.push(content.to_vec());
+            grid.row_lens.push(chars);
+            grid.heading_marks.push(HeadingMark { row, len: chars });
         }
 
-        let start_pos = positions.len() + 1;
+        let start_pos = grid.positions.len() + 1;
         let members_shown = &group.members[..gcount];
-        // Position numbers are assigned by rank within the group (1..=
-        // gcount), independent of which (row, col) grid cell a position
-        // ends up rendered in -- `members_shown[p_local - 1]` (used below
-        // to resolve each cell's candidate) already *is* that mapping, so
-        // `positions` is exactly `members_shown`, built once here rather
-        // than by pushing inside the render loop below. That loop visits
-        // cells in (row, col) scan order, e.g. p_local = 1, 1+grows,
-        // 1+2*grows, ..., 2, 2+grows, ... whenever grows > 1 and cols > 1
-        // -- not in increasing position order -- so a push there would
-        // (and did) desync `positions` from `cell_ranges`/`nav`, which
-        // are always written or read by position index.
-        positions.extend_from_slice(members_shown);
+        // Positions are assigned in rank order once, before visual row/col
+        // scanning. The scan order is (a,c,e,b,d) for a 3-column, 2-row
+        // ragged grid, so assigning positions inside the scan would corrupt
+        // insertion lookup and every position-indexed output.
+        grid.positions.extend_from_slice(members_shown);
         for visual_row in 0..grows {
             let r = if style.bottom_up() {
                 grows - visual_row
@@ -277,88 +299,90 @@ pub(crate) fn build(
                     in_row += GUTTER;
                 }
                 let cell_start = in_row;
-                let cand_idx = members_shown[p_local - 1];
-                let (content, cwidth, cchars) = truncate_to_width(&sources[cand_idx], gmaxw);
+                let candidate = members_shown[p_local - 1];
+                let source = &sources[candidate];
+                let (content, cwidth, cchars) = truncate_to_width(&source.text, gmaxw);
                 row_bytes.extend_from_slice(content);
                 let pad = gmaxw - cwidth;
                 row_bytes.resize(row_bytes.len() + pad, b' ');
                 in_row += cchars + pad;
                 let pos = start_pos + p_local - 1;
-                cell_marks.push(CellMark {
-                    row: rows.len(),
+                grid.cell_marks.push(CellMark {
+                    row: grid.rows.len(),
                     in_row_start: cell_start,
                     content_chars: cchars,
-                    candidate: cand_idx,
+                    candidate,
                     pos,
                 });
             }
-            row_lens.push(in_row);
-            rows.push(row_bytes);
+            grid.row_lens.push(in_row);
+            grid.rows.push(row_bytes);
         }
-        let end_pos = positions.len();
+        let end_pos = grid.positions.len();
         for _ in start_pos..=end_pos {
-            pos_group_start.push(start_pos);
-            pos_group_end.push(end_pos);
-            pos_group_grows.push(grows);
+            grid.group_bounds.push(GroupBounds {
+                start: start_pos,
+                end: end_pos,
+                grows,
+            });
         }
 
         remaining -= grows + usize::from(show_heading);
     }
 
-    // --- Second pass: char offsets are only knowable once every row's
-    // char length is final (contract: offsets run over the *whole*
-    // concatenated listing text, not per row).
-    let mut row_start: Vec<usize> = Vec::with_capacity(rows.len());
-    let mut acc = 0usize;
-    for &len in &row_lens {
-        row_start.push(acc);
-        acc += len + 1; // +1 for the `\n` joining this row to the next
-    }
+    grid
+}
 
-    let mut highlights: Vec<Highlight> = Vec::new();
-    for h in &heading_marks {
-        if h.len > 0 {
+/// Resolve row-relative marks into listing-wide char ranges and highlights.
+/// The row starts are intentionally calculated only after grid construction,
+/// because offsets span the concatenated listing rather than one row.
+fn compute_offsets(
+    sources: &[CellSource],
+    spans: &[Vec<CharSpan>],
+    grid: &GridState,
+) -> OffsetState {
+    let row_starts = row_starts(&grid.row_lens);
+    let mut highlights = Vec::new();
+    for heading in &grid.heading_marks {
+        if heading.len > 0 {
             highlights.push(Highlight {
                 role: Role::Heading,
                 pos: 0,
-                span: CharSpan::new(row_start[h.row], row_start[h.row] + h.len),
+                span: CharSpan::new(
+                    row_starts[heading.row],
+                    row_starts[heading.row] + heading.len,
+                ),
             });
         }
     }
-    let mut cell_ranges = vec![CharSpan::default(); positions.len()];
-    for cm in &cell_marks {
-        // Cell-local char spans become listing-wide ones by shifting past
-        // everything before the cell; both are clipped to the cell's real
-        // (post-truncation) content first.
-        let start = row_start[cm.row] + cm.in_row_start;
-        cell_ranges[cm.pos - 1] = CharSpan::new(start, start + cm.content_chars);
-        if let Some(number) = number_ranges[cm.candidate] {
-            let span = number.clip(cm.content_chars).shift(start);
+
+    let mut cell_ranges = vec![CharSpan::default(); grid.positions.len()];
+    for cell in &grid.cell_marks {
+        let start = row_starts[cell.row] + cell.in_row_start;
+        cell_ranges[cell.pos - 1] = CharSpan::new(start, start + cell.content_chars);
+        let source = &sources[cell.candidate];
+        if let Some(number) = source.number_range {
+            let span = number.clip(cell.content_chars).shift(start);
             if !span.is_empty() {
                 highlights.push(Highlight {
                     role: Role::HistoryNumber,
-                    pos: cm.pos,
+                    pos: cell.pos,
                     span,
                 });
             }
         }
-        // Match decoration only on cells showing match-text verbatim
-        // (contract: "display-text 表示セルには発行されない"). The
-        // candidate's spans index its match-text, which starts after the
-        // history-number prefix when present.
-        if candidates[cm.candidate].d.is_none()
-            && let Some(cand_spans) = spans.get(cm.candidate)
+        if let Some(match_offset) = source.match_offset
+            && let Some(candidate_spans) = spans.get(cell.candidate)
         {
-            let match_offset = match_offsets[cm.candidate];
-            let visible_match_chars = cm.content_chars.saturating_sub(match_offset);
-            for &cand_span in cand_spans {
-                let span = cand_span
+            let visible_match_chars = cell.content_chars.saturating_sub(match_offset);
+            for &candidate_span in candidate_spans {
+                let span = candidate_span
                     .clip(visible_match_chars)
                     .shift(start + match_offset);
                 if !span.is_empty() {
                     highlights.push(Highlight {
                         role: Role::Match,
-                        pos: cm.pos,
+                        pos: cell.pos,
                         span,
                     });
                 }
@@ -366,14 +390,32 @@ pub(crate) fn build(
         }
     }
 
-    let p = positions.len();
-    let mut nav = Vec::with_capacity(p);
-    for pos in 1..=p {
-        let next = if pos == p { pos } else { pos + 1 };
+    OffsetState {
+        highlights,
+        cell_ranges,
+    }
+}
+
+fn row_starts(row_lens: &[usize]) -> Vec<usize> {
+    let mut starts = Vec::with_capacity(row_lens.len());
+    let mut acc = 0usize;
+    for &len in row_lens {
+        starts.push(acc);
+        acc += len + 1; // +1 for the `\n` joining this row to the next
+    }
+    starts
+}
+
+/// Build position-indexed navigation from the bounds produced by the grid
+/// phase. Each position owns one complete, typed group-bound record.
+fn build_navigation(bounds: &[GroupBounds], positions: usize) -> Vec<Nav> {
+    let mut nav = Vec::with_capacity(positions);
+    for pos in 1..=positions {
+        let next = if pos == positions { pos } else { pos + 1 };
         let prev = if pos == 1 { 0 } else { pos - 1 };
-        let grows = pos_group_grows[pos - 1];
-        let left = pos_group_start[pos - 1].max(pos.saturating_sub(grows));
-        let right = pos_group_end[pos - 1].min(pos + grows);
+        let group = bounds[pos - 1];
+        let left = group.start.max(pos.saturating_sub(group.grows));
+        let right = group.end.min(pos + group.grows);
         nav.push(Nav {
             next,
             prev,
@@ -381,14 +423,7 @@ pub(crate) fn build(
             right,
         });
     }
-
-    Plan {
-        rows,
-        highlights,
-        cell_ranges,
-        nav,
-        positions,
-    }
+    nav
 }
 
 /// Group key resolution (cli-protocol.md "グループ分割"): `J` takes
@@ -457,7 +492,7 @@ fn grid_dims(
 /// heading text. One byte maps to one byte, so char offsets computed on
 /// the original text stay valid. Zero-copy when there is nothing to
 /// replace.
-fn normalize_control_bytes(bytes: &[u8]) -> Cow<'_, [u8]> {
+pub(crate) fn normalize_control_bytes(bytes: &[u8]) -> Cow<'_, [u8]> {
     if bytes.iter().any(|&b| is_control_byte(b)) {
         Cow::Owned(
             bytes
@@ -600,7 +635,16 @@ mod tests {
         row_budget: usize,
         width: usize,
     ) -> Plan {
-        super::build(candidates, batches, spans, row_budget, width, Style::Grid)
+        let sources = crate::plan::compose_cell_sources(candidates);
+        super::build(
+            candidates,
+            batches,
+            &sources,
+            spans,
+            row_budget,
+            width,
+            Style::Grid,
+        )
     }
 
     fn grid_dims(
@@ -1191,7 +1235,16 @@ mod tests {
             .iter()
             .map(|w| cand(w.as_bytes(), None, None, 0))
             .collect();
-        let plan = super::build(&cands, &batches, &spans_none(5), 5, 40, Style::History);
+        let sources = crate::plan::compose_cell_sources(&cands);
+        let plan = super::build(
+            &cands,
+            &batches,
+            &sources,
+            &spans_none(5),
+            5,
+            40,
+            Style::History,
+        );
 
         // Logical positions and insertion lookup stay newest-first even
         // though their visual rows run oldest-to-newest from top to bottom.
