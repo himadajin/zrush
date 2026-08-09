@@ -17,6 +17,8 @@ mod fifo;
 mod fixtures;
 mod hist;
 mod hist_compsys;
+mod hist_config;
+mod hist_delegation;
 mod hist_lifecycle;
 mod host;
 mod pty;

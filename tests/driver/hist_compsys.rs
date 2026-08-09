@@ -10,11 +10,8 @@
 use std::time::Duration;
 
 use crate::fake::Mode;
-use crate::hist::{assert_no_history_kind, open_menu};
+use crate::hist::{NO_COLLECTION, assert_no_history_kind, open_menu};
 use crate::host::{Host, keys};
-
-/// Nothing armed, nothing collecting: the `^Xt` dump of an idle line.
-const NO_COLLECTION: &str = "timer=-1 rfd=-1 wfd=-1 pty=<none>";
 
 /// Down at position 1 erases the whole menu, unlike a completion listing, where
 /// the analogous transition only deselects and keeps the text (see
@@ -224,7 +221,8 @@ fn the_fixtures_own_injection_commands_are_not_history_candidates() {
 /// disarms the timer and cancels any collection *before* it displays, so the
 /// fds are clear before ^C is even sent. That is what
 /// `send_break_during_an_in_flight_collection_clears_the_collection_fds` (and
-/// driver.zsh's (h26c), for the merely-armed timer) cover instead.
+/// `hist_config::send_break_clears_a_merely_armed_debounce_timer`, for the
+/// timer that is armed but has not started collecting) cover instead.
 #[test]
 fn worker_death_on_the_synchronous_history_path_leaves_a_clean_line() {
     let mut host = Host::boot_history_fake();

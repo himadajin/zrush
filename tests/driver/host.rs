@@ -22,6 +22,12 @@ pub mod keys {
     pub const TAB: &str = "\t";
     pub const DISMISS: &str = "\x07";
     pub const SEND_BREAK: &str = "\x03";
+    /// `ctrl-p`: a default select-prev key, and the one a `[keybind]` variant
+    /// can drop from the action's list.
+    pub const CTRL_P: &str = "\x10";
+    /// `quoted-insert` then LF: a literal newline in BUFFER, without the line
+    /// being accepted.
+    pub const QUOTED_NEWLINE: &str = "\x16\n";
     pub const DUMP_BUFFER: &str = "\x18b";
     pub const DUMP_POSTDISPLAY: &str = "\x18p";
     pub const DUMP_RH: &str = "\x18h";
@@ -32,9 +38,15 @@ pub mod keys {
     pub const DUMP_EVENT: &str = "\x18e";
     /// Debounce-timer and in-flight-collection fd state (history rc only).
     pub const DUMP_FDS: &str = "\x18t";
+    /// `CURSOR` position, for the cases that need a delegated widget to have
+    /// moved the cursor rather than merely left BUFFER alone (history rc only).
+    pub const DUMP_CURSOR: &str = "\x18z";
     /// `backward-char`: a cursor movement zrush never binds, i.e. an external
     /// CURSOR-only change (history rc only).
     pub const BACKWARD_CHAR: &str = "\x18l";
+    /// `up-line-or-history` bound raw: native history movement that bypasses
+    /// zrush, i.e. the way into `HISTNO != HISTCMD` (history rc only).
+    pub const RAW_HISTORY_UP: &str = "\x18u";
     pub const CURSOR_LEFT_THREE: &str = "\x18v";
     /// `_zrush_worker_shutdown` from a widget: an explicit healthy teardown.
     pub const WORKER_TEARDOWN: &str = "\x18q";
@@ -83,6 +95,9 @@ enum HostRc {
     /// Fixture history in memory (isolated HISTFILE, `SAVEHIST=0`) plus the
     /// history-menu dump widgets.
     History,
+    /// [`HostRc::History`]'s isolation with the small, deliberately ordered
+    /// fixture set the `[history].limit` scan window is read against.
+    HistoryLimit,
 }
 
 impl HostRc {
@@ -90,20 +105,21 @@ impl HostRc {
         match self {
             HostRc::Minimal => "tests/zsh/rc/minimal.zshrc",
             HostRc::History => "tests/zsh/rc/history.zshrc",
+            HostRc::HistoryLimit => "tests/zsh/rc/history-limit.zshrc",
         }
     }
 }
 
 impl Host {
     pub fn boot() -> Self {
-        Self::boot_with(HostRc::Minimal, |_home| {}, false)
+        Self::boot_with(HostRc::Minimal, |_home| {}, false, None)
     }
 
     /// Like [`Host::boot`], but symlinks the shared 7001-file overflow tree
     /// (built once per process, cached under `target/`) into `fx/overflow`
     /// under the host's home.
     pub fn boot_with_overflow() -> Self {
-        Self::boot_with(HostRc::Minimal, fixtures::link_overflow, false)
+        Self::boot_with(HostRc::Minimal, fixtures::link_overflow, false, None)
     }
 
     /// Like [`Host::boot`], but with `$ZRUSH_BIN` pointing at the failure-
@@ -111,21 +127,41 @@ impl Host {
     /// It starts in [`crate::fake::Mode::Proxy`], so the host behaves exactly
     /// as under the real binary until a test sets another mode.
     pub fn boot_fake() -> Self {
-        Self::boot_with(HostRc::Minimal, |_home| {}, true)
+        Self::boot_with(HostRc::Minimal, |_home| {}, true, None)
     }
 
     /// Like [`Host::boot`], but under `tests/zsh/rc/history.zshrc`.
     pub fn boot_history() -> Self {
-        Self::boot_with(HostRc::History, |_home| {}, false)
+        Self::boot_with(HostRc::History, |_home| {}, false, None)
     }
 
     /// [`Host::boot_history`] with [`Host::boot_fake`]'s launcher, for the
     /// history cases that inject a worker failure.
     pub fn boot_history_fake() -> Self {
-        Self::boot_with(HostRc::History, |_home| {}, true)
+        Self::boot_with(HostRc::History, |_home| {}, true, None)
     }
 
-    fn boot_with(rc: HostRc, extra_fixtures: impl FnOnce(&Path), fake: bool) -> Self {
+    /// [`Host::boot_history`] with `config` already at
+    /// `$XDG_CONFIG_HOME/zrush/config.toml` when the shell sources zrush, so
+    /// the variant is in force from the first keystroke instead of racing the
+    /// per-prompt config reload.
+    pub fn boot_history_with_config(config: &str) -> Self {
+        Self::boot_with(HostRc::History, |_home| {}, false, Some(config))
+    }
+
+    /// [`Host::boot_history_with_config`] under
+    /// `tests/zsh/rc/history-limit.zshrc`, whose fixture history is what a
+    /// `[history].limit` scan window is read against.
+    pub fn boot_history_limit_with_config(config: &str) -> Self {
+        Self::boot_with(HostRc::HistoryLimit, |_home| {}, false, Some(config))
+    }
+
+    fn boot_with(
+        rc: HostRc,
+        extra_fixtures: impl FnOnce(&Path),
+        fake: bool,
+        config: Option<&str>,
+    ) -> Self {
         let tmp = TempDir::new().expect("create work dir");
         let home = tmp.path().join("home");
         let work = tmp.path().join("work");
@@ -135,6 +171,9 @@ impl Host {
         fs::create_dir_all(&home).expect("create home");
         fs::create_dir_all(&zdot).expect("create zdotdir");
         fs::create_dir_all(xdg.join("zrush")).expect("create config dir");
+        if let Some(config) = config {
+            fs::write(xdg.join("zrush/config.toml"), config).expect("write config.toml");
+        }
         fixtures::build(&home);
         extra_fixtures(&home);
 
@@ -400,11 +439,26 @@ impl Host {
         None
     }
 
-    pub fn assert_buffer(&mut self, expected: &str, label: &str) {
+    /// The `^Xb` BUFFER dump, unquoted.
+    pub fn buffer(&mut self, label: &str) -> String {
         let dump = self
             .dump_get(keys::DUMP_BUFFER, "TESTBUF")
             .unwrap_or_else(|| panic!("{label}: BUFFER dump did not run"));
-        assert_eq!(unquote(&dump), expected, "{label}");
+        unquote(&dump)
+    }
+
+    pub fn assert_buffer(&mut self, expected: &str, label: &str) {
+        let buffer = self.buffer(label);
+        assert_eq!(buffer, expected, "{label}");
+    }
+
+    /// The `^Xz` CURSOR dump, as an offset into BUFFER.
+    pub fn cursor(&mut self, label: &str) -> usize {
+        let dump = self
+            .dump_get(keys::DUMP_CURSOR, "TESTCUR")
+            .unwrap_or_else(|| panic!("{label}: CURSOR dump did not run"));
+        dump.parse()
+            .unwrap_or_else(|e| panic!("{label}: CURSOR dump {dump:?} is not a position ({e})"))
     }
 
     /// The `^Xk` listing dump: `kind=<...> sel=<n> listing=<0|1> npos=<n>`.
