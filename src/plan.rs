@@ -57,20 +57,13 @@ impl Producer {
     }
 }
 
-/// The only error `run` itself can produce. Session I/O failures are
-/// worker.rs's concern, not this pure pipeline's.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Error {
-    Framing,
-}
-
 /// Run the full pipeline and return the serialized render plan.
 pub(crate) fn run(
     params: &Params,
     payload: &[u8],
     is_dir: &dyn Fn(&[u8]) -> bool,
-) -> Result<Vec<u8>, Error> {
-    let parsed = record::parse(payload).map_err(|_| Error::Framing)?;
+) -> Result<Vec<u8>, record::FramingError> {
+    let parsed = record::parse(payload)?;
 
     let mut qm = QueryMatcher::new(&params.query, params.mode, params.smart_case);
     let mut matched: Vec<(usize, crate::matching::TierHit)> = Vec::new();
@@ -338,7 +331,7 @@ mod tests {
     fn framing_error_is_reported() {
         // no trailing NUL: framing violation (record.rs).
         let err = run(&params("a", Mode::Typo, 10, 40, true), b"b", &no_dir).unwrap_err();
-        assert_eq!(err, Error::Framing);
+        assert_eq!(err, crate::record::FramingError);
     }
 
     #[test]
