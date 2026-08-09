@@ -16,7 +16,7 @@ zrush.zsh(zsh 側)と `zrush` バイナリ(Rust 側)の入出力仕様。
 
 ## プロトコル版
 
-> 検証: 版番号のコピーの一致 — `src/config.rs` のテスト `protocol_version_matches_docs_and_zsh`。
+> 検証: 版番号のコピーの一致 — `src/wire.rs` のテスト `protocol_version_matches_docs_and_zsh`。
 
 - **PROTOCOL_VERSION = 7**
 - `zrush config` の出力に `ZRUSH_PROTOCOL_VERSION` が含まれる。
@@ -34,10 +34,10 @@ zrush.zsh(zsh 側)と `zrush` バイナリ(Rust 側)の入出力仕様。
 
 ### 版番号を上げる手順
 
-1. `src/config.rs` の `PROTOCOL_VERSION` を上げる。
+1. `src/wire.rs` の `PROTOCOL_VERSION` を上げる。
 2. `cargo test --no-fail-fast` を実行する。追従が必要な残りの箇所は、落ちたテストがすべて指す
    (`--no-fail-fast` を付けないと最初に落ちたテストターゲットで止まり、`tests/cli.rs` の分は次の実行まで出てこない):
-   - `protocol_version_matches_docs_and_zsh`(`src/config.rs`)が、この文書の 2 行
+   - `protocol_version_matches_docs_and_zsh`(`src/wire.rs`)が、この文書の 2 行
      (この節の `- **PROTOCOL_VERSION = N**` と「zrush config」節の出力例の
      `typeset -g  ZRUSH_PROTOCOL_VERSION='N'`)と `zsh/zrush.zsh` の
      `typeset -gi _ZRUSH_EXPECTED_PROTO=N` のうち、追従できていないものを列挙する。

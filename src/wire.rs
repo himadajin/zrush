@@ -1,6 +1,80 @@
-//! Reference parser for the render-plan wire format.
+//! Render-plan wire serialization and reference parsing.
 
 use std::fmt;
+use std::io::Write as _;
+
+use crate::layout;
+
+/// Protocol version shared by config output and the worker handshake
+/// (cli-protocol.md "プロトコル版").
+pub(crate) const PROTOCOL_VERSION: &str = "7";
+
+/// Incremental, overflow-checked ASCII decimal accumulation shared by the
+/// protocol's complete-field parsers and streaming netstring decoder.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct Decimal {
+    value: u64,
+    digits: usize,
+    leading_zero: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DecimalError {
+    InvalidDigit,
+    LeadingZero,
+    Overflow,
+}
+
+impl Decimal {
+    pub(crate) fn push(&mut self, byte: u8) -> Result<(), DecimalError> {
+        let digit = byte
+            .checked_sub(b'0')
+            .filter(|digit| *digit <= 9)
+            .ok_or(DecimalError::InvalidDigit)?;
+        self.value = self
+            .value
+            .checked_mul(10)
+            .and_then(|value| value.checked_add(u64::from(digit)))
+            .ok_or(DecimalError::Overflow)?;
+        self.leading_zero = self.digits == 0 && digit == 0;
+        self.digits += 1;
+        Ok(())
+    }
+
+    pub(crate) fn push_canonical(&mut self, byte: u8) -> Result<(), DecimalError> {
+        if !byte.is_ascii_digit() {
+            return Err(DecimalError::InvalidDigit);
+        }
+        if self.leading_zero {
+            return Err(DecimalError::LeadingZero);
+        }
+        self.push(byte)
+    }
+
+    pub(crate) fn is_empty(self) -> bool {
+        self.digits == 0
+    }
+
+    pub(crate) fn value(self) -> u64 {
+        self.value
+    }
+}
+
+pub(crate) fn parse_ascii_u64(value: &[u8]) -> Option<u64> {
+    let mut decimal = Decimal::default();
+    for &byte in value {
+        decimal.push(byte).ok()?;
+    }
+    (!decimal.is_empty()).then_some(decimal.value())
+}
+
+pub(crate) fn parse_canonical_u64(value: &[u8]) -> Option<u64> {
+    let mut decimal = Decimal::default();
+    for &byte in value {
+        decimal.push_canonical(byte).ok()?;
+    }
+    (!decimal.is_empty()).then_some(decimal.value())
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Plan {
@@ -19,6 +93,27 @@ pub enum Role {
     HistoryNumber,
 }
 
+impl Role {
+    fn parse(value: &[u8]) -> Option<Self> {
+        match value {
+            b"match" => Some(Self::Match),
+            b"heading" => Some(Self::Heading),
+            b"history-number" => Some(Self::HistoryNumber),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Match => "match",
+            Self::Heading => "heading",
+            Self::HistoryNumber => "history-number",
+        }
+    }
+}
+
+/// A decoded highlight, preserving the wire's `start len` representation.
+/// Layout computation keeps its end-exclusive span type until serialization.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Highlight {
     pub role: Role,
@@ -27,12 +122,64 @@ pub struct Highlight {
     pub len: usize,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Navigation {
     pub next: usize,
     pub prev: usize,
     pub left: usize,
     pub right: usize,
+}
+
+/// Flatten a computed plan into the render-plan wire format. Internal spans
+/// stay end-exclusive until this boundary converts them to `start len`.
+pub(crate) fn serialize(
+    common_prefix: &[u8],
+    plan: &layout::Plan,
+    insert_texts: &[Vec<u8>],
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    push_bytes(&mut out, common_prefix);
+    let _ = write!(out, "{}", plan.rows.len());
+    out.push(0);
+    let _ = write!(out, "{}", plan.positions.len());
+    out.push(0);
+    for row in &plan.rows {
+        push_bytes(&mut out, row);
+    }
+    let _ = write!(out, "{}", plan.highlights.len());
+    out.push(0);
+    for highlight in &plan.highlights {
+        let _ = write!(
+            out,
+            "{} {} {} {}",
+            highlight.role.as_str(),
+            highlight.pos,
+            highlight.span.start,
+            highlight.span.len()
+        );
+        out.push(0);
+    }
+    for cell in &plan.cell_ranges {
+        let _ = write!(out, "{} {}", cell.start, cell.len());
+        out.push(0);
+    }
+    for navigation in &plan.nav {
+        let _ = write!(
+            out,
+            "{} {} {} {}",
+            navigation.next, navigation.prev, navigation.left, navigation.right
+        );
+        out.push(0);
+    }
+    for text in insert_texts {
+        push_bytes(&mut out, text);
+    }
+    out
+}
+
+fn push_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
+    out.extend_from_slice(bytes);
+    out.push(0);
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -195,21 +342,12 @@ fn count(value: &[u8], field: &'static str) -> Result<usize, Error> {
     // zsh's `<->` accepts unbounded digit strings and does not numerically
     // convert cell ranges; this typed reference API deliberately rejects
     // `usize` overflow because the Rust serializer cannot produce it.
-    if value.is_empty() || !value.iter().all(u8::is_ascii_digit) {
-        return Err(Error::InvalidCount {
+    parse_ascii_u64(value)
+        .and_then(|number| usize::try_from(number).ok())
+        .ok_or_else(|| Error::InvalidCount {
             field,
             value: value.to_vec(),
-        });
-    }
-    value.iter().try_fold(0usize, |number, digit| {
-        number
-            .checked_mul(10)
-            .and_then(|number| number.checked_add(usize::from(*digit - b'0')))
-            .ok_or_else(|| Error::InvalidCount {
-                field,
-                value: value.to_vec(),
-            })
-    })
+        })
 }
 
 /// `start + len` must stay inside the listing text (cli-protocol.md
@@ -243,12 +381,7 @@ fn parse_highlight(
             value: value.to_vec(),
         });
     }
-    let role = match parts[0] {
-        b"match" => Role::Match,
-        b"heading" => Role::Heading,
-        b"history-number" => Role::HistoryNumber,
-        other => return Err(Error::InvalidRole(other.to_vec())),
-    };
+    let role = Role::parse(parts[0]).ok_or_else(|| Error::InvalidRole(parts[0].to_vec()))?;
     let pos = count(parts[1], "highlight pos")?;
     if pos > positions {
         return Err(Error::OutOfRange {
@@ -333,6 +466,54 @@ fn tuple_parts(value: &[u8]) -> Vec<&[u8]> {
 mod tests {
     use super::*;
 
+    const CONTRACT: &str = "docs/internal/contracts/cli-protocol.md";
+
+    fn read_repo_file(relative_path: &str) -> String {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(relative_path);
+        std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()))
+    }
+
+    /// PROTOCOL_VERSION is hand-written here, in two contract lines, and in
+    /// zsh/zrush.zsh. The tests/cli.rs config golden owns its remaining copy.
+    #[test]
+    fn protocol_version_matches_docs_and_zsh() {
+        let expected: [(&str, String); 3] = [
+            (
+                CONTRACT,
+                format!("- **PROTOCOL_VERSION = {PROTOCOL_VERSION}**"),
+            ),
+            (
+                CONTRACT,
+                format!("typeset -g  ZRUSH_PROTOCOL_VERSION='{PROTOCOL_VERSION}'"),
+            ),
+            (
+                "zsh/zrush.zsh",
+                format!("typeset -gi _ZRUSH_EXPECTED_PROTO={PROTOCOL_VERSION}"),
+            ),
+        ];
+
+        let mismatches: Vec<String> = expected
+            .iter()
+            .filter(|(relative_path, expected_line)| {
+                !read_repo_file(relative_path)
+                    .lines()
+                    .any(|line| line.trim() == expected_line)
+            })
+            .map(|(relative_path, expected_line)| {
+                format!("{relative_path}: expected a line \"{expected_line}\"")
+            })
+            .collect();
+
+        assert!(
+            mismatches.is_empty(),
+            "PROTOCOL_VERSION mismatch: src/wire.rs::PROTOCOL_VERSION is \
+             {PROTOCOL_VERSION:?}, but the following locations disagree (or are \
+             missing the anchor line) and need to be updated to match:\n{}",
+            mismatches.join("\n")
+        );
+    }
+
     fn fields(values: &[&[u8]]) -> Vec<u8> {
         let mut output = Vec::new();
         for value in values {
@@ -376,6 +557,11 @@ mod tests {
     #[test]
     fn signed_l_is_rejected() {
         assert_invalid_count(&count_plan(b"-1", b"0", b"0"), "L");
+    }
+
+    #[test]
+    fn leading_zero_counts_are_accepted_as_nonnegative_digit_strings() {
+        assert!(parse(&count_plan(b"00", b"00", b"00")).is_ok());
     }
 
     #[test]

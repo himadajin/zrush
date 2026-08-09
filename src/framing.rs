@@ -2,6 +2,8 @@
 
 use std::fmt;
 
+use crate::wire::{Decimal, DecimalError};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Error {
     MissingLength,
@@ -54,26 +56,15 @@ impl std::error::Error for FeedError {
 
 #[derive(Debug)]
 enum State {
-    Length {
-        value: usize,
-        digits: usize,
-        leading_zero: bool,
-    },
-    Payload {
-        remaining: usize,
-        bytes: Vec<u8>,
-    },
+    Length(Decimal),
+    Payload { remaining: usize, bytes: Vec<u8> },
     Comma(Vec<u8>),
     Failed,
 }
 
 impl State {
     fn length() -> Self {
-        Self::Length {
-            value: 0,
-            digits: 0,
-            leading_zero: false,
-        }
+        Self::Length(Decimal::default())
     }
 }
 
@@ -111,21 +102,23 @@ impl Decoder {
         while offset < input.len() {
             let state = std::mem::replace(&mut self.state, State::Failed);
             match state {
-                State::Length {
-                    value,
-                    digits,
-                    leading_zero,
-                } => {
+                State::Length(mut decimal) => {
                     let byte = input[offset];
                     offset += 1;
 
                     if byte == b':' {
-                        if digits == 0 {
+                        if decimal.is_empty() {
                             return Err(FeedError {
                                 completed,
                                 error: Error::MissingLength,
                             });
                         }
+                        let Ok(value) = usize::try_from(decimal.value()) else {
+                            return Err(FeedError {
+                                completed,
+                                error: Error::LengthOverflow,
+                            });
+                        };
                         self.state = if value == 0 {
                             State::Comma(Vec::new())
                         } else {
@@ -135,27 +128,25 @@ impl Decoder {
                             }
                         };
                     } else if byte.is_ascii_digit() {
-                        if leading_zero {
+                        if let Err(error) = decimal.push_canonical(byte) {
                             return Err(FeedError {
                                 completed,
-                                error: Error::LeadingZero,
+                                error: match error {
+                                    DecimalError::LeadingZero => Error::LeadingZero,
+                                    DecimalError::Overflow => Error::LengthOverflow,
+                                    DecimalError::InvalidDigit => unreachable!(
+                                        "ASCII digit was checked before decimal accumulation"
+                                    ),
+                                },
                             });
                         }
-                        let digit = usize::from(byte - b'0');
-                        let Some(value) = value
-                            .checked_mul(10)
-                            .and_then(|value| value.checked_add(digit))
-                        else {
+                        if usize::try_from(decimal.value()).is_err() {
                             return Err(FeedError {
                                 completed,
                                 error: Error::LengthOverflow,
                             });
-                        };
-                        self.state = State::Length {
-                            value,
-                            digits: digits + 1,
-                            leading_zero: digits == 0 && byte == b'0',
-                        };
+                        }
+                        self.state = State::Length(decimal);
                     } else {
                         return Err(FeedError {
                             completed,
@@ -208,7 +199,7 @@ impl Decoder {
     /// a truncated length, payload, or trailing comma.
     pub(crate) fn finish(&mut self) -> Result<(), Error> {
         match self.state {
-            State::Length { digits: 0, .. } => Ok(()),
+            State::Length(decimal) if decimal.is_empty() => Ok(()),
             State::Failed => Err(Error::DecoderFailed),
             _ => {
                 self.state = State::Failed;
