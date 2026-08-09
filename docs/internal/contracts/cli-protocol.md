@@ -619,7 +619,7 @@ zsh は一覧を消す。
 > 同じ出力を実プロセスで — `tests/cli.rs`(独立したコピーを持つ)。
 > クォート規律・設定値の反映・不正値の既定値フォールバックと警告・キーバインド配列(正規化後の重複解決を含む)— `src/config.rs` と `tests/cli.rs` の設定テスト。
 > config パス解決は `$XDG_CONFIG_HOME` が設定されている経路(ファイル不在を含む)のみ検査される。未設定・空文字列で `~/.config` に落ちる規範を固定するテストは無い。
-> zsh 側の規範(`emulate -L zsh` での source、`key:` の `$terminfo` 解決、`main` キーマップへの bindkey)は、既定キーバインドの範囲で `tests/zsh/driver.zsh` がスモークテストする。
+> zsh 側の規範(`emulate -L zsh` での source、`key:` の `$terminfo` 解決、`main` キーマップへの bindkey)は、既定キーバインドの範囲で `cargo test --test driver`(実 pty 上の host zsh に既定キーを送る)がスモークテストする。
 
 config.toml を解決・検証し、zsh が `source` できる形で設定値とキーバインド定義を出力する。
 
@@ -698,7 +698,7 @@ typeset -ga ZRUSH_CFG_WARNINGS=()
 > 埋め込みスクリプト本体がリポジトリの `zsh/zrush.zsh` とバイト一致すること — `tests/cli.rs`。
 > `$ZRUSH_BIN` が既に設定されている場合に prelude の `${ZRUSH_BIN:-...}` 展開が
 > それを優先して使う規範自体は通常の zsh パラメータ展開であり、`tests/cli.rs` は固定しない
-> (`tests/zsh/driver.zsh` がテスト用ランチャーを `$ZRUSH_BIN` に指定してこの経路を通しで使う)。
+> (`tests/driver/` の pty ハーネスがテスト用ランチャー `zrush-fake-worker` を `$ZRUSH_BIN` に指定してこの経路を通しで使う)。
 
 zsh 側の `.zshrc` が source する zle 統合スクリプトを標準出力へ書き出す。
 スクリプト本体はビルド時にバイナリへ埋め込まれる。

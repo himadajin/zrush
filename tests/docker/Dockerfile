@@ -3,11 +3,10 @@
 FROM rust:bookworm
 
 # - libncurses-dev: zsh build dependency.
-# - locales + locale-gen: tests/zsh/driver.zsh sets LC_ALL=en_US.UTF-8, which
-#   Debian does not ship pre-generated.
-# - python3: tests/zsh/fake-worker.py.
+# - locales + locale-gen: the pty harness (tests/driver/) runs its hosts under
+#   LC_ALL=en_US.UTF-8, which Debian does not ship pre-generated.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends libncurses-dev locales python3 \
+    && apt-get install -y --no-install-recommends libncurses-dev locales \
     && sed -i 's/^# *en_US.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' /etc/locale.gen \
     && locale-gen \
     && rm -rf /var/lib/apt/lists/*

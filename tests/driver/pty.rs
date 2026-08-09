@@ -107,6 +107,21 @@ impl Pty {
 
     /// Wait up to `timeout` for host output and return whatever was readable.
     pub fn read_available(&self, timeout: Duration) -> Vec<u8> {
+        match self.read_chunk(timeout) {
+            Chunk::Data(bytes) => bytes,
+            Chunk::Idle => Vec::new(),
+            Chunk::Eof => {
+                // A hung-up pty stays permanently ready; without this the
+                // caller's deadline loop would spin at full speed.
+                std::thread::sleep(Duration::from_millis(10));
+                Vec::new()
+            }
+        }
+    }
+
+    /// One read attempt, keeping the host's own hang-up distinguishable from a
+    /// quiet host: only the tests that let their shell exit for real care.
+    pub fn read_chunk(&self, timeout: Duration) -> Chunk {
         let mut poll_fd = libc::pollfd {
             fd: self.master.as_raw_fd(),
             events: libc::POLLIN,
@@ -116,19 +131,39 @@ impl Pty {
         // SAFETY: a single initialized pollfd is passed with a matching count.
         let ready = unsafe { libc::poll(&mut poll_fd, 1, ms) };
         if ready <= 0 {
-            return Vec::new();
+            return Chunk::Idle;
         }
         let mut buf = [0u8; READ_CHUNK];
         // SAFETY: reads at most buf.len() bytes into an owned buffer.
         let n = unsafe { libc::read(self.master.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
-        if n <= 0 {
-            // A hung-up pty stays permanently ready; without this the caller's
-            // deadline loop would spin at full speed.
-            std::thread::sleep(Duration::from_millis(10));
-            return Vec::new();
+        if n > 0 {
+            return Chunk::Data(buf[..n as usize].to_vec());
         }
-        buf[..n as usize].to_vec()
+        // A master whose last slave is gone reads as 0 on macOS and as EIO on
+        // Linux. Nothing else may be reported as `Eof`: that is the passing
+        // signal of the tests that let their host exit, so a descriptor bug
+        // here has to fail loudly instead of reading as a clean exit.
+        if n == 0 {
+            return Chunk::Eof;
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::Interrupted {
+            return Chunk::Idle;
+        }
+        if error.raw_os_error() == Some(libc::EIO) {
+            return Chunk::Eof;
+        }
+        panic!("read from the host pty failed: {error}");
     }
+}
+
+/// The outcome of one [`Pty::read_chunk`].
+pub enum Chunk {
+    Data(Vec<u8>),
+    /// Nothing readable within the timeout.
+    Idle,
+    /// The child closed the slave end: no further output can arrive.
+    Eof,
 }
 
 fn set_cloexec(fd: &OwnedFd) -> io::Result<()> {

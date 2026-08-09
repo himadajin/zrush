@@ -7,6 +7,7 @@
 
 mod apply;
 mod async_plumbing;
+mod boot;
 mod cache;
 mod capture;
 mod confirm;
@@ -25,3 +26,4 @@ mod pty;
 mod select;
 mod sendbreak;
 mod tab;
+mod teardown;

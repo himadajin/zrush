@@ -1,4 +1,4 @@
-# Host rc for headless regression tests, loaded through ZDOTDIR by the Rust pty harness (tests/driver/) and by tests/zsh/driver.zsh
+# Host rc for headless regression tests, loaded through ZDOTDIR by the Rust pty harness (tests/driver/), tests/zsh/driver-coexist.zsh and tests/zsh/driver-latency.zsh
 # Required environment: ZRUSH_REAL_BIN (built zrush binary), ZRUSH_TEST_TMP (isolated tmp)
 PS1='HP> '
 autoload -Uz compinit
@@ -23,7 +23,7 @@ zle -N _zrt-dump-rh _zrt_dump_rh
 bindkey '^Xh' _zrt-dump-rh
 
 # ^Xw: persistent-worker lifecycle state. This exposes only stable invariants
-# needed by driver.zsh (lazy start, reuse, monotonic ids, and clean teardown).
+# the tests need (lazy start, reuse, monotonic ids, and clean teardown).
 _zrt_dump_worker() {
   _zlog "TESTWORKER=ready=$_zrush_worker_ready seq=$_zrush_request_seq failures=$_zrush_worker_failures disabled=$_zrush_disabled reason=$_zrush_disable_reason stale=$_zrush_stale_disabled warned=$_zrush_worker_warned buildwarned=$_zrush_build_warned following=$_zrush_build_following verifying=$_zrush_build_verifying stopping=$_zrush_worker_stopping tainted=$_zrush_worker_runtime_tainted rfd=$_zrush_worker_rfd wfd=$_zrush_worker_wfd control=$_zrush_worker_control_wfd ack=$_zrush_worker_ack_fd pending=$#_zrush_worker_pending runtime=${_zrush_worker_runtime_dir:-<none>}"
 }
@@ -118,8 +118,6 @@ _zrt_generated_callback_probe() {
 }
 zle -N _zrt-generated-callback-probe _zrt_generated_callback_probe
 bindkey '^Xg' _zrt-generated-callback-probe
-zle -N _zrt-generated-callback-cleanup _zrt_generated_callback_cleanup
-bindkey '^XG' _zrt-generated-callback-cleanup
 
 _zrt_cursor_left_three() { (( CURSOR >= 3 )) && (( CURSOR -= 3 )) }
 zle -N _zrt-cursor-left-three _zrt_cursor_left_three
