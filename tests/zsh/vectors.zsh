@@ -32,7 +32,7 @@
 # Unlike driver.zsh (a zle/compsys end-to-end smoke test over zpty), nothing
 # here touches zle, so a failure points at the encoder or decoder itself.
 emulate -L zsh
-setopt extended_glob
+setopt extended_glob typeset_silent
 
 typeset -g HERE=${${(%):-%N}:A:h}
 typeset -g REPO=${HERE:h:h}
