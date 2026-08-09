@@ -391,7 +391,7 @@ reserialize_plan() {  # -> REPLY=bytes, or return 1 with REPLY=reason
   # A handshake alone is not a successful terminal response and therefore
   # must not reset the consecutive-session failure streak. A request-level
   # error is terminal, clears its pending request, and does reset the streak.
-  _zrush_worker_ready=0 _zrush_worker_failures=1 _zrush_disabled=0 _zrush_enabled=1
+  _zrush_worker_ready=0 _zrush_worker_failures=1 _zrush_disabled=0 _zrush_disable_reason= _zrush_enabled=1
   _zrush_netstring_take "$ready_frame"
   _zrush_worker_handle_message "$REPLY"
   local -i ready_kept_failures=$(( _zrush_worker_ready == 1 && _zrush_worker_failures == 1 ))
@@ -411,7 +411,7 @@ reserialize_plan() {  # -> REPLY=bytes, or return 1 with REPLY=reason
   read_vector $VECTORS/plan/empty-stdin/expected \
     || { out "FATAL: $REPLY"; exit 1 }
   local stale_plan=$REPLY
-  _zrush_worker_ready=1 _zrush_worker_failures=1 _zrush_disabled=0 _zrush_enabled=1
+  _zrush_worker_ready=1 _zrush_worker_failures=1 _zrush_disabled=0 _zrush_disable_reason= _zrush_enabled=1
   typeset -gA _zrush_worker_pending=( 41 compsys )
   _zrush_current_request=42
   _zrush_plan_text=sentinel _zrush_plan_cp=sentinel-cp _zrush_plan_kind=history
@@ -438,7 +438,7 @@ reserialize_plan() {  # -> REPLY=bytes, or return 1 with REPLY=reason
   functions[_zrush_arm_timer]='return 0'
   typeset -gi _zrt_settle_calls=0
   functions[_zrush_settle_plan]='(( ++_zrt_settle_calls )); _zrush_tab_pending=0; return 0'
-  _zrush_enabled=1 _zrush_disabled=0 _zrush_current_request=41
+  _zrush_enabled=1 _zrush_disabled=0 _zrush_disable_reason= _zrush_current_request=41
   _zrush_last_buffer=old _zrush_last_cursor=0
   BUFFER=new LBUFFER=new CURSOR=3
   _zrush_plan_kind=none _zrush_tab_pending=0 _zrush_selected=0
@@ -471,7 +471,7 @@ reserialize_plan() {  # -> REPLY=bytes, or return 1 with REPLY=reason
   # Populate every active endpoint slot needed by a healthy stop. stdout is
   # already at EOF, so shutdown must raw-drain it before finalizing.
   zmodload zsh/system zsh/datetime || { out "FATAL: lifecycle modules"; exit 1 }
-  _zrush_worker_ready=0 _zrush_worker_failures=0 _zrush_disabled=0 _zrush_enabled=1
+  _zrush_worker_ready=0 _zrush_worker_failures=0 _zrush_disabled=0 _zrush_disable_reason= _zrush_enabled=1
   _zrush_worker_warned=0 _zrush_build_warned=0 _zrush_worker_stopping=0
   _zrush_build_following=1 _zrush_stale_disabled=0
   local -i mismatch_rfd mismatch_wfd mismatch_control_fd mismatch_drain_fd
@@ -499,23 +499,27 @@ reserialize_plan() {  # -> REPLY=bytes, or return 1 with REPLY=reason
     ng "worker lifecycle: mismatch state enabled=$_zrush_enabled disabled=$_zrush_disabled stale=$_zrush_stale_disabled failures=$_zrush_worker_failures warned=$_zrush_build_warned fds=$_zrush_worker_rfd,$_zrush_worker_wfd,$_zrush_worker_control_wfd,$_zrush_worker_ack_fd,$_zrush_worker_drain_fd"
   fi
   _zrush_build_following=0 _zrush_stale_disabled=0
-  _zrush_disabled=0 _zrush_enabled=0 _zrush_worker_warned=0 _zrush_build_warned=0
+  _zrush_disabled=0 _zrush_disable_reason= _zrush_enabled=0 _zrush_worker_warned=0 _zrush_build_warned=0
 
   # Two failed sessions without an intervening terminal response open the
-  # circuit breaker. The user-facing warning latch remains set after the first
+  # circuit breaker. The user-facing notice latch remains set after the first
   # failure, while detailed reasons continue to be logged for both sessions.
   local saved_log=${ZRUSH_LOG:-}
   ZRUSH_LOG=$WORK/lifecycle.log
-  _zrush_worker_failures=0 _zrush_worker_warned=0 _zrush_disabled=0 _zrush_enabled=1
+  _zrush_worker_failures=0 _zrush_worker_warned=0 _zrush_disabled=0 _zrush_disable_reason= _zrush_enabled=1
   _zrush_worker_rfd=-1 _zrush_worker_wfd=-1 _zrush_worker_control_wfd=-1
   _zrush_worker_session_fail fixture-first 2>/dev/null
   local -i first_failure_ok=$(( _zrush_worker_failures == 1 && _zrush_worker_warned \
     && !_zrush_disabled && _zrush_enabled ))
+  local first_notice=$_zrush_notice
   _zrush_enabled=1
   _zrush_worker_session_fail fixture-second 2>/dev/null
   local lifecycle_log="$(<$ZRUSH_LOG)"
   if (( first_failure_ok && _zrush_worker_failures == 2 && _zrush_disabled \
         && !_zrush_enabled && _zrush_worker_warned )) \
+     && [[ $first_notice == 'zrush: worker transport failed; retrying once' \
+           && $_zrush_disable_reason == session-failure \
+           && $_zrush_notice == 'zrush: worker disabled after repeated failures; source <(zrush init zsh) to retry' ]] \
      && [[ $lifecycle_log == *'fixture-first'* && $lifecycle_log == *'fixture-second'* \
            && $lifecycle_log == *'circuit breaker opened'* ]]; then
     ok "worker lifecycle: second consecutive session failure disables; warning latches once"
@@ -523,7 +527,7 @@ reserialize_plan() {  # -> REPLY=bytes, or return 1 with REPLY=reason
     ng "worker lifecycle: breaker state/log mismatch"
   fi
   ZRUSH_LOG=$saved_log
-  _zrush_worker_failures=0 _zrush_worker_warned=0 _zrush_disabled=0 _zrush_enabled=0
+  _zrush_worker_failures=0 _zrush_worker_warned=0 _zrush_disabled=0 _zrush_disable_reason= _zrush_enabled=0
 
   # ---------------- History payload sender ----------------
   # `print -s` leaves its newest entry as the current event until another

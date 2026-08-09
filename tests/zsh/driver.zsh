@@ -1116,10 +1116,10 @@ sec_death() {
   wait_fake "die $death_first_session " $fake_die0 10 || active_death_ok=0
   wait_log 'worker: session failure:' $err_fail0 10 || active_death_ok=0
   local worker_warning_output=${EXPECT_BUF//$'\e['[0-9;]#m/}
-  if [[ $worker_warning_output == *'zrush: worker transport failed; suppressing further warnings this session'* ]]; then
-    ok "(fd-5a) worker warning reaches stderr after worker startup"
+  if [[ $worker_warning_output == *'zrush: worker transport failed; retrying once'* ]]; then
+    ok "(fd-5a) worker failure notice reaches the ZLE status line after worker startup"
   else
-    ng "(fd-5a) worker warning missing from pty output: ${(qqqq)worker_warning_output}"
+    ng "(fd-5a) worker failure notice missing from pty output: ${(qqqq)worker_warning_output}"
   fi
   local err_log_delta=$(sed -n "$(( err_log_line0 + 1 )),\$p" $ZRUSH_LOG 2>/dev/null)
   local -i fake_started_count=$(print -r -- "$err_log_delta" | grep -cF 'worker: started rfd=' 2>/dev/null)
@@ -1204,11 +1204,17 @@ sec_death() {
   assert_buffer 'ls fx/basic/al' "(err-2) pending Tab resolved against an actively-dead worker inserts nothing"
   if dump_get $'\C-xw' TESTWORKER \
      && (( second_death_clean && third_death_clean )) \
-     && worker_state_has "$REPLY" failures=2 disabled=1 warned=1 pending=0 \
+     && worker_state_has "$REPLY" failures=2 disabled=1 reason=session-failure warned=1 pending=0 \
      && (( $(grep -c '^start ' $ZRUSH_FAKE_STATE) == death_starts0 + 3 )); then
     ok "(err-3) two consecutive active-session deaths open the breaker after one lazy replacement"
   else
     ng "(err-3) active-death breaker state missing: second-clean=$second_death_clean third-clean=$third_death_clean state=${REPLY:-<none>}"
+  fi
+  local worker_disabled_output=${EXPECT_BUF//$'\e['[0-9;]#m/}
+  if [[ $worker_disabled_output == *'zrush: worker disabled after repeated failures; source <(zrush init zsh) to retry'* ]]; then
+    ok "(err-3a) disabled worker remains visible with an explicit recovery action"
+  else
+    ng "(err-3a) disabled worker status missing from pty output: ${(qqqq)worker_disabled_output}"
   fi
 
   clear_line
@@ -1224,8 +1230,28 @@ sec_death() {
   # No sync_prompt here: the expect above already covers this command's prompt.
   drain 0.2
 
-  # Hand the fake worker back to proxy mode: the sections after this one
-  # need a working worker even when (10) below is filtered out.
+  # An explicit re-source starts a new recovery epoch for the session-failure
+  # breaker. It must leave the monotonic request counter intact and make the
+  # fake worker available again without starting it until the next request.
+  print -r -- proxy > $ZRUSH_FAKE_CONTROL
+  send_line 'source <($ZRUSH_REAL_BIN init zsh)'
+  if sync_prompt 10 && dump_get $'\C-xw' TESTWORKER \
+     && worker_state_has "$REPLY" ready=0 failures=0 disabled=0 reason= stale=0 stopping=0 \
+          rfd=-1 wfd=-1 control=-1 ack=-1 pending=0; then
+    ok "(err-5a) explicit re-source clears only the session-failure breaker"
+  else
+    ng "(err-5a) explicit re-source did not restore a lazy worker: ${REPLY:-<none>}"
+  fi
+  if send_keys_wait_plan nonempty 'ls fx/basic/al' 10; then
+    ok "(err-5b) the recovered session serves the next completion request"
+  else
+    ng "(err-5b) recovered session did not serve a completion request"
+  fi
+  clear_line
+  drain 0.3
+
+  # Keep the fake worker in proxy mode for sections after this one even when
+  # the death section is filtered out.
   print -r -- proxy > $ZRUSH_FAKE_CONTROL
 }
 
