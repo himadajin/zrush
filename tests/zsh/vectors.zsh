@@ -280,8 +280,8 @@ reserialize_plan() {  # -> REPLY=bytes, or return 1 with REPLY=reason
   exec {exit_rfd}< /dev/null
   exec {exit_wfd}> /dev/null
   _zrush_timer_fd=$exit_timer_fd _zrush_rfd=$exit_rfd _zrush_wfd=$exit_wfd
-  _zrush_pty= _zrush_worker_pid=-1 _zrush_worker_setup_pid=-1
-  _zrush_worker_rfd=-1 _zrush_worker_wfd=-1 _zrush_worker_setup_fd=-1
+  _zrush_pty=
+  _zrush_worker_rfd=-1 _zrush_worker_wfd=-1 _zrush_worker_control_wfd=-1
   _zrush_worker_ack_fd=-1 _zrush_worker_drain_fd=-1
   _zrush_zshexit
   if (( _zrush_timer_fd == -1 && _zrush_rfd == -1 && _zrush_wfd == -1 )) \
@@ -303,7 +303,7 @@ reserialize_plan() {  # -> REPLY=bytes, or return 1 with REPLY=reason
   # Exercise the same incremental loop as _zrush_worker_read without a process
   # or zle. Every byte boundary is tried, and two responses deliberately share
   # one stream so delivery cannot depend on read chunking.
-  _zrush_encode_message ready 6
+  _zrush_encode_message ready 7
   local ready_frame=$REPLY
   _zrush_encode_message error 41 invalid-request
   local error_frame=$REPLY
@@ -330,7 +330,7 @@ reserialize_plan() {  # -> REPLY=bytes, or return 1 with REPLY=reason
         fi
       done
     done
-    [[ -z $rx && $delivered == 2 && $got[1] == 'ready|6' \
+    [[ -z $rx && $delivered == 2 && $got[1] == 'ready|7' \
        && $got[2] == 'error|41|invalid-request' ]] || { framing_ok=0; break }
   done
   (( framing_ok )) \
@@ -467,31 +467,33 @@ reserialize_plan() {  # -> REPLY=bytes, or return 1 with REPLY=reason
 
   # An explicit incompatible handshake opens the permanent shell-session
   # disable immediately; it is not counted as the first retryable failure.
+  # Populate every active endpoint slot needed by a healthy stop. stdout is
+  # already at EOF, so shutdown must raw-drain it before finalizing.
+  zmodload zsh/system zsh/datetime || { out "FATAL: lifecycle modules"; exit 1 }
   _zrush_worker_ready=0 _zrush_worker_failures=0 _zrush_disabled=0 _zrush_enabled=1
-  _zrush_worker_warned=0 _zrush_worker_pid=-1 _zrush_worker_setup_pid=-1
-  local -i mismatch_rfd mismatch_wfd mismatch_setup_fd mismatch_ack_fd mismatch_drain_fd
+  _zrush_worker_warned=0 _zrush_worker_stopping=0
+  local -i mismatch_rfd mismatch_wfd mismatch_control_fd mismatch_drain_fd
   exec {mismatch_rfd}< /dev/null
   exec {mismatch_wfd}> /dev/null
-  exec {mismatch_setup_fd}< /dev/null
-  exec {mismatch_ack_fd}< /dev/null
+  exec {mismatch_control_fd}> /dev/null
   exec {mismatch_drain_fd}< /dev/null
   _zrush_worker_rfd=$mismatch_rfd _zrush_worker_wfd=$mismatch_wfd
-  _zrush_worker_setup_fd=$mismatch_setup_fd
-  _zrush_worker_ack_fd=$mismatch_ack_fd _zrush_worker_drain_fd=$mismatch_drain_fd
+  _zrush_worker_control_wfd=$mismatch_control_fd
+  _zrush_worker_ack_fd=-1 _zrush_worker_drain_fd=$mismatch_drain_fd
   _zrush_encode_message incompatible 7
   local mismatch_frame=$REPLY
   _zrush_netstring_take "$mismatch_frame"
   _zrush_worker_handle_message "$REPLY" 2>/dev/null
   if (( _zrush_disabled && !_zrush_enabled && _zrush_worker_failures == 0 \
         && _zrush_worker_warned && _zrush_worker_rfd == -1 && _zrush_worker_wfd == -1 \
-        && _zrush_worker_setup_fd == -1 && _zrush_worker_ack_fd == -1 \
+        && _zrush_worker_control_wfd == -1 && _zrush_worker_ack_fd == -1 \
         && _zrush_worker_drain_fd == -1 )) \
      && [[ ! -e /dev/fd/$mismatch_rfd && ! -e /dev/fd/$mismatch_wfd \
-           && ! -e /dev/fd/$mismatch_setup_fd && ! -e /dev/fd/$mismatch_ack_fd \
+           && ! -e /dev/fd/$mismatch_control_fd \
            && ! -e /dev/fd/$mismatch_drain_fd ]]; then
     ok "worker lifecycle: protocol mismatch disables immediately and closes every transport fd"
   else
-    ng "worker lifecycle: mismatch state enabled=$_zrush_enabled disabled=$_zrush_disabled failures=$_zrush_worker_failures warned=$_zrush_worker_warned"
+    ng "worker lifecycle: mismatch state enabled=$_zrush_enabled disabled=$_zrush_disabled failures=$_zrush_worker_failures warned=$_zrush_worker_warned fds=$_zrush_worker_rfd,$_zrush_worker_wfd,$_zrush_worker_control_wfd,$_zrush_worker_ack_fd,$_zrush_worker_drain_fd"
   fi
   _zrush_disabled=0 _zrush_enabled=0 _zrush_worker_warned=0
 
@@ -501,7 +503,7 @@ reserialize_plan() {  # -> REPLY=bytes, or return 1 with REPLY=reason
   local saved_log=${ZRUSH_LOG:-}
   ZRUSH_LOG=$WORK/lifecycle.log
   _zrush_worker_failures=0 _zrush_worker_warned=0 _zrush_disabled=0 _zrush_enabled=1
-  _zrush_worker_pid=-1 _zrush_worker_rfd=-1 _zrush_worker_wfd=-1
+  _zrush_worker_rfd=-1 _zrush_worker_wfd=-1 _zrush_worker_control_wfd=-1
   _zrush_worker_session_fail fixture-first 2>/dev/null
   local -i first_failure_ok=$(( _zrush_worker_failures == 1 && _zrush_worker_warned \
     && !_zrush_disabled && _zrush_enabled ))

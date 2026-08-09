@@ -90,7 +90,15 @@ export TERM=vt100
 # keys this driver sends (^U, ^P, ^V, ...) are emacs-keymap bindings, so the
 # invoking environment must not decide which keymap the host gets.
 unset EDITOR VISUAL
-export LC_ALL=en_US.UTF-8   # match POSTDISPLAY printability checks to real UTF-8 use
+# Match POSTDISPLAY printability checks to real UTF-8 use. Minimal Linux
+# images commonly provide only C.UTF-8/C.utf8, while macOS provides
+# en_US.UTF-8; select the first locale this host actually accepts.
+typeset -g DRIVER_UTF8_LOCALE=
+for DRIVER_UTF8_LOCALE in en_US.UTF-8 C.UTF-8 C.utf8; do
+  LC_ALL=$DRIVER_UTF8_LOCALE command locale charmap >/dev/null 2>&1 && break
+done
+LC_ALL=$DRIVER_UTF8_LOCALE command locale charmap >/dev/null 2>&1 || DRIVER_UTF8_LOCALE=C
+export LC_ALL=$DRIVER_UTF8_LOCALE
 export HOME=$PLAYGROUND     # isolated; never the real home
 export ZRUSH_TEST_TMP=$WORK
 export ZDOTDIR=$WORK/zdot
@@ -107,6 +115,7 @@ export ZRUSH_BIN=$WORK/bin/zrush
 export ZRUSH_REAL_BIN=$REPO/target/release/zrush
 export ZRUSH_FAKE_CONTROL=$WORK/fake-control
 export ZRUSH_FAKE_STATE=$WORK/fake-state
+typeset -gi FAKE_DRAIN_TAIL_BYTES=8388608
 # Test seam: 5000 ms matches the driver's other bounded waits.
 export ZRUSH_HISTORY_DEADLINE_MS=5000
 
@@ -269,6 +278,41 @@ fake_count() {  # $1=fixed state line -> REPLY=count
   return 0
 }
 
+fake_session_count() {  # -> REPLY=number of fake worker sessions created
+  typeset -g REPLY=0
+  [[ -r $ZRUSH_FAKE_STATE.count ]] &&
+    REPLY=$(command cat $ZRUSH_FAKE_STATE.count 2>/dev/null)
+  [[ $REPLY == <-> ]] || REPLY=0
+}
+
+worker_state_has() {  # $1=TESTWORKER value, remaining args=exact fields
+  local state=$1 field
+  shift
+  for field in "$@"; do
+    [[ " $state " == *" $field "* ]] || return 1
+  done
+  return 0
+}
+
+# Wait until asynchronous worker-stop cleanup reaches an exact observable
+# state. Session failure is logged before the fixed 100 ms lifecycle budget has
+# necessarily reached response EOF, so a following request must not use that
+# log line alone as evidence that replacement is allowed.
+wait_worker_state() {  # $1=timeout(s), remaining args=exact TESTWORKER fields
+  local -F dl=$(( SECONDS + $1 ))
+  shift
+  local state=
+  while (( SECONDS < dl )); do
+    if dump_get $'\C-xw' TESTWORKER; then
+      state=$REPLY
+      worker_state_has "$state" "$@" && return 0
+    fi
+    drain 0.1
+  done
+  typeset -g REPLY=$state
+  return 1
+}
+
 wait_fake() {  # $1=fixed state line $2=baseline $3=timeout
   local -F dl=$(( SECONDS + ${3:-5} ))
   while (( SECONDS < dl )); do
@@ -281,7 +325,7 @@ wait_fake() {  # $1=fixed state line $2=baseline $3=timeout
 
 # Compare an exact ^Xb BUFFER dump against an expected string.
 assert_buffer() {  # $1=expected buffer $2=label
-  local want=${(qqqq)1}
+  local expected=$1 want=${(qqqq)1}
   send_keys $'\C-xb'
   local -F dl=$(( SECONDS + 5 ))
   local last=
@@ -290,7 +334,7 @@ assert_buffer() {  # $1=expected buffer $2=label
     drain 0.15
     tl=( ${(f)"$(grep -F 'TESTBUF=' $ZRUSH_LOG 2>/dev/null)"} )
     (( $#tl )) && last=${tl[-1]#*TESTBUF=}
-    [[ $last == "$want" ]] && { ok "$2"; return 0 }
+    [[ ${(Q)last} == "$expected" ]] && { ok "$2"; return 0 }
   done
   ng "$2: buffer=${last:-?} want=$want"
   return 1
@@ -393,7 +437,8 @@ sec_boot() {
   sync_prompt
 
   # The Rust worker is lazy: sourcing/config validation alone must not start it.
-  if dump_get $'\C-xw' TESTWORKER && [[ $REPLY == 'pid=-1 ready=0 seq=0 '* ]]; then
+  if dump_get $'\C-xw' TESTWORKER \
+     && worker_state_has "$REPLY" ready=0 seq=0 stopping=0 tainted=0 rfd=-1 wfd=-1 control=-1 ack=-1; then
     ok "(worker-1a) source/config leaves the persistent worker stopped"
   else
     ng "(worker-1a) worker was not lazy: ${REPLY:-<none>}"
@@ -407,6 +452,27 @@ sec_boot() {
     ng "(fd-1b) auxiliary fd teardown mismatch: ${REPLY:-<none>}"
   fi
   assert_host_stdio "(fd-1c) timer/ack/drain teardown preserves host fd 0/1/2"
+
+  # Register a production-generated drain wrapper from a widget, then return
+  # to the real ZLE event loop. Only readiness dispatch through zle -F can
+  # reach the temporary read seam and emit TESTGENERATED=dispatched.
+  log_count 'TESTGENERATED=dispatched'; local -i generated0=$REPLY
+  send_keys $'\C-xg'
+  local -i generated_ok=1
+  wait_log 'TESTGENERATED=dispatched' $generated0 5 || generated_ok=0
+  local generated_line=$(grep -F 'TESTGENERATED=dispatched' $ZRUSH_LOG 2>/dev/null | tail -1)
+  local generated_value=${${generated_line#*generation=}%% *}
+  if (( generated_ok )) && [[ $generated_value == <-> ]] \
+     && worker_state_has "$generated_line" kind=drain current=0 drain=-1 handler_live=0 widget_live=0 \
+     && dump_get $'\C-xw' TESTWORKER \
+     && worker_state_has "$REPLY" ready=0 stopping=0 tainted=0 rfd=-1 wfd=-1 control=-1 ack=-1; then
+    ok "(worker-callback) generated zle -F handler dispatches readiness and self-invalidates"
+  else
+    ng "(worker-callback) generated handler did not progress/clean up: line=${generated_line:-<none>} state=${REPLY:-<none>}"
+    send_keys $'\C-xG'
+    drain 0.2
+  fi
+  assert_host_stdio "(fd-1d) generated callback dispatch preserves host fd 0/1/2"
 }
 
 sec_capture() {
@@ -421,8 +487,11 @@ sec_capture() {
   fi
   dump_get $'\C-xw' TESTWORKER
   local worker_after_first=$REPLY
-  local -i first_worker_pid=${${worker_after_first#pid=}%% *}
-  if (( first_worker_pid > 1 )) && [[ $worker_after_first == *'ready=1'*'seq=1'* ]]; then
+  local -i first_worker_rfd=${${worker_after_first#*rfd=}%% *}
+  local first_runtime=${${worker_after_first#*runtime=}%% *}
+  if (( first_worker_rfd > 2 )) \
+     && worker_state_has "$worker_after_first" ready=1 seq=1 stopping=0 tainted=0 \
+     && [[ $first_runtime != '<none>' ]]; then
     ok "(worker-1b) first real request starts and handshakes one worker"
   else
     ng "(worker-1b) unexpected first-request state: $worker_after_first"
@@ -458,28 +527,96 @@ sec_capture() {
 
   dump_get $'\C-xw' TESTWORKER
   local worker_after_successive=$REPLY
-  if [[ $worker_after_successive == "pid=$first_worker_pid "* ]] && (( ${${worker_after_successive#*seq=}%% *} > 1 )); then
+  local -i successive_rfd=${${worker_after_successive#*rfd=}%% *}
+  local successive_runtime=${${worker_after_successive#*runtime=}%% *}
+  if (( successive_rfd == first_worker_rfd \
+        && ${${worker_after_successive#*seq=}%% *} > 1 )) \
+     && [[ $successive_runtime == $first_runtime ]]; then
     ok "(worker-1c) successive completion requests reuse the same Rust worker"
   else
     ng "(worker-1c) worker was not reused: first=$worker_after_first now=$worker_after_successive"
   fi
 
   local -i seq_before_resource=${${worker_after_successive#*seq=}%% *}
+  log_count 'worker: transport stopped'; local -i resource_stopped0=$REPLY
+  # This case tests the completed handoff, not the separately-covered 100 ms
+  # expiry/quarantine branch. Give the old definition an extended test-only
+  # budget so scheduler variance cannot turn this source invocation into the
+  # specified fail-fast result whose cleanup completes just after the prompt.
+  send_line '_ZRUSH_WORKER_SHUTDOWN_MS=5000'
+  sync_prompt
   send_line "source <($ZRUSH_REAL_BIN init zsh)"
   sync_prompt
-  if dump_get $'\C-xw' TESTWORKER && [[ $REPLY == "pid=-1 ready=0 seq=$seq_before_resource "* && $REPLY == *'rfd=-1 wfd=-1 ack=-1 pending=0' ]]; then
+  local post_resource_state= post_resource_runtime=
+  dump_get $'\C-xw' TESTWORKER && post_resource_state=$REPLY
+  post_resource_runtime=${${post_resource_state#*runtime=}%% *}
+  if worker_state_has "$post_resource_state" ready=0 seq=$seq_before_resource stopping=0 tainted=0 \
+       rfd=-1 wfd=-1 control=-1 ack=-1 pending=0 \
+     && [[ $post_resource_runtime != '<none>' && $post_resource_runtime != $first_runtime ]]; then
     ok "(worker-1d) re-source tears down transport while preserving the request counter"
   else
-    ng "(worker-1d) bad post-resource state: ${REPLY:-<none>}"
+    ng "(worker-1d) bad post-resource state: ${post_resource_state:-<none>}"
   fi
-  local terminated_resource=$(grep -F "worker: terminated pid=$first_worker_pid gone=1" $ZRUSH_LOG 2>/dev/null | tail -1)
-  if [[ -n $terminated_resource ]] \
-     && ! kill -0 $first_worker_pid 2>/dev/null; then
-    ok "(worker-1e) re-source terminates old worker pid=$first_worker_pid and confirms it is gone"
+  if wait_log 'worker: transport stopped' $resource_stopped0 5 \
+     && [[ ! -e $first_runtime ]]; then
+    ok "(worker-1e) re-source observes response EOF before replacing the old runtime generation"
   else
-    ng "(worker-1e) old worker did not disappear: line=${terminated_resource:-<none>}"
+    ng "(worker-1e) old completion/runtime cleanup missing: runtime=$first_runtime"
   fi
   assert_host_stdio "(fd-3) re-source teardown preserves host fd 0/1/2"
+
+  # Re-source a healthy fake session whose final stdout bytes are deliberately
+  # not a protocol frame. The fake records stdin EOF, a successful raw tail
+  # write, and clean return in that order. This makes the shutdown observation
+  # deterministic without depending on whether a real worker happened to have
+  # an outstanding response when the source command ran.
+  fake_session_count; local -i drain_session=$(( REPLY + 1 ))
+  print -r -- drain > $ZRUSH_FAKE_CONTROL
+  fake_count "drain $drain_session "; local -i drain_request0=$REPLY
+  log_count 'worker: error request_id='; local -i drain_error0=$REPLY
+  send_keys 'ls fx/basic/al'
+  if wait_fake "drain $drain_session " $drain_request0 10 \
+     && wait_log 'worker: error request_id=' $drain_error0 10 \
+     && dump_get $'\C-xw' TESTWORKER \
+     && worker_state_has "$REPLY" ready=1 stopping=0 tainted=0; then
+    local -i drain_seq=${${REPLY#*seq=}%% *}
+    fake_count "eof $drain_session"; local -i drain_eof0=$REPLY
+    fake_count "tail $drain_session $FAKE_DRAIN_TAIL_BYTES"; local -i drain_tail0=$REPLY
+    fake_count "exit $drain_session"; local -i drain_exit0=$REPLY
+    clear_line
+    drain 0.2
+    # The 8 MiB tail deliberately exceeds pipe capacity. Extend only this
+    # successful-shutdown fixture; the bounded deadline and quarantine path are
+    # asserted independently by transport.zsh.
+    send_line '_ZRUSH_WORKER_SHUTDOWN_MS=5000'
+    sync_prompt
+    send_line "source <($ZRUSH_REAL_BIN init zsh)"
+    local -i drain_resource_ok=1
+    sync_prompt || drain_resource_ok=0
+    wait_fake "eof $drain_session" $drain_eof0 5 || drain_resource_ok=0
+    wait_fake "tail $drain_session $FAKE_DRAIN_TAIL_BYTES" $drain_tail0 5 || drain_resource_ok=0
+    wait_fake "exit $drain_session" $drain_exit0 5 || drain_resource_ok=0
+    local drain_resource_output=${EXPECT_BUF//$'\e['[0-9;]#m/}
+    if (( drain_resource_ok )) \
+       && [[ $drain_resource_output != *'Terminated'* \
+             && $drain_resource_output != *'Done'* \
+             && $drain_resource_output != *'zsh: you have running jobs.'* ]]; then
+      ok "(worker-1f) healthy re-source closes stdin at EOF, drains raw stdout, and confirms clean worker disappearance"
+    else
+      ng "(worker-1f) healthy fake shutdown incomplete: output=${(qqqq)drain_resource_output}"
+    fi
+    if dump_get $'\C-xw' TESTWORKER \
+       && worker_state_has "$REPLY" ready=0 seq=$drain_seq stopping=0 tainted=0 \
+            rfd=-1 wfd=-1 control=-1 ack=-1 pending=0; then
+      ok "(worker-1g) healthy re-source leaves no transport state and does not start a replacement"
+    else
+      ng "(worker-1g) bad post-resource fake-worker state: ${REPLY:-<none>}"
+    fi
+    assert_host_stdio "(fd-3b) healthy raw-drain re-source preserves host fd 0/1/2"
+  else
+    ng "(worker-1f/g) healthy fake session did not become ready: ${REPLY:-<none>}"
+  fi
+  print -r -- proxy > $ZRUSH_FAKE_CONTROL
 
   # (cap-1c) w vs m: a candidate whose quoted form differs from its raw text.
   # The listing must show the raw text (m, cli-protocol.md "候補レコード"), and
@@ -881,28 +1018,30 @@ sec_death() {
 
   # Switch only future sessions to the fake. It handshakes ready, records the
   # assigned request id, then exits without a terminal response.
-  dump_get $'\C-xw' TESTWORKER
-  local -i explicit_teardown_pid=${${REPLY#pid=}%% *}
+  log_count 'worker: transport stopped'; local -i explicit_stop0=$REPLY
   send_keys $'\C-xq'
   drain 0.3
   dump_get $'\C-xw' TESTWORKER
-  [[ $REPLY == 'pid=-1 ready=0 '* ]] || ng "(err-setup) worker teardown failed: $REPLY"
-  local explicit_termination=$(grep -F "worker: terminated pid=$explicit_teardown_pid gone=1" $ZRUSH_LOG 2>/dev/null | tail -1)
-  if (( explicit_teardown_pid > 1 )) && [[ -n $explicit_termination ]] \
-     && ! kill -0 $explicit_teardown_pid 2>/dev/null; then
-    ok "(err-setup) explicit teardown terminates pid=$explicit_teardown_pid and confirms it is gone"
+  if worker_state_has "$REPLY" ready=0 stopping=0 rfd=-1 wfd=-1 control=-1 ack=-1 pending=0 \
+     && wait_log 'worker: transport stopped' $explicit_stop0 5; then
+    ok "(err-setup) explicit healthy teardown reaches response EOF and clears transport state"
   else
-    ng "(err-setup) explicit teardown did not confirm old worker disappeared: ${explicit_termination:-<none>}"
+    ng "(err-setup) explicit teardown did not finalize: ${REPLY:-<none>}"
   fi
   assert_host_stdio "(fd-4) explicit worker teardown preserves host fd 0/1/2"
+  fake_session_count; local -i death_session0=$REPLY
+  local -i death_first_session=$(( death_session0 + 1 ))
+  local -i death_second_session=$(( death_session0 + 2 ))
+  local -i death_third_session=$(( death_session0 + 3 ))
+  local -i death_starts0=$(grep -c '^start ' $ZRUSH_FAKE_STATE 2>/dev/null)
   print -r -- die > $ZRUSH_FAKE_CONTROL
   log_count 'worker: session failure:'; local -i err_fail0=$REPLY
-  fake_count 'die 1 '; local -i fake_die0=$REPLY
+  fake_count "die $death_first_session "; local -i fake_die0=$REPLY
   local -i err_log_line0=0
   [[ -r $ZRUSH_LOG ]] && err_log_line0=$(wc -l < $ZRUSH_LOG)
   send_keys 'ls fx/basic/al'
   local -i active_death_ok=1
-  wait_fake 'die 1 ' $fake_die0 10 || active_death_ok=0
+  wait_fake "die $death_first_session " $fake_die0 10 || active_death_ok=0
   wait_log 'worker: session failure:' $err_fail0 10 || active_death_ok=0
   local worker_warning_output=${EXPECT_BUF//$'\e['[0-9;]#m/}
   if [[ $worker_warning_output == *'zrush: worker transport failed; suppressing further warnings this session'* ]]; then
@@ -911,27 +1050,15 @@ sec_death() {
     ng "(fd-5a) worker warning missing from pty output: ${(qqqq)worker_warning_output}"
   fi
   local err_log_delta=$(sed -n "$(( err_log_line0 + 1 )),\$p" $ZRUSH_LOG 2>/dev/null)
-  local fake_started=$(print -r -- "$err_log_delta" | grep -F 'worker: started pid=' 2>/dev/null)
-  local -i fake_started_count=$(print -r -- "$fake_started" | grep -cF 'worker: started pid=' 2>/dev/null)
-  local -i fake_worker_pid=-1
-  if (( fake_started_count == 1 )); then
-    local fake_worker_tail=${fake_started#*'worker: started pid='}
-    fake_worker_pid=${fake_worker_tail%% *}
-  fi
-  local exact_fake_termination=
-  if (( fake_worker_pid > 1 )); then
-    exact_fake_termination=$(print -r -- "$err_log_delta" \
-      | grep -E "\\] worker: terminated pid=$fake_worker_pid gone=1\$" 2>/dev/null)
-  fi
-  if (( active_death_ok && fake_started_count == 1 && fake_worker_pid > 1 )) \
-     && [[ -n $exact_fake_termination ]] \
+  local -i fake_started_count=$(print -r -- "$err_log_delta" | grep -cF 'worker: started rfd=' 2>/dev/null)
+  if (( active_death_ok && fake_started_count == 1 )) \
      && dump_get $'\C-xw' TESTWORKER \
-     && [[ $REPLY == *'failures=1 disabled=0'*'warned=1'*'pending=0' ]]; then
+     && worker_state_has "$REPLY" failures=1 disabled=0 warned=1 pending=0; then
     ok "(err-1a) ready worker dies with an assigned request; pending is discarded and failure is retryable"
   else
-    ng "(err-1a) active-death state missing: state=${REPLY:-<none>} pid=$fake_worker_pid termination=${exact_fake_termination:-<none>}"
+    ng "(err-1a) active-death state missing: state=${REPLY:-<none>} starts=$fake_started_count"
   fi
-  local first_die=$(grep -F 'die 1 ' $ZRUSH_FAKE_STATE 2>/dev/null | tail -1)
+  local first_die=$(grep -F "die $death_first_session " $ZRUSH_FAKE_STATE 2>/dev/null | tail -1)
   local first_dead_id=${first_die##* }
   drain 0.5
   if dump_get $'\C-xp' TESTPOST; then
@@ -948,13 +1075,17 @@ sec_death() {
   # and assignment so state can be inspected before its terminal response.
   clear_line; drain 0.3
   assert_host_stdio "(fd-5b) session failure teardown preserves host fd 0/1/2"
+  local -i first_death_clean=0
+  wait_worker_state 10 ready=0 stopping=0 rfd=-1 wfd=-1 control=-1 ack=-1 pending=0 \
+    && first_death_clean=1
   print -r -- hold > $ZRUSH_FAKE_CONTROL
-  fake_count 'hold 2 '; local -i fake_hold0=$REPLY
+  fake_count "hold $death_second_session "; local -i fake_hold0=$REPLY
   send_keys 'ls fx/basic/'
-  if wait_fake 'hold 2 ' $fake_hold0 10 \
+  if (( first_death_clean )) \
+     && wait_fake "hold $death_second_session " $fake_hold0 10 \
      && dump_get $'\C-xw' TESTWORKER \
-     && [[ $REPLY == *'ready=1'*'failures=1 disabled=0'*'pending=1' ]] \
-     && (( $(grep -c '^start ' $ZRUSH_FAKE_STATE) == 2 )); then
+     && worker_state_has "$REPLY" ready=1 failures=1 disabled=0 pending=1 \
+     && (( $(grep -c '^start ' $ZRUSH_FAKE_STATE) == death_starts0 + 2 )); then
     ok "(err-1c) next request starts exactly one replacement; ready handshake does not reset failure streak"
   else
     ng "(err-1c) held replacement state missing: ${REPLY:-<none>}"
@@ -969,7 +1100,7 @@ sec_death() {
   print -r -- error > $ZRUSH_FAKE_CONTROL
   if wait_log 'worker: error request_id=' $err_terminal0 10 \
      && dump_get $'\C-xw' TESTWORKER \
-     && [[ $REPLY == *'failures=0 disabled=0'*'pending=0' ]]; then
+     && worker_state_has "$REPLY" failures=0 disabled=0 pending=0; then
     ok "(err-1e) well-formed terminal error resets the session-failure streak"
   else
     ng "(err-1e) terminal response did not reset streak: ${REPLY:-<none>}"
@@ -980,25 +1111,32 @@ sec_death() {
   # must not resolve against a failed plan.
   print -r -- die > $ZRUSH_FAKE_CONTROL
   clear_line; drain 0.3
-  fake_count 'die 2 '; local -i fake_die1=$REPLY
+  fake_count "die $death_second_session "; local -i fake_die1=$REPLY
   log_count 'worker: session failure:'; local -i active_fail1=$REPLY
   send_keys 'ls fx/basic/al'
-  wait_fake 'die 2 ' $fake_die1 10 \
+  wait_fake "die $death_second_session " $fake_die1 10 \
     && wait_log 'worker: session failure:' $active_fail1 10
+  local -i second_death_clean=0
+  wait_worker_state 10 ready=0 stopping=0 rfd=-1 wfd=-1 control=-1 ack=-1 pending=0 \
+    && second_death_clean=1
   clear_line; drain 0.3
-  fake_count 'die 3 '; local -i fake_die2=$REPLY
+  fake_count "die $death_third_session "; local -i fake_die2=$REPLY
   log_count 'worker: session failure:'; local -i active_fail2=$REPLY
   send_keys 'ls fx/basic/al'$'\t'
-  wait_fake 'die 3 ' $fake_die2 10 \
+  wait_fake "die $death_third_session " $fake_die2 10 \
     && wait_log 'worker: session failure:' $active_fail2 10
+  local -i third_death_clean=0
+  wait_worker_state 10 ready=0 stopping=0 rfd=-1 wfd=-1 control=-1 ack=-1 pending=0 \
+    && third_death_clean=1
   drain 0.5
   assert_buffer 'ls fx/basic/al' "(err-2) pending Tab resolved against an actively-dead worker inserts nothing"
   if dump_get $'\C-xw' TESTWORKER \
-     && [[ $REPLY == *'failures=2 disabled=1'*'warned=1'*'pending=0' ]] \
-     && (( $(grep -c '^start ' $ZRUSH_FAKE_STATE) == 3 )); then
+     && (( second_death_clean && third_death_clean )) \
+     && worker_state_has "$REPLY" failures=2 disabled=1 warned=1 pending=0 \
+     && (( $(grep -c '^start ' $ZRUSH_FAKE_STATE) == death_starts0 + 3 )); then
     ok "(err-3) two consecutive active-session deaths open the breaker after one lazy replacement"
   else
-    ng "(err-3) active-death breaker state missing: ${REPLY:-<none>}"
+    ng "(err-3) active-death breaker state missing: second-clean=$second_death_clean third-clean=$third_death_clean state=${REPLY:-<none>}"
   fi
 
   clear_line
@@ -1457,10 +1595,12 @@ sec_hist() {
   # start an unrelated async request before the history-menu attempt.
   send_keys $'\C-xq'
   drain 0.3
-  local -i hist_fake_session=$(( ${$(<$ZRUSH_FAKE_STATE.count):-0} + 1 ))
+  fake_session_count
+  local -i hist_fake_session=$(( REPLY + 1 ))
   print -r -- die > $ZRUSH_FAKE_CONTROL
   fake_count "die $hist_fake_session "; local -i hist_die0=$REPLY
   log_count 'worker: session failure:'; local -i hist_fail0=$REPLY
+  log_count 'worker: transport stopped'; local -i hist_stopped0=$REPLY
   send_keys $'\e[A'
   if wait_fake "die $hist_fake_session " $hist_die0 10 \
      && wait_log 'worker: session failure:' $hist_fail0 10; then
@@ -1483,6 +1623,11 @@ sec_hist() {
     ng "(h24d) shell did not respond after the failed history-menu plan"
   fi
   sync_prompt
+  # The session-failure log can precede response EOF when abort exhausts its
+  # synchronous budget. Do not make the next history request race the retained
+  # stopping gate.
+  local -i h26_worker_clean=0
+  wait_log 'worker: transport stopped' $hist_stopped0 10 && h26_worker_clean=1
 
   # ---- (h26a/h26b) audit A2: send-break while the history menu is open must
   # not leak kind/listing state into the next line. The existing (sb-1)
@@ -1498,7 +1643,8 @@ sec_hist() {
   drain 0.5
   press $'\e[A'
   dump_get $'\C-xk' TESTKIND
-  [[ $REPLY == 'kind=history'* ]] || ng "(h26-setup) history menu did not open: $REPLY"
+  [[ $REPLY == 'kind=history'* && $h26_worker_clean == 1 ]] ||
+    ng "(h26-setup) history menu did not open after worker cleanup=$h26_worker_clean: $REPLY"
   send_keys $'\C-c'   # send-break: abandon the line, bypassing confirm/dismiss/line-finish
   if sync_prompt 15; then
     ok "(h26a) a new prompt appears after send-break with the history menu open"
@@ -1735,8 +1881,18 @@ sec_jobtable() {
   if start_hist_host $WORK/zdot-exit $WORK/xdg-exit $WORK/host-exit.log; then
     send_line '[[ -o checkjobs && -o checkrunningjobs ]] && print CHECK-JOBS-ENABLED'
     if expect '*CHECK-JOBS-ENABLED*HP>*' 5; then
-      send_keys_wait_plan nonempty 'ls fx/basic/al'
-      if dump_get $'\C-xw' TESTWORKER && [[ $REPLY == 'pid='<->' ready=1 '* ]]; then
+      fake_session_count; local -i exit_session=$(( REPLY + 1 ))
+      # Job-table behavior does not require the separate 8 MiB raw-drain
+      # stressor. A small terminal response keeps this case focused on one
+      # `exit`, while zshexit remains free to stop waiting at its fixed deadline.
+      print -r -- error > $ZRUSH_FAKE_CONTROL
+      fake_count "error $exit_session "; local -i exit_request0=$REPLY
+      log_count 'worker: error request_id='; local -i exit_error0=$REPLY
+      send_keys 'ls fx/basic/al'
+      if wait_fake "error $exit_session " $exit_request0 10 \
+         && wait_log 'worker: error request_id=' $exit_error0 10 \
+         && dump_get $'\C-xw' TESTWORKER \
+         && worker_state_has "$REPLY" ready=1 stopping=0; then
         clear_line
         drain 0.3
         local -F exit_deadline=$(( SECONDS + 5 ))
@@ -1755,8 +1911,11 @@ sec_jobtable() {
           fi
         done
         local visible_exit_output=${exit_output//$'\e['[0-9;]#m/}
-        if (( exit_eof )) && [[ $visible_exit_output != *'zsh: you have running jobs.'* ]]; then
-          ok "(worker-job-table) one exit terminates a worker-owning shell without a running-jobs refusal"
+        if (( exit_eof )) \
+           && [[ $visible_exit_output != *'zsh: you have running jobs.'* \
+                 && $visible_exit_output != *'Terminated'* \
+                 && $visible_exit_output != *'Done'* ]]; then
+          ok "(worker-job-table) one exit terminates without job-control output"
         else
           ng "(worker-job-table) exit did not terminate cleanly: eof=$exit_eof output=${(qqqq)visible_exit_output}"
         fi
@@ -1769,6 +1928,7 @@ sec_jobtable() {
   else
     ng "(worker-job-table) dedicated exit host failed to start"
   fi
+  print -r -- proxy > $ZRUSH_FAKE_CONTROL
 }
 
 sec_inflight() {
@@ -1790,6 +1950,7 @@ sec_inflight() {
   # Reaping it here first, without redirecting stderr, avoids the crash;
   # start_hist_host's own redundant delete of the now-already-gone session
   # is then a harmless no-op.
+  print -r -- proxy > $ZRUSH_FAKE_CONTROL
   zpty -d host
   mkdir -p $WORK/zdot-inflight $WORK/xdg-inflight/zrush
   print "source $REPO/tests/zsh/rc/minimal.zshrc" > $WORK/zdot-inflight/.zshrc
@@ -1806,7 +1967,7 @@ sec_inflight() {
       send_keys 'ls fx/overflow/'
       if wait_log 'worker: sending frame' $inflight_sending_before 15; then
         local inflight_sending_line=$(grep -F 'worker: sending frame' $ZRUSH_LOG 2>/dev/null | tail -1)
-        local -i inflight_writer_pid=${${inflight_sending_line##*writer_pid=}%% *}
+        local -i inflight_ack_fd=${${inflight_sending_line##*ackfd=}%% *}
         log_count 'worker: frame sent'; local -i inflight_sent_at_dispatch=$REPLY
         # No drain here: the whole point is to tear down as close as possible
         # to the writer-child spawn, before its ack can land. ^U
@@ -1814,8 +1975,8 @@ sec_inflight() {
         # 'ls fx/overflow/' buffer text so that `exit` runs on an empty line;
         # the capture already finished -- that's how the frame got queued --
         # and an empty buffer collects nothing (behavior.md 候補収集), so no
-        # new request races the exit. The transport is untouched (only
-        # _zrush_worker_transport_teardown touches it).
+        # new request races the exit. The transport is untouched until the
+        # zshexit hook begins healthy shutdown.
         #
         # ^C would clear the buffer just as well but must not be used here:
         # zsh 5.9 defers a SIGINT that arrives while a `zle -F` watcher
@@ -1847,23 +2008,10 @@ sec_inflight() {
         else
           ng "(inflight-1a) job-control output leaked during in-flight teardown: eof=$inflight_exit_eof output=${(qqqq)inflight_visible_output}"
         fi
-        if (( inflight_writer_pid > 1 )); then
-          local -F inflight_gone_deadline=$(( SECONDS + 2 ))
-          local -i inflight_writer_gone=0
-          while (( SECONDS < inflight_gone_deadline )); do
-            if ! kill -0 $inflight_writer_pid 2>/dev/null; then
-              inflight_writer_gone=1
-              break
-            fi
-            zselect -t 5 2>/dev/null
-          done
-          if (( inflight_writer_gone )); then
-            ok "(inflight-1b) the delegated writer child (pid=$inflight_writer_pid) is gone after teardown"
-          else
-            ng "(inflight-1b) writer child pid=$inflight_writer_pid still alive after teardown"
-          fi
+        if (( inflight_ack_fd > 2 )) && [[ $inflight_sending_line != *'writer_pid='* ]]; then
+          ok "(inflight-1b) delegated writer is tracked only by its ack transport slot"
         else
-          ng "(inflight-1b) could not parse a writer_pid from: ${inflight_sending_line:-<none>}"
+          ng "(inflight-1b) missing PID-free ack slot in: ${inflight_sending_line:-<none>}"
         fi
         if (( inflight_sent_at_dispatch == inflight_sent_before )); then
           obsv "(inflight-1c) teardown was dispatched before this frame's ack was consumed (writer child genuinely still delegated)"

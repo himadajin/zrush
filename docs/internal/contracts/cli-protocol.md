@@ -18,7 +18,7 @@ zrush.zsh(zsh 側)と `zrush` バイナリ(Rust 側)の入出力仕様。
 
 > 検証: 版番号のコピーの一致 — `src/config.rs` のテスト `protocol_version_matches_docs_and_zsh`。
 
-- **PROTOCOL_VERSION = 6**
+- **PROTOCOL_VERSION = 7**
 - `zrush config` の出力に `ZRUSH_PROTOCOL_VERSION` が含まれる。
   zrush.zsh は自身が期待する版番号と照合し、不一致なら警告を 1 回表示して zrush を無効化する。
   zrush.zsh はバイナリに埋め込まれて配布される(「zrush init」節)ため、
@@ -27,7 +27,8 @@ zrush.zsh(zsh 側)と `zrush` バイナリ(Rust 側)の入出力仕様。
   かつ古い版の常駐 worker を保持している状況である。
 - 照合の機会を保証するため、zrush.zsh は **source 時に無条件で `zrush config` を 1 回実行**する
   (config.toml の mtime 変化だけをトリガにすると、バイナリのみ更新された場合に照合されない)。
-- 互換性が壊れる変更(フィールドの追加・削除・意味変更、キー記法の変更)で版番号を上げる。
+- 互換性が壊れる変更(フィールドの追加・削除・意味変更、worker の必須 CLI/control 契約、キー記法の変更)で
+  版番号を上げる。
 - 未知の引数を渡された `zrush` は exit 2 で拒否する(前方互換より誤用の早期検出を優先する意図的選択。
   版不整合は上記の警告で検知される)。
 
@@ -90,7 +91,7 @@ zrush.zsh(zsh 側)と `zrush` バイナリ(Rust 側)の入出力仕様。
 | コード | 意味 |
 |---|---|
 | 0 | 成功。worker は frame 境界での stdin EOF、`zrush config` は設定ファイルの問題があっても既定値と警告を出力して成功する。`zrush init` は自身の絶対パス解決とスクリプト出力に成功する |
-| 1 | worker の session-fatal framing/I/O/内部エラー、`zrush config` の内部エラー、または `zrush init` の自身のパス解決失敗を含む内部エラー |
+| 1 | worker の session-fatal framing/I/O/内部エラー、control-fd の setup failure、watchdog による abort、`zrush config` の内部エラー、または `zrush init` の自身のパス解決失敗を含む内部エラー |
 | 2 | usage エラー(未知・不足・不正な引数、未知または未指定のサブコマンド) |
 
 `--help` / `-h`、および `help` サブコマンドは使用方法を表示して exit 0 する。
@@ -106,10 +107,15 @@ zsh がそのまま適用できる描画プランを返す。
 ### 起動と責務
 
 ```
-zrush worker
+zrush worker --control-fd N
 ```
 
-引数は取らない。未知の引数は起動前に exit 2 で拒否する。起動後は stdin から要求を読み、
+`--control-fd N` は必須で、`N > 2` の open 済み readable Unix fd を指定する。
+worker は検証後にこの fd の sole ownership を引き取り、watchdog 以外からは使用しない。
+option の欠落、数字でない/2 以下の値、未知または余分な引数は起動前に exit 2 で拒否する。
+fd が closed / write-only である場合、または watchdog setup に失敗した場合は、`hello` / `ready` や
+request 処理を始める前に startup 診断を stderr へ 1 行書いて exit 1 する。
+起動後は stdin から要求を読み、
 要求ごとにマッチング・ランキング・グループ分割・グリッドレイアウト・ハイライト計算・
 ナビゲーション表構築・挿入テキスト構築を行って stdout へ応答する。
 one-shot の `zrush plan` サブコマンドは存在しない。
@@ -117,6 +123,24 @@ one-shot の `zrush plan` サブコマンドは存在しない。
 ワーカーは **config.toml を読まない**。設定スナップショットは要求フィールドで受け取る
 (設定の取得・mtime 監視は zsh 側の責務)。`HISTFILE` も読まず、候補 payload 全体を要求ごとに受け取る。
 ただしファイルシステムに対しては純粋でない: `f = 1` 候補の `/` 合成判定だけは要求の `cwd` を基準に stat する。
+
+### abort control と worker 終了
+
+`--control-fd` は request/response protocol と独立した private control byte stream で、message framing を持たない。
+worker は通常の request 処理を始める前に watchdog thread を起動し、control fd を blocking read する。
+
+- 1 byte 以上を受信した場合は値によらず abort。zsh は byte 1 個だけを書けばよい。
+- EOF は control writer の喪失を表し、同じく abort。
+- `EINTR` は read を retry し、それ以外の read error は fatal abort。
+- abort は小さな Unix 専用 wrapper から process 全体へ `_exit(1)` を実行する。
+  main worker thread が request 処理で停止していても watchdog 単独で終了させる。
+- watchdog は detached であり、frame 境界の stdin EOF による main thread の正常 exit 0 を妨げない。
+  zsh は正常 shutdown の response EOF まで control write fd を open に保ち、先に閉じて abort と競合させない。
+
+stdout(fd 1)は response stream 専用で、worker は起動時に cloexec を付ける。
+worker が起動する descendant は fd 1 を継承しないため、zsh は buffered response bytes を raw drain した後の
+stdout EOF を worker completion の唯一の oracle にできる。control channel は supervisor process でも
+request/response の shutdown message でもなく、request/response の netstring fields は変更しない。
 
 ### セッションフレーミングと握手
 
@@ -143,8 +167,8 @@ message   = netstring(netstring(field-1) ... netstring(field-N))
 zsh は kind・フィールド数・版番号が完全一致する `ready` を受けたときだけセッションを利用する。
 
 ```
-hello:        ["hello", "6"]
-ready:        ["ready", "6"]
+hello:        ["hello", "7"]
+ready:        ["ready", "7"]
 incompatible: ["incompatible", worker_version]
 ```
 
@@ -609,7 +633,8 @@ zsh は一覧を消す。
   stale 応答も正常に形成されていれば終端応答として扱い、失敗回数を戻す。
 - worker の stderr は端末に流さない(zle 表示を壊さないため)。`ZRUSH_LOG` が設定されていれば
   診断をそこへ追記し、未設定なら `/dev/null` へ送る。
-  worker はセッション失敗で終了するとき、その理由を 1 行の診断として stderr に書いてから終了する。
+  main request 処理がセッション失敗で終了するときは、その理由を 1 行の診断として stderr に書いてから終了する。
+  control byte / EOF / fatal read error の watchdog abort は `_exit(1)` を使うため、この診断を要求しない。
   この行の内容は契約の対象外であり、zsh が解析してはならない。
 - セッション失敗時の破棄・再起動・無効化・警告は behavior.md「worker ライフサイクル」が定める。
 
@@ -637,7 +662,7 @@ zrush config
 ### stdout(zsh source 形式)
 
 ```zsh
-typeset -g  ZRUSH_PROTOCOL_VERSION='6'
+typeset -g  ZRUSH_PROTOCOL_VERSION='7'
 typeset -g  ZRUSH_CFG_MAX_LINES='10'
 typeset -g  ZRUSH_CFG_DELAY_MS='30'
 typeset -g  ZRUSH_CFG_MIN_INPUT='0'
@@ -734,10 +759,14 @@ typeset -g ZRUSH_BIN=${ZRUSH_BIN:-'<自身の絶対パス>'}
 ## 想定シーケンス(参考・規範ではない)
 
 1. source 時: `.zshrc` の `source <(zrush init zsh)` が `$ZRUSH_BIN` prelude と埋め込みスクリプトを読み込む。
-   埋め込みスクリプト自身の source 時処理として `zrush config` を実行し、版番号を照合してキーバインドを適用する。
+   埋め込みスクリプト自身の source 時処理として `zrush config` を実行し、版番号を照合し、private runtime directory と
+   request/response/abort-control FIFO を同期的・transactional に作成してからキーバインドを適用する。
 2. プロンプト表示ごと: config.toml の mtime を確認し、変化していれば
    `zrush config` を再実行して source、キーバインドを再適用、警告があれば表示。
-3. 最初の実要求時: `zrush worker` を起動して `hello` / `ready` を交換する。
+3. 最初の実要求時: source 時に作成済みの FIFO endpoint だけを開き、abort-control FIFO の read fd を渡して
+   `zrush worker --control-fd N` を起動し、watchdog setup 後に `hello` / `ready` を交換する。
+   遅延起動時に runtime directory/FIFO を作成してはならない。spawn 後の parent endpoint/watcher failure と
+   writer notification/watcher failure の fail-closed quarantine・runtime taint は behavior.md が定める。
 4. 入力変化 → デバウンス → zpty 収集完了後: zsh が pid レコードを取り除いた
    捕獲 payload を `producer = compsys` の plan 要求で worker に送る。
    対応する `ok` の描画プランを POSTDISPLAY / region_highlight に適用する。

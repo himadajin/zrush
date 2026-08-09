@@ -1,6 +1,9 @@
 use std::ffi::OsString;
 use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::io::AsRawFd;
+use std::os::unix::net::UnixStream;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -163,18 +166,33 @@ fn run_vector_raw(path: &Path) -> std::process::Output {
         value("--trailing-space").as_bytes(),
         &payload,
     ]);
-    let mut child = Command::new(env!("CARGO_BIN_EXE_zrush"))
+    let (control_read, _control_write) = UnixStream::pair().expect("create control channel");
+    let control_fd = control_read.as_raw_fd();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_zrush"));
+    command
         .arg("worker")
+        .arg("--control-fd")
+        .arg(control_fd.to_string());
+    unsafe {
+        command.pre_exec(move || {
+            if libc::fcntl(control_fd, libc::F_SETFD, 0) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .unwrap_or_else(|error| panic!("{}: spawn zrush: {error}", path.display()));
+    drop(control_read);
     let write_result = child
         .stdin
         .take()
         .expect("vector child stdin")
-        .write_all(&[msg(&[b"hello", b"6"]), request].concat());
+        .write_all(&[msg(&[b"hello", b"7"]), request].concat());
     if let Err(error) = write_result {
         assert_eq!(
             error.kind(),
@@ -372,7 +390,7 @@ fn reject_vectors_match_expected_in_band_errors() {
         };
         let valid = output.status.code() == Some(0)
             && frames.len() == 2
-            && decode_fields_strict(&frames[0]) == vec![b"ready".to_vec(), b"6".to_vec()]
+            && decode_fields_strict(&frames[0]) == vec![b"ready".to_vec(), b"7".to_vec()]
             && decode_fields_strict(&frames[1])
                 == vec![b"error".to_vec(), b"1".to_vec(), expected.to_vec()];
         if !valid {
