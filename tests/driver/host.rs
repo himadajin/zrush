@@ -34,6 +34,8 @@ pub mod keys {
     pub const DUMP_BUFFER: &str = "\x18b";
     pub const DUMP_POSTDISPLAY: &str = "\x18p";
     pub const DUMP_RH: &str = "\x18h";
+    /// The whole `region_highlight` array, third-party entries included.
+    pub const DUMP_ALL_RH: &str = "\x18a";
     pub const DUMP_WORKER: &str = "\x18w";
     /// Listing kind, selection and position count (history rc only).
     pub const DUMP_KIND: &str = "\x18k";
@@ -98,8 +100,9 @@ pub struct Host {
 }
 
 /// Host rc file, loaded through the host's own `$ZDOTDIR`.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 enum HostRc {
+    #[default]
     Minimal,
     /// Fixture history in memory (isolated HISTFILE, `SAVEHIST=0`) plus the
     /// history-menu dump widgets.
@@ -119,16 +122,36 @@ impl HostRc {
     }
 }
 
+/// What a scenario varies about its host. Every field defaults to the plain
+/// [`Host::boot`] shape, so each constructor names only what it changes.
+#[derive(Default)]
+pub struct BootOptions<'a> {
+    rc: HostRc,
+    /// Shell lines sourced *before* the rc file reaches `zrush init zsh`, for
+    /// a coexistence double that must sit below zrush in the wrapper chain.
+    pre_rc: &'a str,
+    /// Shell lines sourced *after* the rc file, for a double that must sit
+    /// above it. They run after the rc's own `MARK-RC-DONE`, which boot's
+    /// following prompt sync still covers.
+    post_rc: &'a str,
+    extra_fixtures: Option<fn(&Path)>,
+    fake: bool,
+    config: Option<&'a str>,
+}
+
 impl Host {
     pub fn boot() -> Self {
-        Self::boot_with(HostRc::Minimal, |_home| {}, false, None)
+        Self::boot_with(BootOptions::default())
     }
 
     /// Like [`Host::boot`], but symlinks the shared 7001-file overflow tree
     /// (built once per process, cached under `target/`) into `fx/overflow`
     /// under the host's home.
     pub fn boot_with_overflow() -> Self {
-        Self::boot_with(HostRc::Minimal, fixtures::link_overflow, false, None)
+        Self::boot_with(BootOptions {
+            extra_fixtures: Some(fixtures::link_overflow),
+            ..BootOptions::default()
+        })
     }
 
     /// Like [`Host::boot`], but with `$ZRUSH_BIN` pointing at the failure-
@@ -136,18 +159,28 @@ impl Host {
     /// It starts in [`crate::fake::Mode::Proxy`], so the host behaves exactly
     /// as under the real binary until a test sets another mode.
     pub fn boot_fake() -> Self {
-        Self::boot_with(HostRc::Minimal, |_home| {}, true, None)
+        Self::boot_with(BootOptions {
+            fake: true,
+            ..BootOptions::default()
+        })
     }
 
     /// Like [`Host::boot`], but under `tests/zsh/rc/history.zshrc`.
     pub fn boot_history() -> Self {
-        Self::boot_with(HostRc::History, |_home| {}, false, None)
+        Self::boot_with(BootOptions {
+            rc: HostRc::History,
+            ..BootOptions::default()
+        })
     }
 
     /// [`Host::boot_history`] with [`Host::boot_fake`]'s launcher, for the
     /// history cases that inject a worker failure.
     pub fn boot_history_fake() -> Self {
-        Self::boot_with(HostRc::History, |_home| {}, true, None)
+        Self::boot_with(BootOptions {
+            rc: HostRc::History,
+            fake: true,
+            ..BootOptions::default()
+        })
     }
 
     /// [`Host::boot_history`] with `config` already at
@@ -155,22 +188,53 @@ impl Host {
     /// the variant is in force from the first keystroke instead of racing the
     /// per-prompt config reload.
     pub fn boot_history_with_config(config: &str) -> Self {
-        Self::boot_with(HostRc::History, |_home| {}, false, Some(config))
+        Self::boot_with(BootOptions {
+            rc: HostRc::History,
+            config: Some(config),
+            ..BootOptions::default()
+        })
     }
 
     /// [`Host::boot_history_with_config`] under
     /// `tests/zsh/rc/history-limit.zshrc`, whose fixture history is what a
     /// `[history].limit` scan window is read against.
     pub fn boot_history_limit_with_config(config: &str) -> Self {
-        Self::boot_with(HostRc::HistoryLimit, |_home| {}, false, Some(config))
+        Self::boot_with(BootOptions {
+            rc: HostRc::HistoryLimit,
+            config: Some(config),
+            ..BootOptions::default()
+        })
     }
 
-    fn boot_with(
-        rc: HostRc,
-        extra_fixtures: impl FnOnce(&Path),
-        fake: bool,
-        config: Option<&str>,
-    ) -> Self {
+    /// A host whose rc loads coexistence doubles around zrush: `pre` before it
+    /// (so zrush records the double as a predecessor) and `post` after it (so
+    /// the double wraps zrush's own registrations), the ordering
+    /// docs/user/install.md documents for the real plugins.
+    pub fn boot_with_doubles(pre: &'static str, post: &'static str) -> Self {
+        Self::boot_with(BootOptions {
+            pre_rc: pre,
+            post_rc: post,
+            ..BootOptions::default()
+        })
+    }
+
+    /// [`Host::boot`] with an extra fixture tree.
+    pub fn boot_with_fixtures(extra_fixtures: fn(&Path)) -> Self {
+        Self::boot_with(BootOptions {
+            extra_fixtures: Some(extra_fixtures),
+            ..BootOptions::default()
+        })
+    }
+
+    fn boot_with(options: BootOptions) -> Self {
+        let BootOptions {
+            rc,
+            pre_rc,
+            post_rc,
+            extra_fixtures,
+            fake,
+            config,
+        } = options;
         let tmp = TempDir::new().expect("create work dir");
         let home = tmp.path().join("home");
         let work = tmp.path().join("work");
@@ -184,10 +248,13 @@ impl Host {
             fs::write(xdg.join("zrush/config.toml"), config).expect("write config.toml");
         }
         fixtures::build(&home);
-        extra_fixtures(&home);
+        if let Some(extra_fixtures) = extra_fixtures {
+            extra_fixtures(&home);
+        }
 
         let rc = Path::new(env!("CARGO_MANIFEST_DIR")).join(rc.file());
-        fs::write(zdot.join(".zshrc"), format!("source {}\n", rc.display())).expect("write .zshrc");
+        let zshrc = format!("{pre_rc}\nsource {}\n{post_rc}\n", rc.display());
+        fs::write(zdot.join(".zshrc"), zshrc).expect("write .zshrc");
 
         let bin = env!("CARGO_BIN_EXE_zrush");
         let mut command = Command::new("zsh");
@@ -383,6 +450,14 @@ impl Host {
         }
     }
 
+    /// Resize the host terminal. The host learns the new geometry through the
+    /// SIGWINCH the kernel raises, and picks it up on its next render, which
+    /// reads `COLUMNS` per request (docs/internal/contracts/cli-protocol.md
+    /// 「起動」); provoke that render with a following keystroke.
+    pub fn resize(&mut self, cols: u16, rows: u16) {
+        self.pty.resize(cols, rows).expect("resize the host pty");
+    }
+
     pub fn press(&mut self, keys: &str) {
         self.send_keys(keys);
         self.drain(Duration::from_millis(300));
@@ -554,6 +629,27 @@ impl Host {
     /// zsh tags its own region_highlight entries with `memo=` only from 5.9 on.
     pub fn has_memo(&self) -> bool {
         zsh_version() >= (5, 9)
+    }
+
+    /// The `^Xh` dump: zrush's own `region_highlight` entries, one per element.
+    pub fn zrush_highlights(&mut self, label: &str) -> Vec<String> {
+        self.highlight_entries(keys::DUMP_RH, "TESTRH", label)
+    }
+
+    /// The `^Xa` dump: every entry currently in `region_highlight`, zrush's own
+    /// and any third party's.
+    pub fn all_highlights(&mut self, label: &str) -> Vec<String> {
+        self.highlight_entries(keys::DUMP_ALL_RH, "TESTALLRH", label)
+    }
+
+    fn highlight_entries(&mut self, key: &str, tag: &str, label: &str) -> Vec<String> {
+        let dump = self
+            .dump_get(key, tag)
+            .unwrap_or_else(|| panic!("{label}: {tag} dump did not run"));
+        dump.split(" | ")
+            .filter(|entry| !entry.is_empty())
+            .map(str::to_string)
+            .collect()
     }
 
     /// The `^Xw` persistent-worker dump.

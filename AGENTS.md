@@ -32,9 +32,9 @@ cargo build --release
 cargo test
 ```
 
-The zle-integration coverage lives in `cargo test` (the `driver` integration target, `cargo test --test driver`): host zsh sessions on a real pty.
-For changes touching `zsh/`, the zle-integration driver `tests/zsh/driver-coexist.zsh` must also pass — run it locally.
-CI runs `tests/zsh/keybinds.zsh` (dispatch-widget ownership), `tests/zsh/vectors.zsh` (capture-encoder and plan-decoder golden vectors), and `tests/zsh/transport.zsh` (worker transport write path); `driver-coexist.zsh` remains local-only.
+The zle-integration coverage lives in `cargo test` (the `driver` integration target, `cargo test --test driver`): host zsh sessions on a real pty, including coexistence with third-party plugins, several concurrent shells, and terminal resizing.
+Coexistence is driven by doubles — rc fragments reproducing the techniques real plugins use — so the suite needs no plugin installed anywhere; checking the plugins actually installed on a machine is manual, through `zsh/verify.zsh`.
+CI runs `tests/zsh/keybinds.zsh` (dispatch-widget ownership), `tests/zsh/vectors.zsh` (capture-encoder and plan-decoder golden vectors), and `tests/zsh/transport.zsh` (worker transport write path).
 CI's Linux jobs run the whole suite in a container whose zsh is built from source, as a matrix over the supported versions; the same run reproduces locally (needs Docker) with
 
 ```sh

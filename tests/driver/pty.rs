@@ -7,9 +7,10 @@ use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
-/// Geometry of the host terminal, matching zpty's fixed 80x24. The
-/// single-column grid fixture is sized against these 80 columns.
-const COLS: libc::c_ushort = 80;
+/// Geometry the host terminal starts at, matching zpty's fixed 80x24. The
+/// single-column grid fixture is sized against these 80 columns, so a test
+/// that wants another width asks for it explicitly via [`Pty::resize`].
+pub const COLS: libc::c_ushort = 80;
 const ROWS: libc::c_ushort = 24;
 
 const READ_CHUNK: usize = 8192;
@@ -46,16 +47,7 @@ impl Pty {
             )
         };
 
-        let size = libc::winsize {
-            ws_row: ROWS,
-            ws_col: COLS,
-            ws_xpixel: 0,
-            ws_ypixel: 0,
-        };
-        // SAFETY: TIOCSWINSZ reads one winsize through the pointer.
-        if unsafe { libc::ioctl(master.as_raw_fd(), libc::TIOCSWINSZ, &size) } == -1 {
-            return Err(io::Error::last_os_error());
-        }
+        set_winsize(&master, COLS, ROWS)?;
         set_cloexec(&master)?;
 
         let stdin = slave.try_clone()?;
@@ -79,6 +71,13 @@ impl Pty {
         }
         let child = command.spawn()?;
         Ok((Self { master }, child))
+    }
+
+    /// Change the terminal geometry after spawn. The kernel raises SIGWINCH on
+    /// the slave's foreground process group, which is how the host zsh learns
+    /// to re-read `COLUMNS` -- what the tmux resize scenario used to provide.
+    pub fn resize(&self, cols: libc::c_ushort, rows: libc::c_ushort) -> io::Result<()> {
+        set_winsize(&self.master, cols, rows)
     }
 
     pub fn write_all(&self, bytes: &[u8]) -> io::Result<()> {
@@ -164,6 +163,20 @@ pub enum Chunk {
     Idle,
     /// The child closed the slave end: no further output can arrive.
     Eof,
+}
+
+fn set_winsize(master: &OwnedFd, cols: libc::c_ushort, rows: libc::c_ushort) -> io::Result<()> {
+    let size = libc::winsize {
+        ws_row: rows,
+        ws_col: cols,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    // SAFETY: TIOCSWINSZ reads one winsize through the pointer.
+    if unsafe { libc::ioctl(master.as_raw_fd(), libc::TIOCSWINSZ, &size) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 fn set_cloexec(fd: &OwnedFd) -> io::Result<()> {

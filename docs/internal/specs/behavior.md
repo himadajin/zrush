@@ -431,5 +431,8 @@ zsh は zle 統合・compsys 呼び出しによる捕獲・プランの適用
 - fork 内で候補を収集するときは、他プラグイン(zsh-autosuggestions など)が定義した
   compadd ラッパーを除去してから compsys を呼ぶ。この変更は fork 内に限られ、
   親の対話シェルの状態には影響しない。
-- 検証対象は作者環境の zsh-syntax-highlighting と zsh-abbr の 2 つ。
+- 保証範囲は作者環境の zsh-syntax-highlighting と zsh-abbr の 2 つ。
   一般のプラグイン互換性は保証しない。
+- 自動テストが検証するのは上記の共存規則そのもの、すなわち第三者の前任者 widget・
+  pre-redraw フック・compadd ラッパーという形に耐えることであって、特定のプラグインではない。
+  配布されている実物との突き合わせはドッグフーディングによる。

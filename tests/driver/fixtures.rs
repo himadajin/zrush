@@ -36,6 +36,13 @@ pub fn build(home: &Path) {
     }
 }
 
+/// Full-width filenames, for the cases that render candidates whose display
+/// width is not their character count.
+pub fn build_wide(home: &Path) {
+    touch(&home.join("fx/wide/jp-日本語の長い名前のファイルで表示崩れを確認する.txt"));
+    touch(&home.join("fx/wide/jp-これは二つ目の全角ファイル名です.txt"));
+}
+
 fn touch(path: &Path) {
     let parent = path.parent().expect("fixture path has a parent");
     fs::create_dir_all(parent).unwrap_or_else(|e| panic!("create {}: {e}", parent.display()));
@@ -56,8 +63,7 @@ fn overflow_tree() -> &'static Path {
     })
 }
 
-/// Rebuild only when the entry count doesn't already match (same caching idea
-/// as `ensure_many_dir` in tests/zsh/driver-coexist.zsh), so a repeated test
+/// Rebuild only when the entry count doesn't already match, so a repeated test
 /// run reuses the tree instead of recreating 7001 files every time.
 fn ensure_overflow_tree(dir: &Path) {
     let want = OVERFLOW_ITEMS as usize + 1; // + 0000-marker.txt
