@@ -1,4 +1,4 @@
-# Host rc for headless regression tests, loaded through ZDOTDIR by the Rust pty harness (tests/driver/), tests/zsh/driver-coexist.zsh and tests/zsh/driver-latency.zsh
+# Host rc for headless regression tests, loaded through ZDOTDIR by the Rust pty harness (tests/driver/) and tests/zsh/driver-latency.zsh
 # Required environment: ZRUSH_REAL_BIN (built zrush binary), ZRUSH_TEST_TMP (isolated tmp)
 PS1='HP> '
 autoload -Uz compinit
@@ -21,6 +21,13 @@ bindkey '^Xp' _zrt-dump-postdisplay
 _zrt_dump_rh() { _zlog "TESTRH=${(pj: | :)_zrush_rh}" }
 zle -N _zrt-dump-rh _zrt_dump_rh
 bindkey '^Xh' _zrt-dump-rh
+
+# ^Xa: the *whole* region_highlight array, joined the same way. Coexistence
+# tests read this against ^Xh's ledger: what only ^Xa carries is what a third
+# party put in the shared array.
+_zrt_dump_all_rh() { _zlog "TESTALLRH=${(pj: | :)region_highlight}" }
+zle -N _zrt-dump-all-rh _zrt_dump_all_rh
+bindkey '^Xa' _zrt-dump-all-rh
 
 # ^Xw: persistent-worker lifecycle state. This exposes only stable invariants
 # the tests need (lazy start, reuse, monotonic ids, and clean teardown).
