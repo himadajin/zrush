@@ -2,24 +2,29 @@
 # Latency driver for isolating time from key input to the first candidate paint.
 #
 # Usage: zsh -f tests/zsh/driver-latency.zsh <playground-dir>
-#   Prerequisite: cargo build --release completed. Use a real-terminal TERM
-#   (xterm-256color), because zsh-autocomplete skips initialization under vt100.
-#   ZRUSH_LATENCY_TRIALS=N bounds every case to N attempts (default 4); CI or
-#   review runs may use 1 so an unavailable optional comparison stays bounded.
+#   Prerequisites: cargo build --release completed, and a playground holding a
+#   docs/internal tree, which the `ls docs/inte` case completes against (the
+#   repo root qualifies; the `git chec` case needs git but no repository).
+#   ZRUSH_LATENCY_TRIALS=N bounds every case to N attempts (default 4). N=1
+#   medians are not trustworthy: a single trial is the per-host warm-up one.
 #
 # Hosts:
 #   min-zrush     zsh -d -i + isolated minimal.zshrc
-#   min-zrush-d0  same with delay-ms = 0 to isolate debounce contribution
-#   min-zac       zsh -d -i + zsh-autocomplete with min-delay 0.05
+#   min-d0        same with delay-ms = 0 to isolate debounce contribution
+#   hist5000      isolated history-latency.zshrc, ~5000 short fixture entries
+#   hist20000     the same with 20000 long entries and [history].limit = 20000
 #
 # All hosts use a throwaway ZDOTDIR (and, where applicable, XDG_CONFIG_HOME)
 # under $WORK: this driver never reads or sources the real ~/.zshrc, and
-# never touches ~/.zsh_history (AGENTS.md guardrail -- a prior real-
-# environment host here read the real ~/.zshrc/history and was removed).
+# never touches ~/.zsh_history (AGENTS.md guardrail).
+#
+# Every measurement is mandatory: an NA median, an incomplete breakdown chain
+# or a host that fails to start counts as degraded, and a degraded run exits
+# nonzero and keeps $WORK (per-host ZRUSH_LOG) instead of cleaning it up.
 #
 # Measurements:
 #   first-paint: elapsed time from key sequence to expected pty text after stripping
-#                SGR, with roughly 10ms zselect resolution
+#                SGR and its padding, with roughly 10ms zselect resolution
 #   breakdown  : ZRUSH_LOG intervals, keyed off zsh's own _zlog checkpoints
 #                matching, ranking, layout, and render-plan construction happen
 #                in the persistent Rust worker. The worker-roundtrip bucket
@@ -38,20 +43,20 @@ typeset -F SECONDS
 typeset -g HERE=${${(%):-%N}:A:h}
 typeset -g REPO=${HERE:h:h}
 typeset -g PLAYGROUND=${1:?usage: driver-latency.zsh <playground-dir>}
-[[ -d $PLAYGROUND/docs ]] || { print -u2 "FATAL: invalid playground: $PLAYGROUND"; exit 1 }
+[[ -d $PLAYGROUND/docs/internal ]] || { print -u2 "FATAL: invalid playground: $PLAYGROUND"; exit 1 }
 [[ -x $REPO/target/release/zrush ]] || { print -u2 "FATAL: zrush binary not found"; exit 1 }
 [[ $REPO/zsh/zrush.zsh -nt $REPO/target/release/zrush ]] && { print -u2 "FATAL: zsh/zrush.zsh is newer than the built binary; run cargo build --release"; exit 1 }
-typeset -g ZAC_SRC=~/.zsh/zsh-autocomplete/zsh-autocomplete.plugin.zsh
 
 typeset -g WORK=$(mktemp -d ${TMPDIR:-/tmp}/zrush-lat.XXXXXX)
-export TERM=xterm-256color
+export TERM=vt100
 export LC_ALL=en_US.UTF-8
 
 typeset -g HOST= HOSTLOG= CURXDG=
-typeset -gi HOSTFD=-1 SYNCN=0
-out() { print -r -u2 -- "$@" }
+typeset -gi HOSTFD=-1 SYNCN=0 DEGRADED=0
+out()  { print -r -u2 -- "$@" }
+bad()  { (( ++DEGRADED )); out "$@" }   # a reported measurement is missing or unusable
 
-send_line() { zpty -w  $HOST " $1" }   # leading space: harmless hist_ignore_space habit, kept for parity with driver.zsh
+send_line() { zpty -w  $HOST "$1" }
 send_keys() { zpty -wn $HOST $1 }
 
 drain() {
@@ -88,7 +93,9 @@ run_cmd() { send_line $1; sync_host ${2:-30} }
 clear_line() { send_keys $'\C-u'; drain 0.6 }
 
 # ---------------------------------------------------------------- first-paint
-# Milliseconds from sending keys until expected text appears in the SGR-stripped pty stream
+# Milliseconds from sending keys until expected text appears in the SGR-stripped
+# pty stream. Each SGR is stripped together with the NUL run some platforms emit
+# after it (terminfo padding, #64), the same rule as strip_sgr in tests/driver/host.rs.
 paint_once() {  # $1=keys $2=fixed string $3=timeout -> REPLY=ms (NA if not reached)
   typeset -g REPLY=NA
   local pat=$2 buf= chunk
@@ -99,7 +106,7 @@ paint_once() {  # $1=keys $2=fixed string $3=timeout -> REPLY=ms (NA if not reac
     if zselect -t 1 -r $HOSTFD 2>/dev/null; then
       if zpty -r $HOST chunk 2>/dev/null; then
         buf+=$chunk
-        if [[ ${buf//$'\e['[0-9;]#m/} == *$pat* ]]; then
+        if [[ ${buf//$'\e['[0-9;]#m$'\0'#/} == *$pat* ]]; then
           REPLY=$(( (EPOCHREALTIME - t0) * 1000 ))
           clear_line
           return 0
@@ -131,7 +138,10 @@ paint_case() {  # $1=host-label $2=case-label $3=keys $4=pattern [$5=trials]
     drain 0.6
   done
   median $ms
-  out "PAINT | ${(r:12:)1} | ${(r:18:)2} | med=$(fmt $REPLY)ms | trials=[${(j:, :)${(@)ms/(#m)*/$(fmt $MATCH)}}]"
+  # A median over the survivors of a partly failed case is optimistic (median
+  # takes the lower middle), so any missing attempt degrades the whole case.
+  (( $#ms == trials )) || bad "WARN: [$1/$2] $(( trials - $#ms )) of $trials attempts did not complete"
+  out "PAINT | ${(r:12:)1} | ${(r:32:)2} | med=$(fmt $REPLY)ms | trials=[${(j:, :)${(@)ms/(#m)*/$(fmt $MATCH)}}]"
   return 0
 }
 
@@ -146,7 +156,7 @@ breakdown_last() {  # $1=logfile $2=number of leading lines to skip -> one table
   for (( i = $#L; i >= 1; --i )); do
     [[ $L[i] == *" plan: applied "* ]] && { ir=i; break }
   done
-  (( ir )) || { out "WARN: breakdown: 'plan: applied' line not found"; return 1 }
+  (( ir )) || { bad "WARN: breakdown: 'plan: applied' line not found"; return 1 }
   local -F t_apply t_xfer t_comp t_fork t_req t_arm
   t_apply=0; t_xfer=0; t_comp=0; t_fork=0; t_req=0; t_arm=0
   ts_of $L[ir]; t_apply=$REPLY
@@ -159,7 +169,7 @@ breakdown_last() {  # $1=logfile $2=number of leading lines to skip -> one table
       *" MEAS-arm"*)                 (( t_req != 0 )) && { ts_of $L[i]; t_arm=$REPLY; break } ;;
     esac
   done
-  (( t_arm && t_req && t_fork && t_comp && t_xfer )) || { out "WARN: breakdown: incomplete chain"; return 1 }
+  (( t_arm && t_req && t_fork && t_comp && t_xfer )) || { bad "WARN: breakdown: incomplete chain"; return 1 }
   printf 'BREAK | debounce=%4.0f | capture-start=%4.0f | compsys=%5.0f | capture-transport=%4.0f | worker-roundtrip+apply=%4.0f | total(arm→apply)=%5.0f ms\n' \
     $(( (t_req - t_arm) * 1000 )) \
     $(( (t_fork - t_req) * 1000 )) \
@@ -173,8 +183,8 @@ breakdown_last() {  # $1=logfile $2=number of leading lines to skip -> one table
 paint_break_case() {  # $1=host-label $2=case-label $3=keys $4=pattern
   local -i skip=0
   [[ -r $HOSTLOG ]] && skip=$(wc -l < $HOSTLOG)
-  paint_once $3 $4 20 || { out "WARN: [$1/$2] did not complete"; return 1 }
-  out "CASE  | ${(r:12:)1} | ${(r:18:)2} | first-paint=$(fmt $REPLY)ms"
+  paint_once $3 $4 20 || { bad "WARN: [$1/$2] did not complete"; return 1 }
+  out "CASE  | ${(r:12:)1} | ${(r:32:)2} | first-paint=$(fmt $REPLY)ms"
   breakdown_last $HOSTLOG $skip
   drain 0.6
   return 0
@@ -188,7 +198,7 @@ breakdown_hit_last() {  # $1=logfile $2=number of leading lines to skip
   for (( i = $#L; i >= 1; --i )); do
     [[ $L[i] == *" plan: applied "* ]] && { ir=i; break }
   done
-  (( ir )) || { out "WARN: breakdown-hit: 'plan: applied' line not found"; return 1 }
+  (( ir )) || { bad "WARN: breakdown-hit: 'plan: applied' line not found"; return 1 }
   local -F t_apply t_hit t_req t_arm
   t_apply=0; t_hit=0; t_req=0; t_arm=0
   ts_of $L[ir]; t_apply=$REPLY
@@ -200,7 +210,7 @@ breakdown_hit_last() {  # $1=logfile $2=number of leading lines to skip
     esac
   done
   (( t_arm && t_req && t_hit )) || \
-    { out "WARN: breakdown-hit: incomplete chain (cache miss?)"; return 1 }
+    { bad "WARN: breakdown-hit: incomplete chain (cache miss?)"; return 1 }
   printf 'BREAK | debounce=%4.0f | cache-check=%4.0f | worker-roundtrip+apply=%4.0f | total(arm→apply)=%5.0f ms\n' \
     $(( (t_req - t_arm) * 1000 )) \
     $(( (t_hit - t_req) * 1000 )) \
@@ -209,11 +219,11 @@ breakdown_hit_last() {  # $1=logfile $2=number of leading lines to skip
   return 0
 }
 
-paint_break_hit_case() {  # assumes a preceding equivalent case warmed the cache
+paint_break_hit_case() {  # needs two preceding command-position collections (see the run block)
   local -i skip=0
   [[ -r $HOSTLOG ]] && skip=$(wc -l < $HOSTLOG)
-  paint_once $3 $4 20 || { out "WARN: [$1/$2] did not complete"; return 1 }
-  out "CASE  | ${(r:12:)1} | ${(r:18:)2} | first-paint=$(fmt $REPLY)ms"
+  paint_once $3 $4 20 || { bad "WARN: [$1/$2] did not complete"; return 1 }
+  out "CASE  | ${(r:12:)1} | ${(r:32:)2} | first-paint=$(fmt $REPLY)ms"
   breakdown_hit_last $HOSTLOG $skip
   drain 0.6
   return 0
@@ -243,27 +253,6 @@ start_min_zrush() {  # $1=host label $2=XDG directory with configuration
   return 0
 }
 
-start_min_zac() {
-  HOST=zac HOSTLOG= CURXDG=
-  export ZDOTDIR=$WORK/zdot-zac
-  unset ZRUSH_LOG
-  mkdir -p $ZDOTDIR
-  cat > $ZDOTDIR/.zshrc <<EOF
-PS1='HP> '
-zstyle ':autocomplete:*' min-delay 0.05
-zstyle ':autocomplete:*' min-input 0
-source $ZAC_SRC
-print MARK-RC-DONE
-EOF
-  cd $PLAYGROUND || return 1
-  local REPLY=
-  zpty -b $HOST zsh -d -i || return 1
-  HOSTFD=$REPLY
-  expect '*MARK-RC-DONE*' 30 || return 1
-  drain 1.0
-  return 0
-}
-
 host_rss() {
   typeset -g REPLY=NA
   local m=R$(( ++SYNCN ))
@@ -279,6 +268,7 @@ host_rss() {
       fi
     fi
   done
+  [[ $REPLY == NA ]] && bad "WARN: [$HOST] RSS scrape did not complete"
   drain 0.3
 }
 
@@ -295,6 +285,10 @@ start_hist_latency() {  # $1=host label $2=N fixture entries $3=long(0/1) [$4=hi
   export ZRUSH_REAL_BIN=$REPO/target/release/zrush ZRUSH_TEST_TMP=$WORK/t-$1 ZDOTDIR=$WORK/zdot-$1
   export XDG_CONFIG_HOME=$CURXDG ZRUSH_LOG=$HOSTLOG
   export ZRUSH_HIST_N=$2 ZRUSH_HIST_LONG=$3
+  # Test-driver seam of behavior.md "履歴メニュー", raised for both history hosts
+  # because the fixture payloads exceed the fixed production deadline: what the
+  # history cases report is first-paint time, not production menu-open behavior.
+  export ZRUSH_HISTORY_DEADLINE_MS=5000
   mkdir -p $ZDOTDIR $ZRUSH_TEST_TMP $CURXDG/zrush
   if [[ -n ${4:-} ]]; then
     print -r -- $'[history]\nlimit = '$4 > $CURXDG/zrush/config.toml
@@ -333,7 +327,8 @@ paint_history_case() {  # $1=host-label $2=case-label $3=pattern [$4=trials]
     fi
   done
   median $ms
-  out "PAINT | ${(r:12:)1} | ${(r:18:)2} | med=$(fmt $REPLY)ms | trials=[${(j:, :)${(@)ms/(#m)*/$(fmt $MATCH)}}]"
+  (( $#ms == trials )) || bad "WARN: [$1/$2] $(( trials - $#ms )) of $trials attempts did not complete"
+  out "PAINT | ${(r:12:)1} | ${(r:32:)2} | med=$(fmt $REPLY)ms | trials=[${(j:, :)${(@)ms/(#m)*/$(fmt $MATCH)}}]"
   return 0
 }
 
@@ -343,17 +338,22 @@ paint_history_case() {  # $1=host-label $2=case-label $3=pattern [$4=trials]
   out "==== min-zrush (isolated + default delay-ms=30) ===="
   if start_min_zrush min-zrush $WORK/xdg-default; then
     host_rss; out "INFO: RSS=${REPLY}KB"
-    paint_break_case min-zrush "cmd 1st (whic)"   'whic'         'which'   # first run is a cache miss
+    # Command position is the only cached one (behavior.md "空語収集キャッシュ"),
+    # and its first collection is followed by exactly one more invalidation
+    # (同節「既知の癖」), so a guaranteed hit needs two collections before it:
+    # the reported miss, then an unreported warm-up. Every cache-hit case has to
+    # come before the file and git cases, which measure uncached collection.
+    paint_break_case min-zrush "cmd 1st (whic)"   'whic'         'which'
+    paint_once 'whic' 'which' 20 || out "WARN: cache warm-up did not complete"
+    drain 0.6
+    paint_break_hit_case min-zrush "cmd hit (whic)" 'whic'       'which'
+    paint_case min-zrush "cmd hit (whic)"   'whic'         'which'
     paint_break_case min-zrush "file (docs/inte)" 'ls docs/inte' 'internal'
     paint_break_case min-zrush "git (git chec)"   'git chec'     'checkout'
-    # Cache-hit path after the command case above has warmed it.
-    paint_break_hit_case min-zrush "cmd hit (whic)" 'whic'       'which'
-    # Additional median trials; command hits, while file and git are not cacheable.
-    paint_case min-zrush "cmd hit (whic)"   'whic'         'which'
     paint_case min-zrush "file (docs/inte)" 'ls docs/inte' 'internal'
     paint_case min-zrush "git (git chec)"   'git chec'     'checkout'
   else
-    out "FATAL: min-zrush failed to start"
+    bad "FATAL: min-zrush failed to start"
   fi
   stop_host
 
@@ -366,23 +366,11 @@ paint_history_case() {  # $1=host-label $2=case-label $3=pattern [$4=trials]
     paint_case min-d0 "file (docs/inte)" 'ls docs/inte' 'internal'
     paint_case min-d0 "git (git chec)"   'git chec'     'checkout'
   else
-    out "FATAL: min-d0 failed to start"
+    bad "FATAL: min-d0 failed to start"
   fi
   stop_host
 
-  # ============ min-zac ============
-  out "==== min-zac (isolated + zsh-autocomplete, min-delay 0.05) ===="
-  if [[ -r $ZAC_SRC ]] && start_min_zac; then
-    host_rss; out "INFO: RSS=${REPLY}KB"
-    paint_case zac "cmd (whic)"       'whic'         'which'
-    paint_case zac "file (docs/inte)" 'ls docs/inte' 'internal'
-    paint_case zac "git (git chec)"   'git chec'     'checkout'
-  else
-    out "FATAL: min-zac failed to start (ZAC_SRC=$ZAC_SRC)"
-  fi
-  stop_host
-
-  # ============ history-menu first paint (issue #9 latency addendum) ============
+  # ============ history-menu first paint ============
   # behavior.md "履歴メニュー" targets ~50ms at the default limit and normal
   # history sizes as a goal, not a contract (line length is unbounded), so
   # this reports measurements only -- same convention as the cases above.
@@ -390,7 +378,7 @@ paint_history_case() {  # $1=host-label $2=case-label $3=pattern [$4=trials]
   if start_hist_latency hist5000 5000 0; then
     paint_history_case hist5000 "empty-buf Up (5000)" 'needle-latency-target'
   else
-    out "FATAL: hist5000 failed to start"
+    bad "FATAL: hist5000 failed to start"
   fi
   stop_host
 
@@ -398,14 +386,20 @@ paint_history_case() {  # $1=host-label $2=case-label $3=pattern [$4=trials]
   if start_hist_latency hist20000 20000 1 20000; then
     paint_history_case hist20000 "empty-buf Up (20000, long lines)" 'needle-latency-target'
   else
-    out "FATAL: hist20000 failed to start"
+    bad "FATAL: hist20000 failed to start"
   fi
   stop_host
+
+  out "SUMMARY: degraded=$DEGRADED"
 } always {
   zpty -d min-zrush 2>/dev/null
   zpty -d min-d0 2>/dev/null
-  zpty -d zac 2>/dev/null
   zpty -d hist5000 2>/dev/null
   zpty -d hist20000 2>/dev/null
-  [[ -n $WORK && $WORK == */zrush-lat.* ]] && rm -rf $WORK
+  if (( DEGRADED )); then
+    out "NOTE: kept $WORK (per-host ZRUSH_LOG) for post-mortem"
+  else
+    [[ -n $WORK && $WORK == */zrush-lat.* ]] && rm -rf $WORK
+  fi
 }
+(( DEGRADED == 0 ))

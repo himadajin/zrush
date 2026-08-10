@@ -29,8 +29,8 @@
 #     Rust reference parser, so both sides are held to one set of bytes.
 #   - reject-plan/<name>/plan must be rejected (return 1).
 #
-# Unlike driver.zsh (a zle/compsys end-to-end smoke test over zpty), nothing
-# here touches zle, so a failure points at the encoder or decoder itself.
+# Unlike the Rust pty harness (tests/driver/, a zle/compsys end-to-end suite),
+# nothing here touches zle, so a failure points at the encoder or decoder itself.
 emulate -L zsh
 setopt extended_glob typeset_silent
 
