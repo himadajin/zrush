@@ -410,7 +410,7 @@ fn worker_handshake_and_multiple_requests_share_one_process() {
 }
 
 #[test]
-fn worker_protocol_mismatch_exits_after_incompatible_response() {
+fn worker_protocol_mismatch_replies_then_discards_until_stdin_eof() {
     let (mut command, control_read, _control_write) = worker_command();
     let mut child = command
         .stdin(Stdio::piped())
@@ -418,16 +418,15 @@ fn worker_protocol_mismatch_exits_after_incompatible_response() {
         .spawn()
         .unwrap();
     drop(control_read);
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(&msg(&[b"hello", b"deadbeef"]))
-        .unwrap();
+    let mut input = msg(&[b"hello", b"deadbeef"]);
+    input.extend_from_slice(b"1:x!not-a-frame");
+    child.stdin.take().unwrap().write_all(&input).unwrap();
     let out = child.wait_with_output().unwrap();
     assert_eq!(out.status.code(), Some(0));
+    let frames = decode_frames(&out.stdout);
+    assert_eq!(frames.len(), 1, "one terminal response, nothing after it");
     assert_eq!(
-        fields(&decode_frames(&out.stdout)[0]),
+        fields(&frames[0]),
         vec![b"incompatible".to_vec(), BUILD_STAMP.to_vec()]
     );
 }

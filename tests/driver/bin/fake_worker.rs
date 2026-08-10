@@ -162,13 +162,8 @@ fn worker(fake: &Fake, control_fd: i32) {
         atomic_write(&fake.control, "proxy");
         write_message(&[b"incompatible", b"cafebabe"]);
         fake.note(&format!("mismatch {session}"));
-        // Stay until the parent tears the transport down. A worker that
-        // vanishes the instant it answers `incompatible` races the first plan
-        // frame the same lazy start queued behind the handshake: whichever of
-        // the two the shell reaches first decides whether the stale build is
-        // followed or the write is reported as a session failure. Holding the
-        // request end open makes the stale-build path the only outcome; the
-        // watchdog still ends this process the moment the control fd speaks.
+        // cli-protocol.md 「セッションフレーミングと握手」: the post-`incompatible`
+        // discard state.
         io::copy(&mut input, &mut io::sink()).ok();
         return;
     }

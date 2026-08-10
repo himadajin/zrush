@@ -173,6 +173,7 @@ pub(crate) fn run<R: Read, W: Write>(mut input: R, mut output: W) -> Result<End,
                     if process_message(&message, &mut handshake, &mut output)?
                         == MessageResult::Incompatible
                     {
+                        discard_requests(&mut input);
                         return Ok(End::Incompatible);
                     }
                 }
@@ -182,6 +183,7 @@ pub(crate) fn run<R: Read, W: Write>(mut input: R, mut output: W) -> Result<End,
                     if process_message(&message, &mut handshake, &mut output)?
                         == MessageResult::Incompatible
                     {
+                        discard_requests(&mut input);
                         return Ok(End::Incompatible);
                     }
                 }
@@ -189,6 +191,12 @@ pub(crate) fn run<R: Read, W: Write>(mut input: R, mut output: W) -> Result<End,
             }
         }
     }
+}
+
+/// The post-`incompatible` discard state of cli-protocol.md
+/// 「セッションフレーミングと握手」.
+fn discard_requests<R: Read>(input: &mut R) {
+    std::io::copy(input, &mut std::io::sink()).ok();
 }
 
 fn process_message<W: Write>(
@@ -448,10 +456,16 @@ mod tests {
     }
 
     #[test]
-    fn mismatch_replies_once_and_exits() {
+    fn mismatch_replies_once_and_discards_the_rest_of_stdin() {
+        let input = [
+            message(&[b"hello", b"deadbeef"]),
+            message(&request(b"1", b"/", b"")),
+            b"1:x!".to_vec(),
+        ]
+        .concat();
         let mut output = Vec::new();
         assert_eq!(
-            run(Cursor::new(message(&[b"hello", b"deadbeef"])), &mut output).unwrap(),
+            run(Cursor::new(input), &mut output).unwrap(),
             End::Incompatible
         );
         assert_eq!(

@@ -7,6 +7,8 @@ use std::time::{Duration, Instant};
 
 const BUILD_STAMP: &[u8] = env!("ZRUSH_BUILD_STAMP").as_bytes();
 
+const DRAIN_PROBE_BYTES: usize = 8 * 1024 * 1024;
+
 fn netstring(payload: &[u8]) -> Vec<u8> {
     let mut out = payload.len().to_string().into_bytes();
     out.push(b':');
@@ -75,6 +77,25 @@ fn complete_handshake(child: &mut Child) {
     assert_eq!(ready, expected);
 }
 
+fn reach_incompatible(child: &mut Child) {
+    let hello = message(&[b"hello", b"deadbeef"]);
+    child
+        .stdin
+        .as_mut()
+        .expect("request stdin")
+        .write_all(&hello)
+        .expect("write hello");
+    let expected = message(&[b"incompatible", BUILD_STAMP]);
+    let mut reply = vec![0_u8; expected.len()];
+    child
+        .stdout
+        .as_mut()
+        .expect("response stdout")
+        .read_exact(&mut reply)
+        .expect("read incompatible");
+    assert_eq!(reply, expected);
+}
+
 fn wait_bounded(child: &mut Child) -> ExitStatus {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
@@ -106,6 +127,37 @@ fn control_eof_exits_while_request_stdin_is_blocked() {
     complete_handshake(&mut child);
 
     drop(control);
+
+    assert_eq!(wait_bounded(&mut child).code(), Some(1));
+}
+
+#[test]
+fn incompatible_worker_absorbs_a_request_larger_than_the_pipe_buffer_then_exits_at_eof() {
+    let (mut child, control) = spawn_worker();
+    reach_incompatible(&mut child);
+
+    // Well above the largest default pipe capacity in the supported
+    // macOS/Linux matrix (including Linux systems with 64 KiB pages), so the
+    // write cannot finish unless the worker actively drains stdin.
+    let bulk = vec![b'x'; DRAIN_PROBE_BYTES];
+    child
+        .stdin
+        .as_mut()
+        .expect("request stdin")
+        .write_all(&bulk)
+        .expect("write past the pipe buffer");
+    drop(child.stdin.take());
+
+    assert_eq!(wait_bounded(&mut child).code(), Some(0));
+    drop(control);
+}
+
+#[test]
+fn abort_byte_exits_while_an_incompatible_worker_discards_requests() {
+    let (mut child, mut control) = spawn_worker();
+    reach_incompatible(&mut child);
+
+    control.write_all(&[0]).expect("send abort byte");
 
     assert_eq!(wait_bounded(&mut child).code(), Some(1));
 }
