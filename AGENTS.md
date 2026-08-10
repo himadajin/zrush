@@ -63,6 +63,7 @@ Templates under `.github/ISSUE_TEMPLATE/` mirror these rules; only the title and
 Details live in `docs/internal/specs/`; these are the invariants:
 
 - Never act on the user's behalf: don't rewrite input without an explicit action, and don't expand `~`.
+- Never pollute the user's shell namespace: every name zrush defines — functions, widgets, global variables — carries a `zrush` prefix; the only exception is zsh's conventional `REPLY*` return channels.
 - Never block input; collect candidates asynchronously.
 - Configuration lives solely in `~/.config/zrush/config.toml`; no zstyle-based settings.
 - Responsibilities: Rust = matching, ranking, history search, layout/render-plan computation, insertion-text construction, config interpretation; zsh = zle integration, compsys capture, applying the plan (rendering).
