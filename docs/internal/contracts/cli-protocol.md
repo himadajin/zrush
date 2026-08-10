@@ -63,7 +63,7 @@ zrush.zsh(zsh 側)と `zrush` バイナリ(Rust 側)の入出力仕様。
 
 | コード | 意味 |
 |---|---|
-| 0 | 成功。worker は frame 境界での stdin EOF、`zrush config` は設定ファイルの問題があっても既定値と警告を出力して成功する。`zrush init` は自身の絶対パス解決とスクリプト出力に成功する |
+| 0 | 成功。worker は frame 境界での stdin EOF、または `incompatible` 応答後の discard 状態での stdin EOF・read error で終了する。`zrush config` は設定ファイルの問題があっても既定値と警告を出力して成功する。`zrush init` は自身の絶対パス解決とスクリプト出力に成功する |
 | 1 | worker の session-fatal framing/I/O/内部エラー、control-fd の setup failure、watchdog による abort、`zrush config` の内部エラー、または `zrush init` の自身のパス解決失敗を含む内部エラー |
 | 2 | usage エラー(未知・不足・不正な引数、未知または未指定のサブコマンド) |
 
@@ -108,6 +108,8 @@ worker は通常の request 処理を始める前に watchdog thread を起動�
 - abort は小さな Unix 専用 wrapper から process 全体へ `_exit(1)` を実行する。
   main worker thread が request 処理で停止していても watchdog 単独で終了させる。
 - watchdog は detached であり、frame 境界の stdin EOF による main thread の正常 exit 0 を妨げない。
+  `incompatible` 応答後の discard 状態も同じく stdin EOF で exit 0 し、request write end を閉じないシェルに対しては
+  watchdog がその上限を与える。
   zsh は正常 shutdown の response EOF まで control write fd を open に保ち、先に閉じて abort と競合させない。
 
 stdout(fd 1)は response stream 専用で、worker は起動時に cloexec を付ける。
@@ -147,9 +149,13 @@ incompatible: ["incompatible", worker_build_stamp]
 ```
 
 worker は `hello` の build stamp が自身の値と一致しなければ、自身の stamp を
-`worker_build_stamp` に入れた `incompatible` を 1 個返して終了する。zsh は、正しい形の `incompatible` または
-stamp の異なる `ready` を stale build として扱い、自動 re-source を 1 回試みる。握手での別 kind・別フィールド数・
-不正な stamp は protocol failure、EOF・I/O エラー・非 canonical framing は worker session failure である。
+`worker_build_stamp` に入れた `incompatible` を 1 個返し、以後は request bytes を解釈しない discard 状態に入る。
+discard 状態の worker は stdin を読み捨てるだけで、frame として解釈も応答もせず、stdin EOF、または
+読み捨て中の read error で exit 0 する。zsh は hello の後ろに frame を queue していることがある。
+worker が読み捨てて request stream を書き込み可能に保つため、その write は失敗せず、`incompatible` が失われない。
+zsh は、正しい形の `incompatible` または stamp の異なる `ready` を stale build として扱い、自動 re-source を 1 回試みる。
+握手での別 kind・別フィールド数・不正な stamp は protocol failure、
+EOF・I/O エラー・非 canonical framing は worker session failure である。
 worker が受ける `hello` の kind・フィールド数・stamp 表記自体が不正な場合は、応答せず終了する。
 
 ### 要求と応答
@@ -196,7 +202,8 @@ error: ["error", request_id, code]
 外側または nested netstring framing の破損、あるいは request_id の欠落・非 canonical 表記・範囲外によって
 安全に対応付けられない場合は応答せずセッションを終了する。
 
-相関可能な各 request は `ok` または `error` の**終端応答をちょうど 1 個**受ける。
+`ready` を返したセッションでは、相関可能な各 request は `ok` または `error` の**終端応答をちょうど 1 個**受ける。
+`incompatible` を返したセッションでその後に届くバイトは request ではなく、この規範の対象外である。
 worker は要求を受信順に処理し、応答を黙って省略しない。`error` も正常に形成された終端応答であり、
 worker セッション失敗には数えない。`ok` の `render_plan` は後述の描画プランストリームそのものを格納する。
 

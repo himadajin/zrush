@@ -140,7 +140,10 @@ zsh は zle 統合・compsys 呼び出しによる捕獲・プランの適用
 - 正しい形の `incompatible`、stamp の異なる `ready`、source/config の build-stamp 不一致は stale build として
   失敗回数を介さず `$ZRUSH_BIN init zsh` の自動 re-source を 1 回だけ試みる。成功時は警告せず診断ログだけを残し、
   検出時点の未完了 request はすべて破棄して replay しない。re-source の失敗または re-source 中の再不一致だけが
-  警告 1 回と無効化へ落ちる。旧 generation に worker がいた場合は replacement worker を直ちに起動して握手を検証し、
+  警告 1 回と無効化へ落ちる。正しい形の `incompatible` は worker session failure に数えず、連続失敗回数も進めない。
+  worker は `incompatible` の後も request stream を読み捨てるため、hello の後ろに queue されていた frame は
+  通常どおり書き込まれて破棄され、stale worker は re-source の正常 shutdown で停止する。
+  旧 generation に worker がいた場合は replacement worker を直ちに起動して握手を検証し、
   worker が未起動なら lazy 状態を保つ。認識済み `incompatible` や local request_id 枯渇のように
   transport が健全なら正常 shutdown、壊れた handshake/session なら異常 abort を使う。
   stopping/quarantine 中の re-source・config reload・build-stamp 照合は fail fast し、新しい deadline や stop を
