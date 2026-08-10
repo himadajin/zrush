@@ -55,7 +55,7 @@ impl Fake {
         let control = work.join("fake-control");
         let state = work.join("fake-state");
         let count = work.join("fake-state.count");
-        fs::write(&control, Mode::Proxy.as_str()).expect("write fake control file");
+        atomic_write(&control, Mode::Proxy.as_str());
         command
             .env("ZRUSH_BIN", env!("CARGO_BIN_EXE_zrush-fake-worker"))
             .env("ZRUSH_FAKE_CONTROL", &control)
@@ -68,7 +68,7 @@ impl Fake {
     }
 
     pub fn set_mode(&self, mode: Mode) {
-        fs::write(&self.control, mode.as_str()).expect("write fake control file");
+        atomic_write(&self.control, mode.as_str());
     }
 
     /// State lines containing `needle` (`grep -cF` semantics). Needles for a
@@ -134,4 +134,13 @@ impl Fake {
             Err(_) => Vec::new(),
         }
     }
+}
+
+/// Every reader of `path` (the fake's `hold`-loop poller, and its one-shot
+/// mode checks) must see a complete mode, so write a sibling temp file and
+/// `rename` it in.
+fn atomic_write(path: &Path, contents: &str) {
+    let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
+    fs::write(&tmp, contents).expect("write fake control temp file");
+    fs::rename(&tmp, path).expect("rename fake control temp file");
 }
