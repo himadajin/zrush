@@ -125,6 +125,16 @@ impl Fake {
     }
 }
 
+/// Every reader of `path` (the `hold`-loop poller, and the one-shot `proxy`,
+/// `mismatch`, and `drain` mode checks) must see a complete mode, so write a
+/// sibling temp file and `rename` it in.
+fn atomic_write(path: &Path, contents: &str) {
+    let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
+    fs::write(&tmp, contents).unwrap_or_else(|e| panic!("write {}: {e}", tmp.display()));
+    fs::rename(&tmp, path)
+        .unwrap_or_else(|e| panic!("rename {} -> {}: {e}", tmp.display(), path.display()));
+}
+
 fn worker(fake: &Fake, control_fd: i32) {
     // cli-protocol.md 「abort control と worker 終了」: stdout is the response
     // stream and descendants must not inherit it.
@@ -149,8 +159,7 @@ fn worker(fake: &Fake, control_fd: i32) {
     }
 
     if fake.mode() == "mismatch" {
-        fs::write(&fake.control, "proxy")
-            .unwrap_or_else(|e| panic!("rewrite {}: {e}", fake.control.display()));
+        atomic_write(&fake.control, "proxy");
         write_message(&[b"incompatible", b"cafebabe"]);
         fake.note(&format!("mismatch {session}"));
         // Stay until the parent tears the transport down. A worker that
