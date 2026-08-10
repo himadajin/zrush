@@ -139,7 +139,11 @@ message   = netstring(netstring(field-1) ... netstring(field-N))
   完全一致しなければならない。前後空白、符号、別の大小文字表記を許さない。
 
 起動直後、zsh は最初の要求より前に `hello` を送り、worker はその build stamp を照合して応答する。
-zsh は kind・フィールド数・build stamp が完全一致する `ready` を受けたときだけセッションを利用する。
+zsh は kind・フィールド数・build stamp が完全一致する `ready` だけを握手の成立として受け入れる。
+要求は握手応答の到着を待たずに `hello` の後ろへ pipeline してよい。
+pipeline された要求の帰結は握手の結果が定める:
+`ready` を返したセッションは通常の要求として受信順に処理し、
+`incompatible` を返したセッションは request として解釈せず読み捨てる(「要求と応答」の終端応答規範の対象外)。
 `build_stamp` は非空の lowercase hex ASCII (`[0-9a-f]+`)である。
 
 ```
@@ -151,8 +155,8 @@ incompatible: ["incompatible", worker_build_stamp]
 worker は `hello` の build stamp が自身の値と一致しなければ、自身の stamp を
 `worker_build_stamp` に入れた `incompatible` を 1 個返し、以後は request bytes を解釈しない discard 状態に入る。
 discard 状態の worker は stdin を読み捨てるだけで、frame として解釈も応答もせず、stdin EOF、または
-読み捨て中の read error で exit 0 する。zsh は hello の後ろに frame を queue していることがある。
-worker が読み捨てて request stream を書き込み可能に保つため、その write は失敗せず、`incompatible` が失われない。
+読み捨て中の read error で exit 0 する。
+worker が pipeline された要求を読み捨てて request stream を書き込み可能に保つため、その write は失敗せず、`incompatible` が失われない。
 zsh は、正しい形の `incompatible` または stamp の異なる `ready` を stale build として扱い、自動 re-source を 1 回試みる。
 握手での別 kind・別フィールド数・不正な stamp は protocol failure、
 EOF・I/O エラー・非 canonical framing は worker session failure である。
@@ -752,7 +756,8 @@ typeset -g _ZRUSH_EXPECTED_BUILD_STAMP='<build-stamp>'
 2. プロンプト表示ごと: config.toml の mtime を確認し、変化していれば
    `zrush config` を再実行して source、キーバインドを再適用、警告があれば表示。
 3. 最初の実要求時: source 時に作成済みの FIFO endpoint だけを開き、abort-control FIFO の read fd を渡して
-   `zrush worker --control-fd N` を起動し、watchdog setup 後に `hello` / `ready` を交換する。
+   `zrush worker --control-fd N` を起動し、watchdog setup 後に `hello` を送る。
+   最初の要求は `ready` を待たずに `hello` の後ろへ pipeline する(「セッションフレーミングと握手」節)。
    遅延起動時に runtime directory/FIFO を作成してはならない。spawn 後の parent endpoint/watcher failure と
    writer notification/watcher failure の fail-closed quarantine・runtime taint は behavior.md が定める。
 4. 入力変化 → デバウンス → zpty 収集完了後: zsh が pid レコードを取り除いた
