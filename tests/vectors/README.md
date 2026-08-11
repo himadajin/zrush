@@ -88,7 +88,7 @@ A generated `expected` is a proposal, not an answer -- read it against cli-proto
 Reject vectors structurally validate exactly the handshake `ready` plus the terminal in-band responses of the session's `store` and `plan`; no process exit 2/3 compatibility is tested.
 Both runners independently implement the file format above, check every corpus file for canonical spelling, and hold their own codec to a round trip over arbitrary byte strings.
 `zsh -f tests/zsh/vectors.zsh` checks `encode/` against the zsh encoder `_zrush_encode_batch`,
-the history sender's line/event-number pairing and filtering against `_zrush_history_payload`,
+the history sender's line/event-number pairing and filtering against `_zrush_history_snapshot_payload`,
 and the same `plan/` and `reject-plan/` corpus against the independent zsh decoder
 `_zrush_parse_plan`, so both sides are held to one set of bytes.
 

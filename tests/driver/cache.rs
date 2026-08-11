@@ -357,8 +357,11 @@ fn the_latch_dies_with_the_worker_session_and_with_a_re_source() {
 #[test]
 fn live_slot_stores_leave_the_cached_generation_intact() {
     let mut host = Host::boot_history();
-    // Both live-slot producers run once up front: their compsys lazy-loading
-    // is a fingerprint change, and it must not land between latch and hit.
+    // The argument completion runs once up front: its compsys lazy-loading is
+    // a fingerprint change, and it must not land between latch and hit. The
+    // history menu needs no such warm-up -- it synthesizes its payload from
+    // `$history` and runs no compsys at all -- but opening it here leaves the
+    // worker's index warm, so the open below is the plain one-plan case.
     argument_completion(&mut host);
     history_menu(&mut host, "(cc-5 setup)");
     warm_to_a_hit(&mut host, "(cc-5 setup)");

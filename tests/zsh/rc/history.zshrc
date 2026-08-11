@@ -31,6 +31,16 @@ _zrt_dump_kind() { _zlog "TESTKIND=kind=$_zrush_plan_kind sel=$_zrush_selected l
 zle -N _zrt-dump-kind _zrt_dump_kind
 bindkey '^Xk' _zrt-dump-kind
 
+# ^Xi: the history index latch and the fingerprint baseline it carries, which
+# no other dump exposes -- the scenarios in tests/driver/hist_index.rs need to
+# tell "the worker's index is usable" from "the next menu op re-snapshots".
+# A generation of 0 is the single unusable state (an invalid latch and a dirty
+# index are one thing), so there is no separate dirty field to dump
+# (behavior.md "履歴メニュー").
+_zrt_dump_hist() { _zlog "TESTHIST=gen=$_zrush_hist_gen head=$_zrush_hist_head count=$_zrush_hist_count unacked=$_zrush_hist_unacked" }
+zle -N _zrt-dump-hist _zrt_dump_hist
+bindkey '^Xi' _zrt-dump-hist
+
 # ^Xu: raw history movement that bypasses zrush entirely, used to put HISTNO
 # into "browsing" state (HISTNO != HISTCMD) ahead of testing zrush's
 # select-prev/select-next delegation rule for that state
