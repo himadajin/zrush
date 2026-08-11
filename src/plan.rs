@@ -13,12 +13,14 @@
 //! (this is where `-f` directory-synthesis stat happens, and only for
 //! positions layout actually kept) -> wire::serialize.
 //!
-//! `compute` reads an already-parsed candidate payload (record::Stored) and
-//! takes an injected `is_dir` predicate, so it stays free of I/O and is
-//! directly testable. It cannot fail: the payload was validated when the
-//! `store` request parsed it, and session I/O belongs to worker.rs.
+//! `compute` reads a candidate source (record::Candidates: a slot's parsed
+//! payload, or a window over the history index) and takes an injected
+//! `is_dir` predicate, so it stays free of I/O and is directly testable. It
+//! cannot fail: the payload was validated when the request that carried it
+//! was parsed, and session I/O belongs to worker.rs.
 
 use crate::matching::{Mode, QueryMatcher, Tier};
+use crate::record::Candidates;
 use crate::span::CharSpan;
 use crate::{insert, layout, ranking, record, wire};
 
@@ -57,14 +59,14 @@ impl Producer {
     }
 }
 
-/// Run the full pipeline over a stored candidate payload and return the
-/// serialized render plan.
+/// Run the full pipeline over a candidate source and return the serialized
+/// render plan.
 pub(crate) fn compute(
     params: &Params,
-    stored: &record::Stored,
+    source: &dyn Candidates,
     is_dir: &dyn Fn(&[u8]) -> bool,
 ) -> Vec<u8> {
-    let batches = stored.batches();
+    let batches = source.batches();
 
     let mut qm = QueryMatcher::new(&params.query, params.mode, params.smart_case);
     let mut matched: Vec<(usize, crate::matching::TierHit)> = Vec::new();
@@ -75,7 +77,8 @@ pub(crate) fn compute(
     // cli-protocol.md "隠し候補の除外": excluded before tier classification, so
     // hidden files reach neither the listing nor common-prefix.
     let hidden_opt_in = params.query.first() == Some(&b'.');
-    for (idx, cand) in stored.candidates().enumerate() {
+    for idx in 0..source.candidate_count() {
+        let cand = source.candidate(idx);
         let text = cand.match_text();
         if !hidden_opt_in && text.starts_with(b".") && batches[cand.batch].f == b"1" {
             continue;
@@ -97,7 +100,7 @@ pub(crate) fn compute(
     let ranked = ranking::rank(&matched, cap, params.producer.order());
     let candidates: Vec<record::Candidate<'_>> = ranked
         .iter()
-        .map(|&(idx, _)| stored.candidate(idx))
+        .map(|&(idx, _)| source.candidate(idx))
         .collect();
     // spans() is a second pass by design (matching.rs docs): only run it
     // on the ranked subset that actually reaches layout, and derive it
@@ -299,6 +302,64 @@ mod tests {
             };
             let stdin = capture.payload();
             let output = run(&params, &stdin, &no_dir).expect("generated payload is framed");
+            let parsed = wire::parse(&output);
+            prop_assert!(
+                parsed.is_ok(),
+                "reference parser rejected output {output:?}: {parsed:?}"
+            );
+        }
+    }
+
+    /// A history-profile payload as history.rs receives it: one empty batch
+    /// header, then `w` plus an optional `n`, newest first.
+    fn generated_history_payload(entries: &[(Vec<u8>, Option<Vec<u8>>)]) -> Vec<u8> {
+        let mut out = b"b\x01\0".to_vec();
+        for (line, event) in entries {
+            out.extend_from_slice(b"w\x01");
+            out.extend_from_slice(line);
+            if let Some(event) = event {
+                push_capture_field(&mut out, b"n", event);
+            }
+            out.push(0);
+        }
+        out
+    }
+
+    proptest! {
+        /// The same totality and wire-shape invariant over the other
+        /// candidate source: an arbitrary index read through an arbitrary
+        /// scan window.
+        #[test]
+        fn window_sourced_pipeline_output_satisfies_wire_shape(
+            entries in prop::collection::vec(
+                (
+                    capture_value(16),
+                    prop::option::of(prop::collection::vec(b'0'..=b'9', 1..=8)),
+                ),
+                0..=16,
+            ),
+            limit in 1usize..=20,
+            query in prop::collection::vec(1u8..=u8::MAX, 0..=16),
+            mode in generated_mode(),
+            smart_case in any::<bool>(),
+            rows in 1usize..=8,
+            width in 1usize..=64,
+        ) {
+            let stored = record::parse(generated_history_payload(&entries))
+                .expect("generated payload is framed");
+            let mut index = crate::history::HistoryIndex::default();
+            index.install(1, &stored).expect("a fresh index accepts a snapshot");
+
+            let params = Params {
+                producer: Producer::History,
+                query,
+                mode,
+                smart_case,
+                rows,
+                width,
+                trailing_space: false,
+            };
+            let output = compute(&params, &index.window(limit), &no_dir);
             let parsed = wire::parse(&output);
             prop_assert!(
                 parsed.is_ok(),
@@ -857,6 +918,39 @@ mod tests {
             })
         );
         assert!(has_match(&p, 1, 12, 3));
+    }
+
+    /// Moving dedup, the scan window and record building into the worker
+    /// changed no plan: one duplicate-free history payload, read once as a
+    /// stored payload and once as an index window, serializes identically --
+    /// same ordering, layout, event-number column and insertion text.
+    #[test]
+    fn a_history_window_and_a_stored_payload_serialize_the_same_plan() {
+        let mut stdin = header(&[]);
+        for (line, event) in [("echo foo", "105"), ("unrelated", "104"), ("foo", "99")] {
+            stdin.extend(history_word(line, event));
+        }
+        let stored = record::parse(stdin).unwrap();
+        let mut index = crate::history::HistoryIndex::default();
+        index
+            .install(1, &stored)
+            .expect("a fresh index accepts a snapshot");
+        let window = index.window(5000);
+
+        for params in [
+            history_params("foo", Mode::Typo, 10, 16),
+            history_params("", Mode::Typo, 2, 16),
+            history_params("zzz", Mode::Prefix, 10, 16),
+            params("foo", Mode::Typo, 10, 16, true),
+        ] {
+            assert_eq!(
+                compute(&params, &stored, &no_dir),
+                compute(&params, &window, &no_dir),
+                "query {:?} producer {:?}",
+                params.query,
+                params.producer
+            );
+        }
     }
 
     #[test]

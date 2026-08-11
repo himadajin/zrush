@@ -100,6 +100,9 @@ fn run_plan(extra: &[&str], stdin: &[u8]) -> (i32, Vec<u8>) {
             value("--rows").as_bytes(),
             value("--width").as_bytes(),
             value("--trailing-space").as_bytes(),
+            // Mandatory on every `plan`; these vectors read a slot, which
+            // ignores it (cli-protocol.md 「要求と応答」).
+            b"5000",
         ]),
     ]
     .concat();
@@ -387,6 +390,7 @@ fn worker_handshake_and_multiple_requests_share_one_process() {
             b"10",
             b"40",
             b"true",
+            b"5000",
         ])
     };
     let (mut command, control_read, _control_write) = worker_command();

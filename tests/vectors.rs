@@ -117,6 +117,25 @@ fn vector_args(path: &Path) -> Vec<OsString> {
         .collect()
 }
 
+/// A flag's value in a vector's `args`, or the empty string when absent.
+fn flag_value(args: &[OsString], flag: &str) -> OsString {
+    args.windows(2)
+        .find(|pair| pair[0] == flag)
+        .map(|pair| pair[1].clone())
+        .unwrap_or_default()
+}
+
+/// The write request a vector's payload is carried by (`--source`), defaulting
+/// to `store` so a vector that says nothing exercises the completion path.
+fn vector_source(path: &Path) -> OsString {
+    let source = flag_value(&vector_args(path), "--source");
+    if source.is_empty() {
+        OsString::from("store")
+    } else {
+        source
+    }
+}
+
 fn vector_dirs(kind: &str) -> Vec<PathBuf> {
     let root = Path::new(VECTOR_ROOT).join(kind);
     let mut paths: Vec<_> = std::fs::read_dir(root)
@@ -133,12 +152,7 @@ fn vector_dirs(kind: &str) -> Vec<PathBuf> {
 
 fn run_vector_raw(path: &Path) -> std::process::Output {
     let args = vector_args(path);
-    let value = |flag: &str| {
-        args.windows(2)
-            .find(|w| w[0] == flag)
-            .map(|w| w[1].clone())
-            .unwrap_or_default()
-    };
+    let value = |flag: &str| flag_value(&args, flag);
     fn ns(payload: &[u8]) -> Vec<u8> {
         let mut o = payload.len().to_string().into_bytes();
         o.push(b':');
@@ -154,27 +168,47 @@ fn run_vector_raw(path: &Path) -> std::process::Output {
         ns(&p)
     }
     let payload = read_vector_file(&path.join("payload"));
+    let append_path = path.join("append");
+    let append = append_path.exists().then(|| read_vector_file(&append_path));
     let cwd = std::env::current_dir().expect("cwd");
-    // One session carries the vector as the contract's two requests: the
-    // payload goes in with `store` (request_id 1, generation 1), and `plan`
-    // (request_id 2) reads it back out of the slot.
-    let requests = [
-        msg(&[b"store", b"1", b"live", b"1", &payload]),
-        msg(&[
-            b"plan",
-            b"2",
-            b"1",
-            cwd.as_os_str().as_bytes(),
-            value("--producer").as_bytes(),
-            value("--query").as_bytes(),
-            value("--mode").as_bytes(),
-            value("--smart-case").as_bytes(),
-            value("--rows").as_bytes(),
-            value("--width").as_bytes(),
-            value("--trailing-space").as_bytes(),
-        ]),
-    ]
-    .concat();
+    // One session carries the vector as the contract's requests: the payload
+    // goes in with the write `--source` names (request_id 1, generation 1), an
+    // `append` file follows it as a `history-append` (request_id 2, generation
+    // 2), and the trailing `plan` reads back the last generation written.
+    let source = vector_source(path);
+    let mut requests = match source.as_bytes() {
+        b"store" => msg(&[b"store", b"1", b"live", b"1", &payload]),
+        b"history" => msg(&[b"history-snapshot", b"1", b"1", &payload]),
+        b"history-append" => msg(&[b"history-append", b"1", b"1", &payload]),
+        _ => panic!("{}: unknown --source {source:?}", path.display()),
+    };
+    let (generation, plan_id): (&[u8], &[u8]) = match &append {
+        Some(append) => {
+            requests.extend(msg(&[b"history-append", b"2", b"2", append]));
+            (b"2", b"3")
+        }
+        None => (b"1", b"2"),
+    };
+    // `history_limit` is mandatory on every `plan`, so a vector that does not
+    // exercise the scan window inherits the `[history].limit` default.
+    let history_limit = match value("--history-limit") {
+        limit if limit.is_empty() => OsString::from("5000"),
+        limit => limit,
+    };
+    requests.extend(msg(&[
+        b"plan",
+        plan_id,
+        generation,
+        cwd.as_os_str().as_bytes(),
+        value("--producer").as_bytes(),
+        value("--query").as_bytes(),
+        value("--mode").as_bytes(),
+        value("--smart-case").as_bytes(),
+        value("--rows").as_bytes(),
+        value("--width").as_bytes(),
+        value("--trailing-space").as_bytes(),
+        history_limit.as_bytes(),
+    ]));
     let (control_read, _control_write) = UnixStream::pair().expect("create control channel");
     let control_fd = control_read.as_raw_fd();
     let mut command = Command::new(env!("CARGO_BIN_EXE_zrush"));
@@ -393,18 +427,27 @@ fn reject_vectors_match_expected_in_band_errors() {
         let output = run_vector_raw(&path);
         let frames = decode_strict(&output.stdout);
         // A vector is rejected by exactly one of the session's two requests.
-        // A bad payload fails the `store` (request_id 1), leaving nothing for
-        // the `plan` (request_id 2) to reference; bad scalars store fine and
-        // fail the `plan` itself.
-        let (store_reply, plan_reply): (&[u8], &[u8]) = if name.ends_with("nonterminated-stdin") {
-            (b"invalid-payload", b"unknown-generation")
+        // A bad payload fails the write (request_id 1) with `invalid-payload`,
+        // and an append against the uninitialized index fails it with
+        // `unknown-generation`; either way nothing is left for the `plan`
+        // (request_id 2) to reference. Bad scalars write fine and fail the
+        // `plan` itself.
+        let write_reply: &[u8] = if name.ends_with("nonterminated-stdin") {
+            b"invalid-payload"
+        } else if vector_source(&path) == *"history-append" {
+            b"unknown-generation"
         } else {
-            (b"", b"invalid-request")
+            b""
         };
-        let store_frame = if store_reply.is_empty() {
+        let plan_reply: &[u8] = if write_reply.is_empty() {
+            b"invalid-request"
+        } else {
+            b"unknown-generation"
+        };
+        let store_frame = if write_reply.is_empty() {
             vec![b"ok".to_vec(), b"1".to_vec(), Vec::new()]
         } else {
-            vec![b"error".to_vec(), b"1".to_vec(), store_reply.to_vec()]
+            vec![b"error".to_vec(), b"1".to_vec(), write_reply.to_vec()]
         };
         let valid = output.status.code() == Some(0)
             && frames.len() == 3

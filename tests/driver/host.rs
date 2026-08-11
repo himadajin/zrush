@@ -43,6 +43,8 @@ pub mod keys {
     pub const AGE_CACHE: &str = "\x18n";
     /// Listing kind, selection and position count (history rc only).
     pub const DUMP_KIND: &str = "\x18k";
+    /// History-index latch and fingerprint baseline (history rc only).
+    pub const DUMP_HIST: &str = "\x18i";
     /// The `$history` event number of the newest fixture line (history rc only).
     pub const DUMP_EVENT: &str = "\x18e";
     /// Debounce-timer and in-flight-collection fd state (history rc only).
@@ -85,6 +87,12 @@ const TIMING_ENV: &str = "ZRUSH_DRIVER_TIMING";
 /// turn a healthy shutdown into that branch.
 pub const SHUTDOWN_SEAM: &str = "_ZRUSH_WORKER_SHUTDOWN_MS=5000";
 
+/// Default `ZRUSH_HISTORY_DEADLINE_MS` for every host: 5000 ms matches this
+/// harness's other bounded waits, so a loaded machine cannot turn a healthy
+/// synchronous history exchange into the deadline branch. The production
+/// default is 100 ms (docs/internal/specs/behavior.md 「履歴メニュー」).
+const HISTORY_DEADLINE_SEAM: u32 = 5000;
+
 pub struct Host {
     tmp: Option<TempDir>,
     log: PathBuf,
@@ -117,6 +125,9 @@ enum HostRc {
     /// [`HostRc::History`]'s isolation with a fixture history large enough to
     /// cross the payload byte ceiling partway through the scan.
     HistoryBudget,
+    /// [`HostRc::History`]'s isolation with a fixture history small enough to
+    /// show whole, plus the history file a bulk load (`fc -R`) reads.
+    HistorySync,
 }
 
 impl HostRc {
@@ -126,6 +137,7 @@ impl HostRc {
             HostRc::History => "tests/zsh/rc/history.zshrc",
             HostRc::HistoryLimit => "tests/zsh/rc/history-limit.zshrc",
             HostRc::HistoryBudget => "tests/zsh/rc/history-budget.zshrc",
+            HostRc::HistorySync => "tests/zsh/rc/history-sync.zshrc",
         }
     }
 }
@@ -145,6 +157,12 @@ pub struct BootOptions<'a> {
     extra_fixtures: Option<fn(&Path)>,
     fake: bool,
     config: Option<&'a str>,
+    /// This host's `ZRUSH_HISTORY_DEADLINE_MS`; `None` keeps the harness-wide
+    /// [`HISTORY_DEADLINE_SEAM`]. The seam exists so the *structure* of the
+    /// deadline branch is testable (a value no exchange can meet); the
+    /// production magnitude belongs to `tests/zsh/driver-latency.zsh`, which
+    /// deliberately has no seam.
+    history_deadline_ms: Option<u32>,
 }
 
 impl Host {
@@ -223,6 +241,26 @@ impl Host {
         })
     }
 
+    /// [`Host::boot_history`] under `tests/zsh/rc/history-sync.zshrc`, whose
+    /// fixture history is small enough to read whole out of one menu and whose
+    /// sandbox holds the history file a bulk load reads.
+    pub fn boot_history_sync() -> Self {
+        Self::boot_with(BootOptions {
+            rc: HostRc::HistorySync,
+            ..BootOptions::default()
+        })
+    }
+
+    /// [`Host::boot_history`] with its own `ZRUSH_HISTORY_DEADLINE_MS`, for the
+    /// cases that need the synchronous history exchange to run out of time.
+    pub fn boot_history_with_deadline_ms(ms: u32) -> Self {
+        Self::boot_with(BootOptions {
+            rc: HostRc::History,
+            history_deadline_ms: Some(ms),
+            ..BootOptions::default()
+        })
+    }
+
     /// A host whose rc loads coexistence doubles around zrush: `pre` before it
     /// (so zrush records the double as a predecessor) and `post` after it (so
     /// the double wraps zrush's own registrations), the ordering
@@ -251,6 +289,7 @@ impl Host {
             extra_fixtures,
             fake,
             config,
+            history_deadline_ms,
         } = options;
         let tmp = TempDir::new().expect("create work dir");
         let home = tmp.path().join("home");
@@ -297,8 +336,12 @@ impl Host {
             .env("ZRUSH_LOG", &log)
             .env("ZRUSH_BIN", bin)
             .env("ZRUSH_REAL_BIN", bin)
-            // Test seam: 5000 ms matches this harness's other bounded waits.
-            .env("ZRUSH_HISTORY_DEADLINE_MS", "5000");
+            .env(
+                "ZRUSH_HISTORY_DEADLINE_MS",
+                history_deadline_ms
+                    .unwrap_or(HISTORY_DEADLINE_SEAM)
+                    .to_string(),
+            );
         let fake = fake.then(|| Fake::install(&work, &mut command));
 
         let started = Instant::now();
@@ -679,6 +722,16 @@ impl Host {
     pub fn cache_state(&mut self) -> String {
         self.dump_get(keys::DUMP_CACHE, "TESTCACHE")
             .expect("cache-state dump did not run")
+    }
+
+    /// The `^Xi` history-index dump:
+    /// `gen=<n> head=<n> count=<n> unacked=<n>`. `gen=0` is the single
+    /// "index unusable" state -- an invalid latch and a dirty index are one
+    /// thing -- so there is no separate dirty field to read
+    /// (docs/internal/specs/behavior.md 「履歴メニュー」).
+    pub fn history_state(&mut self) -> String {
+        self.dump_get(keys::DUMP_HIST, "TESTHIST")
+            .expect("history-index dump did not run")
     }
 
     /// Poll `^Xw` until the dump carries every one of `fields`, returning it;

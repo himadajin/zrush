@@ -1,0 +1,7 @@
+b\1\0
+w\1git status\2
+n\142\0
+w\1ls -la\2
+n\141\0
+w\1cd /tmp\2
+n\140\0

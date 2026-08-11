@@ -181,10 +181,13 @@ fn worker(fake: &Fake, control_fd: i32) {
             return;
         };
         let request = fields(&payload, fake);
-        // The kind is folded onto the contract's two request kinds so a state
-        // line always splits into four fields (`tests/driver/fake.rs`).
+        // The kind is folded onto "a request carrying a payload" and "a
+        // request asking for a plan" so a state line always splits into four
+        // fields (`tests/driver/fake.rs`). The history writes join the `store`
+        // class: like it they answer with an empty body, and the modes below
+        // decide only what the `plan` behind them gets back.
         let kind = match request.first().map(Vec::as_slice) {
-            Some(b"store") => "store",
+            Some(b"store" | b"history-snapshot" | b"history-append") => "store",
             Some(b"plan") => "plan",
             _ => "other",
         };

@@ -28,8 +28,8 @@ zsh は zle 統合・compsys 呼び出しによる捕獲・プランの適用
   収集が遅い場合も「一覧が遅れて出る」だけで、打鍵は常に即応する。
   この原則に対する同期的な例外は、ユーザーが明示した履歴メニュー(後述)と、
   process の重複・frame 途中の EOF・fd の取り違えを防ぐための worker lifecycle 停止だけである。
-  履歴メニューで走査する履歴エントリ数は `[history].limit` 件までに、合成する payload は
-  固定のバイト上限までに限り、worker 交換には
+  履歴メニューで worker が走査する履歴エントリ数は `[history].limit` 件までに、
+  index を作り直すときに zsh が合成する payload は固定のバイト上限までに限り、worker 交換には
   固定の絶対 100ms deadline を置く。lifecycle 停止も後述の 1 本の絶対 100ms deadline 内だけ
   同期待機を許し、正常 shutdown から異常 abort へ移っても更新しない。超過後は入力へ戻して
   readiness-driven cleanup を続けるため、入力を無期限に止めない。
@@ -75,7 +75,8 @@ zsh は zle 統合・compsys 呼び出しによる捕獲・プランの適用
 - request/response の nested-netstring と `hello` / `ready` は
   `../contracts/cli-protocol.md` が定める。通常の補完経路は cold start・握手・応答を同期的に待たず、
   response fd の `zle -F` callback で進める。同期的に起動と応答を待てるのは履歴メニューだけで、
-  その 1 本の絶対 100ms deadline に起動・握手・先行 request・`store` と `plan` の連送・
+  その 1 本の絶対 100ms deadline に起動・握手・先行 request・
+  `history-snapshot` と `plan` の連送(index が同期済みなら `plan` だけ)・
   `plan` の終端応答をすべて含める。
 - worker stdin への送信単位は完成済み frame 1 個で、outbound queue に send offset を持たない。
   対話シェル自身は request FIFO へ blocking write せず、cloexec 付き request write fd を fork した
@@ -119,6 +120,22 @@ zsh は zle 統合・compsys 呼び出しによる捕獲・プランの適用
   latch を無効化した generation を payload の再送で復元することはせず、
   失敗した `store` / `plan` も replay しない。
   新しい generation を作るのは新しい収集だけである。
+- worker はスロットとは別に、履歴候補の **history index** を 1 個保持する
+  (`../contracts/cli-protocol.md`「要求と応答」節)。
+  index も worker session に属し、worker の終了とともに失われる。zsh はそれを再構築させず、
+  次の明示的な履歴メニュー操作が `history-snapshot` で作り直すまで未初期化のままにする。
+  index の内容を zsh 側に複製して保持することもしない。
+- zsh は「現 worker session の index がどの generation を保持しているか」を
+  **history index latch** として持つ。latch が有効であることが履歴一覧を query だけで開ける条件であり、
+  無効な間の履歴メニュー操作は `history-snapshot` から始める(「履歴メニュー」節)。
+  latch の無効化点は candidate store latch と同一の集合(worker の起動・正常 shutdown・異常 abort・
+  session failure・worker の交換・re-source)に加えて、
+  `history-snapshot` / `history-append` / 履歴の `plan` が `unknown-generation` を受けたときである。
+  失敗した history 要求も replay しない。
+- history index への書き込みは楽観的に latch へ反映する
+  (`history-append` は終端応答を待たずに latch を進める)。
+  frame が実際には届かなかった場合、次の query が `unknown-generation` を受けて latch が無効化されるため、
+  同期の喪失は必ず顕在化する(古い index を黙って参照し続けることはない)。
 - 正常 shutdown は unhanded frame を破棄し、unacked writer があれば full-frame ack を待つ。
   ack を受けると writer が既に自身の request fd を閉じているため、対話シェルの request write fd を閉じて
   frame 境界の EOF を作る。その後も abort-control write fd は閉じず、response FIFO を bytes のまま EOF まで
@@ -211,7 +228,7 @@ zsh は zle 統合・compsys 呼び出しによる捕獲・プランの適用
   候補レコードを継承 pipe fd へ NUL 区切りで搬出する(終端 = EOF)。
   フレーミングに使う制御バイト(NUL、`\1`、`\2`)を含む候補は一覧に載らない。
   レコードのタグ構成(バッチヘッダ・`m` タグを含む)は
-  `../contracts/cli-protocol.md`(`store` 要求の `candidate_payload`)の契約に従う。
+  `../contracts/cli-protocol.md`「`candidate_payload`(候補レコードストリーム)」の契約に従う。
   キャンセルは worker 自己申告 pid のプロセスグループへの SIGINT → `zpty -d`。
 - 収集が完走したら、その payload を新しい candidate generation の `store` 要求で worker へ渡し、
   続けて同じ generation を参照する `plan` 要求を連送する
@@ -354,31 +371,85 @@ zsh は zle 統合・compsys 呼び出しによる捕獲・プランの適用
   ctrl-p も既定で同じ挙動になる。ctrl-p を素の履歴移動のまま使いたい場合は
   keybind 設定で select-prev から外す(config-schema.md `[keybind]`)。
 - **開くときの遷移**は不可分に行う: デバウンス待ちのタイマーを解除し、進行中の収集をキャンセルし、
-  現在の一覧とプランを破棄してから、履歴 payload の合成・同期 worker 交換・履歴一覧としての表示・
-  位置 1 の選択までを一度に確定させる。
+  現在の一覧とプランを破棄してから、index の同期確認・(必要なら)snapshot の合成・
+  同期 worker 交換・履歴一覧としての表示・位置 1 の選択までを一度に確定させる。
   キャンセルされた収集の結果は後から届いても表示に使わない(「候補収集」節)ため、
   遅れて到着した補完結果が履歴メニューを置き換えることはない。
-- payload は zsh がメモリ上の履歴から合成する(fork も compsys も介さない。
-  合成規則は cli-protocol.md「history profile」)。
-  合成した payload は新しい candidate generation の `store` 要求(`live` スロット)で送り、
-  続けて同じ generation を参照する `plan` 要求を連送する。
+- 履歴候補は worker が保持する history index から得る(「worker ライフサイクル」節)。
+  開く操作は同期区間の入口で index の同期状態を判定し、2 つの経路のどちらかを取る。
+  - **cold**(latch が無効、または index が dirty): zsh がメモリ上の履歴から snapshot payload を合成し
+    (fork も compsys も介さない。合成規則は cli-protocol.md「history profile」)、
+    新しい candidate generation の `history-snapshot` 要求で送り、
+    続けて同じ generation を参照する `plan` 要求を連送する。
+  - **warm**(latch が有効かつ dirty でない): payload の合成も送信もせず、
+    latch が指す generation を参照する `plan` 要求だけを送る。
   worker との要求/応答を同期的に待つのはこの経路だけである。
-- 合成する payload の総バイト数には**固定の上限 262144 バイト(256 KiB)**を置く。
+- index の同期状態は 2 段のフィンガープリントで判定する。どちらも zsh 側だけで完結し、
+  worker へ送ることはない。
+  - **Level A**(プロンプト表示ごと、O(1)): `HISTCMD - 1` を最新イベント番号とし、
+    index へ伝えた最新イベント番号(**head**)との連続性を見る。
+    等しければ何もしない。
+    1 つ大きければ後述の更新を 1 件送る。
+    それ以外の不連続(2 以上の飛び・巻き戻し・`fc -p` / `fc -P` による履歴スタックの切り替え)は
+    **dirty** とする。
+  - head は照合のたびに `HISTCMD - 1` へ進める。
+    そのイベントが送信側の除外規則(制御バイトを含む行・空行。cli-protocol.md「history profile」)に
+    当たる場合は要求を送らないが、head と Level B の基準値だけは同じように進める
+    (snapshot でも同じ行は除外されるため、送らないことで index の内容はずれない)。
+    この扱いにより、除外されたイベントが恒久的な不連続として残ることはない。
+  - snapshot を送った直後の head は、合成時に観測した `HISTCMD - 1` とする
+    (payload に載った `n` の最大値ではない。
+    最新側のイベントが除外規則で落ちても head は進む)。
+  - **Level B**(明示的なメニュー操作の同期区間の入口): `(HISTCMD, ${#history})` を
+    最後に受理された同期時点の値と比べ、一致しなければ dirty とする。
+    ここでの「受理」は zsh 側の送信(楽観的な latch 更新)の時点であり、
+    追記を送るたびに基準値も同時に更新する。
+    送った frame が実際には届かなかった場合は、後続の query が `unknown-generation` を受けて
+    dirty になる(fail-closed の経路であり、Level B が肩代わりするわけではない)。
+    Level A の後に起きる変化(`share_history` による他シェルの履歴の取り込み、
+    `HISTSIZE` 変更や `fc -R` による一括入れ替え)は、
+    `(HISTCMD, ${#history})` に現れるかぎりここで捕まえる。
+  - 残余の非検知は仕様として許容する。
+    `HIST_IGNORE_ALL_DUPS` のように新しい行の追加と古い行の削除が同時に起きた場合は
+    どちらの段も不一致にならないが、query 時の重複除去が最新の出現だけを残すため一覧には現れない。
+    実履歴が古い側で縮んだ場合は、次に dirty になるまで index が zsh の持たない古い行を残し得る。
+  - `share_history` の環境では他シェルの履歴が取り込まれるたびに `(HISTCMD, ${#history})` が動き、
+    Level B がそれを検出するため、履歴メニューは取り込みのあるたびに cold 経路になる。
+    結果は正しく、コストは index を持たない場合と等しい。
+- **更新経路**: index への追記は zrush が登録している `precmd` フックで行い、
+  直前のイベント `$history[$((HISTCMD-1))]` の実イベント番号と実格納テキストを読んで
+  `history-append` 1 件として送る。確定直後のフック(`zshaddhistory`)は使わない
+  (その時点では格納の可否とテキストが確定しておらず、予測は恒久的にずれるため)。
+  - 更新は新しい candidate generation を採番して送り、latch はその値へ楽観的に進める
+    (「worker ライフサイクル」節)。
+  - 追記は snapshot に課すバイト上限(後述)の対象外である
+    (deadline の外側で 1 イベントぶんだけを運ぶため。cli-protocol.md「history profile」)。
+  - 更新は worker を起動しない(遅延起動の原則を保つ)。
+    worker が不在、latch が無効、または dirty の間は更新を作らず、送信待ちも溜めない。
+    復旧は次の明示的なメニュー操作の cold 経路が行う。
+  - 未確認の更新数には小さな固定上限(内部定数。設定項目にしない)を置き、超えた時点で dirty へ倒す
+    (送信が詰まっても一覧の正しさは snapshot での作り直しで回復する)。
+- 合成する snapshot payload の総バイト数には**固定の上限 262144 バイト(256 KiB)**を置く。
   新しい方から走査し、次の候補レコードを加えると上限を超える時点で走査を打ち切る。
   そのレコードとそれより古い履歴行は送らず、レコードの途中で切ることもしない。
   この上限は、同期経路が扱うバイト量を有界にして下記の deadline を満たせる状態に保つためにあり、
   deadline と同じく固定方針であって設定項目にしない。
-  1 行の長さには上限を設けないため、`[history].limit` 件に達するより先にバイト上限へ達することがあり、
-  その場合に履歴一覧が対象にするのは走査範囲のうち新しい側の一部だけになる。
-  最も新しい候補レコード 1 件だけで上限を超える場合は候補が 0 件になり、後述の「マッチ 0 件」に従う。
-- 履歴 payload の合成が完了した直後から、`plan` 要求の完全な終端応答を受け取るまでを
-  **1 本の絶対 100ms deadline**で制限する。worker が未起動なら、その起動・`hello` / `ready` 握手・
-  `store` と `plan` の送信・`store` の終端応答の消費・完全な `plan` 応答の受信をすべて同じ 100ms に含める。
+  合成では重複除去も `[history].limit` による絞り込みもしない
+  (どちらも query 時に worker が行う。cli-protocol.md「history profile」)。
+  重複した履歴行もこのバイト上限を消費するため、重複が多い履歴ほど
+  上限内に収まる相異なる行の数は少なくなる。
+  index の作り直しは worker session ごとに最初の履歴メニュー操作で 1 回起き、
+  その後は dirty になるまで起きない(以降の操作は warm 経路になる)。
+  最も新しい候補レコード 1 件だけで上限を超える場合は index が 0 件になり、後述の「マッチ 0 件」に従う。
+- 同期区間の開始(cold なら snapshot の合成が完了した直後)から、`plan` 要求の完全な終端応答を
+  受け取るまでを **1 本の絶対 100ms deadline**で制限する。worker が未起動なら、その起動・
+  `hello` / `ready` 握手・要求の送信・先行要求の終端応答の消費・完全な `plan` 応答の受信を
+  すべて同じ 100ms に含める。cold でも deadline を 2 本に分けたり延長したりしない。
   deadline は固定方針であり設定項目にしない。
   環境変数 `ZRUSH_HISTORY_DEADLINE_MS`(ミリ秒、未設定時は 100)で deadline を上書きできるが、これは `zsh/zrush.zsh` の `ZRUSH_BIN` と `ZRUSH_NO_INIT` に倣ったテストドライバ専用の seam である。
-  payload 合成に費やす時間はこの deadline に含めない。
+  payload 合成と同期判定に費やす時間はこの deadline に含めない。
 - `plan` 要求の完全な終端応答を受信した時点で同期待ちは終了する
-  (先行する `store` の終端応答はその途中で消費する)。
+  (先行する `history-snapshot` の終端応答はその途中で消費する)。
   受信済みで未処理の後続応答は同期待ちの中では処理せず、非同期経路が引き取る。
 - 同期待ちの間に先行する非同期要求の応答を受けた場合も通常どおり終端まで読み、stale なら破棄して
   `plan` 要求の request_id を待ち続ける。先行要求の outbound queue 送信と直列処理に費やす時間も同じ deadline を消費する。
@@ -387,6 +458,9 @@ zsh は zle 統合・compsys 呼び出しによる捕獲・プランの適用
   (連続失敗の扱いは「worker ライフサイクル」)。
 - クエリは `BUFFER` 全体。`min-input` と空バッファ抑止規則は適用しないため、
   空バッファの ↑ は全履歴の一覧を出す。
+- 一覧の対象になるのは、index の新しい側から `[history].limit` 件までを走査した範囲である
+  (走査と重複除去の規則は cli-protocol.md「history profile」)。
+  重複が走査枠を消費するため、対象になる行数は走査件数より少なくなり得る。
 - 並びは新しい順のままで、位置 1 はマッチした候補のうち最も新しい履歴行
   (クエリにマッチしない履歴行は一覧に含まれないため、必ずしも履歴全体の最新行ではない)。
   マッチングのティア(prefix > substring > edit > fuzzy)と smart-case は、
@@ -411,9 +485,11 @@ zsh は zle 統合・compsys 呼び出しによる捕獲・プランの適用
 - 履歴メニューを消して通常状態へ戻る条件:
   - **マッチ 0 件**(履歴が 0 件の場合を含む)→ メニューは開かず(既存の一覧があれば消し)、
     キーは消費してバッファは変えない。素の履歴移動へのフォールバックはしない。
-  - **同期 worker 交換の失敗**(`store` または `plan` の `error` 応答、worker セッション失敗、
-    deadline 超過、または仕様を満たさない `ok`)→ 一覧と種別を破棄し、
+  - **同期 worker 交換の失敗**(`history-snapshot` または `plan` の `error` 応答、
+    worker セッション失敗、deadline 超過、または仕様を満たさない `ok`)→ 一覧と種別を破棄し、
     バッファは変えない(cli-protocol.md「応答の検証と zsh 側の適用(規範)」)。
+    deadline 超過は worker session failure であるため index も失われ、
+    次の履歴メニュー操作は cold 経路から始まる。要求の replay はしない。
   - **zrush のアクション以外の要因による `BUFFER` / `CURSOR` の変化**
     (文字入力・編集・カーソル移動・他ウィジェット)→ 履歴メニューを全消去して通常フローへ戻る。
     補完一覧のように一覧テキストを残すことはしない。

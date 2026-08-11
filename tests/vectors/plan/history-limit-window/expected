@@ -1,0 +1,14 @@
+\0
+2\0
+2\0
+   44  cd /tmp\0
+   45  ls     \0
+2\0
+history-number 2 3 2\0
+history-number 1 18 2\0
+15 9\0
+0 14\0
+2 0 1 2\0
+2 1 1 2\0
+ls\0
+cd /tmp\0

@@ -239,7 +239,8 @@ reserialize_plan() {  # -> REPLY=bytes, or return 1 with REPLY=reason
   unset ZRUSH_NO_INIT
   (( $+functions[_zrush_parse_plan] )) || { out "FATAL: _zrush_parse_plan undefined after source"; exit 1 }
   (( $+functions[_zrush_encode_batch] )) || { out "FATAL: _zrush_encode_batch undefined after source"; exit 1 }
-  (( $+functions[_zrush_history_payload] )) || { out "FATAL: _zrush_history_payload undefined after source"; exit 1 }
+  (( $+functions[_zrush_history_snapshot_payload] )) || { out "FATAL: _zrush_history_snapshot_payload undefined after source"; exit 1 }
+  (( $+functions[_zrush_history_append_payload] )) || { out "FATAL: _zrush_history_append_payload undefined after source"; exit 1 }
   (( _zrush_enabled )) && { out "FATAL: ZRUSH_NO_INIT did not suppress initialization"; exit 1 }
 
   # ---------------- Internal fd close ----------------
@@ -660,7 +661,7 @@ reserialize_plan() {  # -> REPLY=bytes, or return 1 with REPLY=reason
     _zrush_buf= _zrush_pty= _zrush_rfd=-1 _zrush_wfd=-1
   }
   ZRUSH_CFG_MODE=prefix ZRUSH_CFG_SMART_CASE=false ZRUSH_CFG_MAX_LINES=10
-  ZRUSH_CFG_TRAILING_SPACE=true ZRUSH_CFG_MIN_INPUT=0
+  ZRUSH_CFG_TRAILING_SPACE=true ZRUSH_CFG_MIN_INPUT=0 ZRUSH_CFG_HISTORY_LIMIT=1234
   BUFFER= LBUFFER= RBUFFER=
   local -a sf=() pf=() hf=()
   local store_id=
@@ -677,8 +678,10 @@ reserialize_plan() {  # -> REPLY=bytes, or return 1 with REPLY=reason
   (( $#_zrush_worker_txq == 1 )) || hit_wire=0
   if wire_fields "$_zrush_worker_txq[1]"; then
     hf=( "${(@)reply}" )
-    (( $#hf == 11 )) || hit_wire=0
-    [[ $hf[1] == plan && $hf[3] == 7 && $hf[5] == compsys ]] || hit_wire=0
+    # 12 fields: history_limit rides on compsys plans too (cli-protocol.md
+    # "要求と応答"), where the worker ignores it.
+    (( $#hf == 12 )) || hit_wire=0
+    [[ $hf[1] == plan && $hf[3] == 7 && $hf[5] == compsys && $hf[12] == 1234 ]] || hit_wire=0
     [[ ${_zrush_worker_pending[$hf[2]]} == 'plan compsys 1' ]] || hit_wire=0
   else
     hit_wire=0
@@ -749,6 +752,138 @@ reserialize_plan() {  # -> REPLY=bytes, or return 1 with REPLY=reason
     ng "request wiring: finalize store/plan pair or latch commit mismatch"
   fi
 
+  # ---- History index requests, observed on the same outbound queue ----
+  # The index is generation-addressed like a slot, but it is written by its own
+  # two kinds and read by a plan with producer=history
+  # (cli-protocol.md "要求と応答" / "history profile").
+  local -i hist_wire=1
+  local -i snap_gen=0 ev=0
+  wire_reset
+  _zrush_hist_reset
+  _zrush_request_history history-snapshot $'b\1\0w\1ls\2n\17\0' || hist_wire=0
+  snap_gen=$REPLY
+  wire_fields "$_zrush_worker_txq[1]" && sf=( "${(@)reply}" ) || hist_wire=0
+  (( $#sf == 4 )) || hist_wire=0
+  [[ $sf[1] == history-snapshot && $sf[3] == $snap_gen && $sf[4] == $'b\1\0w\1ls\2n\17\0' ]] || hist_wire=0
+  [[ ${_zrush_worker_pending[$sf[2]]} == "history-snapshot $snap_gen" ]] || hist_wire=0
+  # The query behind it: producer=history, the whole buffer as the query,
+  # trailing-space false, and the configured history_limit.
+  _zrush_request_plan $snap_gen history 'ls -l' false 0 || hist_wire=0
+  wire_fields "$_zrush_worker_txq[2]" && pf=( "${(@)reply}" ) || hist_wire=0
+  (( $#pf == 12 )) || hist_wire=0
+  [[ $pf[1] == plan && $pf[3] == $snap_gen && $pf[5] == history && $pf[6] == 'ls -l' \
+     && $pf[11] == false && $pf[12] == 1234 ]] || hist_wire=0
+  [[ ${_zrush_worker_pending[$pf[2]]} == 'plan history 0' ]] || hist_wire=0
+  if (( hist_wire )); then
+    ok "history wiring: a snapshot frame and the history plan that reads it back"
+  else
+    ng "history wiring: snapshot/query frames ${(qqqq)_zrush_worker_txq}"
+  fi
+
+  # The per-prompt update: one append for the event that follows the head, with
+  # the latch and the Level B baseline moving optimistically with the enqueue.
+  # `print -s` leaves its newest entry as the current event, so the second push
+  # is what makes the first one the newest entry `$history` shows -- the one a
+  # precmd would reconcile.
+  print -sr -- 'echo wiring-event'
+  print -sr -- 'echo wiring-current'
+  local -i update_wire=1
+  wire_reset
+  ev=$(( HISTCMD - 1 ))
+  _zrush_hist_latch 40 $(( ev - 1 )) 0
+  _zrush_hist_unacked=0
+  _zrush_hist_reconcile
+  (( $#_zrush_worker_txq == 1 )) || update_wire=0
+  wire_fields "$_zrush_worker_txq[1]" && sf=( "${(@)reply}" ) || update_wire=0
+  (( $#sf == 4 )) || update_wire=0
+  [[ $sf[1] == history-append && $sf[4] == b$'\1'$'\0'w$'\1'"$history[$ev]"$'\2'n$'\1'"$ev"$'\0' ]] ||
+    update_wire=0
+  [[ ${_zrush_worker_pending[$sf[2]]} == "history-append $sf[3]" ]] || update_wire=0
+  (( _zrush_hist_gen == $sf[3] && _zrush_hist_head == ev && _zrush_hist_count == $#history \
+     && _zrush_hist_unacked == 1 )) || update_wire=0
+  # A prompt that added nothing sends nothing.
+  _zrush_hist_reconcile
+  (( $#_zrush_worker_txq == 1 )) || update_wire=0
+  # The append's terminal response retires it from the unacked bound.
+  _zrush_worker_ready=1
+  _zrush_encode_message ok $sf[2] ''
+  _zrush_netstring_take "$REPLY"
+  _zrush_worker_handle_message "$REPLY"
+  (( _zrush_hist_unacked == 0 && _zrush_hist_gen == $sf[3] )) || update_wire=0
+  if (( update_wire )); then
+    ok "history wiring: one append per new event, latched at enqueue"
+  else
+    ng "history wiring: append frames ${(qqqq)_zrush_worker_txq} gen=$_zrush_hist_gen head=$_zrush_hist_head unacked=$_zrush_hist_unacked"
+  fi
+
+  # What the update path refuses to do: send for a discontinuity, send past the
+  # unacked bound, send without a worker (which would defeat lazy start), and
+  # send for an event the sender excludes -- the last one still advancing head
+  # and the baseline, so the exclusion is not a permanent discontinuity.
+  local -i quiet_wire=1
+  wire_reset
+  _zrush_hist_latch 40 $(( HISTCMD - 5 )) 0
+  _zrush_hist_reconcile
+  (( $#_zrush_worker_txq == 0 && _zrush_hist_gen == 0 )) || quiet_wire=0
+  wire_reset
+  _zrush_hist_latch 41 $(( HISTCMD - 2 )) 0
+  _zrush_hist_unacked=$_ZRUSH_HIST_MAX_UNACKED
+  _zrush_hist_reconcile
+  (( $#_zrush_worker_txq == 0 && _zrush_hist_gen == 0 )) || quiet_wire=0
+  wire_reset
+  _zrush_worker_rfd=-1
+  _zrush_hist_latch 42 $(( HISTCMD - 2 )) 0
+  _zrush_hist_unacked=0
+  _zrush_hist_reconcile
+  (( $#_zrush_worker_txq == 0 && _zrush_hist_gen == 42 && _zrush_hist_head == HISTCMD - 2 )) || quiet_wire=0
+  print -sr -- $'ctl\1x'
+  print -sr -- 'sentinel-after-ctl'
+  wire_reset
+  _zrush_hist_latch 43 $(( HISTCMD - 2 )) 0
+  _zrush_hist_unacked=0
+  _zrush_hist_reconcile
+  (( $#_zrush_worker_txq == 0 && _zrush_hist_gen == 43 && _zrush_hist_head == HISTCMD - 1 \
+     && _zrush_hist_count == $#history && _zrush_hist_unacked == 0 )) || quiet_wire=0
+  if (( quiet_wire )); then
+    ok "history wiring: no frame for a discontinuity, a full queue, an absent worker or an excluded event"
+  else
+    ng "history wiring: silent-update cases queued ${#_zrush_worker_txq} frame(s) gen=$_zrush_hist_gen head=$_zrush_hist_head"
+  fi
+
+  # unknown-generation on either write kind or on the history plan drops the
+  # index latch; other producers leave it alone
+  # (behavior.md "worker ライフサイクル").
+  local -i unknown_wire=1
+  local kind
+  for kind in history-snapshot history-append plan; do
+    wire_reset
+    _zrush_worker_ready=1
+    _zrush_hist_latch 50 5 5
+    if [[ $kind == plan ]]; then
+      _zrush_worker_pending=( 900 'plan history 0' )
+    else
+      _zrush_worker_pending=( 900 "$kind 50" )
+    fi
+    _zrush_encode_message error 900 unknown-generation
+    _zrush_netstring_take "$REPLY"
+    _zrush_worker_handle_message "$REPLY"
+    (( _zrush_hist_gen == 0 )) || unknown_wire=0
+  done
+  wire_reset
+  _zrush_worker_ready=1
+  _zrush_hist_latch 50 5 5
+  _zrush_worker_pending=( 901 'plan compsys 0' )
+  _zrush_encode_message error 901 unknown-generation
+  _zrush_netstring_take "$REPLY"
+  _zrush_worker_handle_message "$REPLY"
+  (( _zrush_hist_gen == 50 )) || unknown_wire=0
+  if (( unknown_wire )); then
+    ok "history wiring: unknown-generation on a history request or query drops the index latch"
+  else
+    ng "history wiring: index latch after unknown-generation gen=$_zrush_hist_gen"
+  fi
+  _zrush_hist_reset
+
   unfunction wire_fields wire_reset
   _zrush_worker_rfd=-1 _zrush_worker_ack_fd=-1
   _zrush_close_internal_fd $wire_fd
@@ -756,21 +891,30 @@ reserialize_plan() {  # -> REPLY=bytes, or return 1 with REPLY=reason
   _zrush_current_request=0 _zrush_enabled=0 _zrush_worker_ready=0
   _zrush_cc_fp= _zrush_cc_time=0 _zrush_cc_cand_gen=0 _zrush_query= _zrush_fuzzy=
 
-  # ---------------- History payload sender ----------------
-  # `print -s` leaves its newest entry as the current event until another
-  # entry is pushed, so the final sentinel makes "newest" visible without
-  # itself entering the `$history` view used by the payload function.
+  # ---------------- History snapshot sender ----------------
+  # The bootstrap payload is the whole in-memory history, newest first, with no
+  # dedup and no `[history].limit` slicing: both moved to the worker's query
+  # (cli-protocol.md "history profile"). What the sender still owes is the
+  # record shape, the newest-first order, the real event numbers, the wholesale
+  # exclusion of empty/framing-byte lines, and the byte ceiling's record-boundary
+  # cut.
+  # `print -s` leaves its newest entry as the current event until another entry
+  # is pushed, so the final sentinel makes "newest" visible without itself
+  # entering the `$history` view the payload is built from.
   print -sr -- 'oldest'
   print -sr -- 'dup'
   print -sr -- 'dup'
-  print -sr -- $'bad\1line'
   print -sr -- 'newest'
+  print -sr -- $'bad\1line'
   print -sr -- 'sentinel-not-visible'
-  ZRUSH_CFG_HISTORY_LIMIT=100
-  _zrush_history_payload
+  # A limit small enough to slice the payload if anything still honored it.
+  ZRUSH_CFG_HISTORY_LIMIT=1
+  _zrush_history_snapshot_payload
   local history_payload=$REPLY
+  local -i snap_head=$REPLY_HEAD snap_count=$REPLY_COUNT
   local -a history_records=( "${(@0)${history_payload%$'\0'}}" )
-  local -i history_ok=1 dup_count=0 newest_count=0 oldest_count=0
+  local -i history_ok=1
+  local -a lines=() events=()
   local record line event
   [[ $history_records[1] == b$'\1' ]] || history_ok=0
   for record in "${(@)history_records[2,-1]}"; do
@@ -778,19 +922,71 @@ reserialize_plan() {  # -> REPLY=bytes, or return 1 with REPLY=reason
     event=${record#*$'\2'}
     [[ $line == w$'\1'* && $event == n$'\1'<-> ]] \
       || { history_ok=0; continue }
-    line=${line#w$'\1'}
-    event=${event#n$'\1'}
-    [[ $history[$event] == "$line" ]] || history_ok=0
-    [[ $line == dup ]] && (( ++dup_count ))
-    [[ $line == newest ]] && (( ++newest_count ))
-    [[ $line == oldest ]] && (( ++oldest_count ))
-    [[ $line == *bad* ]] && history_ok=0
+    lines+=( "${line#w$'\1'}" )
+    events+=( "${event#n$'\1'}" )
   done
-  if (( history_ok && dup_count == 1 && newest_count == 1 && oldest_count == 1 )); then
-    ok "history payload: pairs each distinct line with its real newest event number"
+  # Every record pairs a real event number with the line stored under it, the
+  # walk is newest first, the framing-byte and blank lines are gone whole, and
+  # the duplicate is NOT collapsed.
+  local -i i
+  for (( i = 1; i <= $#lines; i++ )); do
+    [[ $history[$events[i]] == "$lines[i]" ]] || history_ok=0
+    (( i == 1 )) || (( events[i] < events[i-1] )) || history_ok=0
+  done
+  [[ ${(j:|:)lines[1,4]} == 'newest|dup|dup|oldest' ]] || history_ok=0
+  # The head a snapshot establishes is HISTCMD - 1 as observed at synthesis --
+  # not the newest event that reached the payload, which the sentinel and the
+  # excluded line both push away from it.
+  (( snap_head == HISTCMD - 1 && snap_head > events[1] )) || history_ok=0
+  (( snap_count == $#history )) || history_ok=0
+  if (( history_ok )); then
+    ok "history snapshot: newest-first records with real event numbers, no dedup, no limit slicing"
   else
     dump_bytes "$history_payload"
-    ng "history payload: unexpected records: $REPLY"
+    ng "history snapshot: unexpected records (head=$snap_head count=$snap_count): $REPLY"
+  fi
+
+  # The exclusion rule itself: empty lines and lines carrying a framing byte go
+  # whole; every other control byte travels raw and is the display's problem
+  # (cli-protocol.md "history profile").
+  local -i excl_ok=1
+  _zrush_hist_excluded '' || excl_ok=0
+  _zrush_hist_excluded $'a\0b' || excl_ok=0
+  _zrush_hist_excluded $'a\1b' || excl_ok=0
+  _zrush_hist_excluded $'a\2b' || excl_ok=0
+  _zrush_hist_excluded 'plain line' && excl_ok=0
+  _zrush_hist_excluded $'esc\e[0m tab\t cr\r' && excl_ok=0
+  if (( excl_ok )); then
+    ok "history exclusion: empty and framing-byte lines only"
+  else
+    ng "history exclusion: the sender's line filter does not match the profile"
+  fi
+
+  # The byte ceiling stops the walk at the record that would cross it, never
+  # inside one, so the payload stays a newest-side prefix of the history.
+  local -i saved_ceiling=$_ZRUSH_HISTORY_PAYLOAD_MAX_BYTES
+  # Room for the framing (b\1 plus the trailing NUL) and the newest record
+  # exactly: the second record cannot fit, and half of it must not be sent.
+  _ZRUSH_HISTORY_PAYLOAD_MAX_BYTES=$(( 3 + ${#lines[1]} + ${#events[1]} + 6 ))
+  _zrush_history_snapshot_payload
+  local cut_payload=$REPLY
+  _ZRUSH_HISTORY_PAYLOAD_MAX_BYTES=$saved_ceiling
+  if [[ $cut_payload == b$'\1'$'\0'w$'\1'newest$'\2'n$'\1'$events[1]$'\0' ]]; then
+    ok "history snapshot: the byte ceiling cuts at a record boundary"
+  else
+    dump_bytes "$cut_payload"
+    ng "history snapshot: ceiling cut is not a whole-record prefix: $REPLY"
+  fi
+
+  # ---------------- History append sender ----------------
+  # One event, same stream shape: a header batch with no shared fields, then the
+  # single candidate record (cli-protocol.md "history profile").
+  _zrush_history_append_payload 42 'git status'
+  if [[ $REPLY == b$'\1'$'\0'w$'\1'"git status"$'\2'n$'\1'42$'\0' ]]; then
+    ok "history append: one header batch and one w/n record"
+  else
+    dump_bytes "$REPLY"
+    ng "history append: unexpected payload: $REPLY"
   fi
 
   # ---------------- Highlight role application ----------------

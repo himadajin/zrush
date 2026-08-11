@@ -2,14 +2,26 @@
 
 This corpus turns the prose rules in `docs/internal/contracts/cli-protocol.md` into executable byte-level fixtures.
 
-Each `plan/<name>/` directory contains `args`, `payload`, and `expected`: the `plan` request's scalar fields, the `store` request's `candidate_payload`, and the `plan` response's `ok` body.
+Each `plan/<name>/` directory contains `args`, `payload`, an optional `append`, and `expected`: the `plan` request's scalar fields, the write request's `candidate_payload`, a second payload appended to the history index, and the `plan` response's `ok` body.
 Each `reject/<name>/` directory contains `args` and `payload`.
 Each `reject-plan/<name>/` directory contains only `plan`.
 Each `encode/<name>/` directory contains `argv`, `hits`, `dscr`, `expected`, and an optional `env`.
-The runner drives each vector through one persistent `zrush worker` session as the contract's two requests: a `store` (request_id 1, slot `live`, generation 1) carrying `payload`, then a `plan` (request_id 2) referencing that generation.
+The runner drives each vector through one persistent `zrush worker` session as the contract's requests: one write (request_id 1, generation 1) carrying `payload`, then a `plan` referencing the last generation written.
 `args` contains flags and their values only.
+
+Two flags select what the session does with `payload` rather than what the `plan` computes:
+
+| flag | meaning |
+|---|---|
+| `--source` | the write kind: `store` (the default: slot `live`), `history` (`history-snapshot`), or `history-append` |
+| `--history-limit` | the `plan`'s scan bound over the history index; omitted, it is the `[history].limit` default of `5000` |
+
+An `append` file adds a `history-append` (request_id 2, generation 2) between the write and the `plan`, so a vector can fix how appended records order and dedup against the snapshot's.
+`history_limit` is a mandatory `plan` field whichever store the generation resolves to, so every vector carries one whether or not it reads the index.
+
 Reject vectors expect that session to answer with a terminal response per request, exactly one of which is an `error`.
-A candidate-stream framing violation fails the `store` with `invalid-payload`, leaving no generation for the `plan` to reference (`unknown-generation`); a malformed request shape or scalar stores fine and fails the `plan` itself with `invalid-request`.
+A candidate-stream framing violation fails the write with `invalid-payload`, and a `history-append` against the uninitialized index fails it with `unknown-generation`; either leaves no generation for the `plan` to reference (`unknown-generation`).
+A malformed request shape or scalar writes fine and fails the `plan` itself with `invalid-request`.
 Vector names use kebab case and describe the rule being fixed.
 
 ## File format
@@ -33,7 +45,7 @@ The corpus covers each condition at digit widths both within and beyond a receiv
 Where a condition constrains a sum (`start + len` against the listing text), a vector also fixes the case where each value alone is in range and only the sum escapes.
 No process runs and no golden output is derived, so `UPDATE_GOLDEN` does not apply: write `plan` by hand.
 
-To add a `plan/` or `reject/` vector, create its directory, write `args` and `payload`, and run `UPDATE_GOLDEN=1 cargo test`.
+To add a `plan/` or `reject/` vector, create its directory, write `args` and `payload` (plus `append` if it needs one), and run `UPDATE_GOLDEN=1 cargo test`.
 Use golden regeneration only for an intentional protocol change, and review every generated diff.
 When regeneration changes files, the test deliberately fails and lists every update so the changes cannot be missed.
 After reviewing the diff, rerun the same command; it passes when no files change.
@@ -76,7 +88,7 @@ A generated `expected` is a proposal, not an answer -- read it against cli-proto
 Reject vectors structurally validate exactly the handshake `ready` plus the terminal in-band responses of the session's `store` and `plan`; no process exit 2/3 compatibility is tested.
 Both runners independently implement the file format above, check every corpus file for canonical spelling, and hold their own codec to a round trip over arbitrary byte strings.
 `zsh -f tests/zsh/vectors.zsh` checks `encode/` against the zsh encoder `_zrush_encode_batch`,
-the history sender's line/event-number pairing and filtering against `_zrush_history_payload`,
+the history sender's line/event-number pairing and filtering against `_zrush_history_snapshot_payload`,
 and the same `plan/` and `reject-plan/` corpus against the independent zsh decoder
 `_zrush_parse_plan`, so both sides are held to one set of bytes.
 
