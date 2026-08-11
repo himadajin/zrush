@@ -99,6 +99,7 @@ unset ZDOTDIR
     _zrush_worker_runtime_tainted=0
     _zrush_worker_txq=() _zrush_worker_pending=() _zrush_cc_staged=()
     _zrush_cc_fp= _zrush_cc_time=0 _zrush_cc_cand_gen=0
+    _zrush_hist_reset
     _zrush_current_request=0 _zrush_sync_target=0 _zrush_sync_done=0 _zrush_sync_ok=0
     _zrush_worker_failures=0 _zrush_worker_warned=0 _zrush_build_warned=0
     _zrush_build_following=0 _zrush_build_verifying=0 _zrush_stale_disabled=0
@@ -680,41 +681,48 @@ unset ZDOTDIR
   verdict "job table: worker and delegated writers remain invisible"
 
   # ------------------------------------------- synchronous history read seam
-  # The history exchange sends store + plan and ends on the plan's terminal
-  # response; the store's is consumed on the way there (behavior.md "履歴メニュー").
+  # The cold history exchange sends history-snapshot + plan and ends on the
+  # plan's terminal response; the snapshot's is consumed on the way there
+  # (behavior.md "履歴メニュー").
   reset_transport
   _zrush_worker_ready=1
-  _zrush_worker_pending=( 1 'store live 1' 2 'plan history 0' 3 'plan compsys 0' )
+  _zrush_worker_pending=( 1 'history-snapshot 1' 2 'plan history 0' 3 'plan compsys 0' )
   _zrush_sync_target=2 _zrush_sync_done=0 _zrush_sync_ok=0
-  _zrush_encode_message ok 1 ''; typeset -g STORE_OK=$REPLY
+  _zrush_encode_message ok 1 ''; typeset -g SNAPSHOT_OK=$REPLY
   _zrush_encode_message ok 2 $'\0'"0"$'\0'"0"$'\0'"0"$'\0'; typeset -g TARGET=$REPLY
   _zrush_encode_message error 3 invalid-request; typeset -g TRAILING=$REPLY
-  _zrush_worker_rx=$STORE_OK$TARGET$TRAILING
+  _zrush_worker_rx=$SNAPSHOT_OK$TARGET$TRAILING
   _zrush_worker_read sync $(( EPOCHREALTIME + 1.0 )); typeset -gi sync_st=$?
   eq "sync target status" $sync_st 0
-  eq "store response consumed en route" ${+_zrush_worker_pending[1]} 0
+  eq "snapshot response consumed en route" ${+_zrush_worker_pending[1]} 0
   eq "sync target committed" "$_zrush_sync_done:$_zrush_sync_ok" 1:1
   eq "trailing response retained" "$_zrush_worker_rx" "$TRAILING"
-  verdict "sync read: the store is consumed and the plan commits while trailing responses remain asynchronous"
+  verdict "sync read: the snapshot is consumed and the plan commits while trailing responses remain asynchronous"
 
-  # A store whose ok carries a body does not satisfy the contract; the plan it
-  # backs must never be applied on such a session.
-  reset_transport
-  _zrush_worker_ready=1
-  _zrush_worker_pending=( 4 'store live 4' )
-  typeset -g STORE_FAILURE=
-  functions[_zrt_session_fail]=$functions[_zrush_worker_session_fail]
-  _zrush_worker_session_fail() { STORE_FAILURE=$1; return 1 }
-  _zrush_encode_message ok 4 'unexpected'
-  _zrush_netstring_take "$REPLY"
-  _zrush_worker_handle_message "$REPLY"; typeset -gi store_body_st=$?
-  functions[_zrush_worker_session_fail]=$functions[_zrt_session_fail]
-  unfunction _zrt_session_fail
-  eq "store body status" $store_body_st 1
-  [[ $STORE_FAILURE == 'store ok carries a body request_id=4' ]] ||
-    note "unexpected store-body failure reason: ${STORE_FAILURE:-<none>}"
-  eq "store body leaves the request pending" ${+_zrush_worker_pending[4]} 1
-  verdict "sync read: a store ok with a body ends the session"
+  # An ok that carries a body does not satisfy the contract for any of the three
+  # payload-carrying kinds; the plan a store or snapshot backs must never be
+  # applied on such a session.
+  typeset -g WRITE_FAILURE=
+  local kind descriptor
+  for kind in store history-snapshot history-append; do
+    [[ $kind == store ]] && descriptor='store live 4' || descriptor="$kind 4"
+    reset_transport
+    _zrush_worker_ready=1
+    _zrush_worker_pending=( 4 "$descriptor" )
+    WRITE_FAILURE=
+    functions[_zrt_session_fail]=$functions[_zrush_worker_session_fail]
+    _zrush_worker_session_fail() { WRITE_FAILURE=$1; return 1 }
+    _zrush_encode_message ok 4 'unexpected'
+    _zrush_netstring_take "$REPLY"
+    _zrush_worker_handle_message "$REPLY"; typeset -gi write_body_st=$?
+    functions[_zrush_worker_session_fail]=$functions[_zrt_session_fail]
+    unfunction _zrt_session_fail
+    eq "$kind body status" $write_body_st 1
+    [[ $WRITE_FAILURE == "$kind ok carries a body request_id=4" ]] ||
+      note "unexpected $kind body failure reason: ${WRITE_FAILURE:-<none>}"
+    eq "$kind body leaves the request pending" ${+_zrush_worker_pending[4]} 1
+  done
+  verdict "sync read: a store or history write whose ok carries a body ends the session"
 
   reset_transport
   out "SUMMARY: PASS=$PASS FAIL=$FAIL"

@@ -93,8 +93,10 @@ fn argument_completion(host: &mut Host) {
 }
 
 /// Open the history menu on an empty buffer and dismiss it again. An empty
-/// buffer collects nothing (behavior.md 「候補収集」), so the only thing this
-/// adds is the menu's own synchronous `live` store and `history` plan.
+/// buffer collects nothing (behavior.md 「候補収集」), and the menu writes the
+/// worker's history index rather than any candidate slot, so the only thing
+/// this adds is a `history-snapshot` (cold) or nothing at all (warm) plus the
+/// `history` plan.
 fn history_menu(host: &mut Host, label: &str) {
     let opened = host.log_count("producer=history");
     host.press(keys::UP);
@@ -345,10 +347,13 @@ fn the_latch_dies_with_the_worker_session_and_with_a_re_source() {
     );
 }
 
-/// The cached generation lives in its own slot: argument completions and the
-/// history menu keep storing into `live`, and the worker drops only the
-/// previous generation *of the same slot*, so the cached one survives them all
-/// (cli-protocol.md 「要求と応答」 slot semantics).
+/// The cached generation lives in its own slot: argument completions keep
+/// storing into `live` and the worker drops only the previous generation *of
+/// the same slot*, so the cached one survives them. The history menu is the
+/// other traffic that used to share the `live` slot and now writes the history
+/// index instead -- a third generation-addressable place that is not a slot at
+/// all -- so it must not touch the cached generation either
+/// (cli-protocol.md 「要求と応答」 slot and index semantics).
 #[test]
 fn live_slot_stores_leave_the_cached_generation_intact() {
     let mut host = Host::boot_history();
@@ -366,12 +371,13 @@ fn live_slot_stores_leave_the_cached_generation_intact() {
         "(cc-5a) the argument completion did not store a newer generation into live: \
          slot={slot} generation={argument} cached={cached}"
     );
+    let stores = host.log_count(STORE);
     history_menu(&mut host, "(cc-5b)");
-    let (slot, history) = last_store(&host, "(cc-5b)");
+    let (slot, stored) = last_store(&host, "(cc-5b)");
     assert!(
-        slot == "live" && history > argument,
-        "(cc-5b) the history menu did not store a newer generation into live: \
-         slot={slot} generation={history} previous={argument}"
+        host.log_count(STORE) == stores && slot == "live" && stored == argument,
+        "(cc-5b) the history menu stored into a candidate slot instead of the index: \
+         slot={slot} generation={stored} previous={argument}"
     );
 
     let collecting = host.log_count(COLLECTING);

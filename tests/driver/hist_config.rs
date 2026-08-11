@@ -55,16 +55,22 @@ fn send_break_clears_a_merely_armed_debounce_timer() {
     );
 }
 
-/// `[history].limit` bounds the RAW scan window: entries that do not survive
-/// the in-window dedup/exclusion are never backfilled from outside that window
-/// (cli-protocol.md 「history profile」, config-schema.md 「[history]」).
+/// `[history].limit` bounds the worker's scan window over the *index*, not a
+/// window over `$history`: the window is the newest `limit` index entries, the
+/// duplicate inside it is collapsed to its newest occurrence, and nothing is
+/// backfilled from outside it (cli-protocol.md 「history profile」,
+/// config-schema.md 「[history]」).
 ///
-/// The rc file's fixture history is ordered so that the newest 5 raw entries
-/// are dupA, dupA, an excluded framing-byte line, keep3 and keep4, leaving
-/// three candidates; keep5-outside and oldest-outside sit just past the window
-/// and are disqualified by nothing but their position.
+/// This is the end-to-end proof that the window moved. The rc file's fixture
+/// history is, newest first, dupA, dupA, an excluded framing-byte line, keep3,
+/// keep4, oldest-outside and keep5-outside. The excluded line never enters the
+/// index -- zsh drops it while synthesizing the snapshot -- so it costs no
+/// window slot, and the newest-5 window reaches one entry deeper into the
+/// history than a raw window over `$history` would: dupA, dupA, keep3, keep4
+/// and oldest-outside, leaving four candidates after dedup. Only
+/// keep5-outside, disqualified by nothing but its position, stays out.
 #[test]
-fn the_history_limit_bounds_the_raw_scan_window() {
+fn the_history_limit_bounds_the_index_scan_window() {
     let mut host = Host::boot_history_limit_with_config("[history]\nlimit = 5\n");
     host.press(keys::UP);
 
@@ -73,9 +79,11 @@ fn the_history_limit_bounds_the_raw_scan_window() {
         post.contains("dupA")
             && post.contains("keep3")
             && post.contains("keep4")
+            && post.contains("oldest-outside")
             && !post.contains("keep5-outside")
-            && !post.contains("oldest-outside"),
-        "(h8a) the newest-5 scan window did not yield exactly dupA/keep3/keep4: {post:?}"
+            && !post.contains("ctrlone"),
+        "(h8a) the newest-5 index window did not yield exactly \
+         dupA/keep3/keep4/oldest-outside: {post:?}"
     );
 
     let dupes = post.split('\n').filter(|row| row.contains("dupA")).count();
@@ -85,9 +93,10 @@ fn the_history_limit_bounds_the_raw_scan_window() {
     );
 }
 
-/// The payload byte ceiling bounds the scan independently of `[history].limit`:
-/// with the default limit far larger than this fixture history, what ends the
-/// scan is the ceiling, and the entries past it are not candidates
+/// The payload byte ceiling bounds the bootstrap synthesis independently of
+/// `[history].limit`: with the default limit far larger than this fixture
+/// history, what ends the walk is the ceiling, and the entries past it never
+/// reach the index -- so no later query can name them, whatever its window
 /// (behavior.md 「履歴メニュー」, cli-protocol.md 「history profile」).
 ///
 /// Both queries name a marker that exists exactly once in the fixture, so each

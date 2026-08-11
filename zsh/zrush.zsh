@@ -182,6 +182,21 @@ typeset -gi _zrush_cc_cand_gen=0
 typeset -gA _zrush_cc_staged=()
 typeset -gi _ZRUSH_CC_TTL=300      # seconds; catches same-count replacement and is not configurable
 
+# See docs/internal/specs/behavior.md "履歴メニュー".
+# The worker owns the history index; this side keeps only the history index
+# latch -- the generation that index holds -- and the baseline the two-level
+# fingerprint compares against. Declared without `${...:-}` preservation, so a
+# re-source starts without an index, which is one of its invalidation points.
+# A generation of 0 is the single "not usable" state: an invalid latch and a
+# dirty index both mean the next menu op starts from a snapshot.
+typeset -gi _zrush_hist_gen=0      # generation the worker's index holds; 0 = cold
+typeset -gi _zrush_hist_head=0     # newest event number the index was told about
+typeset -gi _zrush_hist_count=0    # ${#history} when that baseline was recorded
+typeset -gi _zrush_hist_unacked=0  # appends enqueued whose terminal response is outstanding
+# Bound on unacknowledged appends: past it the index goes dirty rather than
+# queueing (behavior.md "履歴メニュー"). Internal constant, not configurable.
+typeset -gi _ZRUSH_HIST_MAX_UNACKED=8
+
 # Key bindings (dispatch widget -> predecessor/action)
 typeset -gA _zrush_dsp_prev=() _zrush_bound=() _zrush_active_dsp=()
 typeset -gi _zrush_dsp_n=${_zrush_dsp_n:-0}
@@ -435,10 +450,14 @@ _zrush_show_cfg_warnings() {
   return 0
 }
 
-# At each prompt, reload config.toml when its mtime changes.
+# At each prompt, reconcile the worker's history index and reload config.toml
+# when its mtime changes.
 _zrush_precmd() {
   emulate -L zsh
   (( _zrush_enabled )) || return 0
+  # Ahead of the config block, whose reload branches return early: the index
+  # must not skip a prompt (behavior.md "履歴メニュー" 更新経路).
+  _zrush_hist_reconcile
   _zrush_config_mtime
   if [[ $REPLY != $_zrush_cfg_mtime ]]; then
     _zlog "precmd: config mtime changed ($_zrush_cfg_mtime -> $REPLY); reloading"
@@ -1251,9 +1270,11 @@ _zrush_worker_close_response() {
 _zrush_worker_begin_stop() {
   emulate -L zsh
   _zrush_worker_stopping=1
-  # The candidate store dies with the session, whether this is a normal
-  # shutdown, an abort, or a session failure (behavior.md "worker ライフサイクル").
+  # The candidate store and the history index die with the session, whether
+  # this is a normal shutdown, an abort, or a session failure
+  # (behavior.md "worker ライフサイクル": one invalidation set for both latches).
   _zrush_cc_latch_drop
+  _zrush_hist_invalidate session-stop
   _zrush_worker_disarm_drain
   _zrush_worker_txq=()
   _zrush_worker_pending=()
@@ -1424,8 +1445,9 @@ _zrush_worker_start() {
   setopt localoptions no_monitor no_notify no_bg_nice localtraps
   (( !_zrush_disabled && !_zrush_worker_stopping && !_zrush_worker_runtime_tainted )) || return 1
   (( _zrush_worker_rfd >= 0 )) && return 0
-  # A new session starts with empty slots.
+  # A new session starts with empty slots and an uninitialized index.
   _zrush_cc_latch_drop
+  _zrush_hist_invalidate session-start
   _zrush_worker_runtime_valid || {
     _zrush_worker_session_fail "worker runtime unavailable"
     return 1
@@ -1621,14 +1643,20 @@ _zrush_worker_handle_message() {  # message [absolute-deadline]
     _zrush_worker_session_fail "response for unknown request_id=$id"
     return 1
   }
-  # "store <slot> <generation>" for a store, "plan <producer> <latched>" for a plan.
+  # "store <slot> <generation>" for a store, "<kind> <generation>" for the two
+  # history writes, "plan <producer> <latched>" for a plan.
   local -a req=( ${=_zrush_worker_pending[$id]} )
   local reqkind=$req[1] producer= slot=
   local -i latched=0 stored_gen=0
-  if [[ $reqkind == store ]]; then
-    slot=${req[2]:-} stored_gen=${req[3]:-0}
-  else
-    producer=${req[2]:-} latched=${req[3]:-0}
+  case $reqkind in
+    store)                           slot=${req[2]:-} stored_gen=${req[3]:-0} ;;
+    history-snapshot|history-append) stored_gen=${req[2]:-0} ;;
+    *)                               producer=${req[2]:-} latched=${req[3]:-0} ;;
+  esac
+  # A terminal response, whatever it says, retires the frame from the bound on
+  # unacknowledged appends (behavior.md "履歴メニュー" 更新経路).
+  if [[ $reqkind == history-append ]] && (( _zrush_hist_unacked > 0 )); then
+    (( --_zrush_hist_unacked ))
   fi
 
   if [[ $kind == error ]]; then
@@ -1653,9 +1681,17 @@ _zrush_worker_handle_message() {  # message [absolute-deadline]
     # the latch invalidates it and recollects; a plan whose own store failed is
     # dropped and waits for the next real input.
     local -i recollect=0
-    if [[ $code == unknown-generation ]] && (( latched )); then
-      _zrush_cc_latch_drop
-      recollect=1
+    if [[ $code == unknown-generation ]]; then
+      if (( latched )); then
+        _zrush_cc_latch_drop
+        recollect=1
+      fi
+      # The index refused a write, or answered for a generation it does not
+      # hold: the latch was optimistic and is now known wrong, so the next menu
+      # op starts from a snapshot (behavior.md "worker ライフサイクル").
+      if [[ $reqkind == history-* || $producer == history ]]; then
+        _zrush_hist_invalidate unknown-generation
+      fi
     fi
     if (( id == _zrush_sync_target )); then
       _zrush_sync_done=1 _zrush_sync_ok=0
@@ -1669,19 +1705,21 @@ _zrush_worker_handle_message() {  # message [absolute-deadline]
   fi
   [[ $kind == ok ]] || { _zrush_worker_session_fail "invalid response kind"; return 1 }
 
-  if [[ $reqkind == store ]]; then
-    # cli-protocol.md "要求と応答": a successful store answers with an empty body.
+  if [[ $reqkind == store || $reqkind == history-* ]]; then
+    # cli-protocol.md "要求と応答": a successful store or history write answers
+    # with an empty body.
     [[ -z $f[3] ]] || {
-      _zrush_worker_session_fail "store ok carries a body request_id=$id"
+      _zrush_worker_session_fail "$reqkind ok carries a body request_id=$id"
       return 1
     }
     unset "_zrush_worker_pending[$id]"
     _zrush_worker_failures=0
     _zrush_status_set ""
     # The worker now holds this generation, so the entry staged for it becomes
-    # the latch (behavior.md "空語収集キャッシュ").
+    # the latch (behavior.md "空語収集キャッシュ"). The history index latch is
+    # not staged: it already moved optimistically when the frame was enqueued.
     [[ $slot == cache ]] && _zrush_cc_commit $id $stored_gen
-    _zlog "worker: ok store request_id=$id slot=$slot generation=$stored_gen"
+    _zlog "worker: ok $reqkind request_id=$id slot=$slot generation=$stored_gen"
     return 0
   fi
 
@@ -1883,6 +1921,39 @@ _zrush_request_store() {  # slot payload -> REPLY = candidate generation
   return 0
 }
 
+# Hand a candidate record stream to the worker's history index: the whole index
+# for `history-snapshot`, one event for `history-append` (cli-protocol.md
+# "要求と応答"). The caller moves the history index latch optimistically once
+# this returns, and the plan that reads the generation back is pipelined behind
+# the frame without waiting for its terminal response.
+#
+# Unlike a store this never starts a worker (behavior.md "履歴メニュー": the
+# update path must not defeat lazy start). The cold menu path starts one
+# explicitly, inside its deadline, before it gets here.
+_zrush_request_history() {  # kind payload [event] -> REPLY = candidate generation
+  emulate -L zsh
+  setopt localoptions typesetsilent no_monitor no_notify
+  local LC_ALL=C kind=$1 payload=$2 event=${3:-}
+  (( !_zrush_worker_stopping && !_zrush_worker_runtime_tainted )) || return 1
+  (( _zrush_worker_rfd >= 0 )) || return 1
+  _zrush_next_request_id || return 1
+  local -i id=$REPLY
+  _zrush_next_cand_gen || return 1
+  local -i gen=$REPLY
+  _zrush_worker_pending[$id]="$kind $gen"
+  _zrush_encode_message "$kind" "$id" "$gen" "$payload"
+  _zrush_worker_txq+=( "$REPLY" )
+  _zlog "worker: queued $kind request_id=$id generation=$gen bytes=${#REPLY} queued=$#_zrush_worker_txq"
+  if [[ $kind == history-append ]]; then
+    _zlog "history: append request_id=$id generation=$gen event=$event"
+  else
+    _zlog "history: snapshot request_id=$id generation=$gen bytes=${#payload}"
+  fi
+  _zrush_worker_flush || return 1
+  typeset -g REPLY=$gen
+  return 0
+}
+
 # $5 records whether this plan reached the store through the cache latch: an
 # `unknown-generation` answer invalidates the latch and recollects only for
 # such a plan (cli-protocol.md "応答の検証と zsh 側の適用").
@@ -1908,8 +1979,12 @@ _zrush_request_plan() {  # candidate-generation producer query trailing-space la
   _zrush_current_request=$id
   _zrush_worker_pending[$id]="plan $producer $latched"
   _zrush_worker_ensure_session || return 1
+  # history_limit rides on every plan, compsys ones included: the worker
+  # ignores it unless the generation resolves to the history index
+  # (cli-protocol.md "要求と応答").
   _zrush_encode_message plan "$id" "$gen" "$PWD" "$producer" "$query" \
-    "$ZRUSH_CFG_MODE" "$ZRUSH_CFG_SMART_CASE" "$rows" "$width" "$tspace"
+    "$ZRUSH_CFG_MODE" "$ZRUSH_CFG_SMART_CASE" "$rows" "$width" "$tspace" \
+    "$ZRUSH_CFG_HISTORY_LIMIT"
   _zrush_worker_txq+=( "$REPLY" )
   _zlog "worker: queued request_id=$id producer=$producer generation=$gen bytes=${#REPLY} queued=$#_zrush_worker_txq"
   _zrush_worker_flush || return 1
@@ -2084,38 +2159,73 @@ _zrush_apply_highlights() {
   return 0
 }
 
-# ---------------------------------------------------------------- History menu
+# ---------------------------------------------------------------- History index and menu
 # See docs/internal/specs/behavior.md "履歴メニュー" and cli-protocol.md
 # "history profile".
+
+# Forget what the index held. The generation is the whole readiness question:
+# an invalid latch and a dirty index are one state, and both make the next menu
+# op start from a snapshot.
+_zrush_hist_reset() {
+  _zrush_hist_gen=0 _zrush_hist_head=0 _zrush_hist_count=0 _zrush_hist_unacked=0
+  return 0
+}
+
+# Same, for the invalidation points that happen outside the menu's own
+# fingerprint check (worker start/stop, unknown-generation, Level A).
+_zrush_hist_invalidate() {  # reason
+  _zlog "history: index dirty (reason=$1)"
+  _zrush_hist_reset
+}
+
+# The optimistic latch and the Level B baseline move together, at the moment a
+# write is enqueued (behavior.md "履歴メニュー": a frame that never arrives
+# surfaces as the next query's unknown-generation, not as a silent stale index).
+# HISTCMD at that moment is head + 1, so head carries both halves of the
+# recorded (HISTCMD, ${#history}) pair.
+_zrush_hist_latch() {  # generation head count
+  _zrush_hist_gen=$1 _zrush_hist_head=$2 _zrush_hist_count=$3
+  return 0
+}
+
+# Is this history line one the sender excludes wholesale (cli-protocol.md
+# "history profile")? Empty lines and lines carrying a framing byte. The
+# snapshot walk repeats this test inline rather than calling here: one zsh
+# function call per history entry measures ~4us, which is ~90ms of the 100ms
+# deadline at the 20000-entry retention cap.
+_zrush_hist_excluded() {  # line
+  [[ -z $1 || $1 == *$'\0'* || $1 == *$'\1'* || $1 == *$'\2'* ]]
+}
+
+# Bootstrap payload: the whole in-memory history, newest first, up to the byte
+# ceiling. No dedup and no `[history].limit` slicing -- both belong to the
+# worker's query (cli-protocol.md "history profile").
 #
 # $history maps event numbers to lines and its values come out newest first.
-# Event numbers have gaps, so the newest `limit` entries are the first `limit`
-# values -- never a decrement from HISTCMD, and never `fc` output (multi-line
-# entries break its line-oriented format).
-_zrush_history_payload() {  # -> REPLY = candidate payload bytes
+# Event numbers have gaps, so this walks the values -- never a decrement from
+# HISTCMD, and never `fc` output (multi-line entries break its line-oriented
+# format).
+_zrush_history_snapshot_payload() {  # -> REPLY = payload, REPLY_HEAD/REPLY_COUNT = the baseline it describes
   emulate -L zsh
   # Byte-exact lengths for the payload ceiling below, as in _zrush_netstring.
   local LC_ALL=C
-  local -i limit=$ZRUSH_CFG_HISTORY_LIMIT
-  local -a kv=()
-  (( limit > 0 )) && kv=( "${(@kv)history}" )   # one bulk expansion: event/line pairs, newest first
-  local -A seen=()
+  # Recorded before the walk: the head a snapshot establishes is HISTCMD - 1 as
+  # observed at synthesis, not the largest `n` that made it into the payload
+  # (behavior.md "履歴メニュー": the newest events may be excluded or cut).
+  typeset -g REPLY_HEAD=$(( HISTCMD - 1 )) REPLY_COUNT=$#history
+  local -a kv=( "${(@kv)history}" )   # one bulk expansion: event/line pairs, newest first
   local event line block=b$'\1'
   local -i pending=0 size=0
   local -i total=3          # the leading b\1 and the trailing \0 below
   local -a blocks=()
-  for event line in "${(@)kv[1,2 * limit]}"; do   # two elements per entry
-    # Within the raw scan window (nothing is pulled in from outside it to make
-    # up for a drop), reject empty/framing-byte lines and retain only the
-    # newest event number for each distinct line.
+  for event line in "${(@)kv}"; do   # two elements per entry
+    # _zrush_hist_excluded, inlined for the walk's per-entry cost.
     [[ -n $line && $line != *$'\0'* && $line != *$'\1'* && $line != *$'\2'* ]] || continue
-    (( ${+seen[$line]} )) && continue
-    # The scan stops at the record that would cross the payload ceiling, so the
-    # window is bounded by whichever of limit and the ceiling comes first.
+    # The scan stops at the record that would cross the payload ceiling, and
+    # never mid-record: the payload is a newest-side prefix of the history.
     size=$(( ${#line} + ${#event} + 6 ))   # \0 w \1 line \2 n \1 event
     (( total + size > _ZRUSH_HISTORY_PAYLOAD_MAX_BYTES )) && break
     (( total += size ))
-    seen[$line]=1
     block+=$'\0'w$'\1'$line$'\2'n$'\1'$event
     # Appending to a zsh string or array copies everything it already holds, so
     # growing either one record at a time is quadratic. Sealing the open block
@@ -2127,17 +2237,77 @@ _zrush_history_payload() {  # -> REPLY = candidate payload bytes
   return 0
 }
 
-# behavior.md "履歴メニュー": the store and the plan share the single absolute
-# deadline that starts once the payload is synthesized, and the exchange ends
-# on the plan's terminal response -- the store's is consumed on the way there.
-_zrush_request_plan_sync() {
+# One event, in the same record stream shape (a header batch, then the record).
+_zrush_history_append_payload() {  # event line -> REPLY = payload bytes
+  typeset -g REPLY=b$'\1'$'\0'w$'\1'$2$'\2'n$'\1'$1$'\0'
+  return 0
+}
+
+# Level A, once per prompt: O(1) continuity between the newest event and the
+# newest event the index was told about (behavior.md "履歴メニュー" 更新経路).
+# Everything expensive -- ${#history}, the bulk expansion, the fingerprint --
+# stays out of the path a prompt with no new event takes.
+_zrush_hist_reconcile() {
   emulate -L zsh
-  local payload=$1 producer=$2 query=$3 tspace=$4
+  setopt localoptions typesetsilent no_monitor no_notify
+  (( _zrush_hist_gen > 0 )) || return 0
+  # An update neither starts a worker nor queues for an absent one.
+  (( _zrush_worker_rfd >= 0 )) || return 0
+  (( !_zrush_worker_stopping && !_zrush_worker_runtime_tainted )) || return 0
+  local -i newest=$(( HISTCMD - 1 ))
+  (( newest == _zrush_hist_head )) && return 0
+  if (( newest != _zrush_hist_head + 1 )); then
+    _zrush_hist_invalidate continuity
+    return 0
+  fi
+  if (( _zrush_hist_unacked >= _ZRUSH_HIST_MAX_UNACKED )); then
+    _zrush_hist_invalidate unacked
+    return 0
+  fi
+  local line=$history[$newest]
+  local -i count=$#history
+  # An excluded event sends no frame, but head and the baseline advance exactly
+  # as they would have: a snapshot would drop that same line, so the index stays
+  # exact and the exclusion never reads as a permanent discontinuity.
+  if _zrush_hist_excluded "$line"; then
+    _zrush_hist_head=$newest _zrush_hist_count=$count
+    _zlog "history: append skipped event=$newest (excluded)"
+    return 0
+  fi
+  _zrush_history_append_payload $newest "$line"
+  _zrush_request_history history-append "$REPLY" $newest || return 0
+  _zrush_hist_latch $REPLY $newest $count
+  (( ++_zrush_hist_unacked ))
+  return 0
+}
+
+# behavior.md "履歴メニュー": one absolute deadline, anchored here -- once the
+# payload is synthesized, on the cold path -- covers the lazy worker start, the
+# handshake, the optional history-snapshot and the plan pipelined behind it, and
+# ends on the plan's terminal response (the snapshot's is consumed on the way
+# there). Cold does not get a second deadline.
+_zrush_request_plan_sync() {  # cold snapshot-payload snapshot-head snapshot-count query
+  emulate -L zsh
+  local -i cold=$1
+  local payload=$2
+  local -i head=$3 count=$4
+  local query=$5
   local -F deadline=$(( EPOCHREALTIME + ${ZRUSH_HISTORY_DEADLINE_MS:-100} / 1000.0 )) remaining
-  _zrush_request_store live "$payload" || return 1
-  local -i gen=$REPLY
-  _zrush_request_plan $gen "$producer" "$query" "$tspace" 0 || return 1
+  local -i gen=$_zrush_hist_gen
+  if (( cold )); then
+    # The one path allowed to start a worker synchronously; the update path is
+    # not (behavior.md "worker ライフサイクル").
+    _zrush_worker_ensure_session || return 1
+    _zrush_request_history history-snapshot "$payload" || return 1
+    gen=$REPLY
+    _zrush_hist_latch $gen $head $count
+    _zrush_hist_unacked=0
+  fi
+  # cli-protocol.md "history profile": trailing-space is always false, so the
+  # inserted text is the history line verbatim.
+  _zrush_request_plan $gen history "$query" false 0 || return 1
   local -i target=$REPLY cs
+  _zlog "history: query request_id=$target generation=$gen limit=$ZRUSH_CFG_HISTORY_LIMIT"
   _zrush_sync_target=$target _zrush_sync_done=0 _zrush_sync_ok=0
   while (( !_zrush_sync_done )); do
     remaining=$(( deadline - EPOCHREALTIME ))
@@ -2170,9 +2340,9 @@ _zrush_request_plan_sync() {
 }
 
 # The one indivisible transition that opens the history menu: stop everything
-# in flight, drop the current listing, then synthesize, plan, show and select
-# position 1 in one go. Zero matches and a failed plan both leave the buffer
-# alone and consume the key.
+# in flight, drop the current listing, then check the index, synthesize when it
+# is cold, plan, show and select position 1 in one go. Zero matches and a failed
+# plan both leave the buffer alone and consume the key.
 _zrush_open_history_menu() {  # ZLE widget context
   emulate -L zsh
   _zrush_disarm_timer
@@ -2184,10 +2354,37 @@ _zrush_open_history_menu() {  # ZLE widget context
   # menu the moment it appears.
   _zrush_last_buffer=$BUFFER
   _zrush_last_cursor=$CURSOR
-  _zrush_history_payload
+  # Level B, at the entrance of the synchronous window: the recorded baseline is
+  # (HISTCMD, ${#history}) as of the last enqueued write, and head is that
+  # HISTCMD minus one. ${#history} is read only once the cheap halves agree.
+  local payload= reason=
+  local -i cold=1 head=0 count=0
+  if (( _zrush_hist_gen <= 0 )); then
+    reason=index
+  elif (( HISTCMD - 1 != _zrush_hist_head )); then
+    reason=head
+  else
+    count=$#history
+    if (( count != _zrush_hist_count )); then
+      reason=count
+    else
+      cold=0
+    fi
+  fi
+  if (( cold )); then
+    _zlog "history: fingerprint cold (reason=$reason)"
+    # Nothing may claim the old index from here on: the snapshot below
+    # re-establishes the latch and the baseline together.
+    _zrush_hist_reset
+    _zrush_history_snapshot_payload
+    payload=$REPLY head=$REPLY_HEAD count=$REPLY_COUNT
+  else
+    _zlog "history: fingerprint warm (generation=$_zrush_hist_gen)"
+  fi
   # cli-protocol.md "history profile": the whole buffer is the query (the
-  # sender strips NUL from --query) and trailing-space is always false.
-  if _zrush_request_plan_sync "$REPLY" history "${BUFFER//$'\0'/}" false && (( _zrush_plan_npos > 0 )); then
+  # sender strips NUL from --query).
+  if _zrush_request_plan_sync $cold "$payload" $head $count "${BUFFER//$'\0'/}" &&
+     (( _zrush_plan_npos > 0 )); then
     _zrush_selected=1
     _zrush_apply_plan
     _zlog "history: menu opened P=$_zrush_plan_npos"
