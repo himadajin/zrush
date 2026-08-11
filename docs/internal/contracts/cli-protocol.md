@@ -90,12 +90,17 @@ fd が closed / write-only である場合、または watchdog setup に失敗�
 request 処理を始める前に startup 診断を stderr へ 1 行書いて exit 1 する。
 起動後は stdin から要求を読み、
 `store` 要求では候補レコードストリームを解析してスロットへ格納し、
+`history-snapshot` / `history-append` 要求では同じ形式のストリームを解析して history index を
+置き換え・追記し、
 `plan` 要求ごとにマッチング・ランキング・グループ分割・グリッドレイアウト・ハイライト計算・
 ナビゲーション表構築・挿入テキスト構築を行って stdout へ応答する。
 one-shot の `zrush plan` サブコマンドは存在しない。
 
 ワーカーは **config.toml を読まない**。設定スナップショットは要求フィールドで受け取る
-(設定の取得・mtime 監視は zsh 側の責務)。`HISTFILE` も読まず、候補は `store` 要求で受け取る。
+(設定の取得・mtime 監視は zsh 側の責務)。`HISTFILE` も読まず、候補もそのイベント番号も
+`store` / `history-snapshot` / `history-append` 要求で受け取る。
+candidate store のスロットと history index はどちらも worker セッションに属し、
+worker の終了とともに失われる(永続化も再構築もしない)。
 ただしファイルシステムに対しては純粋でない: `f = 1` 候補の `/` 合成判定だけは要求の `cwd` を基準に stat する。
 
 ### abort control と worker 終了
@@ -134,7 +139,8 @@ message   = netstring(netstring(field-1) ... netstring(field-N))
   宣言長未満の EOF、外側 payload 内の不完全または余分なフィールドバイトは framing error である。
 - 読み取りの分割位置に意味はない。1 回の read に複数メッセージが含まれる場合、壊れた後続メッセージより前に
   完成していたメッセージは先に処理し、OS の read 境界によって配送結果を変えない。
-- 候補レコードストリームは `store` 要求の、描画プランストリームは `plan` の成功応答の、
+- 候補レコードストリームは `store` / `history-snapshot` / `history-append` 要求の、
+  描画プランストリームは `plan` の成功応答の、
   それぞれ 1 個の opaque field として入れ子にする。その内側の NUL フレーミングは後述の規範を保つ。
 - kind・build stamp・request_id・列挙値・真偽値・数値・error code は、以下に示す ASCII バイト列と
   完全一致しなければならない。前後空白、符号、別の大小文字表記を許さない。
@@ -168,34 +174,49 @@ worker が受ける `hello` の kind・フィールド数・stamp 表記自体�
 角括弧内は外側 message payload に固定順で並ぶ netstring field を表す。
 
 ```
-store: ["store", request_id, slot, candidate_generation, candidate_payload]
-plan:  ["plan", request_id, candidate_generation, cwd, producer, query, mode, smart_case,
-        rows, width, trailing_space]
-ok:    ["ok", request_id, body]
-error: ["error", request_id, code]
+store:            ["store", request_id, slot, candidate_generation, candidate_payload]
+history-snapshot: ["history-snapshot", request_id, candidate_generation, candidate_payload]
+history-append:   ["history-append", request_id, candidate_generation, candidate_payload]
+plan:             ["plan", request_id, candidate_generation, cwd, producer, query, mode,
+                   smart_case, rows, width, trailing_space, history_limit]
+ok:               ["ok", request_id, body]
+error:            ["error", request_id, code]
 ```
 
-要求は 2 種類ある。
-`store` は候補レコードストリームを worker へ渡して解析済みの candidate store に格納し、
-`plan` はその store を `candidate_generation` で参照して描画プランを得る。
+要求は 4 種類ある。
+`store` は候補レコードストリームを worker へ渡して解析済みの candidate store のスロットへ格納し、
+`history-snapshot` / `history-append` は同じ形式のストリームを worker の history index へ渡し、
+`plan` はスロットまたは history index を `candidate_generation` で参照して描画プランを得る。
 候補 payload は `plan` に載せない。
 
 - `request_id`: zsh が所有する `1..=9223372036854775807`(`i64::MAX`)の canonical ASCII 10 進識別子。
   先頭ゼロを付けない。
   シェルセッション内で単調増加し、worker の終了・再起動でもリセットまたは再利用しない。
   候補集合や履歴の revision を表す値ではない。
-- `slot`: `live` または `cache`。
+- `slot`: `live` または `cache`。`store` だけが持つフィールドである。
   zsh が所有する列挙であり、worker はスロットの意味を解釈しない。
   worker はスロットごとに最大 1 generation の解析済み candidate store を保持し、
   新しい `store` の受理は**同一スロットの**前 generation だけを破棄する(他スロットの generation は残る)。
   candidate store は worker セッションに属し、worker の終了とともに失われる。
+  history index はスロットではない。
+  `store` は index を変更せず、`history-snapshot` / `history-append` はどのスロットも変更しない。
 - `candidate_generation`: zsh が所有する `1..=9223372036854775807`(`i64::MAX`)の canonical ASCII 10 進識別子。
   先頭ゼロを付けない。
   `request_id` とは独立の値である。
   シェルセッション内で単調増加し、再利用せず、worker の終了・再起動でもリセットしない。
-  `store` では格納先の generation を、`plan` では参照する generation を表す。
-  `plan` の generation 検索はスロット横断で行い、ヒットしたスロットの解析結果から描画プランを計算する。
+  `store` では格納先の generation を、`history-snapshot` / `history-append` では
+  index に刻む generation を、`plan` では参照する generation を表す。
+  `plan` の generation 検索は 2 つのスロットと history index を横断して行い、
+  ヒットした側から描画プランを計算する(index は現 stamp との完全一致でヒットとする)。
+  index の revision は index を最後に書いた要求の `candidate_generation` そのものであり、
+  別の revision 識別子は存在しない。
 - `candidate_payload`: 後述の候補レコードストリーム全体をそのまま格納する opaque bytes。
+- `history_limit`: `plan` だけが持つ、先頭ゼロなしの正の canonical ASCII 10 進数
+  (`1..=9223372036854775807`)。
+  history index を参照する `plan` が index の新しい側から走査する件数の上限であり、
+  worker はこれを retention cap へクランプする(走査の意味論は「history profile」節)。
+  スロットを参照する `plan` では無視する
+  (`producer = history` 以外の要求でも値は必須であり、欠落・非 canonical 表記は不正である)。
 - `producer`: `compsys` または `history`。
   結果順に加えてレイアウト方針を選ぶ: `compsys` は最大 8 列・上から下、
   `history` は 1 列・下から上。レコード解釈・ハイライト・挿入テキスト構築は共通である
@@ -217,6 +238,26 @@ error: ["error", request_id, code]
   シンボリックリンクは追跡する。`~` は展開しない。cwd または対象パスを stat できない場合は
   「ディレクトリでない」と扱い、`/` を合成しない。
 
+history index は worker が保持する履歴専用の候補列で、スロットとは独立に 1 個だけ存在する。
+
+- `history-snapshot` は index の内容を要求の payload のレコード列で丸ごと置き換える。
+  `history-append` は要求の payload のレコード列を、その順のまま index の新しい側へ連結する
+  (1 件だけを運ぶ追記はその退化形である)。
+  どちらも受理と同時に index の stamp を要求の `candidate_generation` へ更新する。
+- 受理の条件は、要求の `candidate_generation` が index の現 stamp より**厳密に大きい**ことである。
+  `history-append` はさらに index が初期化済み(`history-snapshot` を 1 回以上受理済み)であることを要求する。
+  条件を満たさない要求は `unknown-generation` で終端し、index の内容も stamp も変更しない。
+  未初期化の index は stamp を持たないため、「厳密に大きい」の条件は空に成り立つ。
+  すなわち未初期化の index に対して `history-snapshot` は generation の値によらず受理され、
+  `history-append` は初期化済みの条件により generation の値によらず拒否される。
+  したがって worker の再起動・交換、途中で失われた追記、順序の巻き戻しはすべて
+  `unknown-generation` として同じ形で観測される。
+- worker は index を最大 **20000 件**(retention cap)保持し、これを超えた分は古い側から捨てる。
+  retention cap は `history_limit` が取り得る最大値
+  (config-schema.md `[history].limit` の上限)と同値であり、worker は要求の `history_limit` を
+  この値へクランプする。したがって query の走査範囲が eviction で欠けることはない。
+- index は worker セッションに属し、worker の終了とともに失われる。
+
 完全な message から canonical な `request_id` を回収できた後に要求を遂行できない場合、
 worker は同じ `request_id` の `error` を返してセッションを継続する。
 終端 `error` の `code` は要求の kind ごとに次のいずれかである。
@@ -225,38 +266,56 @@ worker は同じ `request_id` の `error` を返してセッションを継続�
 |---|---|---|
 | `store` | `invalid-request` | kind・固定フィールド・scalar・`slot` 列挙の不正 |
 | `store` | `invalid-payload` | 候補レコードストリームの framing error |
+| `history-snapshot` | `invalid-request` | kind・固定フィールド・scalar の不正 |
+| `history-snapshot` | `invalid-payload` | 候補レコードストリームの framing error |
+| `history-snapshot` | `unknown-generation` | index の現 stamp 以下の `candidate_generation` |
+| `history-append` | `invalid-request` | kind・固定フィールド・scalar の不正 |
+| `history-append` | `invalid-payload` | 候補レコードストリームの framing error |
+| `history-append` | `unknown-generation` | 未初期化の index への追記、または index の現 stamp 以下の `candidate_generation` |
 | `plan` | `invalid-request` | kind・固定フィールド・scalar の不正 |
-| `plan` | `unknown-generation` | どのスロットにも存在しない `candidate_generation` の参照 |
+| `plan` | `unknown-generation` | どのスロットにも history index にも存在しない `candidate_generation` の参照 |
 
-`invalid-request` と `invalid-payload` は要求自体の不正を、
-`unknown-generation` は整形としては正しい要求が参照先を持たないことを表す。
+`invalid-request` と `invalid-payload` は要求自体の不正を表す。
+`unknown-generation` は整形としては正しい要求が成立しないことを表し、
+`plan` では参照先が存在しないことを、`history-snapshot` / `history-append` では
+名乗った `candidate_generation` が index の現 stamp と両立しないこと
+(未初期化の index への追記を含む)を表す。
 `plan` は候補 payload を運ばないため、`invalid-payload` は `plan` の code 集合に現れない。
-`store` の検証順は、`request_id` の回収 → kind・フィールド数・scalar(`slot` 列挙を含む)→
-`candidate_payload` の framing である。
-scalar と payload の双方に不正がある要求では、先に検出される `invalid-request` を返す。
+`store` と history 2 種の検証順は、`request_id` の回収 → kind・フィールド数・scalar
+(`store` の `slot` 列挙を含む)→ `candidate_payload` の framing →
+(history 2 種のみ)index の受理条件、である。
+複数の不正がある要求では、先に検出されるものを返す。
 `error` で終わる `store` は既存のスロットをいっさい変更しない(全スロット無変更のまま終端 error を返す)。
+`error` で終わる `history-snapshot` / `history-append` も index の内容と stamp をいっさい変更しない。
 外側または nested netstring framing の破損、あるいは request_id の欠落・非 canonical 表記・範囲外によって
 安全に対応付けられない場合は応答せずセッションを終了する。
 
 `ready` を返したセッションでは、相関可能な各 request は `ok` または `error` の**終端応答をちょうど 1 個**受ける。
-`store` もこの規範に従う 1 個の request である。
+`store` と `history-snapshot` / `history-append` もこの規範に従う 1 個の request である。
 `incompatible` を返したセッションでその後に届くバイトは request ではなく、この規範の対象外である。
 worker は要求を受信順に処理し、応答を黙って省略しない。`error` も正常に形成された終端応答であり、
 worker セッション失敗には数えない。
-zsh は `store` の終端応答を待たずに、同じ generation を参照する `plan` をその後ろへ pipeline してよい
+zsh は `store` や `history-snapshot` / `history-append` の終端応答を待たずに、
+同じ generation を参照する `plan` をその後ろへ pipeline してよい
 (pipeline の許容範囲は握手の規範と同じ)。
-`ok` の `body` は kind で決まる: `store` の成功では空バイト列、
+受信順処理の帰結として、generation G を名乗る `plan` は、その `plan` より前に届いた
+`history-snapshot` / `history-append` の効果を**ちょうどすべて**反映した index を参照する
+(後から届く history 要求の効果は含まない)。
+zsh は index への書き込みを query より後ろへ並べ替えず、まとめて後回しにもしない。
+`ok` の `body` は kind で決まる: `store` と history 2 種の成功では空バイト列、
 `plan` の成功では後述の描画プランストリームそのものである。
 
-### `store` の `candidate_payload`(候補レコードストリーム)
+### `candidate_payload`(候補レコードストリーム)
 
 > 検証(この節と以下の小節): 送信側(zsh のエンコーダ)の発行規範 — `tests/vectors/encode/`(`zsh -f tests/zsh/vectors.zsh`)。
 > worker セッションを通した受信側(Rust のパーサ)の解釈規範と、候補ストリーム framing error の
 > `invalid-payload` 応答 — `tests/vectors/plan/`(`tests/vectors.rs`)。
 > パーサの全域性 — `src/record.rs` の proptest。
-> 「history profile」の送信側規範(イベント番号との対応、重複・制御バイト除外) —
+> 「history profile」の送信側規範(イベント番号との対応、制御バイト行の除外、バイト上限での打ち切り) —
 > `tests/zsh/vectors.zsh`。受信側の解釈は上記のベクタが覆う。
 > 「compsys 捕獲 profile」の transport 側の規範(pid レコードの除去)も上記の検証の範囲外。
+
+`store` / `history-snapshot` / `history-append` の `candidate_payload` は、すべてこの形式である。
 
 フレーミングは NUL(`\0`)終端のレコードが連続する形式。
 レコード内は `\2` で連結した `<tag>\1<value>` 形式のフィールドの並び。
@@ -315,9 +374,10 @@ match-text(マッチング・ハイライト計算・表示の対象テキスト
 Rust は zsh のクォート規則を一切実装しない
 (`${(Q)}` 復元・`${(q)}` クォートは zsh 側の責務)。
 
-Rust は重複候補(同一の match-text/display-text 組)を除去しない
-(送信側の発行順の情報を保つ。除去の導入は wire contract の変更である)。
-重複を送出してよいかは producer profile が定める。
+レコードストリームの解析そのものは重複候補(同一の match-text/display-text 組)を除去しない
+(送信側の発行順の情報を保つ)。
+重複を送出してよいか、解析結果に profile 固有の重複除去を掛けるかは producer profile が定める
+(「history profile」は index の query 時に除去し、「compsys 捕獲 profile」は除去しない)。
 
 #### スキップ規律(規範)
 
@@ -344,12 +404,16 @@ zpty 内で compsys を駆動して得る payload(behavior.md「候補収集」�
 - `store` 要求のフィールド値: `slot` は空語収集キャッシュの対象となる収集なら `cache`、それ以外の収集なら `live`。
   どの収集がキャッシュの対象かは behavior.md「空語収集キャッシュ」節が定める。
 - `plan` 要求のフィールド値: `producer` は `compsys`、`query` は広げ規則が定めるクエリ
-  (behavior.md「候補収集」節)、`trailing_space` は `[insert].trailing-space` の設定値。
+  (behavior.md「候補収集」節)、`trailing_space` は `[insert].trailing-space` の設定値、
+  `history_limit` は `[history].limit` の設定値(history profile と同じ値を常に載せる。
+  generation がスロットに解決する要求では worker が無視する)。
 
 #### history profile
 
-zsh が履歴から合成する payload。
-この payload から作られた一覧を履歴一覧、その候補を履歴候補と呼ぶ。
+zsh が `$history` から合成し、`history-snapshot` / `history-append` で worker の history index へ渡す payload。
+index から作られた一覧を履歴一覧、その候補を履歴候補と呼ぶ。
+
+**payload の形**(2 つの kind に共通):
 
 - 共有フィールドが全て空のバッチヘッダを 1 個だけ発行し、以降は候補レコードのみが続く
   (見出し `X` を含め、共有フィールドは 1 つも載せない)。
@@ -358,30 +422,54 @@ zsh が履歴から合成する payload。
   欠番を詰めず、キーをそのまま使う。`m` / `d` は発行しない
   (match-text も番号接頭辞を付ける前のセル表示テキストも `w` そのもの)。
 - 候補レコードは新しい順(最新の履歴行が先頭)。
-  `producer = history` は格納された候補レコードストリームの出現順を保つため(「マッチング・ランキングの意味論」節)、
+  `history-snapshot` はこの列で index を置き換え、`history-append` はこの列をその順のまま
+  index の新しい側へ連結するため、index 全体でも「新しい順」という 1 つの順序が保たれる。
+- フレーミングに使う制御バイト(`\0` `\1` `\2`)を含む履歴行は、
+  zsh が payload を合成する時点で**行ごと**除外する(バイトだけを削って残りを送ることはしない)。
+  空の履歴行も送らない。
+  それ以外の制御バイト(ESC・CR・TAB など)を含む履歴行は除外せず原バイト列のまま送り、
+  表示側の制御バイト→スペース正規化(「表示行の中身」節)に委ねる。
+- 送信側は重複除去をせず、`[history].limit` による絞り込みもしない。
+  index には受け取った列がそのまま入り、重複除去も走査範囲の制限も query 時に worker が行う(下記)。
+- `history-snapshot` の payload の総バイト数には固定の上限があり、
+  次の候補レコードを加えると上限を超える時点で合成を打ち切る(上限値は behavior.md「履歴メニュー」節)。
+  打ち切りは候補レコードの境界で行い、レコードの途中では切らない。
+  打ち切った場合、発行するレコードは新しい側の連続した一部になる。
+- `history-append` にはこのバイト上限を課さない。
+  上限は 100ms deadline の内側で運ぶバイト量を有界にするためのものであり、
+  追記はその外側のプロンプトごとの非同期経路で送るためである。
+- `history-append` の payload には、上記の除外規則を通ったイベントのレコードだけを載せる。
+  除外されたイベントについては要求そのものを送らないため、
+  候補レコードを 1 件も含まない追記が wire に現れることはない。
+
+**index の query**(`producer = history` の `plan` が index を解決したとき):
+
+- 走査対象は index の新しい側から `window = min(history_limit, index の件数)` 件である
+  (`[history].limit` を途中で上げても、index の件数がそれに満たない間の走査範囲は index 全体である)。
+- 走査範囲の中で、同一の履歴行(`w` のバイト列が一致するもの)は**最も新しい出現だけを残す**。
+  残った候補はその出現の位置と `n` を持つ。
+  走査範囲の外から補充はしないため、一覧の対象になる行数は `window` より少なくなり得る
+  (重複が走査枠を消費する)。
+- `producer = history` は走査順(新しい順)をそのまま保つため(「マッチング・ランキングの意味論」節)、
   この順序がそのまま位置番号順になり、位置 1 は**マッチした候補のうち最も新しい履歴行**になる
-  (クエリにマッチしない履歴行は位置を持たないため、位置 1 が payload の先頭レコードとは限らない。
+  (クエリにマッチしない履歴行は位置を持たないため、位置 1 が index の先頭エントリとは限らない。
   クエリが非空でもマッチ品質で並べ替わらない)。
   画面上では単一列を下から上へ配置するため、位置 1 が最下行になり、位置番号が大きいほど上に来る
   (「表示行の中身」節)。
-- 同一の履歴行は最新の 1 件だけを残す。この重複除去は送信側が合成時に行う。
-- フレーミングに使う制御バイト(`\0` `\1` `\2`)を含む履歴行は、
-  zsh が payload を合成する時点で**行ごと**除外する(バイトだけを削って残りを送ることはしない)。
-  それ以外の制御バイト(ESC・CR・TAB など)を含む履歴行は除外せず原バイト列のまま送り、
-  表示側の制御バイト→スペース正規化(「表示行の中身」節)に委ねる。
-- 対象は `[history].limit` 件を新しい方から走査した範囲(config-schema.md)。
-  重複除去と除外はこの範囲の中で行い、除外した分を範囲の外から補充しないため、
-  発行するレコード数は `limit` 以下になる。
-- payload の総バイト数には固定の上限があり、次の候補レコードを加えると上限を超える時点で
-  走査を打ち切る(behavior.md「履歴メニュー」節)。
-  打ち切りは候補レコードの境界で行い、レコードの途中では切らない。
-  打ち切った場合、発行するレコードは走査範囲のうち新しい側の連続した一部になる。
-- payload の合成は、全履歴の値の一括展開 1 回(履歴の総件数に線形)と、
-  走査範囲の処理(打ち切りまでに読んだ行数と行長に線形)からなる
-  (この payload は同期経路で合成される。behavior.md「履歴メニュー」節)。
-- `store` 要求のフィールド値: `slot` は `live`。
-- `plan` 要求のフィールド値: `producer` は `history`、`query` はバッファ全体(as-typed)、
-  `trailing_space` は常に `false`(挿入テキストを履歴行の原文と一致させるため)。
+
+**要求のフィールド値**:
+
+- `history-snapshot` / `history-append`: `candidate_generation` は zsh が新しく採番した値
+  (index の現 stamp より厳密に大きい。「要求と応答」節)。
+- `plan`: `producer` は `history`、`query` はバッファ全体(as-typed)、
+  `trailing_space` は常に `false`(挿入テキストを履歴行の原文と一致させるため)、
+  `history_limit` は `[history].limit` の設定値(config-schema.md)。
+- 履歴候補は `f = 1` を持たないため、`cwd` は履歴一覧の計算に影響しない。
+
+`history-snapshot` の payload の合成は、全履歴の値の一括展開 1 回(履歴の総件数に線形)と、
+打ち切りまでに読んだ行数と行長に線形な処理からなり、同期経路で行う。
+`history-append` の payload は該当イベントの読み出しだけで作り、履歴の総件数に依存しない
+(どちらをいつ送るかは behavior.md「履歴メニュー」節)。
 
 ### `plan` の `ok` body(描画プランストリーム)
 
@@ -624,7 +712,8 @@ zsh は一覧を消す。
   バイト列意味論を保つための意図的制限)。
 - ランキング: 結果順は `producer` で決まる。
   - `producer = compsys`: マッチ品質スコアの降順。同点は candidate payload での出現順(送信側が発行した順)を保つ。
-  - `producer = history`: candidate payload での出現順をそのまま保つ(マッチ品質で並べ替えない)。
+  - `producer = history`: 参照先の並び順(history index を走査した順、すなわち新しい順)を
+    そのまま保つ(マッチ品質で並べ替えない)。
     ティアはこのとき「候補を一覧に含めるかの判定(グループ単位の動的な絞り込みを含む)」と
     「ハイライト範囲の計算」にのみ使う。
   どちらの producer でも、ティアに 1 つも該当しない候補は一覧に含めない。
@@ -649,9 +738,10 @@ zsh は一覧を消す。
   それ以外の値は不正な応答であり、worker セッションを壊れたものとして終了する。
 - `error` は相関する要求の正常な終端応答である。その要求の結果を破棄し、それが現在の最新要求なら
   既存一覧も消す。stale 要求なら UI 状態を変えない。どちらの場合も worker は継続利用する。
-- `unknown-generation` は、`plan` が参照した generation を worker が保持していないことを表す。
+- `unknown-generation` は、`plan` が参照した generation を worker が保持していないこと、または
+  `history-snapshot` / `history-append` が名乗った generation が index の現 stamp と両立しないことを表す。
   他の `error` と同じく正常な終端応答であり、worker セッション失敗にも連続失敗回数にも数えない。
-  zsh はその要求も先行する `store` も replay しない。
+  zsh はその要求も先行する `store` / history 要求も replay しない。
   非同期の補完経路でのその後の扱いは、その `plan` が latch を参照して送ったものかどうかで決まる。
   - latch を参照して送った `plan`: その candidate store latch を無効化し
     (latch の所在と無効化点は behavior.md「worker ライフサイクル」節が定める)、
@@ -662,7 +752,11 @@ zsh は一覧を消す。
     決定的な `store` の失敗が再収集を無限に呼び戻さないための限定である。
   履歴メニューの同期交換では、どちらの場合も他の `error` と同じく交換の失敗として扱う
   (behavior.md「履歴メニュー」節)。
-- `store` の `ok` は body が空バイト列であることを検証する。
+  `history-snapshot` / `history-append` が `unknown-generation` で終端した場合は index の同期が
+  失われたことを表すため、zsh は history index latch を無効化する
+  (latch の所在と無効化点は behavior.md「worker ライフサイクル」節が定める)。
+  次の明示的な履歴メニュー操作が `history-snapshot` から作り直すだけで、payload の replay はしない。
+- `store` と `history-snapshot` / `history-append` の `ok` は body が空バイト列であることを検証する。
   空でなければ仕様を満たさない応答として扱い、プランを破棄する場合と同じく worker セッションを終了する。
 - `plan` の `ok` body が仕様を満たさない場合
   (最終フィールドの NUL 終端欠落、`L` / `P` / `H` が非負の数字列でない、
@@ -827,6 +921,11 @@ typeset -g _ZRUSH_EXPECTED_BUILD_STAMP='<build-stamp>'
    (要求の再送はしない)。
    空語収集キャッシュがヒットした場合は収集も `store` も行わず、
    worker が保持している generation を参照する `plan` 要求だけを送る(behavior.md「空語収集キャッシュ」節)。
-5. 非選択での select-prev(既定 ↑): zsh がメモリ上の履歴から payload を合成し、
-   `store`(`live`)と `producer = history` の `plan` を同期交換で連送して、返ったプランを同じように適用する
+5. 非選択での select-prev(既定 ↑): worker の history index が同期済みなら、
+   `producer = history` の `plan` だけを同期交換で送って、返ったプランを同じように適用する。
+   index が未初期化または dirty なら、zsh がメモリ上の履歴から payload を合成し、
+   `history-snapshot` と `plan` を同じ同期交換で連送する
    (fork も compsys も介さない。behavior.md「履歴メニュー」節)。
+6. コマンド確定後のプロンプトごと: index が同期済みで、直前のコマンドが 1 件の追記として説明できる場合、
+   zsh はその 1 件を `history-append` で送る(worker を起動することはない)。
+   説明できない変化を見つけた場合は index を dirty とし、次の履歴メニュー操作で作り直す。
