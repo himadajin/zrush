@@ -32,6 +32,15 @@
 #                no per-plan Rust process-spawn bucket:
 #                arm -> request -> capture-start -> compsys -> capture-transport
 #                    -> worker-roundtrip+apply
+#   history    : each history host reports three things. `index-cold` opens
+#                (first open of the host, then one forced discontinuity per
+#                later trial) and `index-warm` opens (the index already built)
+#                are separate classes, each with a per-open phase breakdown, so
+#                the payload synthesis and the snapshot send show up on cold and
+#                are visibly absent on warm. `TAX` rows are the per-prompt index
+#                update, measured from precmd entry, for the three prompt
+#                classes behavior.md distinguishes: a prompt that appends, one
+#                with no new event, and one whose index is not ready.
 emulate -L zsh
 setopt extended_glob
 zmodload zsh/zpty    || { print -u2 FATAL: zpty; exit 1 }
@@ -124,6 +133,10 @@ median() {
 }
 
 fmt() { [[ $1 == NA ]] && print -rn NA || printf '%.0f' $1 }
+# Sub-millisecond quantities are carried as whole microseconds: the median above
+# sorts numerically on the integer part only, which is fine for first-paint tens
+# of milliseconds but would misorder 0.4 against 0.378.
+fmtus() { [[ $1 == NA ]] && print -rn NA || printf '%.2f' $(( $1 / 1000.0 )) }
 
 paint_case() {  # $1=host-label $2=case-label $3=keys $4=pattern [$5=trials]
   local -i trials=${5:-${ZRUSH_LATENCY_TRIALS:-4}}
@@ -148,6 +161,12 @@ paint_case() {  # $1=host-label $2=case-label $3=keys $4=pattern [$5=trials]
 # ---------------------------------------------------------------- breakdown
 # Derive interval milliseconds from the final ZRUSH_LOG chain, walking back from latest render.
 ts_of() { typeset -g REPLY=${${${(z)1}[2]}%\]} }
+
+log_has_since() {  # $1=logfile $2=lines to skip $3=substring
+  local -a L=( ${(f)"$(<$1)"} )
+  [[ ${(j:
+:)L[$(( $2 + 1 )),-1]} == *$3* ]]
+}
 
 breakdown_last() {  # $1=logfile $2=number of leading lines to skip -> one table row
   local -a L=( ${(f)"$(<$1)"} )
@@ -314,20 +333,181 @@ paint_history_once() {  # $1=pattern $2=timeout -> REPLY=ms (NA if not reached)
   paint_once $'\e[A' $1 ${2:-20}
 }
 
-paint_history_case() {  # $1=host-label $2=case-label $3=pattern [$4=trials]
-  local -i trials=${4:-${ZRUSH_LATENCY_TRIALS:-4}}
+# Phases of one open transition, from the checkpoints behavior.md "履歴メニュー"
+# prescribes, in the order they are emitted:
+#   history: fingerprint cold|warm  -- the Level A/B verdict at the entrance
+#   history: snapshot ... bytes=N   -- cold only: payload synthesized and enqueued
+#   history: query ...              -- the plan request (cold: right behind the snapshot)
+#   plan: applied                   -- the listing is on screen
+# A cold row therefore carries the two phases a warm row must not have at all,
+# which is the whole point of splitting the two classes.
+breakdown_history_last() {  # $1=logfile $2=lines to skip $3=expected mode -> one table row
+  local -a L=( ${(f)"$(<$1)"} )
+  L=( "${(@)L[$(( $2 + 1 )),-1]}" )
+  local -i i ir=0
+  for (( i = $#L; i >= 1; --i )); do
+    [[ $L[i] == *" plan: applied "* ]] && { ir=i; break }
+  done
+  (( ir )) || { bad "WARN: breakdown-history: 'plan: applied' line not found"; return 1 }
+  local -F t_apply t_query t_snap t_fp
+  t_apply=0; t_query=0; t_snap=0; t_fp=0
+  local mode= bytes=NA
+  ts_of $L[ir]; t_apply=$REPLY
+  for (( i = ir - 1; i >= 1; --i )); do
+    case $L[i] in
+      *" history: query "*)         (( t_query == 0 )) && { ts_of $L[i]; t_query=$REPLY } ;;
+      *" history: snapshot "*)      (( t_snap == 0 ))  && { ts_of $L[i]; t_snap=$REPLY; bytes=${L[i]##*bytes=} } ;;
+      *" history: fingerprint cold "*) ts_of $L[i]; t_fp=$REPLY; mode=cold; break ;;
+      *" history: fingerprint warm "*) ts_of $L[i]; t_fp=$REPLY; mode=warm; break ;;
+    esac
+  done
+  (( t_fp && t_query )) || { bad "WARN: breakdown-history: incomplete chain"; return 1 }
+  [[ $mode == $3 ]] || bad "WARN: breakdown-history: expected $3, log says $mode"
+  if [[ $mode == cold ]]; then
+    (( t_snap )) || { bad "WARN: breakdown-history: cold open without a snapshot"; return 1 }
+    printf 'BREAK | mode=cold | fingerprint→snapshot=%6.1f | snapshot→query=%6.1f | query→apply=%6.1f | total(fingerprint→apply)=%6.1f ms | payload=%sB\n' \
+      $(( (t_snap - t_fp) * 1000 )) \
+      $(( (t_query - t_snap) * 1000 )) \
+      $(( (t_apply - t_query) * 1000 )) \
+      $(( (t_apply - t_fp) * 1000 )) \
+      $bytes >&2
+  else
+    (( t_snap )) && bad "WARN: breakdown-history: warm open synthesized a snapshot"
+    printf 'BREAK | mode=warm | fingerprint→query=%9.1f | synthesis=none | snapshot=none | query→apply=%6.1f | total(fingerprint→apply)=%6.1f ms\n' \
+      $(( (t_query - t_fp) * 1000 )) \
+      $(( (t_apply - t_query) * 1000 )) \
+      $(( (t_apply - t_fp) * 1000 )) >&2
+  fi
+  return 0
+}
+
+paint_history_trial() {  # $1=host-label $2=case-label $3=pattern $4=expected mode -> REPLY=ms
+  local -i skip=0
+  [[ -r $HOSTLOG ]] && skip=$(wc -l < $HOSTLOG)
+  paint_history_once $3 20 || { typeset -g REPLY=NA; return 1 }
+  local ms=$REPLY
+  out "CASE  | ${(r:12:)1} | ${(r:32:)2} | first-paint=$(fmt $ms)ms"
+  breakdown_history_last $HOSTLOG $skip $4
+  typeset -g REPLY=$ms
+  return 0
+}
+
+# One class of history-menu opens. `index-cold` takes its first sample from the
+# host's own first open (nothing has built the index yet, so that sample also
+# carries the lazy worker start) and forces the later ones with the rc's
+# _zrush_lat_resync, which makes Level A see a discontinuity the same way a real
+# one does. `index-warm` needs no preparation: the last cold open latched the
+# index, and opening a menu is not an invalidation point.
+history_class() {  # $1=host-label $2=case-label $3=pattern $4=mode $5=resync-before-later-trials(0/1) [$6=trials]
+  local -i trials=${6:-${ZRUSH_LATENCY_TRIALS:-4}}
   local -a ms=()
   local -i i
   for (( i = 1; i <= trials; ++i )); do
-    if paint_history_once $3 20; then
+    if (( $5 && i > 1 )) && ! run_cmd _zrush_lat_resync; then
+      bad "WARN: [$1/$2] forced resync before attempt $i did not complete"
+      break
+    fi
+    if paint_history_trial $1 "$2 #$i" $3 $4; then
       ms+=( $REPLY )
     else
       out "WARN: [$1/$2] attempt $i did not complete"
     fi
+    drain 0.3
   done
   median $ms
   (( $#ms == trials )) || bad "WARN: [$1/$2] $(( trials - $#ms )) of $trials attempts did not complete"
   out "PAINT | ${(r:12:)1} | ${(r:32:)2} | med=$(fmt $REPLY)ms | trials=[${(j:, :)${(@)ms/(#m)*/$(fmt $MATCH)}}]"
+  return 0
+}
+
+# ------------------------------------------------- Per-prompt index update tax
+# behavior.md "履歴メニュー" 更新経路: what every prompt pays, whether or not it
+# has anything to send. Two of the three classes emit no checkpoint of their own
+# (they return on arithmetic alone), so the host rc brackets _zrush_precmd with
+# MEAS-precmd / MEAS-precmd-end and this reads the first bracket of the window.
+tax_once() {  # $1=logfile $2=lines to skip -> REPLY/REPLY_ENQ = microseconds, REPLY_KIND
+  local -a L=( ${(f)"$(<$1)"} )
+  L=( "${(@)L[$(( $2 + 1 )),-1]}" )
+  local -F t0 t1 t2
+  t0=0; t1=0; t2=0
+  local kind=none
+  local -i i
+  for (( i = 1; i <= $#L; ++i )); do
+    if (( t0 == 0 )); then
+      [[ $L[i] == *" MEAS-precmd" ]] && { ts_of $L[i]; t0=$REPLY }
+      continue
+    fi
+    case $L[i] in
+      *" history: append request_id="*) (( t1 == 0 )) && { ts_of $L[i]; t1=$REPLY; kind=append } ;;
+      *" history: append skipped "*)    (( t1 == 0 )) && { ts_of $L[i]; t1=$REPLY; kind=excluded } ;;
+      *" MEAS-precmd-end")              ts_of $L[i]; t2=$REPLY; break ;;
+    esac
+  done
+  typeset -g REPLY=NA REPLY_ENQ=NA REPLY_KIND=$kind
+  (( t0 && t2 )) || return 1
+  local -i us
+  us=$(( (t2 - t0) * 1000000 ))   # an integer assignment truncates the float
+  REPLY=$us
+  if (( t1 )); then
+    us=$(( (t1 - t0) * 1000000 ))
+    REPLY_ENQ=$us
+  fi
+  return 0
+}
+
+tax_case() {  # $1=host-label $2=case-label $3=trigger(cmd|enter) $4=expected kind [$5=trials]
+  local -i trials=${5:-${ZRUSH_LATENCY_TRIALS:-4}}
+  local -a tot=() enq=()
+  local -i i skip
+  for (( i = 1; i <= trials; ++i )); do
+    skip=0
+    [[ -r $HOSTLOG ]] && skip=$(wc -l < $HOSTLOG)
+    # Either trigger ends on a sync command of its own, so the window always
+    # holds the bracket under test first and the sync command's bracket after it.
+    case $3 in
+      cmd)   send_line "print -r -- TAX-$i" ;;
+      enter) send_keys $'\r' ;;
+    esac
+    if ! sync_host; then
+      bad "WARN: [$1/$2] prompt $i did not return"
+      continue
+    fi
+    if tax_once $HOSTLOG $skip; then
+      [[ $REPLY_KIND == $4 ]] || bad "WARN: [$1/$2] prompt $i took the '$REPLY_KIND' path, expected '$4'"
+      tot+=( $REPLY )
+      [[ $REPLY_ENQ == NA ]] || enq+=( $REPLY_ENQ )
+    else
+      bad "WARN: [$1/$2] prompt $i produced no precmd bracket"
+    fi
+  done
+  (( $#tot == trials )) || bad "WARN: [$1/$2] $(( trials - $#tot )) of $trials prompts were not measured"
+  median $tot; local m_tot=$REPLY
+  median $enq; local m_enq=$REPLY
+  local col
+  if [[ $m_enq == NA ]]; then
+    col="precmd→enqueue: no frame sent            "
+  else
+    col="precmd→enqueue med=$(fmtus $m_enq)ms [${(j:, :)${(@)enq/(#m)*/$(fmtus $MATCH)}}]"
+  fi
+  out "TAX   | ${(r:12:)1} | ${(r:32:)2} | $col | precmd total med=$(fmtus $m_tot)ms [${(j:, :)${(@)tot/(#m)*/$(fmtus $MATCH)}}]"
+  return 0
+}
+
+# The three per-prompt classes, in the only order that lets each one hold: the
+# append class leaves the index latched, the no-new-event class does not touch
+# it, and the resync that sets up the not-ready class is deliberately last.
+history_tax_suite() {  # $1=host-label
+  tax_case $1 "per-prompt: append sent"     cmd   append
+  tax_case $1 "per-prompt: no new event"    enter none
+  local -i skip=0
+  [[ -r $HOSTLOG ]] && skip=$(wc -l < $HOSTLOG)
+  if run_cmd _zrush_lat_resync; then
+    log_has_since $HOSTLOG $skip 'history: index dirty (reason=continuity)' ||
+      bad "WARN: [$1] forced resync did not invalidate the index"
+  else
+    bad "WARN: [$1] forced resync before the not-ready class did not complete"
+  fi
+  tax_case $1 "per-prompt: index not ready" cmd   none
   return 0
 }
 
@@ -376,7 +556,9 @@ paint_history_case() {  # $1=host-label $2=case-label $3=pattern [$4=trials]
   # measurements only -- same convention as the cases above.
   out "==== hist-5000 (history menu, default [history].limit=5000, ~5000-entry history) ===="
   if start_hist_latency hist5000 5000 0; then
-    paint_history_case hist5000 "empty-buf Up (5000)" 'needle-latency-target'
+    history_class hist5000 "index-cold (5000)" 'needle-latency-target' cold 1
+    history_class hist5000 "index-warm (5000)" 'needle-latency-target' warm 0
+    history_tax_suite hist5000
   else
     bad "FATAL: hist5000 failed to start"
   fi
@@ -384,7 +566,9 @@ paint_history_case() {  # $1=host-label $2=case-label $3=pattern [$4=trials]
 
   out "==== hist-20000-long (limit=20000, 20000-entry history, long single lines) ===="
   if start_hist_latency hist20000 20000 1 20000; then
-    paint_history_case hist20000 "empty-buf Up (20000, long lines)" 'needle-latency-target'
+    history_class hist20000 "index-cold (20000, long)" 'needle-latency-target' cold 1
+    history_class hist20000 "index-warm (20000, long)" 'needle-latency-target' warm 0
+    history_tax_suite hist20000
   else
     bad "FATAL: hist20000 failed to start"
   fi

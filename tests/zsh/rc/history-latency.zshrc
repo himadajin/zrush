@@ -27,4 +27,25 @@ done
 # driver can wait for one fixed, unambiguous string regardless of _zrt_n.
 print -sr -- 'echo needle-latency-target'
 
+# Force the worker's history index back to cold, from the outside: injecting one
+# event makes HISTCMD advance by two (this command plus the injected line),
+# which Level A reads as a discontinuity (behavior.md "履歴メニュー"). No
+# _zrush_hist_* internal is touched, so the driver measures the same cold path a
+# real discontinuity takes. The injected line is the needle itself, so the next
+# empty-buffer Up still paints a known string.
+_zrush_lat_resync() { print -sr -- 'echo needle-latency-target' }
+
+# Measurement seam for the per-prompt index update (driver-latency.zsh only):
+# bracketing _zrush_precmd lets the driver time precmd entry -> history-append
+# enqueue -> precmd exit out of ZRUSH_LOG alone, for the prompt classes that
+# emit no checkpoint of their own (no new event, index not ready).
+functions[_zrush_precmd_latorig]=$functions[_zrush_precmd]
+_zrush_precmd() {
+  _zlog "MEAS-precmd"
+  _zrush_precmd_latorig "$@"
+  local -i _zrt_st=$?
+  _zlog "MEAS-precmd-end"
+  return $_zrt_st
+}
+
 print MARK-RC-DONE
