@@ -37,6 +37,10 @@ pub mod keys {
     /// The whole `region_highlight` array, third-party entries included.
     pub const DUMP_ALL_RH: &str = "\x18a";
     pub const DUMP_WORKER: &str = "\x18w";
+    /// Empty-word-cache validity: `fpmatch=<0|1> age=<seconds|-1>`.
+    pub const DUMP_CACHE: &str = "\x18c";
+    /// Age the empty-word cache entry past its fixed TTL.
+    pub const AGE_CACHE: &str = "\x18n";
     /// Listing kind, selection and position count (history rc only).
     pub const DUMP_KIND: &str = "\x18k";
     /// The `$history` event number of the newest fixture line (history rc only).
@@ -669,6 +673,12 @@ impl Host {
     pub fn worker_state(&mut self) -> String {
         self.dump_get(keys::DUMP_WORKER, "TESTWORKER")
             .expect("worker-state dump did not run")
+    }
+
+    /// The `^Xc` empty-word-cache dump.
+    pub fn cache_state(&mut self) -> String {
+        self.dump_get(keys::DUMP_CACHE, "TESTCACHE")
+            .expect("cache-state dump did not run")
     }
 
     /// Poll `^Xw` until the dump carries every one of `fields`, returning it;

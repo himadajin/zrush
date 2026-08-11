@@ -114,6 +114,9 @@ fn active_session_deaths_open_the_breaker_and_a_re_source_recovers() {
         .is_ok();
 
     // ---- the lazy replacement, held after ready and assignment ----
+    // The fake parks on the first request it reads -- the `store` -- with the
+    // `plan` of the same collection already queued behind it, so a held
+    // collection leaves two outstanding requests (cli-protocol.md 「要求と応答」).
     host.fake().set_mode(Mode::Hold);
     let held0 = host.fake().count(&format!("hold {second} "));
     host.send_keys("ls fx/basic/");
@@ -124,7 +127,7 @@ fn active_session_deaths_open_the_breaker_and_a_re_source_recovers() {
             && held
             && state_has(
                 &replacement,
-                &["ready=1", "failures=1", "disabled=0", "pending=1"]
+                &["ready=1", "failures=1", "disabled=0", "pending=2"]
             )
             && host.fake().starts() == starts0 + 2,
         "(err-1c) held replacement state missing: clean={first_death_clean} held={held} \
@@ -259,4 +262,81 @@ fn active_session_deaths_open_the_breaker_and_a_re_source_recovers() {
 
     // The panic inside send_keys_wait_plan is this case's assertion.
     host.send_keys_wait_plan(PlanShape::Nonempty, "ls fx/basic/al"); // (err-5b)
+}
+
+/// A well-formed terminal `error` ends its request for good: neither that
+/// `plan` nor the `store` it was pipelined behind is sent again, and no
+/// candidate generation is spent recovering. Only the next real input makes the
+/// next generation (cli-protocol.md 「応答の検証と zsh 側の適用」,
+/// behavior.md 「worker ライフサイクル」).
+#[test]
+fn a_failed_request_is_not_replayed_and_only_new_input_makes_a_generation() {
+    let mut host = Host::boot_fake();
+    // Every `store` this mode sees succeeds and every `plan` gets an in-band
+    // `error`, so the failing request is a correlated one -- not a session
+    // failure that would discard the pair for a different reason.
+    host.fake().set_mode(Mode::Error);
+
+    let errors0 = host.log_count("worker: error request_id=");
+    // An argument position: this collection stores into `live`, so the
+    // empty-word cache plays no part in what is or is not resent.
+    host.send_keys("ls fx/basic/al");
+    assert!(
+        host.wait_log(
+            "worker: error request_id=",
+            errors0,
+            Duration::from_secs(10)
+        ),
+        "(err-6a) the fake session never answered the plan with an in-band error"
+    );
+
+    let store_line = host
+        .last_log_line("worker: queued store request_id=")
+        .expect("(err-6a) no store was queued for the collection");
+    let plan_line = host
+        .last_log_line("worker: queued request_id=")
+        .expect("(err-6a) no plan was queued for the collection");
+    let store_id = dump_field(&store_line, "request_id").to_string();
+    let plan_id = dump_field(&plan_line, "request_id").to_string();
+    let settled = host.worker_state();
+    let candgen = dump_field(&settled, "candgen").to_string();
+
+    // Long enough for a replay or an unsolicited recollection to show up.
+    host.drain(Duration::from_secs(1));
+    let idle = host.worker_state();
+    assert!(
+        host.fake().requests_for(&store_id) == 1
+            && host.fake().requests_for(&plan_id) == 1
+            && state_has(
+                &idle,
+                &[
+                    &format!("candgen={candgen}"),
+                    "pending=0",
+                    "staged=0",
+                    "failures=0",
+                    "disabled=0",
+                ]
+            ),
+        "(err-6b) the failed pair was replayed or spent a generation: \
+         store={store_id} plan={plan_id} state={idle}"
+    );
+
+    // One more keystroke: one new collection, one new generation.
+    let stores0 = host.log_count("worker: queued store request_id=");
+    host.send_keys("p");
+    assert!(
+        host.wait_log(
+            "worker: queued store request_id=",
+            stores0,
+            Duration::from_secs(10)
+        ),
+        "(err-6c) the next real input did not reach the worker"
+    );
+    let next: i64 = candgen.parse().expect("numeric candgen");
+    let after = host.worker_state();
+    assert!(
+        state_has(&after, &[&format!("candgen={}", next + 1)]),
+        "(err-6d) the next input did not make exactly one new generation \
+         (was candgen={candgen}): {after}"
+    );
 }

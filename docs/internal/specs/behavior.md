@@ -60,7 +60,7 @@ zsh は zle 統合・compsys 呼び出しによる捕獲・プランの適用
   まで保持し、response EOF まで上記の rollback quarantine を続ける。readiness cleanup を保証できない場合は
   fail-closed のまま direct な明示 cleanup または shell exit に委ねてよい。EOF finalization 後も taint は残り、
   同じ source generation で worker を交換しない。
-- worker は最初の実 plan 要求で遅延起動し、対話シェルごとに高々 1 個とする。
+- worker は最初の実要求で遅延起動し、対話シェルごとに高々 1 個とする。
   stdin/stdout は request/response FIFO に接続し、abort-control FIFO の read fd を
   `zrush worker --control-fd N` で渡す(詳細は `../contracts/cli-protocol.md`)。
   worker と短命な writer child は対話シェルの job table に登録せず、zsh は両者の numeric PID を
@@ -74,8 +74,9 @@ zsh は zle 統合・compsys 呼び出しによる捕獲・プランの適用
   control channel や request FIFO の EOF、job/exit status から完了を推測しない。
 - request/response の nested-netstring と `hello` / `ready` は
   `../contracts/cli-protocol.md` が定める。通常の補完経路は cold start・握手・応答を同期的に待たず、
-  response fd の `zle -F` callback で進める。同期的に起動/plan 応答を待てるのは履歴メニューだけで、
-  その 1 本の絶対 100ms deadline に起動・握手・先行 request・対象応答をすべて含める。
+  response fd の `zle -F` callback で進める。同期的に起動と応答を待てるのは履歴メニューだけで、
+  その 1 本の絶対 100ms deadline に起動・握手・先行 request・`store` と `plan` の連送・
+  `plan` の終端応答をすべて含める。
 - worker stdin への送信単位は完成済み frame 1 個で、outbound queue に send offset を持たない。
   対話シェル自身は request FIFO へ blocking write せず、cloexec 付き request write fd を fork した
   短命な writer child に渡す。fork した child は request と通知以外の transport fd copy を直ちに閉じ、
@@ -106,6 +107,18 @@ zsh は zle 統合・compsys 呼び出しによる捕獲・プランの適用
   **異常 abort** がある。どちらも最初に stopping gate を立て、normal callback と新しい enqueue/send/start を止め、
   unhanded frame と session の未完了 request をすべて破棄し、一覧を消して replay しない。
   zrush の disable policy は stop mode と別に決める。
+- 解析済みの候補は worker がスロット(`live` / `cache`)ごとに candidate generation 単位で保持する
+  (`../contracts/cli-protocol.md`「要求と応答」節)。
+  zsh が要求を跨いで参照するのは `cache` スロットだけであり、
+  「現 worker session が `cache` スロットにどの generation を保持しているか」を
+  **candidate store latch** として持つ。
+  `live` スロットの store は直後に連送する `plan` からしか参照しないため、latch を持たない。
+  candidate store は worker session に属するため、latch は worker の起動・正常 shutdown・異常 abort・
+  session failure・worker の交換・re-source のたび、および latch を参照して送った `plan` が
+  `unknown-generation` を受けたときに無効化する。
+  latch を無効化した generation を payload の再送で復元することはせず、
+  失敗した `store` / `plan` も replay しない。
+  新しい generation を作るのは新しい収集だけである。
 - 正常 shutdown は unhanded frame を破棄し、unacked writer があれば full-frame ack を待つ。
   ack を受けると writer が既に自身の request fd を閉じているため、対話シェルの request write fd を閉じて
   frame 境界の EOF を作る。その後も abort-control write fd は閉じず、response FIFO を bytes のまま EOF まで
@@ -137,7 +150,8 @@ zsh は zle 統合・compsys 呼び出しによる捕獲・プランの適用
   worker が健全に finalization された後、ユーザーが明示的に re-source した場合だけ、この reason と
   failure counter を 0 に戻して新しい worker 起動を許可する。request_id、callback generation、warning latch は
   戻さず、未完了 request の replay もしない。自動 build-stamp re-source はこの解除を行わない。
-  invalid handshake、request_id 枯渇、runtime setup failure など別の disable reason はこの操作で解除しない。
+  invalid handshake、request_id または candidate_generation の枯渇、runtime setup failure など
+  別の disable reason はこの操作で解除しない。
 - 正しい形の `incompatible`、stamp の異なる `ready`、source/config の build-stamp 不一致は stale build として
   失敗回数を介さず `$ZRUSH_BIN init zsh` の自動 re-source を 1 回だけ試みる。成功時は警告せず診断ログだけを残し、
   検出時点の未完了 request はすべて破棄して replay しない。re-source の失敗または re-source 中の再不一致だけが
@@ -197,8 +211,14 @@ zsh は zle 統合・compsys 呼び出しによる捕獲・プランの適用
   候補レコードを継承 pipe fd へ NUL 区切りで搬出する(終端 = EOF)。
   フレーミングに使う制御バイト(NUL、`\1`、`\2`)を含む候補は一覧に載らない。
   レコードのタグ構成(バッチヘッダ・`m` タグを含む)は
-  `../contracts/cli-protocol.md`(plan 要求の `candidate_payload`)の契約に従う。
+  `../contracts/cli-protocol.md`(`store` 要求の `candidate_payload`)の契約に従う。
   キャンセルは worker 自己申告 pid のプロセスグループへの SIGINT → `zpty -d`。
+- 収集が完走したら、その payload を新しい candidate generation の `store` 要求で worker へ渡し、
+  続けて同じ generation を参照する `plan` 要求を連送する
+  (`../contracts/cli-protocol.md`「要求と応答」節)。
+  スロットは空語収集キャッシュの対象となる収集が `cache`、それ以外の収集が `live`。
+  どの収集がキャッシュの対象かは「空語収集キャッシュ」節が定める。
+  payload を zsh 側に保持することはせず、後続の要求は generation 参照だけで済ませる。
 - 新しいリクエストの開始時に進行中の収集をキャンセルする。
   **キャンセルされたリクエストの結果は、その後に到着しても表示に使わない**
   (`zpty -d` 後に届く残留データは捨てる)。
@@ -224,21 +244,31 @@ zsh は zle 統合・compsys 呼び出しによる捕獲・プランの適用
 行頭のコマンド位置(広げ結果が空文字列)の収集は最重量ケース(全コマンド名)のため、
 結果をプロンプトを跨いでキャッシュする。
 
-- 対象は広げ結果が空文字列の収集のみ。`sudo ` 後などのコマンド位置は対象外。
-- キャッシュが保持するのは**生の捕獲 payload(ワーカーの pid レコードを取り除いた形。
-  cli-protocol.md)・フィンガープリント・保存時刻**の 3 つ。
-  解析・マッチング結果そのものはキャッシュしない(解析は Rust worker の責務のため)。
-- 検証は使用時に行う: **フィンガープリント**(`$PATH` 文字列 + PATH 各ディレクトリの
+- 対象は広げ結果が空文字列の収集のみ。
+  `sudo ` 後などのコマンド位置は広げ結果が非空になるため対象外である。
+  広げ結果が空文字列でも、捕獲した payload が空の収集は対象外とする。
+  ここで対象とした収集だけが `cache` スロットを使い、それ以外の収集は `live` スロットを使う
+  (cli-protocol.md「要求と応答」節)。
+- 解析済みの候補を保持するのは worker の `cache` スロットである(cli-protocol.md「要求と応答」節)。
+  zsh が保持するのは**フィンガープリント・保存時刻・`cache` スロットの candidate store latch**
+  (現 worker session が保持している generation)の 3 つだけで、生の捕獲 payload は保持しない。
+- 検証は使用時に行う。
+  ヒットの条件は次の 3 つがすべて成り立つこと:
+  **フィンガープリント**(`$PATH` 文字列 + PATH 各ディレクトリの
   mtime + 関数・エイリアス・ビルトインの個数。`autocd` 有効または PATH に相対要素が
-  ある場合のみ `$PWD` を含める)の一致と、**TTL 300 秒**(固定値)。
-- ヒット時は compsys の fork をせず、キャッシュした payload をそのまま plan 要求の
-  `candidate_payload` に入れて結果を得る。ミス時は通常どおり収集し、成功時に payload とフィンガープリントを保存する。
+  ある場合のみ `$PWD` を含める)の一致、**TTL 300 秒**(固定値)以内、latch が有効であること。
+- ヒット時は compsys の fork も `store` も行わず、latch が指す generation を参照する `plan` 要求だけを送る
+  (payload の転送も再解析も起こらない)。
+- ミス時は通常どおり収集し、成功時に新しい generation を `cache` スロットへ `store` してから
+  フィンガープリント・保存時刻・latch を更新する。
+  worker session を失った後は latch が無効なため、フィンガープリントと TTL が有効でもミスとして再収集する
+  (latch の無効化点は「worker ライフサイクル」節)。
 - 既知の癖: compsys が補完関数を遅延ロードすると関数個数が増え、直後の 1 回だけ
   余計にミスする。これは正しい無効化であり一度きりで収束する。
 
 ## マッチング
 
-- 常駐 Rust worker の plan 要求処理が担う。ティア序列は
+- 常駐 Rust worker の `plan` 要求処理が担う。ティア序列は
   **prefix > substring > edit(誤字許容)> fuzzy(部分列)** で、`mode` が
   どのティアまで拾うかの上限を決める。prefix / substring は literal、edit / fuzzy は
   approximate とする。`mode` が許す literal マッチが 1 件以上あれば approximate マッチを
@@ -262,7 +292,7 @@ zsh は zle 統合・compsys 呼び出しによる捕獲・プランの適用
   worker が補完一覧ではランキング上位 `rows × 8` 件、履歴一覧では先頭 `rows` 件
   (それぞれのレイアウトが取り得る最大容量)までをレイアウト対象に取る
   (Rust 内部の上限。プロトコルには現れない)。
-- 補完一覧の plan 要求は、収集完了後の非同期結果経路から worker へ送る。
+- 補完一覧の要求(`store` と `plan`)は、収集完了後の非同期結果経路から worker へ送る。
   応答は worker stdout の `zle -F` コールバックで受け、キー入力を同期的に待たせない
   (「入力は決してブロックしない」原則)。
   例外は履歴メニューで、こちらは select-prev の押下時に同期実行する(「履歴メニュー」節)。
@@ -275,7 +305,7 @@ zsh は zle 統合・compsys 呼び出しによる捕獲・プランの適用
   挿入テキストは原文のまま返る。
 - 端末リサイズ時: 描画プランは要求時点の `rows` / `width` に基づくスナップショットであり、
   リサイズ直後に自動で再計算されることはない。
-  次の plan 要求までのレイアウトのズレは仕様外として許容する。
+  次の `plan` 要求までのレイアウトのズレは仕様外として許容する。
 - 装飾は `[display.highlight]` の 4 種(selected / match / heading / history-number)。
   match と history-number の装飾は選択中セルには適用しない
   (実現方法は cli-protocol.md「ハイライト」節: 選択変更のたびに
@@ -330,7 +360,9 @@ zsh は zle 統合・compsys 呼び出しによる捕獲・プランの適用
   遅れて到着した補完結果が履歴メニューを置き換えることはない。
 - payload は zsh がメモリ上の履歴から合成する(fork も compsys も介さない。
   合成規則は cli-protocol.md「history profile」)。
-  worker との plan 要求/応答を同期的に待つのはこの経路だけである。
+  合成した payload は新しい candidate generation の `store` 要求(`live` スロット)で送り、
+  続けて同じ generation を参照する `plan` 要求を連送する。
+  worker との要求/応答を同期的に待つのはこの経路だけである。
 - 合成する payload の総バイト数には**固定の上限 262144 バイト(256 KiB)**を置く。
   新しい方から走査し、次の候補レコードを加えると上限を超える時点で走査を打ち切る。
   そのレコードとそれより古い履歴行は送らず、レコードの途中で切ることもしない。
@@ -339,15 +371,17 @@ zsh は zle 統合・compsys 呼び出しによる捕獲・プランの適用
   1 行の長さには上限を設けないため、`[history].limit` 件に達するより先にバイト上限へ達することがあり、
   その場合に履歴一覧が対象にするのは走査範囲のうち新しい側の一部だけになる。
   最も新しい候補レコード 1 件だけで上限を超える場合は候補が 0 件になり、後述の「マッチ 0 件」に従う。
-- 履歴 payload の合成が完了した直後から、対象 request_id の完全な終端応答を受け取るまでを
+- 履歴 payload の合成が完了した直後から、`plan` 要求の完全な終端応答を受け取るまでを
   **1 本の絶対 100ms deadline**で制限する。worker が未起動なら、その起動・`hello` / `ready` 握手・
-  要求送信・完全な応答受信をすべて同じ 100ms に含める。deadline は固定方針であり設定項目にしない。
+  `store` と `plan` の送信・`store` の終端応答の消費・完全な `plan` 応答の受信をすべて同じ 100ms に含める。
+  deadline は固定方針であり設定項目にしない。
   環境変数 `ZRUSH_HISTORY_DEADLINE_MS`(ミリ秒、未設定時は 100)で deadline を上書きできるが、これは `zsh/zrush.zsh` の `ZRUSH_BIN` と `ZRUSH_NO_INIT` に倣ったテストドライバ専用の seam である。
   payload 合成に費やす時間はこの deadline に含めない。
-- 対象 request_id の完全な終端応答を受信した時点で同期待ちは終了する。
+- `plan` 要求の完全な終端応答を受信した時点で同期待ちは終了する
+  (先行する `store` の終端応答はその途中で消費する)。
   受信済みで未処理の後続応答は同期待ちの中では処理せず、非同期経路が引き取る。
 - 同期待ちの間に先行する非同期要求の応答を受けた場合も通常どおり終端まで読み、stale なら破棄して
-  対象 request_id を待ち続ける。先行要求の outbound queue 送信と直列処理に費やす時間も同じ deadline を消費する。
+  `plan` 要求の request_id を待ち続ける。先行要求の outbound queue 送信と直列処理に費やす時間も同じ deadline を消費する。
   deadline を要求ごと・write/read ごとに延長しない。超過時は worker プロセスを終了させて消滅を確認し、
   watcher を解除して pipe fd を閉じてから、その session の未完了要求をすべて破棄する。自動 replay しない
   (連続失敗の扱いは「worker ライフサイクル」)。
@@ -377,9 +411,9 @@ zsh は zle 統合・compsys 呼び出しによる捕獲・プランの適用
 - 履歴メニューを消して通常状態へ戻る条件:
   - **マッチ 0 件**(履歴が 0 件の場合を含む)→ メニューは開かず(既存の一覧があれば消し)、
     キーは消費してバッファは変えない。素の履歴移動へのフォールバックはしない。
-  - **同期 worker 交換の失敗**(`error` 応答、worker セッション失敗、deadline 超過、
-    または仕様を満たさない `ok`)→ 一覧と種別を破棄し、
-    バッファは変えない(cli-protocol.md「エラー時の zsh 側挙動」)。
+  - **同期 worker 交換の失敗**(`store` または `plan` の `error` 応答、worker セッション失敗、
+    deadline 超過、または仕様を満たさない `ok`)→ 一覧と種別を破棄し、
+    バッファは変えない(cli-protocol.md「応答の検証と zsh 側の適用(規範)」)。
   - **zrush のアクション以外の要因による `BUFFER` / `CURSOR` の変化**
     (文字入力・編集・カーソル移動・他ウィジェット)→ 履歴メニューを全消去して通常フローへ戻る。
     補完一覧のように一覧テキストを残すことはしない。

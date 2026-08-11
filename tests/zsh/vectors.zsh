@@ -201,7 +201,7 @@ encode_vector() {  # $1=vector directory -> REPLY=wire bytes, or return 1 with R
 }
 
 # Re-serialize the parsed _zrush_plan_* state back into plan bytes, following
-# the field order of cli-protocol.md "stdout(描画プラン)".
+# the field order of cli-protocol.md "plan の ok body".
 # Fails (return 1, reason in REPLY) when _zrush_plan_text does not split back
 # into exactly L rows -- that split is only reversible because display rows are
 # guaranteed to contain no newline, so checking it tests that guarantee too.
@@ -395,7 +395,7 @@ reserialize_plan() {  # -> REPLY=bytes, or return 1 with REPLY=reason
   _zrush_netstring_take "$ready_frame"
   _zrush_worker_handle_message "$REPLY"
   local -i ready_kept_failures=$(( _zrush_worker_ready == 1 && _zrush_worker_failures == 1 ))
-  typeset -gA _zrush_worker_pending=( 41 compsys )
+  typeset -gA _zrush_worker_pending=( 41 'plan compsys 0' )
   _zrush_current_request=0
   _zrush_netstring_take "$error_frame"
   _zrush_worker_handle_message "$REPLY"
@@ -412,7 +412,7 @@ reserialize_plan() {  # -> REPLY=bytes, or return 1 with REPLY=reason
     || { out "FATAL: $REPLY"; exit 1 }
   local stale_plan=$REPLY
   _zrush_worker_ready=1 _zrush_worker_failures=1 _zrush_disabled=0 _zrush_disable_reason= _zrush_enabled=1
-  typeset -gA _zrush_worker_pending=( 41 compsys )
+  typeset -gA _zrush_worker_pending=( 41 'plan compsys 0' )
   _zrush_current_request=42
   _zrush_plan_text=sentinel _zrush_plan_cp=sentinel-cp _zrush_plan_kind=history
   _zrush_plan_nlines=7 _zrush_plan_npos=0
@@ -428,6 +428,74 @@ reserialize_plan() {  # -> REPLY=bytes, or return 1 with REPLY=reason
   else
     ng "worker lifecycle: stale response changed current plan or remained pending"
   fi
+
+  # A store's terminal response is consumed on its own: it carries no body and
+  # never touches the plan the paired request will deliver
+  # (cli-protocol.md "要求と応答").
+  _zrush_worker_ready=1 _zrush_worker_failures=1 _zrush_enabled=1
+  typeset -gA _zrush_worker_pending=( 50 'store live 50' )
+  _zrush_current_request=50
+  _zrush_plan_text=store-sentinel _zrush_plan_nlines=7
+  _zrush_encode_message ok 50 ''
+  _zrush_netstring_take "$REPLY"
+  _zrush_worker_handle_message "$REPLY"; local -i store_ok_st=$?
+  if (( store_ok_st == 0 && ! ${+_zrush_worker_pending[50]} \
+        && _zrush_worker_failures == 0 && _zrush_plan_nlines == 7 )) \
+     && [[ $_zrush_plan_text == store-sentinel ]]; then
+    ok "worker lifecycle: an empty-bodied store ok is terminal and leaves the plan alone"
+  else
+    ng "worker lifecycle: store ok status=$store_ok_st pending=${+_zrush_worker_pending[50]} failures=$_zrush_worker_failures plan=${(qqqq)_zrush_plan_text}"
+  fi
+  _zrush_plan_text= _zrush_plan_nlines=0
+
+  # unknown-generation is a normal terminal error: it never fails the session,
+  # and what follows it on the asynchronous path depends on whether the plan
+  # read the latch (cli-protocol.md "応答の検証と zsh 側の適用"). A latch-backed
+  # plan drops the latch and recollects; nothing is ever replayed.
+  local saved_start_request=$functions[_zrush_start_request]
+  typeset -gi _zrt_restarts=0
+  functions[_zrush_start_request]='(( ++_zrt_restarts )); return 0'
+  _zrush_worker_ready=1 _zrush_worker_failures=0 _zrush_worker_stopping=0
+  _zrush_disabled=0 _zrush_disable_reason= _zrush_enabled=1
+  typeset -gA _zrush_worker_pending=( 51 'plan compsys 1' )
+  _zrush_current_request=51 _zrush_sync_target=0
+  _zrush_cc_fp=fingerprint _zrush_cc_time=$EPOCHSECONDS _zrush_cc_cand_gen=9
+  _zrush_encode_message error 51 unknown-generation
+  _zrush_netstring_take "$REPLY"
+  _zrush_worker_handle_message "$REPLY"; local -i unknown_st=$?
+  local -i latched_dropped=$(( unknown_st == 0 && _zrush_cc_cand_gen == 0 \
+    && _zrt_restarts == 1 && _zrush_worker_failures == 0 && !_zrush_disabled \
+    && !_zrush_worker_stopping && ! ${+_zrush_worker_pending[51]} ))
+  # A plan built on its own fresh store holds no latch: there is none to drop,
+  # and it does not recollect either. Only its own store can have failed, and
+  # repeating a deterministic store failure would loop recollection forever.
+  _zrt_restarts=0 _zrush_cc_cand_gen=9
+  typeset -gA _zrush_worker_pending=( 52 'plan compsys 0' )
+  _zrush_current_request=52
+  _zrush_encode_message error 52 unknown-generation
+  _zrush_netstring_take "$REPLY"
+  _zrush_worker_handle_message "$REPLY"
+  local -i unlatched_dropped=$(( _zrush_cc_cand_gen == 9 && _zrt_restarts == 0 \
+    && _zrush_worker_failures == 0 && ! ${+_zrush_worker_pending[52]} \
+    && _zrush_current_request == 0 && !_zrush_worker_stopping ))
+  # The synchronous history exchange treats it as an exchange failure instead,
+  # and never starts a collection (behavior.md "履歴メニュー").
+  _zrt_restarts=0
+  typeset -gA _zrush_worker_pending=( 53 'plan history 0' )
+  _zrush_current_request=0 _zrush_sync_target=53 _zrush_sync_done=0 _zrush_sync_ok=0
+  _zrush_encode_message error 53 unknown-generation
+  _zrush_netstring_take "$REPLY"
+  _zrush_worker_handle_message "$REPLY"
+  local -i sync_failed=$(( _zrush_sync_done == 1 && _zrush_sync_ok == 0 \
+    && _zrt_restarts == 0 && _zrush_worker_failures == 0 && !_zrush_worker_stopping ))
+  functions[_zrush_start_request]=$saved_start_request
+  _zrush_sync_target=0 _zrush_sync_done=0 _zrush_sync_ok=0 _zrush_cc_cand_gen=0 _zrush_cc_fp=
+  if (( latched_dropped && unlatched_dropped && sync_failed )); then
+    ok "worker lifecycle: unknown-generation recollects only behind a read latch, and fails the sync exchange"
+  else
+    ng "worker lifecycle: unknown-generation latched=$latched_dropped unlatched=$unlatched_dropped sync=$sync_failed"
+  fi
+  unset _zrt_restarts
 
   # A buffer/cursor change invalidates the old async request before debounce
   # assigns its successor. A Tab pressed in that window belongs to the newer
@@ -446,13 +514,13 @@ reserialize_plan() {  # -> REPLY=bytes, or return 1 with REPLY=reason
   _zrush_line_pre_redraw
   local -i invalidated=$(( _zrush_current_request == 0 ))
   _zrush_tab_pending=1
-  typeset -gA _zrush_worker_pending=( 41 compsys )
+  typeset -gA _zrush_worker_pending=( 41 'plan compsys 0' )
   _zrush_encode_message ok 41 "$stale_plan"
   _zrush_netstring_take "$REPLY"
   _zrush_worker_handle_message "$REPLY"
   local -i old_stayed_stale=$(( _zrt_settle_calls == 0 && _zrush_tab_pending == 1 ))
   _zrush_current_request=42
-  _zrush_worker_pending[42]=compsys
+  _zrush_worker_pending[42]='plan compsys 0'
   _zrush_encode_message ok 42 "$stale_plan"
   _zrush_netstring_take "$REPLY"
   _zrush_worker_handle_message "$REPLY"
@@ -528,6 +596,165 @@ reserialize_plan() {  # -> REPLY=bytes, or return 1 with REPLY=reason
   fi
   ZRUSH_LOG=$saved_log
   _zrush_worker_failures=0 _zrush_worker_warned=0 _zrush_disabled=0 _zrush_disable_reason= _zrush_enabled=0
+
+  # ---------------- Empty-word collection cache latch ----------------
+  # The latch is the worker session's, not the shell's: a lost session drops it
+  # and the entry misses even while fingerprint and TTL are still good
+  # (behavior.md "空語収集キャッシュ" / "worker ライフサイクル").
+  zmodload -F zsh/stat b:zstat 2>/dev/null
+  ZRUSH_LOG=$WORK/cache.log
+  local -i cache_ok=1
+  _zrush_query=
+  _zrush_cc_subject || cache_ok=0
+  # A widened word keeps its prefix, so only a line-start empty word is the
+  # cache's subject; `sudo ` and `git ` collections use the live slot.
+  _zrush_query='sudo '
+  _zrush_cc_subject && cache_ok=0
+  _zrush_query=
+  _zrush_cc_fp= _zrush_cc_time=0 _zrush_cc_cand_gen=0 _zrush_cc_staged=()
+  _zrush_cc_check && cache_ok=0
+  # Staging alone is not a latch: only the store's ok turns it into one.
+  _zrush_cc_stage 300
+  (( _zrush_cc_cand_gen == 0 )) || cache_ok=0
+  _zrush_cc_check && cache_ok=0
+  _zrush_cc_commit 300 12
+  (( _zrush_cc_cand_gen == 12 && $#_zrush_cc_staged == 0 )) || cache_ok=0
+  _zrush_cc_check || cache_ok=0
+  _zrush_worker_failures=0 _zrush_worker_warned=0 _zrush_disabled=0 _zrush_disable_reason= _zrush_enabled=1
+  _zrush_worker_rfd=-1 _zrush_worker_wfd=-1 _zrush_worker_control_wfd=-1
+  _zrush_cc_stage 301
+  _zrush_worker_session_fail latch-fixture 2>/dev/null
+  (( _zrush_cc_cand_gen == 0 && $#_zrush_cc_staged == 0 )) || cache_ok=0
+  _zrush_cc_check && cache_ok=0
+  [[ -z $_zrush_cc_fp ]] || cache_ok=0
+  if (( cache_ok )); then
+    ok "cache latch: a session failure drops the latch and turns a live entry into a miss"
+  else
+    ng "cache latch: subject/latch state fp=${(qqqq)_zrush_cc_fp} generation=$_zrush_cc_cand_gen"
+  fi
+  ZRUSH_LOG=$saved_log
+  _zrush_query= _zrush_cc_fp= _zrush_cc_time=0 _zrush_cc_cand_gen=0
+  _zrush_worker_failures=0 _zrush_worker_warned=0 _zrush_disabled=0 _zrush_disable_reason= _zrush_enabled=0
+
+  # ---------------- Request wiring (observed on the outbound queue) ----------------
+  # Pin the callers, not just the message handler. Publishing a response fd
+  # makes the session look up, and holding the writer slot busy makes
+  # _zrush_worker_flush leave completed frames on _zrush_worker_txq, where the
+  # same netstring decoder the worker session uses can read them back. No fork,
+  # no worker, no zle.
+  local -i wire_fd
+  exec {wire_fd}< /dev/null
+  wire_fields() {  # $1=frame -> reply=(fields)
+    emulate -L zsh
+    _zrush_netstring_take "$1" || return 1
+    _zrush_decode_fields "$REPLY"
+  }
+  wire_reset() {
+    emulate -L zsh
+    _zrush_worker_rfd=$wire_fd _zrush_worker_ack_fd=$wire_fd
+    _zrush_worker_wfd=-1 _zrush_worker_control_wfd=-1 _zrush_worker_drain_fd=-1
+    _zrush_worker_ready=1 _zrush_worker_stopping=0 _zrush_worker_runtime_tainted=0
+    _zrush_worker_failures=0 _zrush_disabled=0 _zrush_disable_reason= _zrush_enabled=1
+    _zrush_worker_txq=() _zrush_worker_pending=() _zrush_cc_staged=()
+    _zrush_current_request=0 _zrush_sync_target=0 _zrush_sync_done=0 _zrush_sync_ok=0
+    _zrush_buf= _zrush_pty= _zrush_rfd=-1 _zrush_wfd=-1
+  }
+  ZRUSH_CFG_MODE=prefix ZRUSH_CFG_SMART_CASE=false ZRUSH_CFG_MAX_LINES=10
+  ZRUSH_CFG_TRAILING_SPACE=true ZRUSH_CFG_MIN_INPUT=0
+  BUFFER= LBUFFER= RBUFFER=
+  local -a sf=() pf=() hf=()
+  local store_id=
+
+  # A cache hit collects nothing and stores nothing: one plan frame, reading
+  # the latched generation, recorded as latch-backed. A latched=0 regression
+  # here would leave a dead latch in place and false-hit on every prompt.
+  wire_reset
+  _zrush_cc_fp= _zrush_cc_time=0 _zrush_cc_cand_gen=0 _zrush_cc_staged=()
+  _zrush_cc_stage 400
+  _zrush_cc_commit 400 7
+  local -i hit_wire=1
+  _zrush_start_request 2>/dev/null
+  (( $#_zrush_worker_txq == 1 )) || hit_wire=0
+  if wire_fields "$_zrush_worker_txq[1]"; then
+    hf=( "${(@)reply}" )
+    (( $#hf == 11 )) || hit_wire=0
+    [[ $hf[1] == plan && $hf[3] == 7 && $hf[5] == compsys ]] || hit_wire=0
+    [[ ${_zrush_worker_pending[$hf[2]]} == 'plan compsys 1' ]] || hit_wire=0
+  else
+    hit_wire=0
+  fi
+  (( _zrush_cc_cand_gen == 7 && $#_zrush_cc_staged == 0 )) || hit_wire=0
+  if (( hit_wire )); then
+    ok "request wiring: a cache hit sends one latch-backed plan and no store"
+  else
+    ng "request wiring: cache hit queued ${#_zrush_worker_txq} frame(s) ${(qqqq)_zrush_worker_txq}"
+  fi
+
+  local -i store_wire=1
+  # A finished empty-word capture: store into the cache slot, plan behind it on
+  # the same generation, and the latch only once that store answers ok.
+  wire_reset
+  _zrush_cc_fp= _zrush_cc_time=0 _zrush_cc_cand_gen=0 _zrush_cc_staged=()
+  _zrush_query= _zrush_fuzzy= _zrush_buf=$'b\1\0w\1ls\0'
+  _zrush_finalize
+  (( $#_zrush_worker_txq == 2 )) || store_wire=0
+  wire_fields "$_zrush_worker_txq[1]" && sf=( "${(@)reply}" ) || store_wire=0
+  wire_fields "$_zrush_worker_txq[2]" && pf=( "${(@)reply}" ) || store_wire=0
+  (( $#sf == 5 )) || store_wire=0
+  [[ $sf[1] == store && $sf[3] == cache && $sf[5] == $'b\1\0w\1ls\0' ]] || store_wire=0
+  [[ $pf[1] == plan && $pf[3] == $sf[4] ]] || store_wire=0
+  store_id=$sf[2]
+  [[ ${_zrush_worker_pending[$store_id]} == "store cache $sf[4]" ]] || store_wire=0
+  [[ ${_zrush_worker_pending[$pf[2]]} == 'plan compsys 0' ]] || store_wire=0
+  (( ${+_zrush_cc_staged[$store_id]} && _zrush_cc_cand_gen == 0 )) || store_wire=0
+  _zrush_encode_message ok $store_id ''
+  _zrush_netstring_take "$REPLY"
+  _zrush_worker_handle_message "$REPLY"
+  (( _zrush_cc_cand_gen == $sf[4] && $#_zrush_cc_staged == 0 )) || store_wire=0
+
+  # A store that ends in error changed no slot, so no latch may appear.
+  wire_reset
+  _zrush_cc_fp= _zrush_cc_time=0 _zrush_cc_cand_gen=0
+  _zrush_query= _zrush_fuzzy= _zrush_buf=$'b\1\0w\1ls\0'
+  _zrush_finalize
+  wire_fields "$_zrush_worker_txq[1]" && sf=( "${(@)reply}" ) || store_wire=0
+  _zrush_encode_message error $sf[2] invalid-payload
+  _zrush_netstring_take "$REPLY"
+  _zrush_worker_handle_message "$REPLY"
+  (( _zrush_cc_cand_gen == 0 && $#_zrush_cc_staged == 0 )) || store_wire=0
+
+  # A widened word that keeps a prefix is not the cache's subject, and neither
+  # is a capture that came back empty: both take the live slot and leave an
+  # existing latch alone.
+  wire_reset
+  _zrush_cc_cand_gen=5 _zrush_cc_fp=keep _zrush_cc_time=$EPOCHSECONDS
+  _zrush_query='git ' _zrush_fuzzy=lo _zrush_buf=$'b\1\0w\1log\0'
+  _zrush_finalize
+  wire_fields "$_zrush_worker_txq[1]" && sf=( "${(@)reply}" ) || store_wire=0
+  [[ $sf[1] == store && $sf[3] == live ]] || store_wire=0
+  (( $#_zrush_cc_staged == 0 )) || store_wire=0
+  _zrush_encode_message ok $sf[2] ''
+  _zrush_netstring_take "$REPLY"
+  _zrush_worker_handle_message "$REPLY"
+  (( _zrush_cc_cand_gen == 5 )) || store_wire=0
+  wire_reset
+  _zrush_query= _zrush_fuzzy= _zrush_buf=
+  _zrush_finalize
+  wire_fields "$_zrush_worker_txq[1]" && sf=( "${(@)reply}" ) || store_wire=0
+  [[ $sf[1] == store && $sf[3] == live && -z $sf[5] ]] || store_wire=0
+  (( $#_zrush_cc_staged == 0 && _zrush_cc_cand_gen == 5 )) || store_wire=0
+  if (( store_wire )); then
+    ok "request wiring: the slot follows the cache's subject and only a store ok takes the latch"
+  else
+    ng "request wiring: finalize store/plan pair or latch commit mismatch"
+  fi
+
+  unfunction wire_fields wire_reset
+  _zrush_worker_rfd=-1 _zrush_worker_ack_fd=-1
+  _zrush_close_internal_fd $wire_fd
+  _zrush_worker_txq=() _zrush_worker_pending=() _zrush_cc_staged=()
+  _zrush_current_request=0 _zrush_enabled=0 _zrush_worker_ready=0
+  _zrush_cc_fp= _zrush_cc_time=0 _zrush_cc_cand_gen=0 _zrush_query= _zrush_fuzzy=
 
   # ---------------- History payload sender ----------------
   # `print -s` leaves its newest entry as the current event until another

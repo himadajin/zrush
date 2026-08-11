@@ -32,10 +32,34 @@ bindkey '^Xa' _zrt-dump-all-rh
 # ^Xw: persistent-worker lifecycle state. This exposes only stable invariants
 # the tests need (lazy start, reuse, monotonic ids, and clean teardown).
 _zrt_dump_worker() {
-  _zlog "TESTWORKER=ready=$_zrush_worker_ready seq=$_zrush_request_seq failures=$_zrush_worker_failures disabled=$_zrush_disabled reason=$_zrush_disable_reason stale=$_zrush_stale_disabled warned=$_zrush_worker_warned buildwarned=$_zrush_build_warned following=$_zrush_build_following verifying=$_zrush_build_verifying stopping=$_zrush_worker_stopping tainted=$_zrush_worker_runtime_tainted rfd=$_zrush_worker_rfd wfd=$_zrush_worker_wfd control=$_zrush_worker_control_wfd ack=$_zrush_worker_ack_fd pending=$#_zrush_worker_pending runtime=${_zrush_worker_runtime_dir:-<none>}"
+  _zlog "TESTWORKER=ready=$_zrush_worker_ready seq=$_zrush_request_seq candgen=$_zrush_cand_gen_seq latch=$_zrush_cc_cand_gen staged=$#_zrush_cc_staged failures=$_zrush_worker_failures disabled=$_zrush_disabled reason=$_zrush_disable_reason stale=$_zrush_stale_disabled warned=$_zrush_worker_warned buildwarned=$_zrush_build_warned following=$_zrush_build_following verifying=$_zrush_build_verifying stopping=$_zrush_worker_stopping tainted=$_zrush_worker_runtime_tainted rfd=$_zrush_worker_rfd wfd=$_zrush_worker_wfd control=$_zrush_worker_control_wfd ack=$_zrush_worker_ack_fd pending=$#_zrush_worker_pending runtime=${_zrush_worker_runtime_dir:-<none>}"
 }
 zle -N _zrt-dump-worker _zrt_dump_worker
 bindkey '^Xw' _zrt-dump-worker
+
+# ^Xc: the two empty-word-cache hit conditions that are computed rather than
+# stored -- whether the saved fingerprint still describes this environment, and
+# how old the entry is. ^Xw carries the third (the latch) as raw state. A test
+# that expects a recollection needs to show which condition forced it
+# (behavior.md "空語収集キャッシュ").
+_zrt_dump_cache() {
+  emulate -L zsh
+  local -i match=0 age=-1
+  _zrush_cc_fingerprint
+  [[ -n $_zrush_cc_fp && $REPLY == "$_zrush_cc_fp" ]] && match=1
+  (( _zrush_cc_time )) && age=$(( EPOCHSECONDS - _zrush_cc_time ))
+  _zlog "TESTCACHE=fpmatch=$match age=$age"
+}
+zle -N _zrt-dump-cache _zrt_dump_cache
+bindkey '^Xc' _zrt-dump-cache
+
+# ^Xn: age the cache entry past the fixed 300 s TTL. A widget rather than a
+# typed assignment: typing one would itself be a command-position collection
+# whose store could re-latch the entry -- with a fresh save time -- after the
+# assignment ran.
+_zrt_age_cache() { _zrush_cc_time=$(( EPOCHSECONDS - _ZRUSH_CC_TTL - 1 )) }
+zle -N _zrt-age-cache _zrt_age_cache
+bindkey '^Xn' _zrt-age-cache
 
 _zrt_teardown_worker() { _zrush_worker_shutdown }
 zle -N _zrt-teardown-worker _zrt_teardown_worker

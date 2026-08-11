@@ -155,19 +155,26 @@ fn run_vector_raw(path: &Path) -> std::process::Output {
     }
     let payload = read_vector_file(&path.join("payload"));
     let cwd = std::env::current_dir().expect("cwd");
-    let request = msg(&[
-        b"plan",
-        b"1",
-        cwd.as_os_str().as_bytes(),
-        value("--producer").as_bytes(),
-        value("--query").as_bytes(),
-        value("--mode").as_bytes(),
-        value("--smart-case").as_bytes(),
-        value("--rows").as_bytes(),
-        value("--width").as_bytes(),
-        value("--trailing-space").as_bytes(),
-        &payload,
-    ]);
+    // One session carries the vector as the contract's two requests: the
+    // payload goes in with `store` (request_id 1, generation 1), and `plan`
+    // (request_id 2) reads it back out of the slot.
+    let requests = [
+        msg(&[b"store", b"1", b"live", b"1", &payload]),
+        msg(&[
+            b"plan",
+            b"2",
+            b"1",
+            cwd.as_os_str().as_bytes(),
+            value("--producer").as_bytes(),
+            value("--query").as_bytes(),
+            value("--mode").as_bytes(),
+            value("--smart-case").as_bytes(),
+            value("--rows").as_bytes(),
+            value("--width").as_bytes(),
+            value("--trailing-space").as_bytes(),
+        ]),
+    ]
+    .concat();
     let (control_read, _control_write) = UnixStream::pair().expect("create control channel");
     let control_fd = control_read.as_raw_fd();
     let mut command = Command::new(env!("CARGO_BIN_EXE_zrush"));
@@ -194,7 +201,7 @@ fn run_vector_raw(path: &Path) -> std::process::Output {
         .stdin
         .take()
         .expect("vector child stdin")
-        .write_all(&[msg(&[b"hello", BUILD_STAMP]), request].concat());
+        .write_all(&[msg(&[b"hello", BUILD_STAMP]), requests].concat());
     if let Err(error) = write_result {
         assert_eq!(
             error.kind(),
@@ -385,19 +392,29 @@ fn reject_vectors_match_expected_in_band_errors() {
         let name = vector_name(&path);
         let output = run_vector_raw(&path);
         let frames = decode_strict(&output.stdout);
-        let expected = if name.ends_with("nonterminated-stdin") {
-            b"invalid-payload"
+        // A vector is rejected by exactly one of the session's two requests.
+        // A bad payload fails the `store` (request_id 1), leaving nothing for
+        // the `plan` (request_id 2) to reference; bad scalars store fine and
+        // fail the `plan` itself.
+        let (store_reply, plan_reply): (&[u8], &[u8]) = if name.ends_with("nonterminated-stdin") {
+            (b"invalid-payload", b"unknown-generation")
         } else {
-            b"invalid-request"
+            (b"", b"invalid-request")
+        };
+        let store_frame = if store_reply.is_empty() {
+            vec![b"ok".to_vec(), b"1".to_vec(), Vec::new()]
+        } else {
+            vec![b"error".to_vec(), b"1".to_vec(), store_reply.to_vec()]
         };
         let valid = output.status.code() == Some(0)
-            && frames.len() == 2
+            && frames.len() == 3
             && decode_fields_strict(&frames[0]) == vec![b"ready".to_vec(), BUILD_STAMP.to_vec()]
-            && decode_fields_strict(&frames[1])
-                == vec![b"error".to_vec(), b"1".to_vec(), expected.to_vec()];
+            && decode_fields_strict(&frames[1]) == store_frame
+            && decode_fields_strict(&frames[2])
+                == vec![b"error".to_vec(), b"2".to_vec(), plan_reply.to_vec()];
         if !valid {
             failures.push(format!(
-                "{name}: expected ready + one terminal in-band error; got exit {:?}, stdout: {}, stderr: {}",
+                "{name}: expected ready + a terminal store reply + a terminal in-band plan error; got exit {:?}, stdout: {}, stderr: {}",
                 output.status.code(),
                 dump(&output.stdout),
                 dump(&output.stderr)

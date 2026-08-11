@@ -39,7 +39,7 @@ zrush.zsh(zsh 側)と `zrush` バイナリ(Rust 側)の入出力仕様。
 > 検証: 制御バイトを含む候補・値の除外(送信側の保証)のうち「compsys 捕獲 profile」の分 —
 > `tests/vectors/encode/`(`zsh -f tests/zsh/vectors.zsh`)。他の profile の分を固定するテストは無い。
 
-- 対話シェルごとに `zrush worker` を最大 1 プロセス常駐させ、複数のプラン要求を同じ
+- 対話シェルごとに `zrush worker` を最大 1 プロセス常駐させ、複数の要求を同じ
   stdin/stdout セッションで処理する。ワーカーは最初の実要求まで起動しない。
   `zrush config` は設定の読み込みごとに、`zrush init` はシェル起動(source)時に、
   それぞれ one-shot で起動する。
@@ -69,12 +69,12 @@ zrush.zsh(zsh 側)と `zrush` バイナリ(Rust 側)の入出力仕様。
 
 `--help` / `-h`、および `help` サブコマンドは使用方法を表示して exit 0 する。
 これは人間向けの補助機能であり、zsh がこれらを起動することはない。
-完全で相関可能な plan 要求のエラーは exit code を変えず、`error` 応答で通知する。
+完全で相関可能な要求のエラーは exit code を変えず、`error` 応答で通知する。
 
 ## `zrush worker`
 
-候補列とクエリを受け取り、マッチング・ランキング・グループ分割・グリッドレイアウト・
-ハイライト計算・ナビゲーション表構築・挿入テキスト構築までを行い、
+候補列を受け取って解析済みのまま保持し、クエリと組み合わせてマッチング・ランキング・
+グループ分割・グリッドレイアウト・ハイライト計算・ナビゲーション表構築・挿入テキスト構築までを行い、
 zsh がそのまま適用できる描画プランを返す。
 
 ### 起動と責務
@@ -89,12 +89,13 @@ option の欠落、数字でない/2 以下の値、未知または余分な引�
 fd が closed / write-only である場合、または watchdog setup に失敗した場合は、`hello` / `ready` や
 request 処理を始める前に startup 診断を stderr へ 1 行書いて exit 1 する。
 起動後は stdin から要求を読み、
-要求ごとにマッチング・ランキング・グループ分割・グリッドレイアウト・ハイライト計算・
+`store` 要求では候補レコードストリームを解析してスロットへ格納し、
+`plan` 要求ごとにマッチング・ランキング・グループ分割・グリッドレイアウト・ハイライト計算・
 ナビゲーション表構築・挿入テキスト構築を行って stdout へ応答する。
 one-shot の `zrush plan` サブコマンドは存在しない。
 
 ワーカーは **config.toml を読まない**。設定スナップショットは要求フィールドで受け取る
-(設定の取得・mtime 監視は zsh 側の責務)。`HISTFILE` も読まず、候補 payload 全体を要求ごとに受け取る。
+(設定の取得・mtime 監視は zsh 側の責務)。`HISTFILE` も読まず、候補は `store` 要求で受け取る。
 ただしファイルシステムに対しては純粋でない: `f = 1` 候補の `/` 合成判定だけは要求の `cwd` を基準に stat する。
 
 ### abort control と worker 終了
@@ -133,8 +134,8 @@ message   = netstring(netstring(field-1) ... netstring(field-N))
   宣言長未満の EOF、外側 payload 内の不完全または余分なフィールドバイトは framing error である。
 - 読み取りの分割位置に意味はない。1 回の read に複数メッセージが含まれる場合、壊れた後続メッセージより前に
   完成していたメッセージは先に処理し、OS の read 境界によって配送結果を変えない。
-- 候補レコードストリームと描画プランストリームは、それぞれ 1 個の opaque field として入れ子にする。
-  その内側の NUL フレーミングは後述の規範を保つ。
+- 候補レコードストリームは `store` 要求の、描画プランストリームは `plan` の成功応答の、
+  それぞれ 1 個の opaque field として入れ子にする。その内側の NUL フレーミングは後述の規範を保つ。
 - kind・build stamp・request_id・列挙値・真偽値・数値・error code は、以下に示す ASCII バイト列と
   完全一致しなければならない。前後空白、符号、別の大小文字表記を許さない。
 
@@ -167,16 +168,34 @@ worker が受ける `hello` の kind・フィールド数・stamp 表記自体�
 角括弧内は外側 message payload に固定順で並ぶ netstring field を表す。
 
 ```
-plan:  ["plan", request_id, cwd, producer, query, mode, smart_case,
-        rows, width, trailing_space, candidate_payload]
-ok:    ["ok", request_id, render_plan]
+store: ["store", request_id, slot, candidate_generation, candidate_payload]
+plan:  ["plan", request_id, candidate_generation, cwd, producer, query, mode, smart_case,
+        rows, width, trailing_space]
+ok:    ["ok", request_id, body]
 error: ["error", request_id, code]
 ```
+
+要求は 2 種類ある。
+`store` は候補レコードストリームを worker へ渡して解析済みの candidate store に格納し、
+`plan` はその store を `candidate_generation` で参照して描画プランを得る。
+候補 payload は `plan` に載せない。
 
 - `request_id`: zsh が所有する `1..=9223372036854775807`(`i64::MAX`)の canonical ASCII 10 進識別子。
   先頭ゼロを付けない。
   シェルセッション内で単調増加し、worker の終了・再起動でもリセットまたは再利用しない。
   候補集合や履歴の revision を表す値ではない。
+- `slot`: `live` または `cache`。
+  zsh が所有する列挙であり、worker はスロットの意味を解釈しない。
+  worker はスロットごとに最大 1 generation の解析済み candidate store を保持し、
+  新しい `store` の受理は**同一スロットの**前 generation だけを破棄する(他スロットの generation は残る)。
+  candidate store は worker セッションに属し、worker の終了とともに失われる。
+- `candidate_generation`: zsh が所有する `1..=9223372036854775807`(`i64::MAX`)の canonical ASCII 10 進識別子。
+  先頭ゼロを付けない。
+  `request_id` とは独立の値である。
+  シェルセッション内で単調増加し、再利用せず、worker の終了・再起動でもリセットしない。
+  `store` では格納先の generation を、`plan` では参照する generation を表す。
+  `plan` の generation 検索はスロット横断で行い、ヒットしたスロットの解析結果から描画プランを計算する。
+- `candidate_payload`: 後述の候補レコードストリーム全体をそのまま格納する opaque bytes。
 - `producer`: `compsys` または `history`。
   結果順に加えてレイアウト方針を選ぶ: `compsys` は最大 8 列・上から下、
   `history` は 1 列・下から上。レコード解釈・ハイライト・挿入テキスト構築は共通である
@@ -197,21 +216,39 @@ error: ["error", request_id, code]
   基準に解決する。worker 自身の起動時 cwd は判定に使わない。絶対 stat パスはそのまま使い、
   シンボリックリンクは追跡する。`~` は展開しない。cwd または対象パスを stat できない場合は
   「ディレクトリでない」と扱い、`/` を合成しない。
-- `candidate_payload`: 後述の候補レコードストリーム全体をそのまま格納する opaque bytes。
 
-完全な message から canonical な `request_id` を回収できた後に、kind・フィールド数・列挙値・数値の
-不正を検出した場合、worker は同じ `request_id` の `error` を返してセッションを継続する。
-`code` は `invalid-request`(plan 要求の kind・固定フィールド・scalar 不正)または
-`invalid-payload`(候補レコードストリームの framing error)のいずれかである。
+完全な message から canonical な `request_id` を回収できた後に要求を遂行できない場合、
+worker は同じ `request_id` の `error` を返してセッションを継続する。
+終端 `error` の `code` は要求の kind ごとに次のいずれかである。
+
+| kind | code | 意味 |
+|---|---|---|
+| `store` | `invalid-request` | kind・固定フィールド・scalar・`slot` 列挙の不正 |
+| `store` | `invalid-payload` | 候補レコードストリームの framing error |
+| `plan` | `invalid-request` | kind・固定フィールド・scalar の不正 |
+| `plan` | `unknown-generation` | どのスロットにも存在しない `candidate_generation` の参照 |
+
+`invalid-request` と `invalid-payload` は要求自体の不正を、
+`unknown-generation` は整形としては正しい要求が参照先を持たないことを表す。
+`plan` は候補 payload を運ばないため、`invalid-payload` は `plan` の code 集合に現れない。
+`store` の検証順は、`request_id` の回収 → kind・フィールド数・scalar(`slot` 列挙を含む)→
+`candidate_payload` の framing である。
+scalar と payload の双方に不正がある要求では、先に検出される `invalid-request` を返す。
+`error` で終わる `store` は既存のスロットをいっさい変更しない(全スロット無変更のまま終端 error を返す)。
 外側または nested netstring framing の破損、あるいは request_id の欠落・非 canonical 表記・範囲外によって
 安全に対応付けられない場合は応答せずセッションを終了する。
 
 `ready` を返したセッションでは、相関可能な各 request は `ok` または `error` の**終端応答をちょうど 1 個**受ける。
+`store` もこの規範に従う 1 個の request である。
 `incompatible` を返したセッションでその後に届くバイトは request ではなく、この規範の対象外である。
 worker は要求を受信順に処理し、応答を黙って省略しない。`error` も正常に形成された終端応答であり、
-worker セッション失敗には数えない。`ok` の `render_plan` は後述の描画プランストリームそのものを格納する。
+worker セッション失敗には数えない。
+zsh は `store` の終端応答を待たずに、同じ generation を参照する `plan` をその後ろへ pipeline してよい
+(pipeline の許容範囲は握手の規範と同じ)。
+`ok` の `body` は kind で決まる: `store` の成功では空バイト列、
+`plan` の成功では後述の描画プランストリームそのものである。
 
-### `candidate_payload`(候補レコードストリーム)
+### `store` の `candidate_payload`(候補レコードストリーム)
 
 > 検証(この節と以下の小節): 送信側(zsh のエンコーダ)の発行規範 — `tests/vectors/encode/`(`zsh -f tests/zsh/vectors.zsh`)。
 > worker セッションを通した受信側(Rust のパーサ)の解釈規範と、候補ストリーム framing error の
@@ -219,8 +256,7 @@ worker セッション失敗には数えない。`ok` の `render_plan` は後�
 > パーサの全域性 — `src/record.rs` の proptest。
 > 「history profile」の送信側規範(イベント番号との対応、重複・制御バイト除外) —
 > `tests/zsh/vectors.zsh`。受信側の解釈は上記のベクタが覆う。
-> 「compsys 捕獲 profile」の transport 側の規範(pid レコードの除去、
-> 空語収集キャッシュに保存する payload の形)も上記の検証の範囲外。
+> 「compsys 捕獲 profile」の transport 側の規範(pid レコードの除去)も上記の検証の範囲外。
 
 フレーミングは NUL(`\0`)終端のレコードが連続する形式。
 レコード内は `\2` で連結した `<tag>\1<value>` 形式のフィールドの並び。
@@ -253,7 +289,7 @@ worker セッション失敗には数えない。`ok` の `render_plan` は後�
   - `f`(値 `1`): ファイル候補であることを示す。
   - `rd`: チルダ・パラメータ展開済みの実ディレクトリ(ファイル候補の合成 `/` 判定に使う)。
   - `X`: グループ見出し文字列。`J`: グループ名。
-    グループキーの決定規則は `render_plan`「表示行の中身」節。
+    グループキーの決定規則は「描画プランストリーム」の「表示行の中身」節。
 - 共有フィールドが全て空でも、ヘッダレコードは必ず発行する
   (バッチ境界を一意に識別するため)。
 - 候補レコードを 1 件も発行しないバッチについては、
@@ -303,10 +339,11 @@ zpty 内で compsys を駆動して得る payload(behavior.md「候補収集」�
 - 重複候補(同一の match-text/display-text 組)は除去せずそのまま送ってよい。
 - 制御バイト(`\0` `\1` `\2`)を含む候補・値の除外は fork 内の compadd フックが保証する。
 - ワーカーの pid レコード(`pid\1<pid>\0` としてストリーム先頭に流れる)は、
-  zsh が受信中に取り除いてから plan 要求の `candidate_payload` へ入れる。
-  空語収集キャッシュ(behavior.md)に保存する payload も pid を取り除いた形が契約である。
+  zsh が受信中に取り除いてから `store` 要求の `candidate_payload` へ入れる。
   Rust 側でのスキップは保険であり、通常の入力では発生しない。
-- plan 要求のフィールド値: `producer` は `compsys`、`query` は広げ規則が定めるクエリ
+- `store` 要求のフィールド値: `slot` は空語収集キャッシュの対象となる収集なら `cache`、それ以外の収集なら `live`。
+  どの収集がキャッシュの対象かは behavior.md「空語収集キャッシュ」節が定める。
+- `plan` 要求のフィールド値: `producer` は `compsys`、`query` は広げ規則が定めるクエリ
   (behavior.md「候補収集」節)、`trailing_space` は `[insert].trailing-space` の設定値。
 
 #### history profile
@@ -321,7 +358,7 @@ zsh が履歴から合成する payload。
   欠番を詰めず、キーをそのまま使う。`m` / `d` は発行しない
   (match-text も番号接頭辞を付ける前のセル表示テキストも `w` そのもの)。
 - 候補レコードは新しい順(最新の履歴行が先頭)。
-  `producer = history` は `candidate_payload` の出現順を保つため(「マッチング・ランキングの意味論」節)、
+  `producer = history` は格納された候補レコードストリームの出現順を保つため(「マッチング・ランキングの意味論」節)、
   この順序がそのまま位置番号順になり、位置 1 は**マッチした候補のうち最も新しい履歴行**になる
   (クエリにマッチしない履歴行は位置を持たないため、位置 1 が payload の先頭レコードとは限らない。
   クエリが非空でもマッチ品質で並べ替わらない)。
@@ -342,10 +379,11 @@ zsh が履歴から合成する payload。
 - payload の合成は、全履歴の値の一括展開 1 回(履歴の総件数に線形)と、
   走査範囲の処理(打ち切りまでに読んだ行数と行長に線形)からなる
   (この payload は同期経路で合成される。behavior.md「履歴メニュー」節)。
-- plan 要求のフィールド値: `producer` は `history`、`query` はバッファ全体(as-typed)、
+- `store` 要求のフィールド値: `slot` は `live`。
+- `plan` 要求のフィールド値: `producer` は `history`、`query` はバッファ全体(as-typed)、
   `trailing_space` は常に `false`(挿入テキストを履歴行の原文と一致させるため)。
 
-### `ok` の `render_plan`(描画プランストリーム)
+### `plan` の `ok` body(描画プランストリーム)
 
 > 検証(この節と以下の小節。ただし「適用(zsh 側の規範)」を除く):
 > ワイヤ形式とプランの中身 — `tests/vectors/plan/` を、Rust のシリアライザと参照パーサ `src/wire.rs`(`tests/vectors.rs`)、
@@ -416,7 +454,7 @@ NUL(`\0`)終端フィールドの平坦列。数値は ASCII 10 進表記。順�
   受け取ったプランからエントリを再構築することで実現する:
   `pos == 選択位置` の match / history-number エントリをスキップし、
   代わりに選択エントリ(その位置のセル実テキスト範囲 + `selected` スペック)を追加する。
-  プランの再取得・plan 要求の再送は伴わない。
+  プランの再取得・`plan` 要求の再送は伴わない。
 - match 装飾は match-text をそのまま表示しているセルにのみ発行される
   (display-text 表示セルには発行されない)。
   切り詰め済みセルへのクリップも Rust 側で計算済み。
@@ -498,7 +536,7 @@ NUL(`\0`)終端フィールドの平坦列。数値は ASCII 10 進表記。順�
   (バッチヘッダの共有フィールド + その候補固有の `w`)。
 - `f = 1` かつ連結結果の末尾が `/` でない候補は、`rd` と match-text
   (`m` があれば `m`、なければ `w`)の生バイト列を連結したパスを、
-  plan 要求の `cwd` を基準に、シンボリックリンクを追跡して stat する。
+  `plan` 要求の `cwd` を基準に、シンボリックリンクを追跡して stat する。
   stat が失敗する場合・対象がディレクトリでない場合は `/` を合成しない。
   この判定はプラン計算時点のスナップショットであり、zsh は確定時に再検証しない
   (該当ディレクトリがプラン計算後に削除・変更されていても、返された挿入テキストをそのまま使う)。
@@ -607,9 +645,26 @@ zsh は一覧を消す。
 
 - zsh は応答の外側/nested netstring、固定フィールド数、kind、canonical な request_id、
   および request_id が未完了要求の 1 つに対応することを検証する。不正なら worker セッションを壊れたものとして終了する。
+- `error` の `code` は `invalid-request` / `invalid-payload` / `unknown-generation` のいずれかでなければならない。
+  それ以外の値は不正な応答であり、worker セッションを壊れたものとして終了する。
 - `error` は相関する要求の正常な終端応答である。その要求の結果を破棄し、それが現在の最新要求なら
   既存一覧も消す。stale 要求なら UI 状態を変えない。どちらの場合も worker は継続利用する。
-- `ok` の `render_plan` が仕様を満たさない場合
+- `unknown-generation` は、`plan` が参照した generation を worker が保持していないことを表す。
+  他の `error` と同じく正常な終端応答であり、worker セッション失敗にも連続失敗回数にも数えない。
+  zsh はその要求も先行する `store` も replay しない。
+  非同期の補完経路でのその後の扱いは、その `plan` が latch を参照して送ったものかどうかで決まる。
+  - latch を参照して送った `plan`: その candidate store latch を無効化し
+    (latch の所在と無効化点は behavior.md「worker ライフサイクル」節が定める)、
+    入力がまだ current なら新しい収集を開始して新しい generation を作る。
+  - それ以外の `plan`: 同じ収集で直前に送った `store` が `error` で終端した場合に限られる
+    (受信順処理により、成功した `store` の直後へ連送した `plan` が `unknown-generation` を受けることはない)。
+    失敗した要求として捨てるだけで、再収集はせず次の実入力を待つ。
+    決定的な `store` の失敗が再収集を無限に呼び戻さないための限定である。
+  履歴メニューの同期交換では、どちらの場合も他の `error` と同じく交換の失敗として扱う
+  (behavior.md「履歴メニュー」節)。
+- `store` の `ok` は body が空バイト列であることを検証する。
+  空でなければ仕様を満たさない応答として扱い、プランを破棄する場合と同じく worker セッションを終了する。
+- `plan` の `ok` body が仕様を満たさない場合
   (最終フィールドの NUL 終端欠落、`L` / `P` / `H` が非負の数字列でない、
   総フィールド数が `4 + L + H + 3P` と一致しない、ハイライト・セル範囲・ナビゲーションの
   各タプルの要素数が不正、`role` が `match` / `heading` / `history-number` 以外、
@@ -764,11 +819,14 @@ typeset -g _ZRUSH_EXPECTED_BUILD_STAMP='<build-stamp>'
    最初の要求は `ready` を待たずに `hello` の後ろへ pipeline する(「セッションフレーミングと握手」節)。
    遅延起動時に runtime directory/FIFO を作成してはならない。spawn 後の parent endpoint/watcher failure と
    writer notification/watcher failure の fail-closed quarantine・runtime taint は behavior.md が定める。
-4. 入力変化 → デバウンス → zpty 収集完了後: zsh が pid レコードを取り除いた
-   捕獲 payload を `producer = compsys` の plan 要求で worker に送る。
-   対応する `ok` の描画プランを POSTDISPLAY / region_highlight に適用する。
+4. 入力変化 → デバウンス → zpty 収集完了後: zsh が pid レコードを取り除いた捕獲 payload を、
+   新しい `candidate_generation` の `store` 要求(空語収集キャッシュの対象なら `cache`、それ以外は `live`)で送り、
+   続けて同じ generation を参照する `producer = compsys` の `plan` 要求を連送する。
+   `plan` に対応する `ok` の描画プランを POSTDISPLAY / region_highlight に適用する。
    以降の選択移動・確定は、プラン内のナビゲーション表・セル範囲・挿入テキストの配列引きだけで完結する
-   (plan 要求の再送はしない)。
+   (要求の再送はしない)。
+   空語収集キャッシュがヒットした場合は収集も `store` も行わず、
+   worker が保持している generation を参照する `plan` 要求だけを送る(behavior.md「空語収集キャッシュ」節)。
 5. 非選択での select-prev(既定 ↑): zsh がメモリ上の履歴から payload を合成し、
-   `producer = history` の plan 要求と応答を同期交換して、返ったプランを同じように適用する
+   `store`(`live`)と `producer = history` の `plan` を同期交換で連送して、返ったプランを同じように適用する
    (fork も compsys も介さない。behavior.md「履歴メニュー」節)。

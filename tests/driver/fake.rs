@@ -23,10 +23,14 @@ pub enum Mode {
     Hold,
     /// Exit without a terminal response.
     Die,
-    /// Reply with an in-band `error` and keep serving.
+    /// Reply to every `plan` with an in-band `error` and keep serving; a
+    /// `store` still succeeds, as it does in every replying mode.
     Error,
     /// Like `Error`, plus a raw non-protocol tail on stdin EOF.
     Drain,
+    /// Answer every `plan` with the in-band `unknown-generation` error, as a
+    /// worker whose candidate store never holds the referenced generation.
+    UnknownGeneration,
 }
 
 impl Mode {
@@ -38,6 +42,7 @@ impl Mode {
             Self::Die => "die",
             Self::Error => "error",
             Self::Drain => "drain",
+            Self::UnknownGeneration => "unknown-generation",
         }
     }
 }
@@ -112,18 +117,19 @@ impl Fake {
             .count()
     }
 
-    /// How many `request <session> <request_id>` lines carry exactly this id,
-    /// across every session -- one means it was never replayed.
+    /// How many `request <session> <kind> <request_id>` lines carry exactly
+    /// this id, across every session and either kind -- one means it was
+    /// never replayed.
     pub fn requests_for(&self, request_id: &str) -> usize {
         self.lines()
             .iter()
             .filter(|line| {
                 let fields: Vec<&str> = line.split(' ').collect();
-                fields.len() == 3
+                fields.len() == 4
                     && fields[0] == "request"
                     && !fields[1].is_empty()
                     && fields[1].bytes().all(|b| b.is_ascii_digit())
-                    && fields[2] == request_id
+                    && fields[3] == request_id
             })
             .count()
     }
