@@ -134,6 +134,8 @@ typeset -gi _zrush_sync_target=0 _zrush_sync_done=0 _zrush_sync_ok=0
 # Lifecycle stops may block briefly, but each operation uses one 100ms
 # absolute budget, matching the existing synchronous history exchange.
 typeset -gi _ZRUSH_WORKER_SHUTDOWN_MS=100
+# Byte ceiling on one synthesized history payload (behavior.md "履歴メニュー").
+typeset -gi _ZRUSH_HISTORY_PAYLOAD_MAX_BYTES=262144
 
 # Render plan received from the Rust worker (cli-protocol.md "render_plan").
 # zsh applies these verbatim; it never recomputes layout, offsets, or spans.
@@ -1941,12 +1943,15 @@ _zrush_apply_highlights() {
 # entries break its line-oriented format).
 _zrush_history_payload() {  # -> REPLY = candidate payload bytes
   emulate -L zsh
+  # Byte-exact lengths for the payload ceiling below, as in _zrush_netstring.
+  local LC_ALL=C
   local -i limit=$ZRUSH_CFG_HISTORY_LIMIT
   local -a kv=()
   (( limit > 0 )) && kv=( "${(@kv)history}" )   # one bulk expansion: event/line pairs, newest first
   local -A seen=()
   local event line block=b$'\1'
-  local -i pending=0
+  local -i pending=0 size=0
+  local -i total=3          # the leading b\1 and the trailing \0 below
   local -a blocks=()
   for event line in "${(@)kv[1,2 * limit]}"; do   # two elements per entry
     # Within the raw scan window (nothing is pulled in from outside it to make
@@ -1954,6 +1959,11 @@ _zrush_history_payload() {  # -> REPLY = candidate payload bytes
     # newest event number for each distinct line.
     [[ -n $line && $line != *$'\0'* && $line != *$'\1'* && $line != *$'\2'* ]] || continue
     (( ${+seen[$line]} )) && continue
+    # The scan stops at the record that would cross the payload ceiling, so the
+    # window is bounded by whichever of limit and the ceiling comes first.
+    size=$(( ${#line} + ${#event} + 6 ))   # \0 w \1 line \2 n \1 event
+    (( total + size > _ZRUSH_HISTORY_PAYLOAD_MAX_BYTES )) && break
+    (( total += size ))
     seen[$line]=1
     block+=$'\0'w$'\1'$line$'\2'n$'\1'$event
     # Appending to a zsh string or array copies everything it already holds, so

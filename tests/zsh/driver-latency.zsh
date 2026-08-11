@@ -285,10 +285,9 @@ start_hist_latency() {  # $1=host label $2=N fixture entries $3=long(0/1) [$4=hi
   export ZRUSH_REAL_BIN=$REPO/target/release/zrush ZRUSH_TEST_TMP=$WORK/t-$1 ZDOTDIR=$WORK/zdot-$1
   export XDG_CONFIG_HOME=$CURXDG ZRUSH_LOG=$HOSTLOG
   export ZRUSH_HIST_N=$2 ZRUSH_HIST_LONG=$3
-  # Test-driver seam of behavior.md "履歴メニュー", raised for both history hosts
-  # because the fixture payloads exceed the fixed production deadline: what the
-  # history cases report is first-paint time, not production menu-open behavior.
-  export ZRUSH_HISTORY_DEADLINE_MS=5000
+  # No ZRUSH_HISTORY_DEADLINE_MS seam: the payload byte ceiling (behavior.md
+  # "履歴メニュー") keeps the exchange inside the production deadline at every
+  # scan window this driver measures, so these numbers are production ones.
   mkdir -p $ZDOTDIR $ZRUSH_TEST_TMP $CURXDG/zrush
   if [[ -n ${4:-} ]]; then
     print -r -- $'[history]\nlimit = '$4 > $CURXDG/zrush/config.toml
@@ -371,9 +370,10 @@ paint_history_case() {  # $1=host-label $2=case-label $3=pattern [$4=trials]
   stop_host
 
   # ============ history-menu first paint ============
-  # behavior.md "履歴メニュー" targets ~50ms at the default limit and normal
-  # history sizes as a goal, not a contract (line length is unbounded), so
-  # this reports measurements only -- same convention as the cases above.
+  # behavior.md "履歴メニュー" bounds the synchronous exchange (100ms deadline,
+  # payload byte ceiling) but sets no first-paint target: synthesis is outside
+  # the deadline and stays linear in total history size, so this reports
+  # measurements only -- same convention as the cases above.
   out "==== hist-5000 (history menu, default [history].limit=5000, ~5000-entry history) ===="
   if start_hist_latency hist5000 5000 0; then
     paint_history_case hist5000 "empty-buf Up (5000)" 'needle-latency-target'

@@ -110,6 +110,9 @@ enum HostRc {
     /// [`HostRc::History`]'s isolation with the small, deliberately ordered
     /// fixture set the `[history].limit` scan window is read against.
     HistoryLimit,
+    /// [`HostRc::History`]'s isolation with a fixture history large enough to
+    /// cross the payload byte ceiling partway through the scan.
+    HistoryBudget,
 }
 
 impl HostRc {
@@ -118,6 +121,7 @@ impl HostRc {
             HostRc::Minimal => "tests/zsh/rc/minimal.zshrc",
             HostRc::History => "tests/zsh/rc/history.zshrc",
             HostRc::HistoryLimit => "tests/zsh/rc/history-limit.zshrc",
+            HostRc::HistoryBudget => "tests/zsh/rc/history-budget.zshrc",
         }
     }
 }
@@ -202,6 +206,15 @@ impl Host {
         Self::boot_with(BootOptions {
             rc: HostRc::HistoryLimit,
             config: Some(config),
+            ..BootOptions::default()
+        })
+    }
+
+    /// [`Host::boot_history`] under `tests/zsh/rc/history-budget.zshrc`, whose
+    /// fixture history outgrows the payload byte ceiling.
+    pub fn boot_history_budget() -> Self {
+        Self::boot_with(BootOptions {
+            rc: HostRc::HistoryBudget,
             ..BootOptions::default()
         })
     }
