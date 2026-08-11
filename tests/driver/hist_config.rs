@@ -10,7 +10,7 @@
 
 use std::time::Duration;
 
-use crate::hist::NO_COLLECTION;
+use crate::hist::{self, NO_COLLECTION};
 use crate::host::{Host, keys};
 
 /// Send-break while merely debounce-armed -- timer fd alive, no collection
@@ -82,6 +82,43 @@ fn the_history_limit_bounds_the_raw_scan_window() {
     assert_eq!(
         dupes, 1,
         "(h8b) the duplicate within the scan window was not deduplicated to exactly one row: {post:?}"
+    );
+}
+
+/// The payload byte ceiling bounds the scan independently of `[history].limit`:
+/// with the default limit far larger than this fixture history, what ends the
+/// scan is the ceiling, and the entries past it are not candidates
+/// (behavior.md 「履歴メニュー」, cli-protocol.md 「history profile」).
+///
+/// Both queries name a marker that exists exactly once in the fixture, so each
+/// assertion is about that one entry reaching the payload or not. The bulk
+/// entries between them cannot answer either query (no shared letters), which
+/// is what makes "no menu" mean "cut by the ceiling" rather than "matched
+/// something else".
+#[test]
+fn the_payload_byte_ceiling_bounds_the_scan_before_the_history_limit_does() {
+    let mut host = Host::boot_history_budget();
+
+    hist::open_menu(&mut host, "zqxinside");
+    assert!(
+        host.listing_kind("(h8c-kind)")
+            .starts_with("kind=history sel=1 listing=1"),
+        "(h8c) the newest entry, well inside the ceiling, did not open the menu: {}",
+        host.listing_kind("(h8c-kind)")
+    );
+    assert!(
+        host.postdisplay("(h8c-post)").contains("zqxinside"),
+        "(h8c-post) the menu opened without the entry the query names: {:?}",
+        host.postdisplay("(h8c-post)")
+    );
+
+    host.press(keys::DISMISS);
+    host.clear_line();
+
+    hist::open_menu(&mut host, "zqxoutside");
+    hist::assert_no_history_kind(
+        &host.listing_kind("(h8d-kind)"),
+        "(h8d) the oldest entry, past the ceiling, still reached the payload:",
     );
 }
 
