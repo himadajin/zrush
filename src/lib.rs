@@ -12,6 +12,7 @@
 
 mod config;
 mod framing;
+mod history;
 mod init;
 mod insert;
 mod keybind;

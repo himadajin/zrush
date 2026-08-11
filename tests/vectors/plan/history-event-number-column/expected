@@ -1,0 +1,16 @@
+echo \0
+2\0
+2\0
+     7  echo bar\0
+100234  echo foo\0
+4\0
+history-number 2 5 1\0
+match 2 8 4\0
+history-number 1 17 6\0
+match 1 25 4\0
+17 16\0
+0 16\0
+2 0 1 2\0
+2 1 1 2\0
+echo foo\0
+echo bar\0

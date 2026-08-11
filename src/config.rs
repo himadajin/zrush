@@ -11,6 +11,11 @@ use crate::keybind;
 use crate::matching::Mode;
 use crate::wire::BUILD_STAMP;
 
+/// Upper bound of `[history].limit` (config-schema.md). history.rs reuses it
+/// as the index's retention cap, and the worker clamps a request's
+/// `history_limit` to it (cli-protocol.md 「history profile」).
+pub(crate) const HISTORY_LIMIT_MAX: u32 = 20000;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TabBehavior {
     CommonPrefix,
@@ -241,7 +246,8 @@ fn apply_key(
             cfg.trailing_space = bool_val(val, table, key, true, warnings);
         }
         ("history", "limit") => {
-            cfg.history_limit = int_val(val, table, key, 1, 20000, 5000, warnings);
+            cfg.history_limit =
+                int_val(val, table, key, 1, HISTORY_LIMIT_MAX.into(), 5000, warnings);
         }
         ("keybind", _) => {
             if let Some(i) = keybind::ACTIONS.iter().position(|a| *a == key) {

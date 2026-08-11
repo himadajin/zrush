@@ -1,4 +1,5 @@
-//! Persistent worker session for `store` and `plan` requests.
+//! Persistent worker session for `store`, `history-snapshot`,
+//! `history-append` and `plan` requests.
 
 use std::ffi::OsStr;
 use std::fmt;
@@ -9,6 +10,7 @@ use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::Path;
 
 use crate::framing::{self, Decoder};
+use crate::history::HistoryIndex;
 use crate::matching::Mode;
 use crate::plan::{self, Producer};
 use crate::record;
@@ -149,9 +151,15 @@ enum Request {
         generation: i64,
         payload: Vec<u8>,
     },
+    History {
+        write: HistoryWrite,
+        generation: i64,
+        payload: Vec<u8>,
+    },
     Plan {
         generation: i64,
         cwd: Vec<u8>,
+        history_limit: usize,
         params: plan::Params,
     },
     Invalid,
@@ -162,6 +170,13 @@ enum Request {
 enum Slot {
     Live,
     Cache,
+}
+
+/// The two writes of the history index (cli-protocol.md 「要求と応答」).
+#[derive(Clone, Copy)]
+enum HistoryWrite {
+    Snapshot,
+    Append,
 }
 
 const SLOT_COUNT: usize = 2;
@@ -189,10 +204,19 @@ impl CandidateStore {
     }
 }
 
+/// Everything one session retains: the candidate store's slots and the
+/// history index, which is not a slot -- `store` never reaches it and the
+/// history writes never reach a slot (cli-protocol.md 「要求と応答」).
+#[derive(Default)]
+struct Retained {
+    store: CandidateStore,
+    history: HistoryIndex,
+}
+
 pub(crate) fn run<R: Read, W: Write>(mut input: R, mut output: W) -> Result<End, Error> {
     let mut decoder = Decoder::new();
     let mut handshake = Handshake::Awaiting;
-    let mut store = CandidateStore::default();
+    let mut retained = Retained::default();
     let mut buffer = [0; READ_BUFFER_SIZE];
 
     loop {
@@ -205,7 +229,7 @@ pub(crate) fn run<R: Read, W: Write>(mut input: R, mut output: W) -> Result<End,
         match decoder.feed(&buffer[..read]) {
             Ok(messages) => {
                 for message in messages {
-                    if process_message(&message, &mut handshake, &mut store, &mut output)?
+                    if process_message(&message, &mut handshake, &mut retained, &mut output)?
                         == MessageResult::Incompatible
                     {
                         discard_requests(&mut input);
@@ -215,7 +239,7 @@ pub(crate) fn run<R: Read, W: Write>(mut input: R, mut output: W) -> Result<End,
             }
             Err(feed_error) => {
                 for message in feed_error.completed {
-                    if process_message(&message, &mut handshake, &mut store, &mut output)?
+                    if process_message(&message, &mut handshake, &mut retained, &mut output)?
                         == MessageResult::Incompatible
                     {
                         discard_requests(&mut input);
@@ -237,14 +261,14 @@ fn discard_requests<R: Read>(input: &mut R) {
 fn process_message<W: Write>(
     message: &[u8],
     handshake: &mut Handshake,
-    store: &mut CandidateStore,
+    retained: &mut Retained,
     output: &mut W,
 ) -> Result<MessageResult, Error> {
     let fields = decode_fields(message)?;
     match handshake {
         Handshake::Awaiting => process_hello(&fields, handshake, output),
         Handshake::Ready => {
-            process_request(fields, store, output)?;
+            process_request(fields, retained, output)?;
             Ok(MessageResult::Continue)
         }
     }
@@ -271,7 +295,7 @@ fn process_hello<W: Write>(
 
 fn process_request<W: Write>(
     fields: Vec<Vec<u8>>,
-    store: &mut CandidateStore,
+    retained: &mut Retained,
     output: &mut W,
 ) -> Result<(), Error> {
     let request_id = fields
@@ -288,8 +312,29 @@ fn process_request<W: Write>(
             payload,
         } => match record::parse(payload) {
             Ok(stored) => {
-                store.insert(slot, generation, stored);
+                retained.store.insert(slot, generation, stored);
                 write_message(output, &[b"ok", &request_id, b""])
+            }
+            Err(record::FramingError) => {
+                write_message(output, &[b"error", &request_id, b"invalid-payload"])
+            }
+        },
+        Request::History {
+            write,
+            generation,
+            payload,
+        } => match record::parse(payload) {
+            Ok(stored) => {
+                let accepted = match write {
+                    HistoryWrite::Snapshot => retained.history.install(generation, &stored),
+                    HistoryWrite::Append => retained.history.append(generation, &stored),
+                };
+                match accepted {
+                    Ok(()) => write_message(output, &[b"ok", &request_id, b""]),
+                    Err(_) => {
+                        write_message(output, &[b"error", &request_id, b"unknown-generation"])
+                    }
+                }
             }
             Err(record::FramingError) => {
                 write_message(output, &[b"error", &request_id, b"invalid-payload"])
@@ -298,21 +343,35 @@ fn process_request<W: Write>(
         Request::Plan {
             generation,
             cwd,
+            history_limit,
             params,
-        } => match store.find(generation) {
-            Some(stored) => {
-                let is_dir = |path: &[u8]| is_dir_from(&cwd, path);
-                let body = plan::compute(&params, stored, &is_dir);
-                write_message(output, &[b"ok", &request_id, &body])
+        } => {
+            let is_dir = |path: &[u8]| is_dir_from(&cwd, path);
+            // cli-protocol.md 「要求と応答」: one generation namespace spanning
+            // both slots and the index. The index answers only for its
+            // current stamp, and builds the query window per request because
+            // the scan bound is the request's.
+            let body = if let Some(stored) = retained.store.find(generation) {
+                Some(plan::compute(&params, stored, &is_dir))
+            } else if retained.history.holds(generation) {
+                let window = retained.history.window(history_limit);
+                Some(plan::compute(&params, &window, &is_dir))
+            } else {
+                None
+            };
+            match body {
+                Some(body) => write_message(output, &[b"ok", &request_id, &body]),
+                None => write_message(output, &[b"error", &request_id, b"unknown-generation"]),
             }
-            None => write_message(output, &[b"error", &request_id, b"unknown-generation"]),
-        },
+        }
     }
 }
 
 fn parse_request(fields: Vec<Vec<u8>>) -> Request {
     match fields.first().map(Vec::as_slice) {
         Some(b"store") => parse_store(fields),
+        Some(b"history-snapshot") => parse_history(fields, HistoryWrite::Snapshot),
+        Some(b"history-append") => parse_history(fields, HistoryWrite::Append),
         Some(b"plan") => parse_plan(fields),
         _ => Request::Invalid,
     }
@@ -335,6 +394,20 @@ fn parse_store(fields: Vec<Vec<u8>>) -> Request {
     }
 }
 
+fn parse_history(fields: Vec<Vec<u8>>, write: HistoryWrite) -> Request {
+    let Ok([_kind, _id, generation, payload]) = <[Vec<u8>; 4]>::try_from(fields) else {
+        return Request::Invalid;
+    };
+    let Some(generation) = parse_identifier(&generation) else {
+        return Request::Invalid;
+    };
+    Request::History {
+        write,
+        generation,
+        payload,
+    }
+}
+
 fn parse_plan(fields: Vec<Vec<u8>>) -> Request {
     let Ok(
         [
@@ -349,8 +422,9 @@ fn parse_plan(fields: Vec<Vec<u8>>) -> Request {
             rows,
             width,
             trailing_space,
+            history_limit,
         ],
-    ) = <[Vec<u8>; 11]>::try_from(fields)
+    ) = <[Vec<u8>; 12]>::try_from(fields)
     else {
         return Request::Invalid;
     };
@@ -376,10 +450,16 @@ fn parse_plan(fields: Vec<Vec<u8>>) -> Request {
     let Some(trailing_space) = parse_bool(&trailing_space) else {
         return Request::Invalid;
     };
+    // Same grammar as an identifier, and mandatory whichever store the
+    // generation resolves to (cli-protocol.md 「要求と応答」).
+    let Some(history_limit) = parse_identifier(&history_limit) else {
+        return Request::Invalid;
+    };
 
     Request::Plan {
         generation,
         cwd,
+        history_limit: usize::try_from(history_limit).unwrap_or(usize::MAX),
         params: plan::Params {
             producer,
             query,
@@ -532,8 +612,55 @@ mod tests {
 
     fn plan_request<'a>(id: &'a [u8], generation: &'a [u8]) -> Vec<&'a [u8]> {
         vec![
-            b"plan", id, generation, b"/", b"compsys", b"", b"typo", b"true", b"10", b"40", b"true",
+            b"plan", id, generation, b"/", b"compsys", b"", b"typo", b"true", b"10", b"40",
+            b"true", b"5000",
         ]
+    }
+
+    /// A `plan` reading the history index: the `history` producer and an
+    /// explicit scan bound.
+    fn history_plan_request<'a>(
+        id: &'a [u8],
+        generation: &'a [u8],
+        history_limit: &'a [u8],
+    ) -> Vec<&'a [u8]> {
+        vec![
+            b"plan",
+            id,
+            generation,
+            b"/",
+            b"history",
+            b"",
+            b"typo",
+            b"true",
+            b"10",
+            b"40",
+            b"false",
+            history_limit,
+        ]
+    }
+
+    /// A history-profile payload: one empty batch header, then `w`/`n`
+    /// candidate records newest first.
+    fn history_payload(entries: &[(&[u8], &[u8])]) -> Vec<u8> {
+        let mut out = b"b\x01\0".to_vec();
+        for (line, event) in entries {
+            out.extend_from_slice(b"w\x01");
+            out.extend_from_slice(line);
+            out.extend_from_slice(b"\x02n\x01");
+            out.extend_from_slice(event);
+            out.push(0);
+        }
+        out
+    }
+
+    fn history_request<'a>(
+        kind: &'a [u8],
+        id: &'a [u8],
+        generation: &'a [u8],
+        payload: &'a [u8],
+    ) -> Vec<&'a [u8]> {
+        vec![kind, id, generation, payload]
     }
 
     /// Field 3 of a terminal response: an `ok` body or an error `code`.
@@ -761,6 +888,315 @@ mod tests {
                 b"invalid-request".to_vec()
             ]
         );
+    }
+
+    #[test]
+    fn a_snapshot_serves_a_plan_that_references_its_generation() {
+        let payload = history_payload(&[(b"echo hi", b"42"), (b"ls", b"41")]);
+        let decoded = session(&[
+            message(&history_request(b"history-snapshot", b"1", b"5", &payload)),
+            message(&history_plan_request(b"2", b"5", b"5000")),
+        ]);
+
+        assert_eq!(decoded[1], [b"ok".to_vec(), b"1".to_vec(), Vec::new()]);
+        // The index is a single column drawn bottom-up, so the newest line is
+        // the last display row, and each cell carries its event number.
+        assert!(
+            body(&decoded[2])
+                .windows(15)
+                .any(|bytes| bytes == b"   42  echo hi\0"),
+            "plan does not list the newest entry: {:?}",
+            body(&decoded[2])
+        );
+        assert!(body(&decoded[2]).windows(2).any(|bytes| bytes == b"41"));
+    }
+
+    /// cli-protocol.md 「要求と応答」: a `plan` sees exactly the history
+    /// writes that preceded it in the byte stream, and the index answers only
+    /// for its current stamp.
+    #[test]
+    fn pipelined_history_writes_are_visible_to_the_plan_behind_them() {
+        let snapshot = history_payload(&[(b"ls", b"41")]);
+        let appended = history_payload(&[(b"echo hi", b"42")]);
+        let decoded = session(&[
+            message(&history_request(b"history-snapshot", b"1", b"5", &snapshot)),
+            message(&history_request(b"history-append", b"2", b"6", &appended)),
+            message(&history_plan_request(b"3", b"6", b"5000")),
+            message(&history_plan_request(b"4", b"5", b"5000")),
+        ]);
+
+        assert_eq!(decoded[1], [b"ok".to_vec(), b"1".to_vec(), Vec::new()]);
+        assert_eq!(decoded[2], [b"ok".to_vec(), b"2".to_vec(), Vec::new()]);
+        let listed = body(&decoded[3]);
+        assert!(listed.windows(7).any(|bytes| bytes == b"echo hi"));
+        assert!(listed.windows(2).any(|bytes| bytes == b"ls"));
+        assert_eq!(
+            decoded[4],
+            [
+                b"error".to_vec(),
+                b"4".to_vec(),
+                b"unknown-generation".to_vec()
+            ]
+        );
+    }
+
+    #[test]
+    fn every_history_request_receives_exactly_one_terminal_response() {
+        let payload = history_payload(&[(b"ls", b"41")]);
+        let decoded = session(&[
+            message(&history_request(b"history-append", b"1", b"5", &payload)),
+            message(&history_request(b"history-snapshot", b"2", b"5", &payload)),
+            message(&history_request(b"history-snapshot", b"3", b"5", &payload)),
+            message(&history_request(b"history-append", b"4", b"6", &payload)),
+        ]);
+
+        assert_eq!(
+            decoded[1..],
+            [
+                // An append cannot initialize the index.
+                vec![
+                    b"error".to_vec(),
+                    b"1".to_vec(),
+                    b"unknown-generation".to_vec()
+                ],
+                vec![b"ok".to_vec(), b"2".to_vec(), Vec::new()],
+                // Equal to the stamp the snapshot just wrote: not strictly
+                // greater.
+                vec![
+                    b"error".to_vec(),
+                    b"3".to_vec(),
+                    b"unknown-generation".to_vec()
+                ],
+                vec![b"ok".to_vec(), b"4".to_vec(), Vec::new()],
+            ]
+        );
+    }
+
+    #[test]
+    fn a_history_write_that_fails_framing_changes_neither_the_index_nor_a_slot() {
+        let stored = payload(b"git");
+        let installed = history_payload(&[(b"ls", b"41")]);
+        let decoded = session(&[
+            message(&store_request(b"1", b"live", b"5", &stored)),
+            message(&history_request(
+                b"history-snapshot",
+                b"2",
+                b"6",
+                &installed,
+            )),
+            message(&history_request(
+                b"history-snapshot",
+                b"3",
+                b"7",
+                b"unterminated",
+            )),
+            message(&history_request(
+                b"history-append",
+                b"4",
+                b"8",
+                b"unterminated",
+            )),
+            message(&history_plan_request(b"5", b"6", b"5000")),
+            message(&history_plan_request(b"6", b"7", b"5000")),
+            message(&plan_request(b"7", b"5")),
+        ]);
+
+        assert_eq!(
+            decoded[3],
+            [
+                b"error".to_vec(),
+                b"3".to_vec(),
+                b"invalid-payload".to_vec()
+            ]
+        );
+        assert_eq!(
+            decoded[4],
+            [
+                b"error".to_vec(),
+                b"4".to_vec(),
+                b"invalid-payload".to_vec()
+            ]
+        );
+        // The index kept both its content and the stamp of the last write it
+        // accepted, and the slot is untouched.
+        assert!(body(&decoded[5]).windows(2).any(|bytes| bytes == b"ls"));
+        assert_eq!(
+            decoded[6],
+            [
+                b"error".to_vec(),
+                b"6".to_vec(),
+                b"unknown-generation".to_vec()
+            ]
+        );
+        assert!(body(&decoded[7]).windows(3).any(|bytes| bytes == b"git"));
+    }
+
+    #[test]
+    fn a_new_session_starts_with_an_uninitialized_index() {
+        let installed = history_payload(&[(b"ls", b"41")]);
+        session(&[message(&history_request(
+            b"history-snapshot",
+            b"1",
+            b"5",
+            &installed,
+        ))]);
+
+        let decoded = session(&[
+            message(&history_plan_request(b"2", b"5", b"5000")),
+            message(&history_request(b"history-append", b"3", b"6", &installed)),
+        ]);
+
+        assert_eq!(
+            decoded[1..],
+            [
+                vec![
+                    b"error".to_vec(),
+                    b"2".to_vec(),
+                    b"unknown-generation".to_vec()
+                ],
+                vec![
+                    b"error".to_vec(),
+                    b"3".to_vec(),
+                    b"unknown-generation".to_vec()
+                ],
+            ]
+        );
+    }
+
+    /// cli-protocol.md 「要求と応答」: `store` never reaches the index and the
+    /// history writes never reach a slot.
+    #[test]
+    fn history_writes_and_slots_are_independent() {
+        let live = payload(b"git");
+        let cached = payload(b"grep");
+        let installed = history_payload(&[(b"ls", b"41")]);
+        let decoded = session(&[
+            message(&store_request(b"1", b"live", b"5", &live)),
+            message(&store_request(b"2", b"cache", b"6", &cached)),
+            message(&history_request(
+                b"history-snapshot",
+                b"3",
+                b"7",
+                &installed,
+            )),
+            message(&store_request(b"4", b"live", b"8", &live)),
+            message(&plan_request(b"5", b"6")),
+            message(&history_plan_request(b"6", b"7", b"5000")),
+            message(&history_plan_request(b"7", b"8", b"5000")),
+            message(&plan_request(b"8", b"5")),
+        ]);
+
+        assert!(body(&decoded[5]).windows(4).any(|bytes| bytes == b"grep"));
+        assert!(body(&decoded[6]).windows(2).any(|bytes| bytes == b"ls"));
+        // Generation 8 belongs to the `live` slot, and generation 5 was
+        // replaced there: neither resolves to the index.
+        assert!(!body(&decoded[7]).windows(2).any(|bytes| bytes == b"ls"));
+        assert_eq!(
+            decoded[8],
+            [
+                b"error".to_vec(),
+                b"8".to_vec(),
+                b"unknown-generation".to_vec()
+            ]
+        );
+    }
+
+    #[test]
+    fn history_scalar_validation_precedes_payload_framing() {
+        let payload = history_payload(&[(b"ls", b"41")]);
+        let decoded = session(&[
+            message(&history_request(b"history-snapshot", b"1", b"05", &payload)),
+            message(&history_request(b"history-append", b"2", b"0", &payload)),
+            message(&history_request(
+                b"history-snapshot",
+                b"3",
+                b"05",
+                b"unterminated",
+            )),
+            message(&[b"history-snapshot", b"4", b"5"]),
+        ]);
+
+        assert_eq!(
+            decoded[1..],
+            [
+                vec![
+                    b"error".to_vec(),
+                    b"1".to_vec(),
+                    b"invalid-request".to_vec()
+                ],
+                vec![
+                    b"error".to_vec(),
+                    b"2".to_vec(),
+                    b"invalid-request".to_vec()
+                ],
+                vec![
+                    b"error".to_vec(),
+                    b"3".to_vec(),
+                    b"invalid-request".to_vec()
+                ],
+                vec![
+                    b"error".to_vec(),
+                    b"4".to_vec(),
+                    b"invalid-request".to_vec()
+                ],
+            ]
+        );
+    }
+
+    #[test]
+    fn a_plan_without_a_canonical_history_limit_is_invalid() {
+        let mut requests = Vec::new();
+        for (id, limit) in [
+            (b"1".as_slice(), b"".as_slice()),
+            (b"2", b"0"),
+            (b"3", b"05000"),
+            (b"4", b" 5000"),
+            (b"5", b"9223372036854775808"),
+        ] {
+            requests.push(message(&history_plan_request(id, b"9", limit)));
+        }
+        // The 11-field plan of the previous wire is not a request either.
+        requests.push(message(&[
+            b"plan", b"6", b"9", b"/", b"compsys", b"", b"typo", b"true", b"10", b"40", b"true",
+        ]));
+        let decoded = session(&requests);
+
+        for (index, id) in [b"1", b"2", b"3", b"4", b"5", b"6"].into_iter().enumerate() {
+            assert_eq!(
+                decoded[index + 1],
+                [b"error".to_vec(), id.to_vec(), b"invalid-request".to_vec()]
+            );
+        }
+    }
+
+    /// cli-protocol.md 「history profile」: the request's scan bound is
+    /// clamped to the retention cap, and a slot-resolved `plan` ignores it.
+    #[test]
+    fn the_history_limit_bounds_the_scan_and_is_ignored_by_slots() {
+        let installed = history_payload(&[(b"newest", b"3"), (b"older", b"2"), (b"oldest", b"1")]);
+        let stored = payload(b"git");
+        let decoded = session(&[
+            message(&history_request(
+                b"history-snapshot",
+                b"1",
+                b"5",
+                &installed,
+            )),
+            message(&store_request(b"2", b"live", b"6", &stored)),
+            message(&history_plan_request(b"3", b"5", b"1")),
+            message(&history_plan_request(b"4", b"5", b"9223372036854775807")),
+            message(&history_plan_request(b"5", b"6", b"1")),
+        ]);
+
+        let scanned_one = body(&decoded[3]);
+        assert!(scanned_one.windows(6).any(|bytes| bytes == b"newest"));
+        assert!(!scanned_one.windows(5).any(|bytes| bytes == b"older"));
+        // A limit past the retention cap simply scans the whole index.
+        let scanned_all = body(&decoded[4]);
+        assert!(scanned_all.windows(6).any(|bytes| bytes == b"oldest"));
+        // The slot's payload is listed whole: `history_limit` addresses the
+        // index alone.
+        assert!(body(&decoded[5]).windows(3).any(|bytes| bytes == b"git"));
     }
 
     #[test]

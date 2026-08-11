@@ -110,6 +110,19 @@ struct CandidateSpans {
     batch: usize,
 }
 
+/// A source of candidate records for the plan pipeline: a payload the
+/// candidate store holds, or a query window over the worker's history index
+/// (history.rs). plan.rs and everything downstream see only this view, so
+/// both sources produce plans through one code path.
+pub(crate) trait Candidates {
+    /// Batch headers in source order; a [`Candidate`]'s `batch` indexes this.
+    fn batches(&self) -> Vec<Batch<'_>>;
+
+    fn candidate_count(&self) -> usize;
+
+    fn candidate(&self, index: usize) -> Candidate<'_>;
+}
+
 /// One parsed candidate payload, owning the bytes its views borrow: batch
 /// headers and candidates in stream order.
 #[derive(Debug)]
@@ -124,8 +137,13 @@ impl Stored {
         &self.bytes[span.start..span.end]
     }
 
-    /// Batch headers in stream order; a [`Candidate`]'s `batch` indexes this.
-    pub(crate) fn batches(&self) -> Vec<Batch<'_>> {
+    pub(crate) fn candidates(&self) -> impl ExactSizeIterator<Item = Candidate<'_>> {
+        (0..self.candidate_count()).map(|index| self.candidate(index))
+    }
+}
+
+impl Candidates for Stored {
+    fn batches(&self) -> Vec<Batch<'_>> {
         self.batches
             .iter()
             .map(|spans| Batch {
@@ -144,11 +162,11 @@ impl Stored {
             .collect()
     }
 
-    pub(crate) fn candidate_count(&self) -> usize {
+    fn candidate_count(&self) -> usize {
         self.candidates.len()
     }
 
-    pub(crate) fn candidate(&self, index: usize) -> Candidate<'_> {
+    fn candidate(&self, index: usize) -> Candidate<'_> {
         let spans = self.candidates[index];
         Candidate {
             w: self.slice(spans.w),
@@ -157,10 +175,6 @@ impl Stored {
             n: spans.n.map(|span| self.slice(span)),
             batch: spans.batch,
         }
-    }
-
-    pub(crate) fn candidates(&self) -> impl ExactSizeIterator<Item = Candidate<'_>> {
-        (0..self.candidate_count()).map(|index| self.candidate(index))
     }
 }
 
