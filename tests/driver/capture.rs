@@ -26,9 +26,15 @@ fn fork_capture_round_trip_reuses_one_worker() {
     let first = host.worker_state();
     let first_rfd: i32 = dump_field(&first, "rfd").parse().expect("numeric rfd");
     let first_runtime = dump_field(&first, "runtime").to_string();
+    // One collection spends two request ids and one candidate generation: the
+    // `store` that hands the records over and the `plan` pipelined behind it
+    // (cli-protocol.md 「要求と応答」).
     assert!(
         first_rfd > 2
-            && state_has(&first, &["ready=1", "seq=1", "stopping=0", "tainted=0"])
+            && state_has(
+                &first,
+                &["ready=1", "seq=2", "candgen=1", "stopping=0", "tainted=0"]
+            )
             && first_runtime != "<none>",
         "(worker-1b) unexpected first-request state: {first}"
     );

@@ -181,13 +181,20 @@ fn worker(fake: &Fake, control_fd: i32) {
             return;
         };
         let request = fields(&payload, fake);
+        // The kind is folded onto the contract's two request kinds so a state
+        // line always splits into four fields (`tests/driver/fake.rs`).
+        let kind = match request.first().map(Vec::as_slice) {
+            Some(b"store") => "store",
+            Some(b"plan") => "plan",
+            _ => "other",
+        };
         let request_id = match request.get(1) {
             Some(field) => str::from_utf8(field)
                 .unwrap_or_else(|e| panic!("request_id is not UTF-8: {field:?} ({e})"))
                 .to_string(),
             None => "missing".to_string(),
         };
-        fake.note(&format!("request {session} {request_id}"));
+        fake.note(&format!("request {session} {kind} {request_id}"));
 
         let mut action = fake.mode();
         if action == "hold" {
@@ -203,8 +210,16 @@ fn worker(fake: &Fake, control_fd: i32) {
             // is the point: no terminal response ever reaches the parent.
             unsafe { libc::_exit(DIE_STATUS) };
         }
-        if action == "error" || action == "drain" {
-            write_message(&[b"error", request_id.as_bytes(), b"invalid-request"]);
+        if action == "error" || action == "drain" || action == "unknown-generation" {
+            // A `store` always succeeds with the contract's empty body; the
+            // mode decides only what the `plan` referencing it gets back.
+            if kind == "store" {
+                write_message(&[b"ok", request_id.as_bytes(), b""]);
+            } else if action == "unknown-generation" {
+                write_message(&[b"error", request_id.as_bytes(), b"unknown-generation"]);
+            } else {
+                write_message(&[b"error", request_id.as_bytes(), b"invalid-request"]);
+            }
             fake.note(&format!("{action} {session} {request_id}"));
             continue;
         }

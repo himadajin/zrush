@@ -118,7 +118,7 @@ zsh は zle 統合・compsys 呼び出しによる捕獲・プランの適用
   `unknown-generation` を受けたときに無効化する。
   latch を無効化した generation を payload の再送で復元することはせず、
   失敗した `store` / `plan` も replay しない。
-  次の実入力による新しい収集だけが新しい generation を作る。
+  新しい generation を作るのは新しい収集だけである。
 - 正常 shutdown は unhanded frame を破棄し、unacked writer があれば full-frame ack を待つ。
   ack を受けると writer が既に自身の request fd を閉じているため、対話シェルの request write fd を閉じて
   frame 境界の EOF を作る。その後も abort-control write fd は閉じず、response FIFO を bytes のまま EOF まで
@@ -150,7 +150,8 @@ zsh は zle 統合・compsys 呼び出しによる捕獲・プランの適用
   worker が健全に finalization された後、ユーザーが明示的に re-source した場合だけ、この reason と
   failure counter を 0 に戻して新しい worker 起動を許可する。request_id、callback generation、warning latch は
   戻さず、未完了 request の replay もしない。自動 build-stamp re-source はこの解除を行わない。
-  invalid handshake、request_id 枯渇、runtime setup failure など別の disable reason はこの操作で解除しない。
+  invalid handshake、request_id または candidate_generation の枯渇、runtime setup failure など
+  別の disable reason はこの操作で解除しない。
 - 正しい形の `incompatible`、stamp の異なる `ready`、source/config の build-stamp 不一致は stale build として
   失敗回数を介さず `$ZRUSH_BIN init zsh` の自動 re-source を 1 回だけ試みる。成功時は警告せず診断ログだけを残し、
   検出時点の未完了 request はすべて破棄して replay しない。re-source の失敗または re-source 中の再不一致だけが
@@ -244,8 +245,9 @@ zsh は zle 統合・compsys 呼び出しによる捕獲・プランの適用
 結果をプロンプトを跨いでキャッシュする。
 
 - 対象は広げ結果が空文字列の収集のみ。
-  `sudo ` 後などのコマンド位置は、広げ結果が空文字列でも対象外とする。
-  ここで対象とした収集だけが `cache` スロットを使い、対象外の収集は `live` スロットを使う
+  `sudo ` 後などのコマンド位置は広げ結果が非空になるため対象外である。
+  広げ結果が空文字列でも、捕獲した payload が空の収集は対象外とする。
+  ここで対象とした収集だけが `cache` スロットを使い、それ以外の収集は `live` スロットを使う
   (cli-protocol.md「要求と応答」節)。
 - 解析済みの候補を保持するのは worker の `cache` スロットである(cli-protocol.md「要求と応答」節)。
   zsh が保持するのは**フィンガープリント・保存時刻・`cache` スロットの candidate store latch**

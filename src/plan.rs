@@ -1,6 +1,6 @@
 //! Orchestration for worker plan requests (cli-protocol.md "`zrush worker`").
 //!
-//! Pipeline: record::parse -> hidden-file exclusion -> matching::QueryMatcher
+//! Pipeline: hidden-file exclusion -> matching::QueryMatcher
 //! (score every remaining candidate + common-prefix over the *untruncated*
 //! prefix-tier matches)
 //! -> ranking::rank (suppress approximate tiers when a literal exists,
@@ -13,10 +13,10 @@
 //! (this is where `-f` directory-synthesis stat happens, and only for
 //! positions layout actually kept) -> wire::serialize.
 //!
-//! `run` takes one complete candidate payload and an injected
-//! `is_dir` predicate, so it stays free of I/O and is directly testable.
-//! The only error this pipeline itself can produce is candidate framing
-//! violation (record.rs); session I/O belongs to worker.rs.
+//! `compute` reads an already-parsed candidate payload (record::Stored) and
+//! takes an injected `is_dir` predicate, so it stays free of I/O and is
+//! directly testable. It cannot fail: the payload was validated when the
+//! `store` request parsed it, and session I/O belongs to worker.rs.
 
 use crate::matching::{Mode, QueryMatcher, Tier};
 use crate::span::CharSpan;
@@ -57,13 +57,14 @@ impl Producer {
     }
 }
 
-/// Run the full pipeline and return the serialized render plan.
-pub(crate) fn run(
+/// Run the full pipeline over a stored candidate payload and return the
+/// serialized render plan.
+pub(crate) fn compute(
     params: &Params,
-    payload: &[u8],
+    stored: &record::Stored,
     is_dir: &dyn Fn(&[u8]) -> bool,
-) -> Result<Vec<u8>, record::FramingError> {
-    let parsed = record::parse(payload)?;
+) -> Vec<u8> {
+    let batches = stored.batches();
 
     let mut qm = QueryMatcher::new(&params.query, params.mode, params.smart_case);
     let mut matched: Vec<(usize, crate::matching::TierHit)> = Vec::new();
@@ -74,9 +75,9 @@ pub(crate) fn run(
     // cli-protocol.md "隠し候補の除外": excluded before tier classification, so
     // hidden files reach neither the listing nor common-prefix.
     let hidden_opt_in = params.query.first() == Some(&b'.');
-    for (idx, cand) in parsed.candidates.iter().enumerate() {
+    for (idx, cand) in stored.candidates().enumerate() {
         let text = cand.match_text();
-        if !hidden_opt_in && text.starts_with(b".") && parsed.batches[cand.batch].f == b"1" {
+        if !hidden_opt_in && text.starts_with(b".") && batches[cand.batch].f == b"1" {
             continue;
         }
         if let Some(hit) = qm.classify(text) {
@@ -96,7 +97,7 @@ pub(crate) fn run(
     let ranked = ranking::rank(&matched, cap, params.producer.order());
     let candidates: Vec<record::Candidate<'_>> = ranked
         .iter()
-        .map(|&(idx, _)| parsed.candidates[idx])
+        .map(|&(idx, _)| stored.candidate(idx))
         .collect();
     // spans() is a second pass by design (matching.rs docs): only run it
     // on the ranked subset that actually reaches layout, and derive it
@@ -115,7 +116,7 @@ pub(crate) fn run(
 
     let built = layout::build(
         &candidates,
-        &parsed.batches,
+        &batches,
         &sources,
         &spans,
         params.rows,
@@ -130,12 +131,12 @@ pub(crate) fn run(
         .iter()
         .map(|&i| {
             let cand = &candidates[i];
-            let batch = &parsed.batches[cand.batch];
+            let batch = &batches[cand.batch];
             insert::build(batch, cand, params.trailing_space, is_dir)
         })
         .collect();
 
-    Ok(wire::serialize(common_prefix, &built, &insert_texts))
+    wire::serialize(common_prefix, &built, &insert_texts)
 }
 
 /// Compose the display source for every candidate before the layout phase.
@@ -331,6 +332,17 @@ mod tests {
         false
     }
 
+    /// The store-then-plan pair the worker performs, as one call: parse a
+    /// payload and compute a plan from the result.
+    fn run(
+        params: &Params,
+        payload: &[u8],
+        is_dir: &dyn Fn(&[u8]) -> bool,
+    ) -> Result<Vec<u8>, record::FramingError> {
+        let stored = record::parse(payload.to_vec())?;
+        Ok(compute(params, &stored, is_dir))
+    }
+
     fn parse_wire(out: &[u8]) -> wire::Plan {
         wire::parse(out).expect("valid plan")
     }
@@ -378,13 +390,6 @@ mod tests {
     fn empty_stdin_is_the_four_field_zero_match_form() {
         let out = run(&params("abc", Mode::Typo, 10, 40, true), b"", &no_dir).unwrap();
         assert_eq!(out, b"\x000\x000\x000\x00");
-    }
-
-    #[test]
-    fn framing_error_is_reported() {
-        // no trailing NUL: framing violation (record.rs).
-        let err = run(&params("a", Mode::Typo, 10, 40, true), b"b", &no_dir).unwrap_err();
-        assert_eq!(err, crate::record::FramingError);
     }
 
     #[test]

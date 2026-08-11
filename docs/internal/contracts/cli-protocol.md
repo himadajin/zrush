@@ -652,10 +652,16 @@ zsh は一覧を消す。
 - `unknown-generation` は、`plan` が参照した generation を worker が保持していないことを表す。
   他の `error` と同じく正常な終端応答であり、worker セッション失敗にも連続失敗回数にも数えない。
   zsh はその要求も先行する `store` も replay しない。
-  latch を参照して送った `plan` であれば、その candidate store latch を無効化する
-  (latch の所在と無効化点は behavior.md「worker ライフサイクル」節が定める)。
-  非同期の補完経路では、入力がまだ current なら新しい収集を開始して新しい generation を作る。
-  履歴メニューの同期交換では他の `error` と同じく交換の失敗として扱う(behavior.md「履歴メニュー」節)。
+  非同期の補完経路でのその後の扱いは、その `plan` が latch を参照して送ったものかどうかで決まる。
+  - latch を参照して送った `plan`: その candidate store latch を無効化し
+    (latch の所在と無効化点は behavior.md「worker ライフサイクル」節が定める)、
+    入力がまだ current なら新しい収集を開始して新しい generation を作る。
+  - それ以外の `plan`: 同じ収集で直前に送った `store` が `error` で終端した場合に限られる
+    (受信順処理により、成功した `store` の直後へ連送した `plan` が `unknown-generation` を受けることはない)。
+    失敗した要求として捨てるだけで、再収集はせず次の実入力を待つ。
+    決定的な `store` の失敗が再収集を無限に呼び戻さないための限定である。
+  履歴メニューの同期交換では、どちらの場合も他の `error` と同じく交換の失敗として扱う
+  (behavior.md「履歴メニュー」節)。
 - `store` の `ok` は body が空バイト列であることを検証する。
   空でなければ仕様を満たさない応答として扱い、プランを破棄する場合と同じく worker セッションを終了する。
 - `plan` の `ok` body が仕様を満たさない場合

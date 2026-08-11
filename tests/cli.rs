@@ -41,7 +41,7 @@ fn worker_command() -> (Command, UnixStream, UnixStream) {
 
 // ---- zrush worker ----
 
-/// Run one `plan` request through a fresh `zrush worker` session.
+/// Run one `store`/`plan` pair through a fresh `zrush worker` session.
 fn ns(payload: &[u8]) -> Vec<u8> {
     let mut out = payload.len().to_string().into_bytes();
     out.push(b':');
@@ -84,19 +84,25 @@ fn run_plan(extra: &[&str], stdin: &[u8]) -> (i32, Vec<u8>) {
             .map(|w| w[1])
             .unwrap_or("")
     };
-    let req = msg(&[
-        b"plan",
-        b"1",
-        std::env::current_dir().unwrap().as_os_str().as_bytes(),
-        value("--producer").as_bytes(),
-        value("--query").as_bytes(),
-        value("--mode").as_bytes(),
-        b"true",
-        value("--rows").as_bytes(),
-        value("--width").as_bytes(),
-        value("--trailing-space").as_bytes(),
-        stdin,
-    ]);
+    // `stdin` is the candidate payload: it reaches the worker as a `store`
+    // (generation 1) that the `plan` then references.
+    let req = [
+        msg(&[b"store", b"1", b"live", b"1", stdin]),
+        msg(&[
+            b"plan",
+            b"2",
+            b"1",
+            std::env::current_dir().unwrap().as_os_str().as_bytes(),
+            value("--producer").as_bytes(),
+            value("--query").as_bytes(),
+            value("--mode").as_bytes(),
+            b"true",
+            value("--rows").as_bytes(),
+            value("--width").as_bytes(),
+            value("--trailing-space").as_bytes(),
+        ]),
+    ]
+    .concat();
     let (mut command, control_read, _control_write) = worker_command();
     let mut child = command
         .stdin(Stdio::piped())
@@ -368,10 +374,11 @@ fn worker_handshake_and_multiple_requests_share_one_process() {
         p.extend(word("git"));
         p
     };
-    let request = |id: &[u8]| {
+    let plan = |id: &[u8]| {
         msg(&[
             b"plan",
             id,
+            b"1",
             cwd.as_os_str().as_bytes(),
             b"compsys",
             b"",
@@ -380,7 +387,6 @@ fn worker_handshake_and_multiple_requests_share_one_process() {
             b"10",
             b"40",
             b"true",
-            &payload,
         ])
     };
     let (mut command, control_read, _control_write) = worker_command();
@@ -392,8 +398,9 @@ fn worker_handshake_and_multiple_requests_share_one_process() {
     drop(control_read);
     let mut input = Vec::new();
     input.extend(msg(&[b"hello", BUILD_STAMP]));
-    input.extend(request(b"1"));
-    input.extend(request(b"2"));
+    input.extend(msg(&[b"store", b"1", b"live", b"1", &payload]));
+    input.extend(plan(b"2"));
+    input.extend(plan(b"3"));
     let mut stdin = child.stdin.take().unwrap();
     for chunk in input.chunks(3) {
         stdin.write_all(chunk).unwrap();
@@ -401,12 +408,19 @@ fn worker_handshake_and_multiple_requests_share_one_process() {
     drop(stdin);
     let out = child.wait_with_output().unwrap();
     let frames = decode_frames(&out.stdout);
-    assert_eq!(frames.len(), 3, "ready plus two terminal responses");
+    assert_eq!(frames.len(), 4, "ready plus three terminal responses");
     assert_eq!(
         fields(&frames[0]),
         vec![b"ready".to_vec(), BUILD_STAMP.to_vec()]
     );
-    assert!(fields(&frames[1])[0] == b"ok" && fields(&frames[2])[0] == b"ok");
+    assert_eq!(
+        fields(&frames[1]),
+        vec![b"ok".to_vec(), b"1".to_vec(), Vec::new()],
+        "the store body is empty"
+    );
+    // Both plans read the one stored generation.
+    assert!(fields(&frames[2])[0] == b"ok" && fields(&frames[3])[0] == b"ok");
+    assert_eq!(fields(&frames[2])[2], fields(&frames[3])[2]);
 }
 
 #[test]

@@ -2,12 +2,14 @@
 
 This corpus turns the prose rules in `docs/internal/contracts/cli-protocol.md` into executable byte-level fixtures.
 
-Each `plan/<name>/` directory contains `args`, `payload`, and `expected`.
+Each `plan/<name>/` directory contains `args`, `payload`, and `expected`: the `plan` request's scalar fields, the `store` request's `candidate_payload`, and the `plan` response's `ok` body.
 Each `reject/<name>/` directory contains `args` and `payload`.
 Each `reject-plan/<name>/` directory contains only `plan`.
 Each `encode/<name>/` directory contains `argv`, `hits`, `dscr`, `expected`, and an optional `env`.
-The runner sends each vector as a `plan` request to a persistent `zrush worker`; `args` contains flags and their values only.
-Reject vectors expect a worker session with exactly one terminal `error` response (`invalid-request` for malformed request shape/scalars, `invalid-payload` for candidate framing).
+The runner drives each vector through one persistent `zrush worker` session as the contract's two requests: a `store` (request_id 1, slot `live`, generation 1) carrying `payload`, then a `plan` (request_id 2) referencing that generation.
+`args` contains flags and their values only.
+Reject vectors expect that session to answer with a terminal response per request, exactly one of which is an `error`.
+A candidate-stream framing violation fails the `store` with `invalid-payload`, leaving no generation for the `plan` to reference (`unknown-generation`); a malformed request shape or scalar stores fine and fails the `plan` itself with `invalid-request`.
 Vector names use kebab case and describe the rule being fixed.
 
 ## File format
@@ -70,7 +72,8 @@ A generated `expected` is a proposal, not an answer -- read it against cli-proto
 
 ## Who checks what
 
-`cargo test` checks `plan/`, `reject/`, and `reject-plan/` against the Rust worker and the `wire` reference parser. Reject vectors structurally validate exactly `[ready,7]` plus one terminal in-band `error`; no process exit 2/3 compatibility is tested.
+`cargo test` checks `plan/`, `reject/`, and `reject-plan/` against the Rust worker and the `wire` reference parser.
+Reject vectors structurally validate exactly the handshake `ready` plus the terminal in-band responses of the session's `store` and `plan`; no process exit 2/3 compatibility is tested.
 Both runners independently implement the file format above, check every corpus file for canonical spelling, and hold their own codec to a round trip over arbitrary byte strings.
 `zsh -f tests/zsh/vectors.zsh` checks `encode/` against the zsh encoder `_zrush_encode_batch`,
 the history sender's line/event-number pairing and filtering against `_zrush_history_payload`,

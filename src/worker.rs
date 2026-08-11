@@ -1,4 +1,4 @@
-//! Persistent worker session for plan requests.
+//! Persistent worker session for `store` and `plan` requests.
 
 use std::ffi::OsStr;
 use std::fmt;
@@ -143,21 +143,56 @@ enum MessageResult {
     Incompatible,
 }
 
-enum Request<'a> {
-    Valid {
-        request_id: &'a [u8],
-        cwd: &'a [u8],
+enum Request {
+    Store {
+        slot: Slot,
+        generation: i64,
+        payload: Vec<u8>,
+    },
+    Plan {
+        generation: i64,
+        cwd: Vec<u8>,
         params: plan::Params,
-        payload: &'a [u8],
     },
-    Invalid {
-        request_id: &'a [u8],
-    },
+    Invalid,
+}
+
+/// The slots zsh addresses; the worker never interprets what they mean.
+#[derive(Clone, Copy)]
+enum Slot {
+    Live,
+    Cache,
+}
+
+const SLOT_COUNT: usize = 2;
+
+/// At most one parsed candidate generation per slot, for the lifetime of
+/// this session (cli-protocol.md 「要求と応答」).
+#[derive(Default)]
+struct CandidateStore {
+    slots: [Option<(i64, record::Stored)>; SLOT_COUNT],
+}
+
+impl CandidateStore {
+    /// Replace this slot's generation, leaving every other slot untouched.
+    fn insert(&mut self, slot: Slot, generation: i64, stored: record::Stored) {
+        self.slots[slot as usize] = Some((generation, stored));
+    }
+
+    /// Look a generation up across every slot.
+    fn find(&self, generation: i64) -> Option<&record::Stored> {
+        self.slots
+            .iter()
+            .flatten()
+            .find(|(stored_generation, _)| *stored_generation == generation)
+            .map(|(_, stored)| stored)
+    }
 }
 
 pub(crate) fn run<R: Read, W: Write>(mut input: R, mut output: W) -> Result<End, Error> {
     let mut decoder = Decoder::new();
     let mut handshake = Handshake::Awaiting;
+    let mut store = CandidateStore::default();
     let mut buffer = [0; READ_BUFFER_SIZE];
 
     loop {
@@ -170,7 +205,7 @@ pub(crate) fn run<R: Read, W: Write>(mut input: R, mut output: W) -> Result<End,
         match decoder.feed(&buffer[..read]) {
             Ok(messages) => {
                 for message in messages {
-                    if process_message(&message, &mut handshake, &mut output)?
+                    if process_message(&message, &mut handshake, &mut store, &mut output)?
                         == MessageResult::Incompatible
                     {
                         discard_requests(&mut input);
@@ -180,7 +215,7 @@ pub(crate) fn run<R: Read, W: Write>(mut input: R, mut output: W) -> Result<End,
             }
             Err(feed_error) => {
                 for message in feed_error.completed {
-                    if process_message(&message, &mut handshake, &mut output)?
+                    if process_message(&message, &mut handshake, &mut store, &mut output)?
                         == MessageResult::Incompatible
                     {
                         discard_requests(&mut input);
@@ -202,13 +237,14 @@ fn discard_requests<R: Read>(input: &mut R) {
 fn process_message<W: Write>(
     message: &[u8],
     handshake: &mut Handshake,
+    store: &mut CandidateStore,
     output: &mut W,
 ) -> Result<MessageResult, Error> {
     let fields = decode_fields(message)?;
     match handshake {
         Handshake::Awaiting => process_hello(&fields, handshake, output),
         Handshake::Ready => {
-            process_request(&fields, output)?;
+            process_request(fields, store, output)?;
             Ok(MessageResult::Continue)
         }
     }
@@ -233,86 +269,134 @@ fn process_hello<W: Write>(
     Ok(MessageResult::Continue)
 }
 
-fn process_request<W: Write>(fields: &[Vec<u8>], output: &mut W) -> Result<(), Error> {
+fn process_request<W: Write>(
+    fields: Vec<Vec<u8>>,
+    store: &mut CandidateStore,
+    output: &mut W,
+) -> Result<(), Error> {
     let request_id = fields
         .get(1)
-        .filter(|value| parse_request_id(value).is_some())
-        .ok_or(Error::Protocol)?;
+        .filter(|value| parse_identifier(value).is_some())
+        .ok_or(Error::Protocol)?
+        .clone();
 
-    match parse_request(fields, request_id) {
-        Request::Invalid { request_id } => {
-            write_message(output, &[b"error", request_id, b"invalid-request"])
-        }
-        Request::Valid {
-            request_id,
+    match parse_request(fields) {
+        Request::Invalid => write_message(output, &[b"error", &request_id, b"invalid-request"]),
+        Request::Store {
+            slot,
+            generation,
+            payload,
+        } => match record::parse(payload) {
+            Ok(stored) => {
+                store.insert(slot, generation, stored);
+                write_message(output, &[b"ok", &request_id, b""])
+            }
+            Err(record::FramingError) => {
+                write_message(output, &[b"error", &request_id, b"invalid-payload"])
+            }
+        },
+        Request::Plan {
+            generation,
             cwd,
             params,
-            payload,
-        } => {
-            let is_dir = |path: &[u8]| is_dir_from(cwd, path);
-            match plan::run(&params, payload, &is_dir) {
-                Ok(render_plan) => write_message(output, &[b"ok", request_id, &render_plan]),
-                Err(record::FramingError) => {
-                    write_message(output, &[b"error", request_id, b"invalid-payload"])
-                }
+        } => match store.find(generation) {
+            Some(stored) => {
+                let is_dir = |path: &[u8]| is_dir_from(&cwd, path);
+                let body = plan::compute(&params, stored, &is_dir);
+                write_message(output, &[b"ok", &request_id, &body])
             }
-        }
+            None => write_message(output, &[b"error", &request_id, b"unknown-generation"]),
+        },
     }
 }
 
-fn parse_request<'a>(fields: &'a [Vec<u8>], request_id: &'a [u8]) -> Request<'a> {
-    let [
-        cmd,
-        _id,
-        cwd,
-        producer,
-        query,
-        mode,
-        smart_case,
-        rows,
-        width,
-        trailing_space,
-        payload,
-    ] = fields
-    else {
-        return Request::Invalid { request_id };
-    };
-    if cmd != b"plan" {
-        return Request::Invalid { request_id };
+fn parse_request(fields: Vec<Vec<u8>>) -> Request {
+    match fields.first().map(Vec::as_slice) {
+        Some(b"store") => parse_store(fields),
+        Some(b"plan") => parse_plan(fields),
+        _ => Request::Invalid,
     }
+}
 
-    let Some(producer) = parse_producer(producer) else {
-        return Request::Invalid { request_id };
+fn parse_store(fields: Vec<Vec<u8>>) -> Request {
+    let Ok([_kind, _id, slot, generation, payload]) = <[Vec<u8>; 5]>::try_from(fields) else {
+        return Request::Invalid;
     };
-    let Some(mode) = Mode::parse(std::str::from_utf8(mode).unwrap_or("")) else {
-        return Request::Invalid { request_id };
+    let Some(slot) = parse_slot(&slot) else {
+        return Request::Invalid;
     };
-    let Some(smart_case) = parse_bool(smart_case) else {
-        return Request::Invalid { request_id };
+    let Some(generation) = parse_identifier(&generation) else {
+        return Request::Invalid;
     };
-    let Some(rows) = parse_positive_usize(rows) else {
-        return Request::Invalid { request_id };
-    };
-    let Some(width) = parse_positive_usize(width) else {
-        return Request::Invalid { request_id };
-    };
-    let Some(trailing_space) = parse_bool(trailing_space) else {
-        return Request::Invalid { request_id };
+    Request::Store {
+        slot,
+        generation,
+        payload,
+    }
+}
+
+fn parse_plan(fields: Vec<Vec<u8>>) -> Request {
+    let Ok(
+        [
+            _kind,
+            _id,
+            generation,
+            cwd,
+            producer,
+            query,
+            mode,
+            smart_case,
+            rows,
+            width,
+            trailing_space,
+        ],
+    ) = <[Vec<u8>; 11]>::try_from(fields)
+    else {
+        return Request::Invalid;
     };
 
-    Request::Valid {
-        request_id,
+    let Some(generation) = parse_identifier(&generation) else {
+        return Request::Invalid;
+    };
+    let Some(producer) = parse_producer(&producer) else {
+        return Request::Invalid;
+    };
+    let Some(mode) = Mode::parse(std::str::from_utf8(&mode).unwrap_or("")) else {
+        return Request::Invalid;
+    };
+    let Some(smart_case) = parse_bool(&smart_case) else {
+        return Request::Invalid;
+    };
+    let Some(rows) = parse_positive_usize(&rows) else {
+        return Request::Invalid;
+    };
+    let Some(width) = parse_positive_usize(&width) else {
+        return Request::Invalid;
+    };
+    let Some(trailing_space) = parse_bool(&trailing_space) else {
+        return Request::Invalid;
+    };
+
+    Request::Plan {
+        generation,
         cwd,
         params: plan::Params {
             producer,
-            query: query.clone(),
+            query,
             mode,
             smart_case,
             rows,
             width,
             trailing_space,
         },
-        payload,
+    }
+}
+
+fn parse_slot(value: &[u8]) -> Option<Slot> {
+    match value {
+        b"live" => Some(Slot::Live),
+        b"cache" => Some(Slot::Cache),
+        _ => None,
     }
 }
 
@@ -332,7 +416,9 @@ fn parse_bool(value: &[u8]) -> Option<bool> {
     }
 }
 
-fn parse_request_id(value: &[u8]) -> Option<i64> {
+/// `request_id` and `candidate_generation` share one grammar: canonical
+/// ASCII decimal in `1..=i64::MAX`.
+fn parse_identifier(value: &[u8]) -> Option<i64> {
     let parsed = parse_canonical_u64(value)?;
     i64::try_from(parsed).ok().filter(|id| *id > 0)
 }
@@ -430,36 +516,173 @@ mod tests {
         }
     }
 
-    fn request<'a>(id: &'a [u8], cwd: &'a [u8], payload: &'a [u8]) -> Vec<&'a [u8]> {
+    /// One batch header plus one candidate record.
+    fn payload(word: &[u8]) -> Vec<u8> {
+        [b"b\x01\0w\x01", word, b"\0"].concat()
+    }
+
+    fn store_request<'a>(
+        id: &'a [u8],
+        slot: &'a [u8],
+        generation: &'a [u8],
+        payload: &'a [u8],
+    ) -> Vec<&'a [u8]> {
+        vec![b"store", id, slot, generation, payload]
+    }
+
+    fn plan_request<'a>(id: &'a [u8], generation: &'a [u8]) -> Vec<&'a [u8]> {
         vec![
-            b"plan", id, cwd, b"compsys", b"", b"typo", b"true", b"10", b"40", b"true", payload,
+            b"plan", id, generation, b"/", b"compsys", b"", b"typo", b"true", b"10", b"40", b"true",
         ]
     }
 
-    #[test]
-    fn handshake_and_multiple_requests_share_one_session() {
-        let hello = message(&[b"hello", BUILD_STAMP.as_bytes()]);
-        let first = request(b"1", b"/", b"");
-        let second = request(b"2", b"/", b"");
-        let input = [hello, message(&first), message(&second)].concat();
-        let mut output = Vec::new();
+    /// Field 3 of a terminal response: an `ok` body or an error `code`.
+    fn body(response: &[Vec<u8>]) -> &[u8] {
+        &response[2]
+    }
 
+    fn session(requests: &[Vec<u8>]) -> Vec<Vec<Vec<u8>>> {
+        let mut input = message(&[b"hello", BUILD_STAMP.as_bytes()]);
+        for fields in requests {
+            input.extend_from_slice(fields);
+        }
+        let mut output = Vec::new();
         assert_eq!(run(Cursor::new(input), &mut output).unwrap(), End::Eof);
         let decoded = messages(&output);
         assert_eq!(
             decoded[0],
             [b"ready".to_vec(), BUILD_STAMP.as_bytes().to_vec()]
         );
-        assert_eq!(&decoded[1][..2], [b"ok".as_slice(), b"1".as_slice()]);
+        decoded
+    }
+
+    #[test]
+    fn handshake_and_multiple_requests_share_one_session() {
+        let decoded = session(&[
+            message(&store_request(b"1", b"live", b"5", b"")),
+            message(&plan_request(b"2", b"5")),
+            message(&plan_request(b"3", b"5")),
+        ]);
+
+        assert_eq!(decoded[1], [b"ok".to_vec(), b"1".to_vec(), Vec::new()]);
         assert_eq!(&decoded[2][..2], [b"ok".as_slice(), b"2".as_slice()]);
-        assert_eq!(decoded[1][2], b"\0\x30\0\x30\0\x30\0");
+        assert_eq!(&decoded[3][..2], [b"ok".as_slice(), b"3".as_slice()]);
+        assert_eq!(body(&decoded[2]), b"\0\x30\0\x30\0\x30\0");
+    }
+
+    #[test]
+    fn one_store_serves_every_later_plan() {
+        let payload = payload(b"git");
+        let decoded = session(&[
+            message(&store_request(b"1", b"live", b"5", &payload)),
+            message(&plan_request(b"2", b"5")),
+            message(&plan_request(b"3", b"5")),
+        ]);
+
+        assert!(
+            body(&decoded[2]).windows(3).any(|bytes| bytes == b"git"),
+            "plan does not list the stored candidate: {:?}",
+            body(&decoded[2])
+        );
+        assert_eq!(body(&decoded[2]), body(&decoded[3]));
+    }
+
+    #[test]
+    fn a_new_generation_replaces_only_its_own_slot() {
+        let cached = payload(b"git");
+        let live = payload(b"grep");
+        let recached = payload(b"gzip");
+        let decoded = session(&[
+            message(&store_request(b"1", b"cache", b"5", &cached)),
+            message(&store_request(b"2", b"live", b"6", &live)),
+            message(&store_request(b"3", b"cache", b"7", &recached)),
+            message(&plan_request(b"4", b"7")),
+            message(&plan_request(b"5", b"6")),
+            message(&plan_request(b"6", b"5")),
+        ]);
+
+        assert!(body(&decoded[4]).windows(4).any(|b| b == b"gzip"));
+        assert!(body(&decoded[5]).windows(4).any(|b| b == b"grep"));
+        assert_eq!(
+            decoded[6],
+            [
+                b"error".to_vec(),
+                b"6".to_vec(),
+                b"unknown-generation".to_vec()
+            ]
+        );
+    }
+
+    #[test]
+    fn a_plan_for_a_generation_no_slot_holds_is_a_terminal_error() {
+        let decoded = session(&[message(&plan_request(b"1", b"9"))]);
+
+        assert_eq!(
+            decoded[1],
+            [
+                b"error".to_vec(),
+                b"1".to_vec(),
+                b"unknown-generation".to_vec()
+            ]
+        );
+    }
+
+    #[test]
+    fn a_store_that_fails_framing_leaves_every_slot_unchanged() {
+        let live = payload(b"git");
+        let cached = payload(b"grep");
+        let decoded = session(&[
+            message(&store_request(b"1", b"live", b"5", &live)),
+            message(&store_request(b"2", b"cache", b"6", &cached)),
+            message(&store_request(b"3", b"live", b"7", b"unterminated")),
+            message(&plan_request(b"4", b"5")),
+            message(&plan_request(b"5", b"6")),
+            message(&plan_request(b"6", b"7")),
+        ]);
+
+        assert_eq!(
+            decoded[3],
+            [
+                b"error".to_vec(),
+                b"3".to_vec(),
+                b"invalid-payload".to_vec()
+            ]
+        );
+        // Neither the slot the failed store addressed nor the other one moved.
+        assert!(body(&decoded[4]).windows(3).any(|b| b == b"git"));
+        assert!(body(&decoded[5]).windows(4).any(|b| b == b"grep"));
+        assert_eq!(
+            decoded[6],
+            [
+                b"error".to_vec(),
+                b"6".to_vec(),
+                b"unknown-generation".to_vec()
+            ]
+        );
+    }
+
+    #[test]
+    fn a_new_session_starts_with_an_empty_store() {
+        let stored = payload(b"git");
+        session(&[message(&store_request(b"1", b"live", b"5", &stored))]);
+
+        let decoded = session(&[message(&plan_request(b"2", b"5"))]);
+
+        assert_eq!(
+            decoded[1],
+            [
+                b"error".to_vec(),
+                b"2".to_vec(),
+                b"unknown-generation".to_vec()
+            ]
+        );
     }
 
     #[test]
     fn mismatch_replies_once_and_discards_the_rest_of_stdin() {
         let input = [
             message(&[b"hello", b"deadbeef"]),
-            message(&request(b"1", b"/", b"")),
+            message(&plan_request(b"1", b"5")),
             b"1:x!".to_vec(),
         ]
         .concat();
@@ -479,20 +702,17 @@ mod tests {
 
     #[test]
     fn correlatable_shape_and_payload_errors_are_in_band() {
-        let hello = message(&[b"hello", BUILD_STAMP.as_bytes()]);
-        let bad_shape = message(&[b"other", b"7"]);
-        let bad_payload = message(&request(b"8", b"/", b"unterminated"));
-        let mut output = Vec::new();
+        let decoded = session(&[
+            message(&[b"other", b"7"]),
+            message(&store_request(b"8", b"live", b"5", b"unterminated")),
+            message(&store_request(b"9", b"elsewhere", b"5", b"")),
+            message(&store_request(b"10", b"live", b"05", b"")),
+            message(&plan_request(b"11", b"0")),
+        ]);
 
-        run(
-            Cursor::new([hello, bad_shape, bad_payload].concat()),
-            &mut output,
-        )
-        .unwrap();
         assert_eq!(
-            messages(&output),
+            decoded[1..],
             [
-                vec![b"ready".to_vec(), BUILD_STAMP.as_bytes().to_vec()],
                 vec![
                     b"error".to_vec(),
                     b"7".to_vec(),
@@ -503,6 +723,42 @@ mod tests {
                     b"8".to_vec(),
                     b"invalid-payload".to_vec()
                 ],
+                vec![
+                    b"error".to_vec(),
+                    b"9".to_vec(),
+                    b"invalid-request".to_vec()
+                ],
+                vec![
+                    b"error".to_vec(),
+                    b"10".to_vec(),
+                    b"invalid-request".to_vec()
+                ],
+                vec![
+                    b"error".to_vec(),
+                    b"11".to_vec(),
+                    b"invalid-request".to_vec()
+                ],
+            ]
+        );
+    }
+
+    /// cli-protocol.md 「要求と応答」: a `store` whose scalars *and* payload
+    /// are both invalid answers with the error detected first.
+    #[test]
+    fn store_scalar_validation_precedes_payload_framing() {
+        let decoded = session(&[message(&store_request(
+            b"1",
+            b"elsewhere",
+            b"5",
+            b"unterminated",
+        ))]);
+
+        assert_eq!(
+            decoded[1],
+            [
+                b"error".to_vec(),
+                b"1".to_vec(),
+                b"invalid-request".to_vec()
             ]
         );
     }
@@ -532,7 +788,7 @@ mod tests {
     fn completed_prefix_is_written_before_later_outer_corruption() {
         let input = [
             message(&[b"hello", BUILD_STAMP.as_bytes()]),
-            message(&request(b"1", b"/", b"")),
+            message(&store_request(b"1", b"live", b"5", b"")),
             b"1:x!".to_vec(),
         ]
         .concat();
@@ -578,8 +834,8 @@ mod tests {
 
     #[test]
     fn scalar_parsers_require_canonical_positive_ascii() {
-        assert_eq!(parse_request_id(b"1"), Some(1));
-        assert_eq!(parse_request_id(b"9223372036854775807"), Some(i64::MAX));
+        assert_eq!(parse_identifier(b"1"), Some(1));
+        assert_eq!(parse_identifier(b"9223372036854775807"), Some(i64::MAX));
         for value in [
             b"".as_slice(),
             b"0",
@@ -589,7 +845,7 @@ mod tests {
             b" 1",
             b"9223372036854775808",
         ] {
-            assert_eq!(parse_request_id(value), None, "{value:?}");
+            assert_eq!(parse_identifier(value), None, "{value:?}");
         }
         for value in [b"1".as_slice(), b"42", usize::MAX.to_string().as_bytes()] {
             assert!(parse_positive_usize(value).is_some(), "{value:?}");

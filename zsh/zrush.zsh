@@ -69,6 +69,10 @@ typeset -g  _zrush_cfg_path= _zrush_cfg_mtime=
 # Shell-session identity/latches survive a manual re-source; the
 # session-failure breaker below is the explicit recovery exception.
 typeset -gi _zrush_request_seq=${_zrush_request_seq:-0}
+# candidate_generation is independent of request_id and shares its survival
+# rule: monotonic per shell session, never reused, never reset by a worker
+# restart or a re-source (cli-protocol.md "要求と応答").
+typeset -gi _zrush_cand_gen_seq=${_zrush_cand_gen_seq:-0}
 typeset -gi _zrush_worker_warned=${_zrush_worker_warned:-0}
 typeset -gi _zrush_build_warned=${_zrush_build_warned:-0}
 typeset -gi _zrush_worker_failures=${_zrush_worker_failures:-0}
@@ -137,7 +141,7 @@ typeset -gi _ZRUSH_WORKER_SHUTDOWN_MS=100
 # Byte ceiling on one synthesized history payload (behavior.md "履歴メニュー").
 typeset -gi _ZRUSH_HISTORY_PAYLOAD_MAX_BYTES=262144
 
-# Render plan received from the Rust worker (cli-protocol.md "render_plan").
+# Render plan received from the Rust worker (cli-protocol.md "plan の ok body").
 # zsh applies these verbatim; it never recomputes layout, offsets, or spans.
 typeset -g  _zrush_plan_text=          # L display-row texts, \n-joined
 typeset -gi _zrush_plan_nlines=0       # L
@@ -164,12 +168,18 @@ typeset -gi _zrush_tab_pending=0   # Tab was pressed before candidates arrived
 
 # See docs/internal/specs/behavior.md "空語収集キャッシュ".
 # Cache storage is separate from working state and survives across prompts.
-# The stored payload is the raw capture stream (pid record already stripped,
-# cli-protocol.md "候補レコード" / "スキップ規律"), sent to the worker unparsed
-# on a hit; an empty fingerprint means no cache entry.
+# The parsed candidates live in the worker's `cache` slot; this side keeps only
+# the fingerprint, the save time and the candidate store latch. An empty
+# fingerprint means no cache entry.
 typeset -g  _zrush_cc_fp=          # fingerprint at save time
 typeset -gi _zrush_cc_time=0       # save time (EPOCHSECONDS)
-typeset -g  _zrush_cc_payload=
+# Candidate store latch: the generation this worker session holds in its
+# `cache` slot, 0 when there is none. Belongs to the worker session, so a
+# source starts without one (behavior.md "worker ライフサイクル").
+typeset -gi _zrush_cc_cand_gen=0
+# Cache entries whose `store` is still outstanding, by request_id ->
+# "<save time> <fingerprint>"; they become the latch on that store's `ok`.
+typeset -gA _zrush_cc_staged=()
 typeset -gi _ZRUSH_CC_TTL=300      # seconds; catches same-count replacement and is not configurable
 
 # Key bindings (dispatch widget -> predecessor/action)
@@ -779,17 +789,37 @@ _zrush_cc_fingerprint() {
   return 0
 }
 
+# The worker no longer holds the cache slot's generation. Called from every
+# invalidation point named in behavior.md "worker ライフサイクル".
+_zrush_cc_latch_drop() {
+  _zrush_cc_cand_gen=0
+  return 0
+}
+
 _zrush_cc_invalidate() {
   _zrush_cc_fp=
-  _zrush_cc_payload=
   _zrush_cc_time=0
+  _zrush_cc_latch_drop
   return 0
+}
+
+# Is this collection the empty-word cache's subject? Asked before collecting,
+# to reuse the entry, and again on the finished capture -- which also has to be
+# non-empty -- to pick the `cache` slot. Nothing outside the subject can
+# overwrite the latched generation.
+_zrush_cc_subject() {
+  [[ -z $_zrush_query ]]
 }
 
 _zrush_cc_check() {  # 0=usable hit; on a miss, log the reason and return nonzero
   emulate -L zsh
   if [[ -z $_zrush_cc_fp ]]; then
     _zlog "cache: miss (empty)"
+    return 1
+  fi
+  if (( _zrush_cc_cand_gen <= 0 )); then
+    _zlog "cache: miss (latch)"
+    _zrush_cc_invalidate
     return 1
   fi
   if (( EPOCHSECONDS - _zrush_cc_time > _ZRUSH_CC_TTL )); then
@@ -803,17 +833,31 @@ _zrush_cc_check() {  # 0=usable hit; on a miss, log the reason and return nonzer
     _zrush_cc_invalidate
     return 1
   fi
-  _zlog "cache: hit (${#_zrush_cc_payload} bytes)"
+  _zlog "cache: hit (generation=$_zrush_cc_cand_gen)"
   return 0
 }
 
-_zrush_cc_save() {  # $1=raw capture payload (pid stripped)
+# The latch may only name a generation the worker actually holds
+# (behavior.md "空語収集キャッシュ"), so an entry is staged when the `cache`
+# store goes out and committed when that store's `ok` comes back. The
+# fingerprint and the save time are snapshotted here, at collection time:
+# computing them on arrival would describe an environment the capture never saw.
+_zrush_cc_stage() {  # $1=store request_id
   emulate -L zsh
   _zrush_cc_fingerprint
-  _zrush_cc_fp=$REPLY
-  _zrush_cc_time=$EPOCHSECONDS
-  _zrush_cc_payload=$1
-  _zlog "cache: saved (${#1} bytes)"
+  _zrush_cc_staged[$1]="$EPOCHSECONDS $REPLY"
+  return 0
+}
+
+_zrush_cc_commit() {  # $1=store request_id $2=generation the worker accepted
+  emulate -L zsh
+  local staged=${_zrush_cc_staged[$1]:-}
+  unset "_zrush_cc_staged[$1]"
+  [[ -n $staged ]] || return 0
+  _zrush_cc_time=${staged%% *}
+  _zrush_cc_fp=${staged#* }
+  _zrush_cc_cand_gen=$2
+  _zlog "cache: latched (generation=$2)"
   return 0
 }
 
@@ -831,9 +875,12 @@ _zrush_start_request() {
   _zrush_fuzzy=${REPLY_QUERY//$'\0'/}   # the sender must strip NUL from --query
   _zlog "request: widened=${(qqqq)_zrush_query} fuzzy=${(qqqq)_zrush_fuzzy}"
 
-  # See behavior.md "空語収集キャッシュ". zle -F -w callers require explicit redraw.
-  if [[ -z $_zrush_query ]] && _zrush_cc_check; then
-    _zrush_request_plan "$_zrush_cc_payload" compsys "$_zrush_fuzzy" "$ZRUSH_CFG_TRAILING_SPACE" || _zrush_teardown
+  # See behavior.md "空語収集キャッシュ": a hit collects nothing and stores
+  # nothing; it plans against the generation the worker already holds.
+  # zle -F -w callers require explicit redraw.
+  if _zrush_cc_subject && _zrush_cc_check; then
+    _zrush_request_plan $_zrush_cc_cand_gen compsys "$_zrush_fuzzy" \
+      "$ZRUSH_CFG_TRAILING_SPACE" 1 || _zrush_teardown
     zle -R
     return 0
   fi
@@ -901,11 +948,15 @@ _zrush_on_data() {  # zle -F -w handler ($1=fd)
   return 0
 }
 
-# Collection payload (pid already stripped) -> worker request.
+# Collection payload (pid already stripped) -> worker requests.
 # The payload is handed to Rust unparsed: record parsing, matching,
 # ranking, layout, and highlight/nav/insert construction are all Rust's job
-# (cli-protocol.md). Cache successful empty-word command-position results
-# across prompts (behavior.md "空語収集キャッシュ").
+# (cli-protocol.md). It goes out once, in a `store` under a fresh generation,
+# with the `plan` that references that generation pipelined behind it; zsh
+# keeps no copy. A successful empty-word command-position collection is the
+# cache's subject, so it stores into the `cache` slot; the latch itself is
+# staged here and taken only once that store answers `ok`
+# (behavior.md "空語収集キャッシュ").
 _zrush_finalize() {
   emulate -L zsh
   setopt localoptions no_monitor no_notify
@@ -914,10 +965,12 @@ _zrush_finalize() {
   # Marks "transport" (fork -> parent pipe) complete, mirroring every other
   # pipeline stage's own checkpoint; driver-latency.zsh's breakdown reads it.
   _zlog "finalize: ${#payload} bytes"
-  if [[ -z $_zrush_query && -n $payload ]]; then
-    _zrush_cc_save "$payload"
-  fi
-  _zrush_request_plan "$payload" compsys "$_zrush_fuzzy" "$ZRUSH_CFG_TRAILING_SPACE" || _zrush_teardown
+  local slot=live
+  _zrush_cc_subject && [[ -n $payload ]] && slot=cache
+  _zrush_request_store $slot "$payload" || { _zrush_teardown; return 0 }
+  local -i gen=$REPLY
+  _zrush_request_plan $gen compsys "$_zrush_fuzzy" "$ZRUSH_CFG_TRAILING_SPACE" 0 ||
+    _zrush_teardown
   return 0
 }
 
@@ -1198,9 +1251,13 @@ _zrush_worker_close_response() {
 _zrush_worker_begin_stop() {
   emulate -L zsh
   _zrush_worker_stopping=1
+  # The candidate store dies with the session, whether this is a normal
+  # shutdown, an abort, or a session failure (behavior.md "worker ライフサイクル").
+  _zrush_cc_latch_drop
   _zrush_worker_disarm_drain
   _zrush_worker_txq=()
   _zrush_worker_pending=()
+  _zrush_cc_staged=()
   _zrush_current_request=0
   _zrush_sync_target=0 _zrush_sync_done=0 _zrush_sync_ok=0
 }
@@ -1216,6 +1273,7 @@ _zrush_worker_finalize() {
   _zrush_worker_rx=
   _zrush_worker_txq=()
   _zrush_worker_pending=()
+  _zrush_cc_staged=()
   _zrush_current_request=0
   _zrush_sync_target=0 _zrush_sync_done=0 _zrush_sync_ok=0
   _zrush_worker_stopping=0
@@ -1366,6 +1424,8 @@ _zrush_worker_start() {
   setopt localoptions no_monitor no_notify no_bg_nice localtraps
   (( !_zrush_disabled && !_zrush_worker_stopping && !_zrush_worker_runtime_tainted )) || return 1
   (( _zrush_worker_rfd >= 0 )) && return 0
+  # A new session starts with empty slots.
+  _zrush_cc_latch_drop
   _zrush_worker_runtime_valid || {
     _zrush_worker_session_fail "worker runtime unavailable"
     return 1
@@ -1561,10 +1621,20 @@ _zrush_worker_handle_message() {  # message [absolute-deadline]
     _zrush_worker_session_fail "response for unknown request_id=$id"
     return 1
   }
-  local producer=$_zrush_worker_pending[$id]
+  # "store <slot> <generation>" for a store, "plan <producer> <latched>" for a plan.
+  local -a req=( ${=_zrush_worker_pending[$id]} )
+  local reqkind=$req[1] producer= slot=
+  local -i latched=0 stored_gen=0
+  if [[ $reqkind == store ]]; then
+    slot=${req[2]:-} stored_gen=${req[3]:-0}
+  else
+    producer=${req[2]:-} latched=${req[3]:-0}
+  fi
 
   if [[ $kind == error ]]; then
-    [[ $f[3] == invalid-request || $f[3] == invalid-payload ]] || {
+    local code=$f[3]
+    [[ $code == invalid-request || $code == invalid-payload ||
+       $code == unknown-generation ]] || {
       _zrush_worker_session_fail "invalid error code"
       return 1
     }
@@ -1573,18 +1643,47 @@ _zrush_worker_handle_message() {  # message [absolute-deadline]
       return 1
     fi
     unset "_zrush_worker_pending[$id]"
+    # A store that ends in error changed no slot, so its staged entry never
+    # becomes a latch.
+    unset "_zrush_cc_staged[$id]"
     _zrush_worker_failures=0
     _zrush_status_set ""
+    # cli-protocol.md "応答の検証と zsh 側の適用": unknown-generation is an
+    # ordinary terminal error, and nothing is replayed. Only a plan that read
+    # the latch invalidates it and recollects; a plan whose own store failed is
+    # dropped and waits for the next real input.
+    local -i recollect=0
+    if [[ $code == unknown-generation ]] && (( latched )); then
+      _zrush_cc_latch_drop
+      recollect=1
+    fi
     if (( id == _zrush_sync_target )); then
       _zrush_sync_done=1 _zrush_sync_ok=0
     elif (( id == _zrush_current_request )); then
       _zrush_teardown
+      (( recollect )) && _zrush_start_request
       zle -R 2>/dev/null
     fi
-    _zlog "worker: error request_id=$id code=$f[3]"
+    _zlog "worker: error request_id=$id code=$code"
     return 0
   fi
   [[ $kind == ok ]] || { _zrush_worker_session_fail "invalid response kind"; return 1 }
+
+  if [[ $reqkind == store ]]; then
+    # cli-protocol.md "要求と応答": a successful store answers with an empty body.
+    [[ -z $f[3] ]] || {
+      _zrush_worker_session_fail "store ok carries a body request_id=$id"
+      return 1
+    }
+    unset "_zrush_worker_pending[$id]"
+    _zrush_worker_failures=0
+    _zrush_status_set ""
+    # The worker now holds this generation, so the entry staged for it becomes
+    # the latch (behavior.md "空語収集キャッシュ").
+    [[ $slot == cache ]] && _zrush_cc_commit $id $stored_gen
+    _zlog "worker: ok store request_id=$id slot=$slot generation=$stored_gen"
+    return 0
+  fi
 
   local old_text=$_zrush_plan_text old_cp=$_zrush_plan_cp old_kind=$_zrush_plan_kind
   local -i old_l=$_zrush_plan_nlines old_p=$_zrush_plan_npos
@@ -1726,10 +1825,73 @@ _zrush_worker_on_drain() {
   return 0
 }
 
-_zrush_request_plan() {  # payload producer query trailing-space
+_zrush_next_request_id() {  # -> REPLY
+  emulate -L zsh
+  (( _zrush_request_seq < 9223372036854775807 )) || {
+    _zrush_worker_disable_policy "request_id exhausted"
+    _zrush_worker_shutdown
+    _zrush_teardown
+    return 1
+  }
+  typeset -g REPLY=$(( ++_zrush_request_seq ))
+  return 0
+}
+
+_zrush_next_cand_gen() {  # -> REPLY
+  emulate -L zsh
+  (( _zrush_cand_gen_seq < 9223372036854775807 )) || {
+    _zrush_worker_disable_policy "candidate_generation exhausted"
+    _zrush_worker_shutdown
+    _zrush_teardown
+    return 1
+  }
+  typeset -g REPLY=$(( ++_zrush_cand_gen_seq ))
+  return 0
+}
+
+_zrush_worker_ensure_session() {
+  emulate -L zsh
+  (( _zrush_worker_rfd >= 0 )) && return 0
+  local -i failures_before=$_zrush_worker_failures
+  if ! _zrush_worker_start; then
+    (( _zrush_worker_failures != failures_before )) || _zrush_worker_session_fail "startup failed"
+    return 1
+  fi
+  return 0
+}
+
+# Hand a candidate record stream to one slot of the worker's candidate store
+# (cli-protocol.md "要求と応答"). The plan that reads the generation back is
+# pipelined behind this without waiting for its terminal response.
+_zrush_request_store() {  # slot payload -> REPLY = candidate generation
   emulate -L zsh
   setopt localoptions typesetsilent no_monitor no_notify
-  local payload=$1 producer=$2 query=$3 tspace=$4
+  local slot=$1 payload=$2
+  (( !_zrush_worker_stopping && !_zrush_worker_runtime_tainted )) || return 1
+  _zrush_next_request_id || return 1
+  local -i id=$REPLY
+  _zrush_next_cand_gen || return 1
+  local -i gen=$REPLY
+  _zrush_worker_pending[$id]="store $slot $gen"
+  [[ $slot == cache ]] && _zrush_cc_stage $id
+  _zrush_worker_ensure_session || return 1
+  _zrush_encode_message store "$id" "$slot" "$gen" "$payload"
+  _zrush_worker_txq+=( "$REPLY" )
+  _zlog "worker: queued store request_id=$id slot=$slot generation=$gen bytes=${#REPLY} queued=$#_zrush_worker_txq"
+  _zrush_worker_flush || return 1
+  typeset -g REPLY=$gen
+  return 0
+}
+
+# $5 records whether this plan reached the store through the cache latch: an
+# `unknown-generation` answer invalidates the latch and recollects only for
+# such a plan (cli-protocol.md "応答の検証と zsh 側の適用").
+_zrush_request_plan() {  # candidate-generation producer query trailing-space latched
+  emulate -L zsh
+  setopt localoptions typesetsilent no_monitor no_notify
+  local -i gen=$1
+  local producer=$2 query=$3 tspace=$4
+  local -i latched=${5:-0}
   (( !_zrush_worker_stopping && !_zrush_worker_runtime_tainted )) || return 1
 
   # cli-protocol.md "起動": rows = min(max-lines, LINES - 1), clamped to >= 1
@@ -1741,26 +1903,15 @@ _zrush_request_plan() {  # payload producer query trailing-space
   local -i width=$(( COLUMNS - 1 ))
   (( width < 1 )) && width=1
 
-  (( _zrush_request_seq < 9223372036854775807 )) || {
-    _zrush_worker_disable_policy "request_id exhausted"
-    _zrush_worker_shutdown
-    _zrush_teardown
-    return 1
-  }
-  local -i id=$(( ++_zrush_request_seq ))
+  _zrush_next_request_id || return 1
+  local -i id=$REPLY
   _zrush_current_request=$id
-  _zrush_worker_pending[$id]=$producer
-  if (( _zrush_worker_rfd < 0 )); then
-    local -i failures_before=$_zrush_worker_failures
-    if ! _zrush_worker_start; then
-      (( _zrush_worker_failures != failures_before )) || _zrush_worker_session_fail "startup failed"
-      return 1
-    fi
-  fi
-  _zrush_encode_message plan "$id" "$PWD" "$producer" "$query" \
-    "$ZRUSH_CFG_MODE" "$ZRUSH_CFG_SMART_CASE" "$rows" "$width" "$tspace" "$payload"
+  _zrush_worker_pending[$id]="plan $producer $latched"
+  _zrush_worker_ensure_session || return 1
+  _zrush_encode_message plan "$id" "$gen" "$PWD" "$producer" "$query" \
+    "$ZRUSH_CFG_MODE" "$ZRUSH_CFG_SMART_CASE" "$rows" "$width" "$tspace"
   _zrush_worker_txq+=( "$REPLY" )
-  _zlog "worker: queued request_id=$id producer=$producer bytes=${#REPLY} queued=$#_zrush_worker_txq"
+  _zlog "worker: queued request_id=$id producer=$producer generation=$gen bytes=${#REPLY} queued=$#_zrush_worker_txq"
   _zrush_worker_flush || return 1
   typeset -g REPLY=$id
   return 0
@@ -1787,7 +1938,7 @@ _zrush_dec_le_all() {  # $1=bound, $2.. = values, all matched by <->
 }
 
 # Validate and split one render-plan buffer into _zrush_plan_*.
-# Field layout is fixed (cli-protocol.md "stdout(描画プラン)"):
+# Field layout is fixed (cli-protocol.md "plan の ok body"):
 #   common-prefix, L, P, L rows, H, H "role pos start len", P "start len",
 #   P "next prev left right", P insert texts -- total 4 + L + H + 3P fields.
 _zrush_parse_plan() {  # $1=raw render-plan bytes
@@ -1976,11 +2127,16 @@ _zrush_history_payload() {  # -> REPLY = candidate payload bytes
   return 0
 }
 
+# behavior.md "履歴メニュー": the store and the plan share the single absolute
+# deadline that starts once the payload is synthesized, and the exchange ends
+# on the plan's terminal response -- the store's is consumed on the way there.
 _zrush_request_plan_sync() {
   emulate -L zsh
   local payload=$1 producer=$2 query=$3 tspace=$4
   local -F deadline=$(( EPOCHREALTIME + ${ZRUSH_HISTORY_DEADLINE_MS:-100} / 1000.0 )) remaining
-  _zrush_request_plan "$payload" "$producer" "$query" "$tspace" || return 1
+  _zrush_request_store live "$payload" || return 1
+  local -i gen=$REPLY
+  _zrush_request_plan $gen "$producer" "$query" "$tspace" 0 || return 1
   local -i target=$REPLY cs
   _zrush_sync_target=$target _zrush_sync_done=0 _zrush_sync_ok=0
   while (( !_zrush_sync_done )); do

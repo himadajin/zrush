@@ -1,6 +1,6 @@
 //! Grid layout, highlight, and navigation engine for worker plan requests.
 //!
-//! Semantics: docs/internal/contracts/cli-protocol.md "render_plan",
+//! Semantics: docs/internal/contracts/cli-protocol.md 「`plan` の `ok` body」,
 //! specifically "表示行の中身" (grouping/grid), "オフセット規律"
 //! (char-count vs display-width split), "ハイライト", and "ナビ". This
 //! module owns grouping, the column-major grid, cell truncation/padding,
