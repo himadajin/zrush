@@ -241,7 +241,7 @@ breakdown_hit_last() {  # $1=logfile $2=number of leading lines to skip
   return 0
 }
 
-paint_break_hit_case() {  # needs two preceding command-position collections (see the run block)
+paint_break_hit_case() {  # needs one preceding command-position collection (see the run block)
   local -i skip=0
   [[ -r $HOSTLOG ]] && skip=$(wc -l < $HOSTLOG)
   paint_once $3 $4 20 || { bad "WARN: [$1/$2] did not complete"; return 1 }
@@ -521,13 +521,10 @@ history_tax_suite() {  # $1=host-label
   if start_min_zrush min-zrush $WORK/xdg-default; then
     host_rss; out "INFO: RSS=${REPLY}KB"
     # Command position is the only cached one (behavior.md "空語収集キャッシュ"),
-    # and its first collection is followed by exactly one more invalidation
-    # (同節「既知の癖」), so a guaranteed hit needs two collections before it:
-    # the reported miss, then an unreported warm-up. Every cache-hit case has to
-    # come before the file and git cases, which measure uncached collection.
+    # so the miss case is this host's first collection and the hit case is
+    # whatever it latched. Every cache-hit case has to come before the file and
+    # git cases, which measure uncached collection.
     paint_break_case min-zrush "cmd 1st (whic)"   'whic'         'which'
-    paint_once 'whic' 'which' 20 || out "WARN: cache warm-up did not complete"
-    drain 0.6
     paint_break_hit_case min-zrush "cmd hit (whic)" 'whic'       'which'
     paint_case min-zrush "cmd hit (whic)"   'whic'         'which'
     paint_break_case min-zrush "file (docs/inte)" 'ls docs/inte' 'internal'

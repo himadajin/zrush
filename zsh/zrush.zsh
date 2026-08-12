@@ -804,12 +804,16 @@ _zrush_teardown() {
 # See docs/internal/specs/behavior.md "空語収集キャッシュ".
 # Do not use $#commands: lazy command hashing changes its size independently of the
 # candidate set. Directory mtimes detect executable additions and removals.
+# The function names are counted through their keys: $#functions would expand
+# every function *body*, which is both the most expensive part of this
+# fingerprint and pointless -- only the names are candidates.
 _zrush_cc_fingerprint() {
   emulate -L zsh
+  setopt localoptions extendedglob
   local fp=$PATH
   local d
   local -i rel=0
-  local -a st
+  local -a st others
   for d in $path; do
     [[ $d == /* ]] || rel=1
     if zstat -A st +mtime $d 2>/dev/null; then
@@ -818,7 +822,8 @@ _zrush_cc_fingerprint() {
       fp+=":-"
     fi
   done
-  fp+=":$#functions:$#aliases:$#builtins"
+  others=( "${(@k)functions[(I)^_zrush*]}" )
+  fp+=":$#others:$#aliases:$#builtins"
   if [[ -o autocd ]] || (( rel )); then
     fp+=":$PWD"
   fi

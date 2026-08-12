@@ -49,11 +49,10 @@ fn query(host: &mut Host, label: &str) -> bool {
     }
 }
 
-/// Repeat the query until one of them is answered from the latch. A host's
-/// first completions lazy-load compsys functions, and every load changes the
-/// function count the fingerprint covers, so the steady state is reached by
-/// repeating rather than by a fixed number of rounds
-/// (behavior.md 「空語収集キャッシュ」 「既知の癖」).
+/// Repeat the query until one of them is answered from the latch. The first
+/// one has nothing to reuse, and anything the caller did beforehand may have
+/// moved the fingerprint, so the steady state is reached by repeating rather
+/// than by a fixed number of rounds.
 fn warm_to_a_hit(host: &mut Host, label: &str) {
     for _ in 0..5 {
         let hit = query(host, label);
@@ -251,9 +250,7 @@ fn the_latch_dies_with_the_worker_session_and_with_a_re_source() {
         .parse()
         .unwrap_or_else(|e| panic!("(cc-4a) non-numeric age in {entry:?} ({e})"));
     // Established here, while the session is still alive: from now on the only
-    // hit condition that changes is the latch. (The fingerprint counts every
-    // function, zrush's own generated `zle -F` handlers included, so it stops
-    // being a fixed quantity once a session tears down.)
+    // hit condition that changes is the latch.
     assert!(
         candgen != "0" && dump_field(&live, "latch") == candgen,
         "(cc-4a) the cache store did not latch its own generation: {live}"
@@ -350,6 +347,69 @@ fn the_latch_dies_with_the_worker_session_and_with_a_re_source() {
     );
 }
 
+/// zrush generates one handler function per armed `zle -F` watcher, so its own
+/// function table moves whenever a worker session starts or stops. None of that
+/// is a candidate-set change, and the fingerprint counts only the names outside
+/// zrush's namespace so that it says so (behavior.md 「空語収集キャッシュ」).
+/// A restart still costs one recollection -- through the latch, which is the
+/// worker's own state -- but the fingerprint must survive it untouched.
+#[test]
+fn a_worker_restart_leaves_the_fingerprint_alone() {
+    let mut host = Host::boot();
+    host.send_line(SHUTDOWN_SEAM);
+    host.sync_prompt(Duration::from_secs(5));
+    warm_to_a_hit(&mut host, "(cc-6 setup)");
+
+    let live = host.cache_state();
+    assert!(
+        state_has(&live, &["fpmatch=1"]),
+        "(cc-6a) the warmed entry does not describe its own environment: {live}"
+    );
+
+    let stale = host.log_count("cache: miss (fingerprint)");
+    let latchless = host.log_count("cache: miss (latch)");
+    host.press(keys::WORKER_TEARDOWN);
+    let stopped = host
+        .wait_worker_state(Duration::from_secs(10), &["rfd=-1", "stopping=0", "ack=-1"])
+        .unwrap_or_else(|last| panic!("(cc-6b) the worker did not stop: {last}"));
+    assert!(
+        state_has(&stopped, &["latch=0"]),
+        "(cc-6b) the stopped session kept its latch: {stopped}"
+    );
+    // The handler the stopped session took with it is the whole point: this is
+    // the state in which the fingerprint used to disagree with itself.
+    let torn_down = host.cache_state();
+    assert!(
+        state_has(&torn_down, &["fpmatch=1"]),
+        "(cc-6c) stopping the worker changed the fingerprint: {torn_down}"
+    );
+
+    // The restart happens inside the next notification, before the cache is
+    // consulted, so the recollection this query pays for is the lost latch's.
+    assert!(
+        !query(&mut host, "(cc-6d)"),
+        "(cc-6d) a latch that died with its worker still served a hit"
+    );
+    assert!(
+        host.log_count("cache: miss (latch)") == latchless + 1
+            && host.log_count("cache: miss (fingerprint)") == stale,
+        "(cc-6e) the restart invalidated the fingerprint as well as the latch"
+    );
+    host.clear_line();
+    host.drain(Duration::from_millis(300));
+
+    // And the entry that restart wrote is reusable straight away: the handler
+    // the new session added was already there when the entry was staged.
+    assert!(
+        query(&mut host, "(cc-6f)"),
+        "(cc-6f) the entry written after the restart did not survive to the next query"
+    );
+    assert!(
+        host.log_count("cache: miss (fingerprint)") == stale,
+        "(cc-6g) the restarted session's own handler expired the fingerprint"
+    );
+}
+
 /// The cached generation lives in its own slot: argument completions keep
 /// storing into `live` and the worker drops only the previous generation *of
 /// the same slot*, so the cached one survives them. The history menu is the
@@ -360,11 +420,10 @@ fn the_latch_dies_with_the_worker_session_and_with_a_re_source() {
 #[test]
 fn live_slot_stores_leave_the_cached_generation_intact() {
     let mut host = Host::boot_history();
-    // The argument completion runs once up front: its compsys lazy-loading is
-    // a fingerprint change, and it must not land between latch and hit. The
-    // history menu needs no such warm-up -- it synthesizes its payload from
-    // `$history` and runs no compsys at all -- but opening it here leaves the
-    // worker's index warm, so the open below is the plain one-plan case.
+    // The argument completion runs once up front only so that the one below is
+    // not this host's first: nothing about a first collection may land between
+    // latch and hit. Opening the history menu here likewise leaves the worker's
+    // index warm, so the open below is the plain one-plan case.
     argument_completion(&mut host);
     history_menu(&mut host, "(cc-5 setup)");
     warm_to_a_hit(&mut host, "(cc-5 setup)");
