@@ -415,7 +415,9 @@ current input は最後に受理した `input` 通知そのもの(その全フ�
 - worker は静穏期間を単調時計で測り、stdin の待機にその満了時刻を deadline として与える。
   新しいメッセージが来なくても、満了だけで settle して event を送る。
 - 入力通知と worker event は `request_id` を持たないため、in-band の error 応答を持たない。
-  kind・フィールド数・scalar 表記・`input_generation` の単調性のいずれかが不正な通知は
+  kind・フィールド数・scalar 表記のいずれかが不正な通知と、
+  `input_generation` が単調増加していない `input`(単調性を課すのは `input` の受理だけであり、
+  `flush` は上の規則どおり何も変えずに捨てる)は
   worker session failure であり、worker は診断を stderr へ 1 行書いて exit 1 する。
   外側/nested netstring framing の破損も session failure である。
 - 通知の `candidate_generation` が worker の保持しない値であることは失敗ではない。
