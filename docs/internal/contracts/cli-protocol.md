@@ -436,6 +436,8 @@ current input は最後に受理した `input` 通知そのもの(その全フ�
   同じ規則で適用する(「応答の検証と zsh 側の適用(規範)」節)。
 - 一致する `capture-required` を受けた `input_generation` について、zsh は compsys 捕獲を
   ちょうど 1 回開始し、その結果を同じ `input_generation` を束縛した `store` で送る。
+  無効化された `input_generation` のために完走した捕獲の結果は、`store` にせず破棄する
+  (`store` は必ず束縛を持つため、他に適合する形が無い)。
 - 未知の kind、フィールド数違い、非 canonical な `input_generation` を持つ event は
   worker session failure である。
 - outbound queue では、通知を取り消す・置き換えるときに、まだ writer child へ委譲していない
@@ -932,6 +934,11 @@ zsh は一覧を消す。
   それ以外の値は不正な応答であり、worker セッションを壊れたものとして終了する。
 - `error` は相関する要求の正常な終端応答である。その要求の結果を破棄し、それが現在の最新要求なら
   既存一覧も消す。stale 要求なら UI 状態を変えない。どちらの場合も worker は継続利用する。
+  「現在の最新要求」の判定は経路ごとに決まる。
+  非同期経路の要求は `store` だけであり、その束縛の `input_generation` が
+  zsh のいま有効な `input_generation` と一致することが判定になる
+  (`superseded` はこの一致が成り立たないことを表すため、UI 状態を変えない)。
+  `plan` は履歴メニューの同期交換専用であり、同期待ちの対象要求と一致することが判定になる。
 - `unknown-generation` は、`plan` が参照した generation を worker が保持していないこと、または
   `history-snapshot` / `history-append` が名乗った generation が index の現 stamp と両立しないことを表す。
   他の `error` と同じく正常な終端応答であり、worker セッション失敗にも連続失敗回数にも数えない。

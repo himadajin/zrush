@@ -6,6 +6,7 @@ Each `plan/<name>/` directory contains `args`, `payload`, an optional `append`, 
 Each `reject/<name>/` directory contains `args` and `payload`.
 Each `reject-plan/<name>/` directory contains only `plan`.
 Each `encode/<name>/` directory contains `argv`, `hits`, `dscr`, `expected`, and an optional `env`.
+Each `message/<name>/` directory contains a single `frame`.
 The runner drives each vector through one persistent `zrush worker` session as the contract's requests: one write (request_id 1, generation 1) carrying `payload`, then a `plan` referencing the last generation written.
 `args` contains flags and their values only.
 
@@ -81,6 +82,23 @@ These vectors exist because the guarantees below are the sender's, never appear 
 To add an `encode/` vector, create its directory, write `argv` / `hits` / `dscr` (and `env` if it needs one), then run `UPDATE_GOLDEN=1 zsh -f tests/zsh/vectors.zsh`.
 It follows the same discipline as the Rust runner: it writes the golden, then fails listing every file it changed.
 A generated `expected` is a proposal, not an answer -- read it against cli-protocol.md before rerunning.
+
+## `message/`
+
+`message/` fixes whole outer messages of the session that carry no candidate stream and no render plan of their own: the input notifications zsh sends, the events the worker sends back, and the terminal response that tells zsh a capture arrived too late.
+Each `frame` is one complete outer message, byte for byte as cli-protocol.md "入力通知と worker event" spells it, so the six examples in that section and this corpus are one set of bytes.
+
+| vector | message it fixes |
+|---|---|
+| `input-no-cache` | an `input` notification with no reusable candidates (`candidate_generation = 0`) |
+| `capture-required` | the `capture-required` event answering that input |
+| `store-capture` | the `store` carrying that capture, bound to the same `input_generation` |
+| `error-superseded` | the `superseded` that store receives when the input is already gone |
+| `plan-ready-zero-match` | a `plan-ready` carrying the four-field zero-match plan |
+| `flush` | the `flush` that settles an input immediately |
+
+`zsh -f tests/zsh/vectors.zsh` drives these in both directions: it makes the sender produce the notification, flush and store frames byte for byte, and feeds the event and error frames to the receiver to fix what each one does -- including that an event whose `input_generation` is not the current one is dropped before its body is looked at.
+The Rust runner reads no vector here; it only holds every `frame` to the canonical spelling above.
 
 ## Who checks what
 
