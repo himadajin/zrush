@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use crate::fake::Mode;
 use crate::host::{Host, PlanShape, SHUTDOWN_SEAM, dump_field, keys, state_has};
+use crate::tab::TAB_FLUSHED;
 
 /// Transport state after a stop has fully unwound.
 const STOPPED: &[&str] = &[
@@ -90,13 +91,16 @@ fn active_session_deaths_open_the_breaker_and_a_re_source_recovers() {
             ),
         "(err-1a) active-death state missing: state={after_death} starts={restarts}"
     );
-    let dead_request_id = host
+    // The first message of a collection is the `input` notification the
+    // keystroke makes, so that is what this session died on
+    // (cli-protocol.md 「入力通知と worker event」).
+    let dead_generation = host
         .fake()
         .last(&format!("die {first} "))
         .expect("(err-1a) the die state line vanished after wait_fake succeeded")
         .rsplit(' ')
         .next()
-        .expect("a die line ends with its request id")
+        .expect("a die line ends with its correlation key")
         .to_string();
 
     host.drain(Duration::from_millis(500));
@@ -114,9 +118,10 @@ fn active_session_deaths_open_the_breaker_and_a_re_source_recovers() {
         .is_ok();
 
     // ---- the lazy replacement, held after ready and assignment ----
-    // The fake parks on the first request it reads -- the `store` -- with the
-    // `plan` of the same collection already queued behind it, so a held
-    // collection leaves two outstanding requests (cli-protocol.md 「要求と応答」).
+    // The fake parks on the first message it reads, which is the `input`
+    // notification the keystroke makes: it answers with no event, so nothing is
+    // ever collected and no request goes out behind it
+    // (cli-protocol.md 「入力通知と worker event」).
     host.fake().set_mode(Mode::Hold);
     let held0 = host.fake().count(&format!("hold {second} "));
     host.send_keys("ls fx/basic/");
@@ -127,24 +132,29 @@ fn active_session_deaths_open_the_breaker_and_a_re_source_recovers() {
             && held
             && state_has(
                 &replacement,
-                &["ready=1", "failures=1", "disabled=0", "pending=2"]
+                &["ready=1", "failures=1", "disabled=0", "pending=0"]
             )
             && host.fake().starts() == starts0 + 2,
         "(err-1c) held replacement state missing: clean={first_death_clean} held={held} \
          state={replacement}"
     );
     assert_eq!(
-        host.fake().requests_for(&dead_request_id),
+        host.fake().notifications_for(&dead_generation),
         1,
-        "(err-1d) failed request_id={dead_request_id} was replayed or fake-state accounting changed"
+        "(err-1d) failed input_generation={dead_generation} was replayed or \
+         fake-state accounting changed"
     );
 
-    // A well-formed terminal error is not a session failure.
-    let errors0 = host.log_count("worker: error request_id=");
+    // A well-formed terminal response is not a session failure. Releasing the
+    // hold lets the parked notification settle, and the collection it asks for
+    // answers with the `store` this waits on. (The same reset after a terminal
+    // *error* is what `a_failed_request_is_not_replayed_and_only_new_input_\
+    // makes_a_generation` fixes, on the one path that still sends a `plan`.)
+    let answered0 = host.log_count("worker: ok store request_id=");
     host.fake().set_mode(Mode::Error);
     let answered = host.wait_log(
-        "worker: error request_id=",
-        errors0,
+        "worker: ok store request_id=",
+        answered0,
         Duration::from_secs(10),
     );
     let after_error = host.worker_state();
@@ -174,7 +184,7 @@ fn active_session_deaths_open_the_breaker_and_a_re_source_recovers() {
     host.drain(Duration::from_millis(300));
     let died2 = host.fake().count(&format!("die {third} "));
     let failures2 = host.log_count("worker: session failure:");
-    host.send_keys("ls fx/basic/al\t"); // Tab pending before candidates exist
+    host.send_keys("ls fx/basic/al");
     host.wait_fake(&format!("die {third} "), died2, Duration::from_secs(10));
     host.wait_log(
         "worker: session failure:",
@@ -184,11 +194,15 @@ fn active_session_deaths_open_the_breaker_and_a_re_source_recovers() {
     let third_death_clean = host
         .wait_worker_state(Duration::from_secs(10), STOPPED)
         .is_ok();
-    host.drain(Duration::from_millis(500));
 
+    // Tab once the death has unwound: no listing, no input awaiting an event
+    // and no collection, so it falls through to the predecessor chain and
+    // inserts nothing of its own (behavior.md 「Tab」).
+    host.press(keys::TAB);
+    host.drain(Duration::from_millis(500));
     host.assert_buffer(
         "ls fx/basic/al",
-        "(err-2) pending Tab resolved against an actively-dead worker inserts nothing",
+        "(err-2) Tab resolved against an actively-dead worker inserts nothing",
     );
     let disabled = host.worker_state();
     assert!(
@@ -265,22 +279,53 @@ fn active_session_deaths_open_the_breaker_and_a_re_source_recovers() {
 }
 
 /// A well-formed terminal `error` ends its request for good: neither that
-/// `plan` nor the `store` it was pipelined behind is sent again, and no
-/// candidate generation is spent recovering. Only the next real input makes the
-/// next generation (cli-protocol.md 「応答の検証と zsh 側の適用」,
+/// `plan` nor the `history-snapshot` it was pipelined behind is sent again, and
+/// no candidate generation is spent recovering. Only the next real input makes
+/// the next generation (cli-protocol.md 「応答の検証と zsh 側の適用」,
 /// behavior.md 「worker ライフサイクル」).
+///
+/// The history menu is where a `plan` request still goes. The input-following
+/// listing sends none: its candidates arrive as the event an accepted `store`
+/// settles (cli-protocol.md 「入力通知と worker event」).
 #[test]
 fn a_failed_request_is_not_replayed_and_only_new_input_makes_a_generation() {
-    let mut host = Host::boot_fake();
-    // Every `store` this mode sees succeeds and every `plan` gets an in-band
+    let mut host = Host::boot_history_fake();
+    // One session failure first, so the streak the in-band error has to reset
+    // below is a non-zero one.
+    host.fake().set_mode(Mode::Die);
+    let failures0 = host.log_count("worker: session failure:");
+    let stopped0 = host.log_count("worker: transport stopped");
+    host.press(keys::UP);
+    assert!(
+        host.wait_log(
+            "worker: session failure:",
+            failures0,
+            Duration::from_secs(15)
+        ),
+        "(err-6 setup) the worker did not die inside the menu's exchange"
+    );
+    // A replacement may only start once the dead session has finalized.
+    assert!(
+        host.wait_log(
+            "worker: transport stopped",
+            stopped0,
+            Duration::from_secs(15)
+        ),
+        "(err-6 setup) the dead session never finalized"
+    );
+    let broken = host.worker_state();
+    assert!(
+        state_has(&broken, &["failures=1", "disabled=0"]),
+        "(err-6 setup) the death left no streak for the error to reset: {broken}"
+    );
+
+    // Every write this mode sees succeeds and every `plan` gets an in-band
     // `error`, so the failing request is a correlated one -- not a session
     // failure that would discard the pair for a different reason.
     host.fake().set_mode(Mode::Error);
 
     let errors0 = host.log_count("worker: error request_id=");
-    // An argument position: this collection stores into `live`, so the
-    // empty-word cache plays no part in what is or is not resent.
-    host.send_keys("ls fx/basic/al");
+    host.press(keys::UP);
     assert!(
         host.wait_log(
             "worker: error request_id=",
@@ -289,14 +334,19 @@ fn a_failed_request_is_not_replayed_and_only_new_input_makes_a_generation() {
         ),
         "(err-6a) the fake session never answered the plan with an in-band error"
     );
+    let reset = host.worker_state();
+    assert!(
+        state_has(&reset, &["failures=0", "disabled=0"]),
+        "(err-6a) a well-formed terminal error did not reset the failure streak: {reset}"
+    );
 
-    let store_line = host
-        .last_log_line("worker: queued store request_id=")
-        .expect("(err-6a) no store was queued for the collection");
+    let snapshot_line = host
+        .last_log_line("worker: queued history-snapshot request_id=")
+        .expect("(err-6a) no history snapshot was queued for the menu");
     let plan_line = host
         .last_log_line("worker: queued request_id=")
-        .expect("(err-6a) no plan was queued for the collection");
-    let store_id = dump_field(&store_line, "request_id").to_string();
+        .expect("(err-6a) no plan was queued for the menu");
+    let snapshot_id = dump_field(&snapshot_line, "request_id").to_string();
     let plan_id = dump_field(&plan_line, "request_id").to_string();
     let settled = host.worker_state();
     let candgen = dump_field(&settled, "candgen").to_string();
@@ -305,7 +355,7 @@ fn a_failed_request_is_not_replayed_and_only_new_input_makes_a_generation() {
     host.drain(Duration::from_secs(1));
     let idle = host.worker_state();
     assert!(
-        host.fake().requests_for(&store_id) == 1
+        host.fake().requests_for(&snapshot_id) == 1
             && host.fake().requests_for(&plan_id) == 1
             && state_has(
                 &idle,
@@ -318,7 +368,7 @@ fn a_failed_request_is_not_replayed_and_only_new_input_makes_a_generation() {
                 ]
             ),
         "(err-6b) the failed pair was replayed or spent a generation: \
-         store={store_id} plan={plan_id} state={idle}"
+         snapshot={snapshot_id} plan={plan_id} state={idle}"
     );
 
     // One more keystroke: one new collection, one new generation.
@@ -338,5 +388,62 @@ fn a_failed_request_is_not_replayed_and_only_new_input_makes_a_generation() {
         state_has(&after, &[&format!("candgen={}", next + 1)]),
         "(err-6d) the next input did not make exactly one new generation \
          (was candgen={candgen}): {after}"
+    );
+}
+
+/// A Tab recorded while the worker still owed an event, on a session that then
+/// dies: the failure drops the input generation, so the press it left behind
+/// has nothing to resolve against and the buffer is never touched
+/// (behavior.md 「Tab」「worker ライフサイクル」).
+///
+/// `Hold` is what makes that window deterministic. The parked `input`
+/// notification cannot be answered while the mode holds, so the Tab provably
+/// lands on a still-pending input -- it has to take the quiet-period flush
+/// branch to pass -- and the death is only released afterwards.
+#[test]
+fn a_pending_tab_whose_worker_dies_inserts_nothing() {
+    let mut host = Host::boot_fake();
+    let session = host.fake().sessions() + 1;
+    host.fake().set_mode(Mode::Hold);
+
+    let held0 = host.fake().count(&format!("hold {session} "));
+    let flushed0 = host.log_count(TAB_FLUSHED);
+    host.send_keys("ls fx/basic/al");
+    assert!(
+        host.wait_fake(&format!("hold {session} "), held0, Duration::from_secs(10)),
+        "(err-7a) the fake never parked the input notification"
+    );
+
+    host.press(keys::TAB);
+    assert!(
+        host.wait_log(TAB_FLUSHED, flushed0, Duration::from_secs(5)),
+        "(err-7b) Tab did not record itself against the still-pending input"
+    );
+
+    let failures0 = host.log_count("worker: session failure:");
+    host.fake().set_mode(Mode::Die);
+    assert!(
+        host.wait_log(
+            "worker: session failure:",
+            failures0,
+            Duration::from_secs(15)
+        ),
+        "(err-7c) the parked session did not die once the hold was released"
+    );
+    assert!(
+        host.wait_worker_state(Duration::from_secs(15), STOPPED)
+            .is_ok(),
+        "(err-7c) the dead session never finalized"
+    );
+
+    host.drain(Duration::from_millis(500));
+    host.assert_buffer(
+        "ls fx/basic/al",
+        "(err-7d) the pending Tab inserted something after its worker died",
+    );
+    assert_eq!(
+        host.postdisplay("(err-7d)"),
+        "",
+        "(err-7d) a listing survived the worker the pending Tab was waiting on"
     );
 }

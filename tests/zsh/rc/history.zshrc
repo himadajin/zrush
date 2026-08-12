@@ -58,13 +58,22 @@ _zrt_dump_cursor() { _zlog "TESTCUR=$CURSOR" }
 zle -N _zrt-dump-cursor _zrt_dump_cursor
 bindkey '^Xz' _zrt-dump-cursor
 
-# ^Xt: debounce timer / in-flight collection fd state, for confirming that a
-# send-break leaves behind neither an armed timer nor a live collection.
-# Neither is observable through the plan state (_zrush_plan_npos/
-# _zrush_listing) that the other send-break scenarios read.
-_zrt_dump_fds() { _zlog "TESTFDS=timer=$_zrush_timer_fd rfd=$_zrush_rfd wfd=$_zrush_wfd pty=${_zrush_pty:-<none>}" }
+# ^Xt: the current input generation, whether its worker event is still awaited,
+# and the in-flight collection fd state, for confirming that a send-break leaves
+# behind neither an unanswered input nor a live collection. Neither is
+# observable through the plan state (_zrush_plan_npos/_zrush_listing) that the
+# other send-break scenarios read.
+_zrt_dump_fds() { _zlog "TESTFDS=gen=$_zrush_input_gen pending=$_zrush_input_pending collect=$_zrush_collect_gen rfd=$_zrush_rfd wfd=$_zrush_wfd pty=${_zrush_pty:-<none>}" }
 zle -N _zrt-dump-fds _zrt_dump_fds
 bindkey '^Xt' _zrt-dump-fds
+
+# ^Xw: persistent-worker lifecycle state, the same dump minimal.zshrc carries,
+# for the history-rc scenarios that assert on request/generation accounting.
+_zrt_dump_worker() {
+  _zlog "TESTWORKER=ready=$_zrush_worker_ready seq=$_zrush_request_seq candgen=$_zrush_cand_gen_seq latch=$_zrush_cc_cand_gen staged=$#_zrush_cc_staged failures=$_zrush_worker_failures disabled=$_zrush_disabled reason=$_zrush_disable_reason stale=$_zrush_stale_disabled warned=$_zrush_worker_warned buildwarned=$_zrush_build_warned following=$_zrush_build_following verifying=$_zrush_build_verifying stopping=$_zrush_worker_stopping tainted=$_zrush_worker_runtime_tainted rfd=$_zrush_worker_rfd wfd=$_zrush_worker_wfd control=$_zrush_worker_control_wfd ack=$_zrush_worker_ack_fd pending=$#_zrush_worker_pending runtime=${_zrush_worker_runtime_dir:-<none>}"
+}
+zle -N _zrt-dump-worker _zrt_dump_worker
+bindkey '^Xw' _zrt-dump-worker
 
 # ^Xq: deterministic test-only transport teardown before replacing the private
 # binary. Unlike typing an internal function call, this does not pollute history.

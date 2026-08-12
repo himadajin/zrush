@@ -20,7 +20,7 @@ fn dismiss_closes_the_list_without_changing_the_buffer() {
     host.assert_buffer("ls fx/basic/", "(dis-1b) buffer is unchanged after dismiss");
 }
 
-/// Regression (dis-2): dismiss must cancel any still-armed debounce timer or
+/// Regression (dis-2): dismiss must cancel any still-pending input or
 /// in-flight collection for a newer keystroke, or a late-arriving result can
 /// silently reopen the list right after the user closed it. Reproduced with
 /// git's naturally slow (~150ms+) subcommand completion; no extra fixture
@@ -29,7 +29,7 @@ fn dismiss_closes_the_list_without_changing_the_buffer() {
 fn dismiss_cancels_an_in_flight_collection() {
     let mut host = Host::boot();
     host.send_keys_wait_plan(PlanShape::Nonempty, "git c"); // first list applied
-    host.send_keys("hec"); // -> 'git chec': re-arms debounce/collection
+    host.send_keys("hec"); // -> 'git chec': notifies a new input and recollects
     host.send_keys(keys::DISMISS); // dismiss immediately, no drain in between
     host.drain(Duration::from_secs(1)); // comfortably longer than 'git chec' compsys (~150-200ms)
 

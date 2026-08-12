@@ -17,7 +17,7 @@ fn slow_fork_does_not_block_input_and_still_completes() {
     host.sync_prompt(Duration::from_secs(5));
 
     host.send_keys("zrushtestslow ");
-    host.drain(Duration::from_millis(400)); // let debounce elapse and the fork start (still sleeping)
+    host.drain(Duration::from_millis(400)); // let the quiet period elapse and the fork start (still sleeping)
     host.send_keys("zzz"); // typed while the fork is asleep
     assert!(
         host.expect_in_order(&["z", "z", "z"], Duration::from_secs(2)),

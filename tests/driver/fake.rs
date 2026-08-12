@@ -11,17 +11,23 @@ use std::process::Command;
 /// `DRAIN_TAIL_BYTES` in the binary; the `tail` state line carries the count.
 pub const DRAIN_TAIL_BYTES: usize = 8 * 1024 * 1024;
 
-/// What the fake does with the *next* request it reads. The control file is
-/// re-read per request, so a mode set while a session is live still applies.
+/// What the fake does with the *next* message it reads. The control file is
+/// re-read per message, so a mode set while a session is live still applies.
+///
+/// The modes differ only in how requests are answered. The fake parses no
+/// candidate payload and so holds no generation, which makes every input
+/// notification settle into a `capture-required` whatever the mode -- and an
+/// accepted `store` answer `ok` and then the `plan-ready` for the input it was
+/// bound to (cli-protocol.md 「入力通知と worker event」).
 #[derive(Clone, Copy, Debug)]
 pub enum Mode {
     /// Delegate every invocation to the real binary (`execv`); no fake session.
     Proxy,
     /// Answer the handshake with `incompatible`, then fall back to `Proxy`.
     Mismatch,
-    /// Park the request until the mode changes, leaving it pending.
+    /// Park the message until the mode changes, answering nothing meanwhile.
     Hold,
-    /// Exit without a terminal response.
+    /// Exit without a terminal response or an event.
     Die,
     /// Reply to every `plan` with an in-band `error` and keep serving; a
     /// `store` still succeeds, as it does in every replying mode.
@@ -118,18 +124,30 @@ impl Fake {
     }
 
     /// How many `request <session> <kind> <request_id>` lines carry exactly
-    /// this id, across every session and either kind -- one means it was
-    /// never replayed.
+    /// this id, across every session and any kind -- one means it was never
+    /// replayed.
     pub fn requests_for(&self, request_id: &str) -> usize {
+        self.arrivals_for("request", request_id)
+    }
+
+    /// The same accounting over `notify <session> <kind> <input_generation>`:
+    /// a notification is no more replayable than a request
+    /// (cli-protocol.md 「zsh 側の規範」).
+    pub fn notifications_for(&self, input_generation: &str) -> usize {
+        self.arrivals_for("notify", input_generation)
+    }
+
+    /// State lines of one arrival tag whose correlation key is exactly `key`.
+    fn arrivals_for(&self, tag: &str, key: &str) -> usize {
         self.lines()
             .iter()
             .filter(|line| {
                 let fields: Vec<&str> = line.split(' ').collect();
                 fields.len() == 4
-                    && fields[0] == "request"
+                    && fields[0] == tag
                     && !fields[1].is_empty()
                     && fields[1].bytes().all(|b| b.is_ascii_digit())
-                    && fields[3] == request_id
+                    && fields[3] == key
             })
             .count()
     }

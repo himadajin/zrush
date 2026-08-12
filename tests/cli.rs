@@ -85,9 +85,26 @@ fn run_plan(extra: &[&str], stdin: &[u8]) -> (i32, Vec<u8>) {
             .unwrap_or("")
     };
     // `stdin` is the candidate payload: it reaches the worker as a `store`
-    // (generation 1) that the `plan` then references.
+    // (generation 1) that the `plan` then references. Every `store` is bound to
+    // the worker's current input, so the session opens with an `input`
+    // notification whose quiet period outlives the whole exchange: it is still
+    // pending when the `store` arrives, and the `store` settles it
+    // (cli-protocol.md 「入力通知と worker event」).
     let req = [
-        msg(&[b"store", b"1", b"live", b"1", stdin]),
+        msg(&[
+            b"input",
+            b"1",
+            b"0",
+            b"10000",
+            std::env::current_dir().unwrap().as_os_str().as_bytes(),
+            b"",
+            b"typo",
+            b"true",
+            b"10",
+            b"40",
+            b"true",
+        ]),
+        msg(&[b"store", b"1", b"live", b"1", b"1", stdin]),
         msg(&[
             b"plan",
             b"2",
@@ -402,7 +419,20 @@ fn worker_handshake_and_multiple_requests_share_one_process() {
     drop(control_read);
     let mut input = Vec::new();
     input.extend(msg(&[b"hello", BUILD_STAMP]));
-    input.extend(msg(&[b"store", b"1", b"live", b"1", &payload]));
+    input.extend(msg(&[
+        b"input",
+        b"1",
+        b"0",
+        b"10000",
+        cwd.as_os_str().as_bytes(),
+        b"",
+        b"typo",
+        b"true",
+        b"10",
+        b"40",
+        b"true",
+    ]));
+    input.extend(msg(&[b"store", b"1", b"live", b"1", b"1", &payload]));
     input.extend(plan(b"2"));
     input.extend(plan(b"3"));
     let mut stdin = child.stdin.take().unwrap();
@@ -412,7 +442,11 @@ fn worker_handshake_and_multiple_requests_share_one_process() {
     drop(stdin);
     let out = child.wait_with_output().unwrap();
     let frames = decode_frames(&out.stdout);
-    assert_eq!(frames.len(), 4, "ready plus three terminal responses");
+    assert_eq!(
+        frames.len(),
+        5,
+        "ready, three terminal responses, and the accepted store's event"
+    );
     assert_eq!(
         fields(&frames[0]),
         vec![b"ready".to_vec(), BUILD_STAMP.to_vec()]
@@ -422,9 +456,17 @@ fn worker_handshake_and_multiple_requests_share_one_process() {
         vec![b"ok".to_vec(), b"1".to_vec(), Vec::new()],
         "the store body is empty"
     );
+    // The accepted store settles the pending input, and the contract fixes the
+    // order: the terminal `ok` first, then the event it caused.
+    let event = fields(&frames[2]);
+    assert_eq!(event[0], b"plan-ready");
+    assert_eq!(event[1], b"1", "the event names the settled input");
     // Both plans read the one stored generation.
-    assert!(fields(&frames[2])[0] == b"ok" && fields(&frames[3])[0] == b"ok");
-    assert_eq!(fields(&frames[2])[2], fields(&frames[3])[2]);
+    assert!(fields(&frames[3])[0] == b"ok" && fields(&frames[4])[0] == b"ok");
+    assert_eq!(fields(&frames[3])[2], fields(&frames[4])[2]);
+    // The notification snapshotted the same fields the plans carry, so the
+    // event's body is the same render plan.
+    assert_eq!(event[2], fields(&frames[3])[2]);
 }
 
 #[test]

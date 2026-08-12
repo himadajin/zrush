@@ -31,11 +31,10 @@ fn sourcing_zrush_leaves_the_worker_stopped_and_host_stdio_intact() {
     host.assert_host_stdio("(fd-1a) source leaves host fd 0/1/2 attached and writable");
 }
 
-/// The transport's auxiliary descriptors -- the writer ack, the raw-drain
-/// continuation, and the debounce timer -- all close through one teardown, and
-/// a generated `zle -F` handler that dispatches once invalidates itself. Both
-/// run on a shell whose worker has never started, so what they exercise is the
-/// bookkeeping alone.
+/// The transport's auxiliary descriptors -- the writer ack and the raw-drain
+/// continuation -- both close through one teardown, and a generated `zle -F`
+/// handler that dispatches once invalidates itself. Both run on a shell whose
+/// worker has never started, so what they exercise is the bookkeeping alone.
 #[test]
 fn auxiliary_fd_teardown_and_generated_dispatch_preserve_host_stdio() {
     let mut host = Host::boot();
@@ -45,10 +44,10 @@ fn auxiliary_fd_teardown_and_generated_dispatch_preserve_host_stdio() {
         .dump_get(keys::CLOSE_AUX_FDS, "TESTAUX")
         .expect("(fd-1b) auxiliary-fd dump did not run");
     assert_eq!(
-        aux, "closed=1 ack=-1 drain=-1 timer=-1",
-        "(fd-1b) timer/ack/drain descriptors did not close through shared teardown"
+        aux, "closed=1 ack=-1 drain=-1",
+        "(fd-1b) ack/drain descriptors did not close through shared teardown"
     );
-    host.assert_host_stdio("(fd-1c) timer/ack/drain teardown preserves host fd 0/1/2");
+    host.assert_host_stdio("(fd-1c) ack/drain teardown preserves host fd 0/1/2");
 
     let dispatched0 = host.log_count("TESTGENERATED=dispatched");
     host.send_keys(keys::GENERATED_CALLBACK);

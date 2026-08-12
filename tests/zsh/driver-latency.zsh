@@ -10,7 +10,7 @@
 #
 # Hosts:
 #   min-zrush     zsh -d -i + isolated minimal.zshrc
-#   min-d0        same with delay-ms = 0 to isolate debounce contribution
+#   min-d0        same with delay-ms = 0 to isolate the quiet period's contribution
 #   hist5000      isolated history-latency.zshrc, ~5000 short fixture entries
 #   hist20000     the same with 20000 long entries and [history].limit = 20000
 #
@@ -27,11 +27,15 @@
 #                SGR and its padding, with roughly 10ms zselect resolution
 #   breakdown  : ZRUSH_LOG intervals, keyed off zsh's own _zlog checkpoints
 #                matching, ranking, layout, and render-plan construction happen
-#                in the persistent Rust worker. The worker-roundtrip bucket
-#                starts after capture transport completes; there is deliberately
-#                no per-plan Rust process-spawn bucket:
-#                arm -> request -> capture-start -> compsys -> capture-transport
-#                    -> worker-roundtrip+apply
+#                in the persistent Rust worker, and so does the quiet period:
+#                the quiet-period bucket runs from the input notification this
+#                side sends to the capture the worker's event asks for, so it
+#                covers the period plus that round trip. The worker-roundtrip
+#                bucket starts after capture transport completes; there is
+#                deliberately no per-plan Rust process-spawn bucket, and no
+#                timer-subprocess bucket, because neither exists:
+#                notify -> quiet-period -> capture-start -> compsys
+#                    -> capture-transport -> worker-roundtrip+apply
 #   history    : each history host reports three things. `index-cold` opens
 #                (first open of the host, then one forced discontinuity per
 #                later trial) and `index-warm` opens (the index already built)
@@ -184,12 +188,12 @@ breakdown_last() {  # $1=logfile $2=number of leading lines to skip -> one table
       *" finalize: "*" bytes"*)      (( t_xfer == 0 ))  && { ts_of $L[i]; t_xfer=$REPLY } ;;
       *" fork: _main_complete "*)    (( t_comp == 0 ))  && { ts_of $L[i]; t_comp=$REPLY } ;;
       *" fork: start "*)             (( t_fork == 0 ))  && { ts_of $L[i]; t_fork=$REPLY } ;;
-      *" request: widened"*)         (( t_req == 0 ))   && { ts_of $L[i]; t_req=$REPLY } ;;
-      *" MEAS-arm"*)                 (( t_req != 0 )) && { ts_of $L[i]; t_arm=$REPLY; break } ;;
+      *" collect: widened"*)         (( t_req == 0 ))   && { ts_of $L[i]; t_req=$REPLY } ;;
+      *" MEAS-notify"*)              (( t_req != 0 )) && { ts_of $L[i]; t_arm=$REPLY; break } ;;
     esac
   done
   (( t_arm && t_req && t_fork && t_comp && t_xfer )) || { bad "WARN: breakdown: incomplete chain"; return 1 }
-  printf 'BREAK | debounce=%4.0f | capture-start=%4.0f | compsys=%5.0f | capture-transport=%4.0f | worker-roundtrip+apply=%4.0f | total(arm→apply)=%5.0f ms\n' \
+  printf 'BREAK | quiet-period=%4.0f | capture-start=%4.0f | compsys=%5.0f | capture-transport=%4.0f | worker-roundtrip+apply=%4.0f | total(notify→apply)=%5.0f ms\n' \
     $(( (t_req - t_arm) * 1000 )) \
     $(( (t_fork - t_req) * 1000 )) \
     $(( (t_comp - t_fork) * 1000 )) \
@@ -209,7 +213,8 @@ paint_break_case() {  # $1=host-label $2=case-label $3=keys $4=pattern
   return 0
 }
 
-# Cache-hit breakdown: arm -> request -> cache hit -> worker roundtrip + apply
+# Cache-hit breakdown: notify -> cache hit -> quiet period + worker roundtrip
+# + apply. A hit sends no capture, so the notification's own event is the paint.
 breakdown_hit_last() {  # $1=logfile $2=number of leading lines to skip
   local -a L=( ${(f)"$(<$1)"} )
   L=( "${(@)L[$(( $2 + 1 )),-1]}" )
@@ -218,21 +223,19 @@ breakdown_hit_last() {  # $1=logfile $2=number of leading lines to skip
     [[ $L[i] == *" plan: applied "* ]] && { ir=i; break }
   done
   (( ir )) || { bad "WARN: breakdown-hit: 'plan: applied' line not found"; return 1 }
-  local -F t_apply t_hit t_req t_arm
-  t_apply=0; t_hit=0; t_req=0; t_arm=0
+  local -F t_apply t_hit t_arm
+  t_apply=0; t_hit=0; t_arm=0
   ts_of $L[ir]; t_apply=$REPLY
   for (( i = ir - 1; i >= 1; --i )); do
     case $L[i] in
-      *" cache: hit"*)        (( t_hit == 0 ))  && { ts_of $L[i]; t_hit=$REPLY } ;;
-      *" request: widened"*)  (( t_req == 0 ))  && { ts_of $L[i]; t_req=$REPLY } ;;
-      *" MEAS-arm"*)          (( t_req != 0 )) && { ts_of $L[i]; t_arm=$REPLY; break } ;;
+      *" cache: hit"*)    (( t_hit == 0 ))  && { ts_of $L[i]; t_hit=$REPLY } ;;
+      *" MEAS-notify"*)   (( t_hit != 0 )) && { ts_of $L[i]; t_arm=$REPLY; break } ;;
     esac
   done
-  (( t_arm && t_req && t_hit )) || \
+  (( t_arm && t_hit )) || \
     { bad "WARN: breakdown-hit: incomplete chain (cache miss?)"; return 1 }
-  printf 'BREAK | debounce=%4.0f | cache-check=%4.0f | worker-roundtrip+apply=%4.0f | total(arm→apply)=%5.0f ms\n' \
-    $(( (t_req - t_arm) * 1000 )) \
-    $(( (t_hit - t_req) * 1000 )) \
+  printf 'BREAK | cache-check=%4.0f | quiet-period+worker-roundtrip+apply=%5.0f | total(notify→apply)=%5.0f ms\n' \
+    $(( (t_hit - t_arm) * 1000 )) \
     $(( (t_apply - t_hit) * 1000 )) \
     $(( (t_apply - t_arm) * 1000 )) >&2
   return 0
@@ -251,8 +254,8 @@ paint_break_hit_case() {  # needs two preceding command-position collections (se
 # ---------------------------------------------------------------- Hosts
 typeset -g MEAS_RC=$WORK/meas.zsh
 cat > $MEAS_RC <<'EOF'
-functions[_zrush_arm_timer_orig]=$functions[_zrush_arm_timer]
-_zrush_arm_timer() { _zlog "MEAS-arm"; _zrush_arm_timer_orig "$@" }
+functions[_zrush_send_input_orig]=$functions[_zrush_send_input]
+_zrush_send_input() { _zlog "MEAS-notify"; _zrush_send_input_orig "$@" }
 print MEAS-READY
 EOF
 

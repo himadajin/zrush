@@ -26,14 +26,15 @@ fn fork_capture_round_trip_reuses_one_worker() {
     let first = host.worker_state();
     let first_rfd: i32 = dump_field(&first, "rfd").parse().expect("numeric rfd");
     let first_runtime = dump_field(&first, "runtime").to_string();
-    // One collection spends two request ids and one candidate generation: the
-    // `store` that hands the records over and the `plan` pipelined behind it
-    // (cli-protocol.md 「要求と応答」).
+    // One collection spends one request id and one candidate generation: the
+    // `store` that hands the records over. Its listing arrives as the
+    // `plan-ready` that store settles, which is no request at all
+    // (cli-protocol.md 「入力通知と worker event」).
     assert!(
         first_rfd > 2
             && state_has(
                 &first,
-                &["ready=1", "seq=2", "candgen=1", "stopping=0", "tainted=0"]
+                &["ready=1", "seq=1", "candgen=1", "stopping=0", "tainted=0"]
             )
             && first_runtime != "<none>",
         "(worker-1b) unexpected first-request state: {first}"
@@ -264,7 +265,7 @@ fn healthy_re_source_drains_a_raw_stdout_tail() {
     host.fake().set_mode(Mode::Drain);
 
     let served0 = host.fake().count(&format!("drain {session} "));
-    let error0 = host.log_count("worker: error request_id=");
+    let stored0 = host.log_count("worker: ok store request_id=");
     host.send_keys("ls fx/basic/al");
     assert!(
         host.wait_fake(
@@ -275,8 +276,12 @@ fn healthy_re_source_drains_a_raw_stdout_tail() {
         "(worker-1f) the fake session never served a request"
     );
     assert!(
-        host.wait_log("worker: error request_id=", error0, Duration::from_secs(10)),
-        "(worker-1f) the in-band error never reached the host"
+        host.wait_log(
+            "worker: ok store request_id=",
+            stored0,
+            Duration::from_secs(10)
+        ),
+        "(worker-1f) the terminal response never reached the host"
     );
     let live = host.worker_state();
     assert!(

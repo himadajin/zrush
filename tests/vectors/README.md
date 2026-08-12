@@ -8,6 +8,7 @@ Each `reject-plan/<name>/` directory contains only `plan`.
 Each `encode/<name>/` directory contains `argv`, `hits`, `dscr`, `expected`, and an optional `env`.
 Each `message/<name>/` directory contains a single `frame`.
 The runner drives each vector through one persistent `zrush worker` session as the contract's requests: one write (request_id 1, generation 1) carrying `payload`, then a `plan` referencing the last generation written.
+A `store` write is bound to the worker's current input, so its session opens with an `input` notification (input_generation 1) whose quiet period outlives the exchange; the `store` settles it, and the resulting `plan-ready` trails the `store`'s terminal `ok`.
 `args` contains flags and their values only.
 
 Two flags select what the session does with `payload` rather than what the `plan` computes:
@@ -22,6 +23,7 @@ An `append` file adds a `history-append` (request_id 2, generation 2) between th
 
 Reject vectors expect that session to answer with a terminal response per request, exactly one of which is an `error`.
 A candidate-stream framing violation fails the write with `invalid-payload`, and a `history-append` against the uninitialized index fails it with `unknown-generation`; either leaves no generation for the `plan` to reference (`unknown-generation`).
+A failed `store` settles nothing, so the `plan-ready` above appears only in the sessions whose `store` is accepted.
 A malformed request shape or scalar writes fine and fails the `plan` itself with `invalid-request`.
 Vector names use kebab case and describe the rule being fixed.
 

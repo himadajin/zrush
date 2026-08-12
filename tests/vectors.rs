@@ -13,6 +13,9 @@ use zrush::wire;
 
 const VECTOR_ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/vectors");
 
+/// The `input_generation` a `store` vector's session notifies and binds to.
+const BINDING: &[u8] = b"1";
+
 /// Render a byte string in the corpus text format (tests/vectors/README.md).
 /// A line break is layout, never data, so the writer is free to start a new
 /// line after every `\0` and `\2`.
@@ -175,9 +178,30 @@ fn run_vector_raw(path: &Path) -> std::process::Output {
     // goes in with the write `--source` names (request_id 1, generation 1), an
     // `append` file follows it as a `history-append` (request_id 2, generation
     // 2), and the trailing `plan` reads back the last generation written.
+    // A `store` is bound to the worker's current input, so a `store` vector
+    // opens with an `input` notification (input_generation 1) whose quiet period
+    // outlives the session: it is still pending when the `store` arrives, and
+    // the `store` settles it into one `plan-ready`
+    // (cli-protocol.md 「入力通知と worker event」).
     let source = vector_source(path);
     let mut requests = match source.as_bytes() {
-        b"store" => msg(&[b"store", b"1", b"live", b"1", &payload]),
+        b"store" => [
+            msg(&[
+                b"input",
+                BINDING,
+                b"0",
+                b"10000",
+                cwd.as_os_str().as_bytes(),
+                b"",
+                b"typo",
+                b"true",
+                b"1",
+                b"1",
+                b"false",
+            ]),
+            msg(&[b"store", b"1", b"live", b"1", BINDING, &payload]),
+        ]
+        .concat(),
         b"history" => msg(&[b"history-snapshot", b"1", b"1", &payload]),
         b"history-append" => msg(&[b"history-append", b"1", b"1", &payload]),
         _ => panic!("{}: unknown --source {source:?}", path.display()),
@@ -449,11 +473,20 @@ fn reject_vectors_match_expected_in_band_errors() {
         } else {
             vec![b"error".to_vec(), b"1".to_vec(), write_reply.to_vec()]
         };
+        // Only an accepted `store` settles the notification its session opened
+        // with, so only then does a `plan-ready` sit between the two terminal
+        // responses (cli-protocol.md 「入力通知と worker event」).
+        let settles = write_reply.is_empty() && vector_source(&path) == *"store";
+        let event_is_plan_ready = |frame: &[u8]| {
+            let event = decode_fields_strict(frame);
+            event.len() == 3 && event[0] == b"plan-ready" && event[1] == BINDING
+        };
         let valid = output.status.code() == Some(0)
-            && frames.len() == 3
+            && frames.len() == 3 + usize::from(settles)
             && decode_fields_strict(&frames[0]) == vec![b"ready".to_vec(), BUILD_STAMP.to_vec()]
             && decode_fields_strict(&frames[1]) == store_frame
-            && decode_fields_strict(&frames[2])
+            && (!settles || event_is_plan_ready(&frames[2]))
+            && decode_fields_strict(frames.last().expect("a nonempty response stream"))
                 == vec![b"error".to_vec(), b"2".to_vec(), plan_reply.to_vec()];
         if !valid {
             failures.push(format!(
