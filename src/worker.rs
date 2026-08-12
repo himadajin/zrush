@@ -133,8 +133,17 @@ pub(crate) trait Source {
     ) -> std::io::Result<Chunk>;
 }
 
-/// The session stream of a real worker: stdin, polled so a quiet period can
+/// The session stream of a real worker: stdin, waited on so a quiet period can
 /// expire while no message is arriving.
+///
+/// The wait is `select(2)` rather than `poll(2)`: on macOS a reader parked in
+/// an open-ended `poll` on a FIFO never sees the writer that is blocked inside
+/// a single `write(2)` larger than the FIFO buffer -- 8192 bytes arrive, 8193
+/// hang -- and a `store` carrying a command-position capture is tens of
+/// kilobytes. An open-ended `kqueue` wait loses the same wakeup; `select` and a
+/// blocking `read` do not, and a `poll` with a timeout recovers because each
+/// call arms again. Only stdin is ever watched, so the descriptor is always
+/// inside `FD_SETSIZE`.
 pub(crate) struct StdinSource;
 
 impl Source for StdinSource {
@@ -148,23 +157,31 @@ impl Source for StdinSource {
         buffer: &mut [u8],
     ) -> std::io::Result<Chunk> {
         loop {
-            let timeout = match deadline {
-                None => -1,
+            let mut timeout = match deadline {
+                None => None,
                 Some(deadline) => {
-                    match poll_timeout(deadline.saturating_duration_since(self.now())) {
-                        Some(timeout) => timeout,
+                    match wait_timeout(deadline.saturating_duration_since(self.now())) {
+                        Some(timeout) => Some(timeout),
                         None => return Ok(Chunk::Expired),
                     }
                 }
             };
 
-            let mut watched = libc::pollfd {
-                fd: libc::STDIN_FILENO,
-                events: libc::POLLIN,
-                revents: 0,
+            // select is called with one owned descriptor set and one owned
+            // timeout, both left to the kernel to update.
+            let ready = unsafe {
+                let mut watched = std::mem::zeroed::<libc::fd_set>();
+                libc::FD_SET(libc::STDIN_FILENO, &mut watched);
+                libc::select(
+                    libc::STDIN_FILENO + 1,
+                    &mut watched,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    timeout.as_mut().map_or(std::ptr::null_mut(), |timeout| {
+                        timeout as *mut libc::timeval
+                    }),
+                )
             };
-            // poll is called with one owned descriptor slot.
-            let ready = unsafe { libc::poll(&mut watched, 1, timeout) };
             if ready < 0 {
                 let error = std::io::Error::last_os_error();
                 if error.kind() == std::io::ErrorKind::Interrupted {
@@ -194,16 +211,25 @@ impl Source for StdinSource {
     }
 }
 
-/// Round a remaining quiet period up to poll(2)'s millisecond timeout, so a
-/// sub-millisecond remainder waits rather than spinning. `None` once nothing
+/// Round a remaining quiet period up to select(2)'s microsecond timeout, so a
+/// sub-microsecond remainder waits rather than spinning. `None` once nothing
 /// remains.
-fn poll_timeout(remaining: Duration) -> Option<libc::c_int> {
+fn wait_timeout(remaining: Duration) -> Option<libc::timeval> {
+    /// Longest wait ever handed to select. A quiet period is at most ten
+    /// seconds, so the clamp is unreachable; it exists so that no arithmetic
+    /// here can produce a `tv_sec` that select is free to reject as `EINVAL`.
+    const MAX_MICROS: u128 = i32::MAX as u128 * 1_000;
+
     if remaining.is_zero() {
         return None;
     }
-    let millis =
-        remaining.as_millis() + u128::from(!remaining.subsec_nanos().is_multiple_of(1_000_000));
-    Some(libc::c_int::try_from(millis).unwrap_or(libc::c_int::MAX))
+    let micros = (remaining.as_micros()
+        + u128::from(!remaining.subsec_nanos().is_multiple_of(1_000)))
+    .min(MAX_MICROS);
+    Some(libc::timeval {
+        tv_sec: (micros / 1_000_000) as libc::time_t,
+        tv_usec: (micros % 1_000_000) as libc::suseconds_t,
+    })
 }
 
 #[derive(Debug)]
