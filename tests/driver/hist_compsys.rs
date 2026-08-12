@@ -75,16 +75,16 @@ fn up_at_a_completion_listing_deselects_before_opening_the_history_menu() {
     );
 }
 
-/// Opening the history menu while only debounce-armed -- no collection started
-/// yet -- disarms the pending timer, which
+/// Opening the history menu while the notified input is merely pending -- no
+/// collection started yet -- drops that input generation, which
 /// `opening_the_menu_cancels_an_in_flight_collection_and_confirm_resumes_it`
 /// does not cover: there the collection has already begun. The Up is sent in
-/// the same burst as the query, well inside the default 30 ms debounce, so the
-/// timer must still be pending when select-prev disarms it.
+/// the same burst as the query, well inside the default 30 ms quiet period, so
+/// the input must still be pending when select-prev drops it.
 #[test]
-fn an_up_inside_the_debounce_window_opens_the_menu_and_disarms_the_timer() {
+fn an_up_inside_the_quiet_period_opens_the_menu_and_drops_the_input() {
     let mut host = Host::boot_history();
-    let collecting = "request: collecting";
+    let collecting = "collect: collecting";
     let before = host.log_count(collecting);
     host.send_keys("echo");
     host.send_keys(keys::UP);
@@ -93,15 +93,15 @@ fn an_up_inside_the_debounce_window_opens_the_menu_and_disarms_the_timer() {
     assert_eq!(
         host.listing_kind("(h25a)"),
         "kind=history sel=1 listing=1 npos=6",
-        "(h25a) Up sent within the debounce window did not open the history menu:"
+        "(h25a) Up sent within the quiet period did not open the history menu:"
     );
 
-    // Comfortably longer than the debounce plus a real fork/collection round trip.
+    // Comfortably longer than the quiet period plus a real fork/collection round trip.
     host.drain(Duration::from_secs(1));
     let after = host.log_count(collecting);
     assert_eq!(
         after, before,
-        "(h25b) a compsys collection started despite the timer being disarmed"
+        "(h25b) a compsys collection started despite the input being dropped"
     );
 }
 
@@ -119,7 +119,7 @@ fn an_up_inside_the_debounce_window_opens_the_menu_and_disarms_the_timer() {
 fn opening_the_menu_cancels_an_in_flight_collection_and_confirm_resumes_it() {
     let mut host = Host::boot_history();
     host.send_keys("zrushtestslow ");
-    host.drain(Duration::from_millis(200)); // debounce elapsed, fork started, still asleep
+    host.drain(Duration::from_millis(200)); // quiet period elapsed, fork started, still asleep
     host.press(keys::UP);
 
     let kind = host.listing_kind("(h17a)");
@@ -185,7 +185,9 @@ fn assert_exact_match_confirm_recollects(confirm: &str, setup_label: &str, label
         "{setup_label} exact-match menu did not open as expected:"
     );
 
-    let answered = "worker: ok request_id=";
+    // The recollection the confirm has to provoke is a compsys one, so what
+    // proves it ran is its own `store` reaching the worker.
+    let answered = "worker: ok store request_id=";
     let before = host.log_count(answered);
     host.press(confirm);
     assert!(
@@ -218,11 +220,11 @@ fn the_fixtures_own_injection_commands_are_not_history_candidates() {
 /// steps are one chain.
 ///
 /// No fd check follows the send-break here: opening the history menu already
-/// disarms the timer and cancels any collection *before* it displays, so the
-/// fds are clear before ^C is even sent. That is what
+/// drops the pending input and cancels any collection *before* it displays, so
+/// the state is clear before ^C is even sent. That is what
 /// `send_break_during_an_in_flight_collection_clears_the_collection_fds` (and
-/// `hist_config::send_break_clears_a_merely_armed_debounce_timer`, for the
-/// timer that is armed but has not started collecting) cover instead.
+/// `hist_config::send_break_clears_a_merely_pending_input`, for the input that
+/// is pending but has not started collecting) cover instead.
 #[test]
 fn worker_death_on_the_synchronous_history_path_leaves_a_clean_line() {
     let mut host = Host::boot_history_fake();
@@ -296,18 +298,18 @@ fn worker_death_on_the_synchronous_history_path_leaves_a_clean_line() {
 }
 
 /// Send-break while a real collection is in flight -- rfd/pty alive, not merely
-/// debounce-armed -- clears those fds too. Same slow fixture as
+/// a pending input -- clears those fds too. Same slow fixture as
 /// `opening_the_menu_cancels_an_in_flight_collection_and_confirm_resumes_it`,
 /// ending in ^C instead of Up.
 #[test]
 fn send_break_during_an_in_flight_collection_clears_the_collection_fds() {
     let mut host = Host::boot_history();
     host.send_keys("zrushtestslow ");
-    host.drain(Duration::from_millis(200)); // debounce elapsed, fork started, still asleep (0.5s)
+    host.drain(Duration::from_millis(200)); // quiet period elapsed, fork started, still asleep (0.5s)
 
     // Without this the cleanup assertion below would pass for the wrong reason
     // whenever no collection is actually in flight.
-    let fds = host.collection_fds("(h26d-pre)");
+    let fds = host.input_state("(h26d-pre)");
     assert_ne!(
         fds, NO_COLLECTION,
         "(h26d-pre) no in-flight collection detected before send-break:"
@@ -318,7 +320,7 @@ fn send_break_during_an_in_flight_collection_clears_the_collection_fds() {
         "(h26d-a) send-break did not produce a new prompt"
     );
     assert_eq!(
-        host.collection_fds("(h26d)"),
+        host.input_state("(h26d)"),
         NO_COLLECTION,
         "(h26d) the cancelled collection's fds/pty survived the following line-init:"
     );

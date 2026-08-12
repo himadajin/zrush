@@ -27,7 +27,7 @@ fn one_exit_terminates_without_job_control_output() {
     let session = host.fake().sessions() + 1;
     host.fake().set_mode(Mode::Error);
     let served0 = host.fake().count(&format!("error {session} "));
-    let errors0 = host.log_count("worker: error request_id=");
+    let answered0 = host.log_count("worker: ok store request_id=");
     host.send_keys("ls fx/basic/al");
     let served = host.wait_fake(
         &format!("error {session} "),
@@ -35,8 +35,8 @@ fn one_exit_terminates_without_job_control_output() {
         Duration::from_secs(10),
     );
     let answered = host.wait_log(
-        "worker: error request_id=",
-        errors0,
+        "worker: ok store request_id=",
+        answered0,
         Duration::from_secs(10),
     );
     let live = host.worker_state();

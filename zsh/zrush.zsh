@@ -54,8 +54,7 @@ if (( ${_zrush_installed:-0} || ${_zrush_worker_stopping:-0} ||
       add-zsh-hook -d precmd _zrush_precmd 2>/dev/null
       add-zsh-hook -d zshexit _zrush_zshexit 2>/dev/null
     }
-    (( $+functions[_zrush_disarm_timer] )) && _zrush_disarm_timer
-    (( $+functions[_zrush_cancel_collection] )) && _zrush_cancel_collection
+    (( $+functions[_zrush_input_invalidate] )) && _zrush_input_invalidate
     (( $+functions[_zrush_rh_clear] )) && _zrush_rh_clear
     return 0
   }
@@ -73,6 +72,11 @@ typeset -gi _zrush_request_seq=${_zrush_request_seq:-0}
 # rule: monotonic per shell session, never reused, never reset by a worker
 # restart or a re-source (cli-protocol.md "要求と応答").
 typeset -gi _zrush_cand_gen_seq=${_zrush_cand_gen_seq:-0}
+# input_generation is the third shell-owned counter, independent of the two
+# above and sharing their survival rule (cli-protocol.md "入力通知と worker
+# event"): monotonic per shell session, never reused, never reset by a worker
+# restart or a re-source.
+typeset -gi _zrush_input_gen_seq=${_zrush_input_gen_seq:-0}
 typeset -gi _zrush_worker_warned=${_zrush_worker_warned:-0}
 typeset -gi _zrush_build_warned=${_zrush_build_warned:-0}
 typeset -gi _zrush_worker_failures=${_zrush_worker_failures:-0}
@@ -113,10 +117,20 @@ typeset -ga _ZRUSH_CFG_VARS=(
 
 # Collection request state
 typeset -g  _zrush_query= _zrush_fuzzy= _zrush_buf= _zrush_pty= _zrush_capture_pid=
-typeset -gi _zrush_rfd=-1 _zrush_wfd=-1 _zrush_gen=0 _zrush_timer_fd=-1
-typeset -g  _zrush_pending_buffer=
+typeset -gi _zrush_rfd=-1 _zrush_wfd=-1 _zrush_gen=0
 typeset -g  _zrush_last_buffer=
 typeset -gi _zrush_last_cursor=-1
+# The one input_generation this shell currently treats as valid (0 = none), and
+# what is still expected of it. Declared without `${...:-}` preservation, so a
+# re-source starts without one -- one of its invalidation points
+# (behavior.md "worker ライフサイクル").
+typeset -gi _zrush_input_gen=0
+typeset -gi _zrush_input_pending=0   # no worker event has answered it yet
+typeset -gi _zrush_input_latched=0   # its notification named the cache latch's generation
+# The input_generation the collection in flight was started for, 0 when none is
+# running. What the finished capture answers is this one, not whatever is
+# current when it finishes.
+typeset -gi _zrush_collect_gen=0
 typeset -gi _zrush_kick_fd=${_zrush_kick_fd:--1}  # shell-session permanent; see "Watcher self-repair"
 
 # Persistent Rust worker transport.
@@ -133,7 +147,6 @@ typeset -gi _zrush_worker_callback_seq=${_zrush_worker_callback_seq:-0}
 typeset -gA _zrush_worker_callback_generation=( data 0 ack 0 drain 0 )
 typeset -gA _zrush_worker_callback_handler=()
 typeset -gA _zrush_worker_pending=()
-typeset -gi _zrush_current_request=0
 typeset -gi _zrush_sync_target=0 _zrush_sync_done=0 _zrush_sync_ok=0
 # Lifecycle stops may block briefly, but each operation uses one 100ms
 # absolute budget, matching the existing synchronous history exchange.
@@ -250,8 +263,8 @@ _zrush_close_internal_fd() {  # $1=owned fd; idempotent best-effort close
 # removes a watcher and registers a new one that reuses the removed fd's
 # number and slot while that slot still holds POLLHUP/POLLERR revents. The
 # slot recovers on the next dispatch round -- but nothing forces one when the
-# silenced fd is the only pending event, and zrush's disposable fds (timer,
-# ack, setup, drain, capture) all read from short-lived children whose final
+# silenced fd is the only pending event, and zrush's disposable fds (ack,
+# setup, drain, capture) all read from short-lived children whose final
 # readiness usually carries exactly that POLLHUP. Writing one byte to this
 # permanent self-pipe right after a registration forces the extra round, so a
 # silenced watcher never survives the poll that silenced it. Invariant:
@@ -697,15 +710,21 @@ _zrush_cancel_collection() {
   fi
   _zrush_capture_pid=
   _zrush_buf=
+  _zrush_collect_gen=0
 }
 
-_zrush_disarm_timer() {
+# Drop the current input_generation. Every invalidation point named in
+# behavior.md "worker ライフサイクル" goes through here: the worker keeps
+# measuring its quiet period and may still send an event, but this shell no
+# longer has a generation for it to match, so it is discarded on arrival. No
+# cancellation message is sent. The collection that generation started, if any,
+# is cancelled with it (behavior.md "候補収集").
+_zrush_input_invalidate() {
   emulate -L zsh
-  if (( _zrush_timer_fd >= 0 )); then
-    zle -F $_zrush_timer_fd 2>/dev/null
-    _zrush_close_internal_fd $_zrush_timer_fd
-    _zrush_timer_fd=-1
-  fi
+  _zrush_input_gen=0 _zrush_input_pending=0 _zrush_input_latched=0
+  _zrush_txq_drop_notifications
+  _zrush_cancel_collection
+  return 0
 }
 
 # Remove only this plugin's region_highlight entries.
@@ -765,9 +784,9 @@ _zrush_rh_add() {  # $1=start $2=end $3=spec [$4=memo suffix (-sel)]
 # _zrush_listing -- so no caller has to reason about whether something is
 # currently showing, and stale plan state from an earlier prompt or query can
 # never survive to be used by a later pending Tab or confirmation.
-# Call only from a ZLE widget context. In-flight work (debounce timer,
-# collection) is not part of the listing; callers that must also stop it call
-# _zrush_disarm_timer / _zrush_cancel_collection first.
+# Call only from a ZLE widget context. Work in flight (the input_generation
+# awaiting a worker event, the collection it started) is not part of the
+# listing; callers that must also stop it call _zrush_input_invalidate first.
 _zrush_teardown() {
   POSTDISPLAY=
   _zrush_rh_clear
@@ -778,7 +797,6 @@ _zrush_teardown() {
   _zrush_plan_hl=() _zrush_plan_cells=() _zrush_plan_nav=() _zrush_plan_insert=()
   _zrush_plan_cp=
   _zrush_plan_kind=none
-  _zrush_current_request=0
   return 0
 }
 
@@ -822,14 +840,15 @@ _zrush_cc_invalidate() {
   return 0
 }
 
-# Is this collection the empty-word cache's subject? Asked before collecting,
-# to reuse the entry, and again on the finished capture -- which also has to be
-# non-empty -- to pick the `cache` slot. Nothing outside the subject can
-# overwrite the latched generation.
+# Is this input the empty-word cache's subject? Asked when the notification is
+# made, to name the latched generation on it, and again on the finished capture
+# -- which also has to be non-empty -- to pick the `cache` slot. Nothing outside
+# the subject can overwrite the latched generation.
 _zrush_cc_subject() {
   [[ -z $_zrush_query ]]
 }
 
+# Checked when the notification is made (behavior.md "空語収集キャッシュ").
 _zrush_cc_check() {  # 0=usable hit; on a miss, log the reason and return nonzero
   emulate -L zsh
   if [[ -z $_zrush_cc_fp ]]; then
@@ -880,29 +899,17 @@ _zrush_cc_commit() {  # $1=store request_id $2=generation the worker accepted
   return 0
 }
 
-# Start a collection request from a widget or handler context.
-_zrush_start_request() {
+# Start the compsys collection for the current input_generation, from a widget
+# or handler context. Only a `capture-required` event matching that generation
+# gets here (behavior.md "候補収集"); the query and the widened collection
+# string are the ones snapshotted when its notification was made, because any
+# buffer change since would have invalidated the generation.
+_zrush_start_collection() {
   emulate -L zsh
   setopt localoptions no_monitor no_notify
   [[ -n $ZRUSH_INTERNAL ]] && return 0
   _zrush_cancel_collection
-
-  # Recompute widening from the buffer at start time. pre-redraw normally re-arms the
-  # timer after any change during debounce, so this should already be current.
-  _zrush_widen "$LBUFFER"
-  _zrush_query=$REPLY_WIDENED
-  _zrush_fuzzy=${REPLY_QUERY//$'\0'/}   # the sender must strip NUL from --query
-  _zlog "request: widened=${(qqqq)_zrush_query} fuzzy=${(qqqq)_zrush_fuzzy}"
-
-  # See behavior.md "空語収集キャッシュ": a hit collects nothing and stores
-  # nothing; it plans against the generation the worker already holds.
-  # zle -F -w callers require explicit redraw.
-  if _zrush_cc_subject && _zrush_cc_check; then
-    _zrush_request_plan $_zrush_cc_cand_gen compsys "$_zrush_fuzzy" \
-      "$ZRUSH_CFG_TRAILING_SPACE" 1 || _zrush_teardown
-    zle -R
-    return 0
-  fi
+  _zlog "collect: widened=${(qqqq)_zrush_query} fuzzy=${(qqqq)_zrush_fuzzy} input_generation=$_zrush_input_gen"
 
   # Anonymous pipe: open both FIFO ends, unlink immediately, and use EOF as terminator.
   local fifo=${TMPDIR:-/tmp}/zrush-$$-$RANDOM.fifo
@@ -916,7 +923,7 @@ _zrush_start_request() {
 
   _zrush_pty=zrush-w$(( ++_zrush_gen ))
   if ! zpty $_zrush_pty _zrush_capture_worker; then
-    _zlog "request: zpty create failed"
+    _zlog "collect: zpty create failed"
     _zrush_cancel_collection
     return 1
   fi
@@ -924,9 +931,12 @@ _zrush_start_request() {
   _zrush_close_internal_fd $_zrush_wfd
   _zrush_wfd=-1
 
+  # Recorded once the collection really is in flight: this is the generation its
+  # capture answers, whatever becomes current before it finishes.
+  _zrush_collect_gen=$_zrush_input_gen
   zle -F -w $_zrush_rfd _zrush-on-data
   _zrush_kick
-  _zlog "request: collecting on fd $_zrush_rfd (pty $_zrush_pty)"
+  _zlog "collect: collecting on fd $_zrush_rfd (pty $_zrush_pty) for input_generation=$_zrush_collect_gen"
   return 0
 }
 
@@ -957,25 +967,27 @@ _zrush_on_data() {  # zle -F -w handler ($1=fd)
   _zrush_capture_pid=
   if (( st == 5 )); then
     _zrush_finalize
-    # zle -F -w does not redraw on return. Apply POSTDISPLAY, region_highlight, and
-    # any BUFFER change from a pending Tab in one explicit redraw.
+    # zle -F -w does not redraw on return, and a failed store clears the listing
+    # here; the plan the accepted store produces arrives as an event and redraws
+    # on its own.
     zle -R
   else
-    _zlog "on-data: read error st=$st; dropping request"
+    _zlog "on-data: read error st=$st; dropping collection"
     _zrush_buf=
   fi
   return 0
 }
 
-# Collection payload (pid already stripped) -> worker requests.
+# Collection payload (pid already stripped) -> one `store` request.
 # The payload is handed to Rust unparsed: record parsing, matching,
 # ranking, layout, and highlight/nav/insert construction are all Rust's job
-# (cli-protocol.md). It goes out once, in a `store` under a fresh generation,
-# with the `plan` that references that generation pipelined behind it; zsh
-# keeps no copy. A successful empty-word command-position collection is the
-# cache's subject, so it stores into the `cache` slot; the latch itself is
-# staged here and taken only once that store answers `ok`
-# (behavior.md "空語収集キャッシュ").
+# (cli-protocol.md). It goes out once, under a fresh candidate generation and
+# bound to the input_generation whose `capture-required` asked for it; zsh
+# keeps no copy and pipelines no `plan` behind it, because the worker answers
+# an accepted store with the `plan-ready` for that same input. A successful
+# empty-word command-position collection is the cache's subject, so it stores
+# into the `cache` slot; the latch itself is staged here and taken only once
+# that store answers `ok` (behavior.md "空語収集キャッシュ").
 _zrush_finalize() {
   emulate -L zsh
   setopt localoptions no_monitor no_notify
@@ -984,34 +996,31 @@ _zrush_finalize() {
   # Marks "transport" (fork -> parent pipe) complete, mirroring every other
   # pipeline stage's own checkpoint; driver-latency.zsh's breakdown reads it.
   _zlog "finalize: ${#payload} bytes"
+  # Every store carries the binding of the input this capture answers, and only
+  # an input this shell still treats as valid has an answer worth sending: a
+  # capture that outlived its generation is dropped rather than stored
+  # (behavior.md "候補収集").
+  local -i bound=$_zrush_collect_gen
+  _zrush_collect_gen=0
+  (( bound > 0 && bound == _zrush_input_gen )) || {
+    _zlog "finalize: capture generation=$bound is no longer current ($_zrush_input_gen); dropping it"
+    return 0
+  }
   local slot=live
   _zrush_cc_subject && [[ -n $payload ]] && slot=cache
-  _zrush_request_store $slot "$payload" || { _zrush_teardown; return 0 }
-  local -i gen=$REPLY
-  _zrush_request_plan $gen compsys "$_zrush_fuzzy" "$ZRUSH_CFG_TRAILING_SPACE" 0 ||
-    _zrush_teardown
+  _zrush_request_store $slot "$payload" $bound || _zrush_teardown
   return 0
 }
 
-# Apply (or discard, on failure) the plan just received from the worker,
-# then resolve a Tab recorded before it arrived. $1=0 on success (state
-# already populated), nonzero on failure. Shared by fresh collection and
-# cache-hit responses so the pending-Tab handling
-# in behavior.md "Tab" ("候補未着時の Tab は...結果到着時に上記の挙動を適用する")
-# cannot be forgotten on one path but not the other.
-#
-# On failure, a pending Tab is discarded outright -- it is never resolved
-# against _zrush_plan_* here (cli-protocol.md "エラー時の zsh 側挙動").
+# Apply the plan the worker just sent for the current input, then resolve a Tab
+# recorded before it arrived, so the pending-Tab handling in behavior.md "Tab"
+# ("候補未着時の Tab は...結果到着時に上記の挙動を適用する") lives in one place.
 _zrush_settle_plan() {
   emulate -L zsh
-  if (( $1 == 0 )); then
-    _zrush_apply_plan
-    if (( _zrush_tab_pending )); then
-      _zrush_tab_pending=0
-      _zrush_tab_with_results
-    fi
-  else
-    _zrush_teardown
+  _zrush_apply_plan
+  if (( _zrush_tab_pending )); then
+    _zrush_tab_pending=0
+    _zrush_tab_with_results
   fi
   return 0
 }
@@ -1275,11 +1284,13 @@ _zrush_worker_begin_stop() {
   # (behavior.md "worker ライフサイクル": one invalidation set for both latches).
   _zrush_cc_latch_drop
   _zrush_hist_invalidate session-stop
+  # The worker's current input dies with the session too, so the generation it
+  # would have answered is invalidated here and never replayed.
+  _zrush_input_invalidate
   _zrush_worker_disarm_drain
   _zrush_worker_txq=()
   _zrush_worker_pending=()
   _zrush_cc_staged=()
-  _zrush_current_request=0
   _zrush_sync_target=0 _zrush_sync_done=0 _zrush_sync_ok=0
 }
 
@@ -1295,7 +1306,6 @@ _zrush_worker_finalize() {
   _zrush_worker_txq=()
   _zrush_worker_pending=()
   _zrush_cc_staged=()
-  _zrush_current_request=0
   _zrush_sync_target=0 _zrush_sync_done=0 _zrush_sync_ok=0
   _zrush_worker_stopping=0
   _zlog "worker: transport stopped"
@@ -1633,8 +1643,21 @@ _zrush_worker_handle_message() {  # message [absolute-deadline]
     return 1
   fi
 
+  # The three message kinds are told apart by the kind field alone: worker
+  # events carry an input_generation and no request_id, and are correlated and
+  # applied entirely on their own terms (cli-protocol.md "メッセージの種別").
+  local kind=$f[1]
+  case $kind in
+    plan-ready|capture-required)
+      _zrush_worker_handle_event "${(@)f}"
+      return $?
+      ;;
+    ok|error) ;;
+    *) _zrush_worker_session_fail "invalid response kind"; return 1 ;;
+  esac
+
   (( $#f == 3 )) || { _zrush_worker_session_fail "invalid response field count"; return 1 }
-  local kind=$f[1] id=$f[2]
+  local id=$f[2]
   [[ $id == [1-9][0-9]# ]] && _zrush_dec_le_all 9223372036854775807 "$id" || {
     _zrush_worker_session_fail "noncanonical response request_id"
     return 1
@@ -1643,15 +1666,15 @@ _zrush_worker_handle_message() {  # message [absolute-deadline]
     _zrush_worker_session_fail "response for unknown request_id=$id"
     return 1
   }
-  # "store <slot> <generation>" for a store, "<kind> <generation>" for the two
-  # history writes, "plan <producer> <latched>" for a plan.
+  # "store <slot> <generation> <input_generation>" for a store,
+  # "<kind> <generation>" for the two history writes, "plan <producer>" for a plan.
   local -a req=( ${=_zrush_worker_pending[$id]} )
   local reqkind=$req[1] producer= slot=
-  local -i latched=0 stored_gen=0
+  local -i stored_gen=0 bound_gen=0
   case $reqkind in
-    store)                           slot=${req[2]:-} stored_gen=${req[3]:-0} ;;
+    store)                           slot=${req[2]:-} stored_gen=${req[3]:-0} bound_gen=${req[4]:-0} ;;
     history-snapshot|history-append) stored_gen=${req[2]:-0} ;;
-    *)                               producer=${req[2]:-} latched=${req[3]:-0} ;;
+    *)                               producer=${req[2]:-} ;;
   esac
   # A terminal response, whatever it says, retires the frame from the bound on
   # unacknowledged appends (behavior.md "履歴メニュー" 更新経路).
@@ -1662,7 +1685,7 @@ _zrush_worker_handle_message() {  # message [absolute-deadline]
   if [[ $kind == error ]]; then
     local code=$f[3]
     [[ $code == invalid-request || $code == invalid-payload ||
-       $code == unknown-generation ]] || {
+       $code == unknown-generation || $code == superseded ]] || {
       _zrush_worker_session_fail "invalid error code"
       return 1
     }
@@ -1672,38 +1695,34 @@ _zrush_worker_handle_message() {  # message [absolute-deadline]
     fi
     unset "_zrush_worker_pending[$id]"
     # A store that ends in error changed no slot, so its staged entry never
-    # becomes a latch.
+    # becomes a latch -- `superseded` included (cli-protocol.md "応答の検証と
+    # zsh 側の適用": only an `ok` moves the latch).
     unset "_zrush_cc_staged[$id]"
     _zrush_worker_failures=0
     _zrush_status_set ""
     # cli-protocol.md "応答の検証と zsh 側の適用": unknown-generation is an
-    # ordinary terminal error, and nothing is replayed. Only a plan that read
-    # the latch invalidates it and recollects; a plan whose own store failed is
-    # dropped and waits for the next real input.
-    local -i recollect=0
-    if [[ $code == unknown-generation ]]; then
-      if (( latched )); then
-        _zrush_cc_latch_drop
-        recollect=1
-      fi
-      # The index refused a write, or answered for a generation it does not
-      # hold: the latch was optimistic and is now known wrong, so the next menu
-      # op starts from a snapshot (behavior.md "worker ライフサイクル").
-      if [[ $reqkind == history-* || $producer == history ]]; then
-        _zrush_hist_invalidate unknown-generation
-      fi
+    # ordinary terminal error, and nothing is replayed. The index refused a
+    # write, or answered for a generation it does not hold: the latch was
+    # optimistic and is now known wrong, so the next menu op starts from a
+    # snapshot (behavior.md "worker ライフサイクル").
+    if [[ $code == unknown-generation ]] &&
+       [[ $reqkind == history-* || $producer == history ]]; then
+      _zrush_hist_invalidate unknown-generation
     fi
     if (( id == _zrush_sync_target )); then
       _zrush_sync_done=1 _zrush_sync_ok=0
-    elif (( id == _zrush_current_request )); then
+    elif [[ $reqkind == store ]] && (( bound_gen == _zrush_input_gen )) &&
+         [[ $code != superseded ]]; then
+      # No plan-ready can follow a store that failed, so the input this capture
+      # answered gets no listing at all. `superseded` is the exception the
+      # contract names: the input it answered is already gone, and the listing
+      # showing belongs to whatever replaced it (behavior.md "候補収集").
       _zrush_teardown
-      (( recollect )) && _zrush_start_request
       zle -R 2>/dev/null
     fi
     _zlog "worker: error request_id=$id code=$code"
     return 0
   fi
-  [[ $kind == ok ]] || { _zrush_worker_session_fail "invalid response kind"; return 1 }
 
   if [[ $reqkind == store || $reqkind == history-* ]]; then
     # cli-protocol.md "要求と応答": a successful store or history write answers
@@ -1719,10 +1738,13 @@ _zrush_worker_handle_message() {  # message [absolute-deadline]
     # the latch (behavior.md "空語収集キャッシュ"). The history index latch is
     # not staged: it already moved optimistically when the frame was enqueued.
     [[ $slot == cache ]] && _zrush_cc_commit $id $stored_gen
-    _zlog "worker: ok $reqkind request_id=$id slot=$slot generation=$stored_gen"
+    _zlog "worker: ok $reqkind request_id=$id slot=$slot generation=$stored_gen binding=$bound_gen"
     return 0
   fi
 
+  # Only the synchronous history exchange sends a `plan`, so a plan response is
+  # either the one it is waiting for or a stale one it must leave the UI alone
+  # for (behavior.md "履歴メニュー").
   local old_text=$_zrush_plan_text old_cp=$_zrush_plan_cp old_kind=$_zrush_plan_kind
   local -i old_l=$_zrush_plan_nlines old_p=$_zrush_plan_npos
   local -a old_hl=( "${(@)_zrush_plan_hl}" ) old_cells=( "${(@)_zrush_plan_cells}" )
@@ -1738,10 +1760,6 @@ _zrush_worker_handle_message() {  # message [absolute-deadline]
   if (( id == _zrush_sync_target )); then
     _zrush_plan_kind=$producer
     _zrush_sync_done=1 _zrush_sync_ok=1
-  elif (( id == _zrush_current_request )); then
-    _zrush_plan_kind=$producer
-    _zrush_settle_plan 0
-    zle -R 2>/dev/null
   else
     _zrush_plan_text=$old_text _zrush_plan_nlines=$old_l _zrush_plan_npos=$old_p
     _zrush_plan_cp=$old_cp _zrush_plan_kind=$old_kind
@@ -1749,6 +1767,60 @@ _zrush_worker_handle_message() {  # message [absolute-deadline]
     _zrush_plan_nav=( "${(@)old_nav}" ) _zrush_plan_insert=( "${(@)old_insert}" )
   fi
   _zlog "worker: ok request_id=$id producer=$producer"
+  return 0
+}
+
+# A worker event (cli-protocol.md "入力通知と worker event"). Events carry no
+# request_id, get no response, and are never registered anywhere: the whole
+# correlation is the input_generation, and only the one this shell still treats
+# as valid is applied. A malformed shape is a session failure, because an event
+# has no in-band way to report one.
+_zrush_worker_handle_event() {  # kind input_generation [plan_body]
+  emulate -L zsh
+  setopt localoptions extendedglob
+  local kind=$1 gen=$2
+  if [[ $kind == plan-ready ]]; then
+    (( $# == 3 )) || { _zrush_worker_session_fail "invalid plan-ready field count"; return 1 }
+  else
+    (( $# == 2 )) || { _zrush_worker_session_fail "invalid capture-required field count"; return 1 }
+  fi
+  [[ $gen == [1-9][0-9]# ]] && _zrush_dec_le_all 9223372036854775807 "$gen" || {
+    _zrush_worker_session_fail "noncanonical event input_generation"
+    return 1
+  }
+  # A well-formed event counts like a terminal response for the consecutive
+  # failure streak, whether or not its generation still matches
+  # (cli-protocol.md "応答の検証と zsh 側の適用").
+  _zrush_worker_failures=0
+  _zrush_status_set ""
+  if (( gen != _zrush_input_gen )); then
+    _zlog "worker: dropped $kind for input_generation=$gen (current=$_zrush_input_gen)"
+    return 0
+  fi
+  _zrush_input_pending=0
+  if [[ $kind == capture-required ]]; then
+    # The notification named the cache latch's generation and the worker turns
+    # out not to hold it: the latch is wrong, and this is a notification of that
+    # rather than an error (behavior.md "空語収集キャッシュ").
+    if (( _zrush_input_latched )); then
+      _zrush_input_latched=0
+      _zrush_cc_latch_drop
+      _zlog "cache: latch dropped by capture-required"
+    fi
+    _zrush_start_collection
+    return 0
+  fi
+  # The generation is matched above, before the body is parsed, and an accepted
+  # body is applied exactly as a plan response's is (cli-protocol.md "zsh 側の規範").
+  # zle -F -w callers require an explicit redraw.
+  _zrush_parse_plan "$3" || {
+    _zrush_worker_session_fail "malformed render plan input_generation=$gen"
+    return 1
+  }
+  _zrush_plan_kind=compsys
+  _zrush_settle_plan
+  zle -R 2>/dev/null
+  _zlog "worker: plan-ready applied input_generation=$gen"
   return 0
 }
 
@@ -1887,6 +1959,52 @@ _zrush_next_cand_gen() {  # -> REPLY
   return 0
 }
 
+_zrush_next_input_gen() {  # -> REPLY
+  emulate -L zsh
+  (( _zrush_input_gen_seq < 9223372036854775807 )) || {
+    _zrush_worker_disable_policy "input_generation exhausted"
+    _zrush_worker_shutdown
+    _zrush_teardown
+    return 1
+  }
+  typeset -g REPLY=$(( ++_zrush_input_gen_seq ))
+  return 0
+}
+
+# The row and column budgets every plan-bearing message carries
+# (cli-protocol.md "要求と応答"): rows = min(max-lines, LINES - 1), clamped to
+# >= 1 unconditionally (not just when LINES > 1 -- LINES <= 1 must still clamp
+# down to the 1-row floor, not silently keep max-lines).
+_zrush_geometry() {  # -> REPLY_ROWS / REPLY_WIDTH
+  emulate -L zsh
+  local -i rows=$(( LINES - 1 )) width=$(( COLUMNS - 1 ))
+  (( rows > ZRUSH_CFG_MAX_LINES )) && rows=$ZRUSH_CFG_MAX_LINES
+  (( rows < 1 )) && rows=1
+  (( width < 1 )) && width=1
+  typeset -g REPLY_ROWS=$rows REPLY_WIDTH=$width
+  return 0
+}
+
+# Undelegated notification frames may be removed or replaced when the
+# notification they carry is cancelled or superseded; request frames never are
+# (behavior.md "worker ライフサイクル"). A queued frame is a notification when
+# its outer payload opens with the `input` or `flush` kind netstring, which is
+# the whole wire identity of one -- no parallel bookkeeping to keep in step
+# with the queue, and no decoding of a store's candidate payload to find out.
+_zrush_txq_drop_notifications() {
+  emulate -L zsh
+  setopt localoptions extendedglob
+  (( $#_zrush_worker_txq )) || return 0
+  local frame
+  local -a keep=()
+  for frame in "${(@)_zrush_worker_txq}"; do
+    [[ $frame == [0-9]##:(5:input,|5:flush,)* ]] && continue
+    keep+=( "$frame" )
+  done
+  _zrush_worker_txq=( "${(@)keep}" )
+  return 0
+}
+
 _zrush_worker_ensure_session() {
   emulate -L zsh
   (( _zrush_worker_rfd >= 0 )) && return 0
@@ -1899,23 +2017,25 @@ _zrush_worker_ensure_session() {
 }
 
 # Hand a candidate record stream to one slot of the worker's candidate store
-# (cli-protocol.md "要求と応答"). The plan that reads the generation back is
-# pipelined behind this without waiting for its terminal response.
-_zrush_request_store() {  # slot payload -> REPLY = candidate generation
+# (cli-protocol.md "要求と応答"). Every store binds the input_generation whose
+# `capture-required` asked for this capture; the worker answers an accepted one
+# with the `plan-ready` for that input, so nothing is pipelined behind it.
+_zrush_request_store() {  # slot payload input-generation -> REPLY = candidate generation
   emulate -L zsh
   setopt localoptions typesetsilent no_monitor no_notify
   local slot=$1 payload=$2
+  local -i input_gen=$3
   (( !_zrush_worker_stopping && !_zrush_worker_runtime_tainted )) || return 1
   _zrush_next_request_id || return 1
   local -i id=$REPLY
   _zrush_next_cand_gen || return 1
   local -i gen=$REPLY
-  _zrush_worker_pending[$id]="store $slot $gen"
+  _zrush_worker_pending[$id]="store $slot $gen $input_gen"
   [[ $slot == cache ]] && _zrush_cc_stage $id
   _zrush_worker_ensure_session || return 1
-  _zrush_encode_message store "$id" "$slot" "$gen" "$payload"
+  _zrush_encode_message store "$id" "$slot" "$gen" "$input_gen" "$payload"
   _zrush_worker_txq+=( "$REPLY" )
-  _zlog "worker: queued store request_id=$id slot=$slot generation=$gen bytes=${#REPLY} queued=$#_zrush_worker_txq"
+  _zlog "worker: queued store request_id=$id slot=$slot generation=$gen input_generation=$input_gen bytes=${#REPLY} queued=$#_zrush_worker_txq"
   _zrush_worker_flush || return 1
   typeset -g REPLY=$gen
   return 0
@@ -1954,33 +2074,25 @@ _zrush_request_history() {  # kind payload [event] -> REPLY = candidate generati
   return 0
 }
 
-# $5 records whether this plan reached the store through the cache latch: an
-# `unknown-generation` answer invalidates the latch and recollects only for
-# such a plan (cli-protocol.md "応答の検証と zsh 側の適用").
-_zrush_request_plan() {  # candidate-generation producer query trailing-space latched
+# The explicit query the history menu's synchronous exchange sends
+# (behavior.md "履歴メニュー"). Listings that follow the input are made from
+# `input` notifications instead, so nothing else sends a `plan`.
+_zrush_request_plan() {  # candidate-generation producer query trailing-space
   emulate -L zsh
   setopt localoptions typesetsilent no_monitor no_notify
   local -i gen=$1
   local producer=$2 query=$3 tspace=$4
-  local -i latched=${5:-0}
   (( !_zrush_worker_stopping && !_zrush_worker_runtime_tainted )) || return 1
 
-  # cli-protocol.md "起動": rows = min(max-lines, LINES - 1), clamped to >= 1
-  # unconditionally (not just when LINES > 1 -- LINES <= 1 must still clamp
-  # down to the 1-row floor, not silently keep max-lines).
-  local -i rows=$(( LINES - 1 ))
-  (( rows > ZRUSH_CFG_MAX_LINES )) && rows=$ZRUSH_CFG_MAX_LINES
-  (( rows < 1 )) && rows=1
-  local -i width=$(( COLUMNS - 1 ))
-  (( width < 1 )) && width=1
+  _zrush_geometry
+  local -i rows=$REPLY_ROWS width=$REPLY_WIDTH
 
   _zrush_next_request_id || return 1
   local -i id=$REPLY
-  _zrush_current_request=$id
-  _zrush_worker_pending[$id]="plan $producer $latched"
+  _zrush_worker_pending[$id]="plan $producer"
   _zrush_worker_ensure_session || return 1
-  # history_limit rides on every plan, compsys ones included: the worker
-  # ignores it unless the generation resolves to the history index
+  # history_limit is mandatory on every plan whichever store the generation
+  # resolves to; the worker ignores it unless that is the history index
   # (cli-protocol.md "要求と応答").
   _zrush_encode_message plan "$id" "$gen" "$PWD" "$producer" "$query" \
     "$ZRUSH_CFG_MODE" "$ZRUSH_CFG_SMART_CASE" "$rows" "$width" "$tspace" \
@@ -1989,6 +2101,67 @@ _zrush_request_plan() {  # candidate-generation producer query trailing-space la
   _zlog "worker: queued request_id=$id producer=$producer generation=$gen bytes=${#REPLY} queued=$#_zrush_worker_txq"
   _zrush_worker_flush || return 1
   typeset -g REPLY=$id
+  return 0
+}
+
+# Tell the worker the buffer changed (cli-protocol.md "入力通知と worker
+# event"). A notification carries no request_id and gets no terminal response:
+# the worker replaces it while its quiet period runs and answers the survivor
+# with one event. The caller has already applied the suppression rules and the
+# input-pressure check, so reaching here means a notification is owed.
+#
+# The quiet period itself is `delay-ms`, measured by the worker; this side has
+# no timer. The candidate generation is the empty-word cache's latch when it
+# hits and the reserved 0 otherwise (behavior.md "空語収集キャッシュ").
+_zrush_send_input() {
+  emulate -L zsh
+  setopt localoptions typesetsilent no_monitor no_notify
+  (( !_zrush_worker_stopping && !_zrush_worker_runtime_tainted )) || return 1
+  # A notification is a real message, so it is what starts the worker when none
+  # is running. It happens before the cache is consulted because a fresh session
+  # holds no slots and drops the latch (behavior.md "worker ライフサイクル").
+  _zrush_worker_ensure_session || return 1
+
+  _zrush_widen "$LBUFFER"
+  _zrush_query=$REPLY_WIDENED
+  _zrush_fuzzy=${REPLY_QUERY//$'\0'/}   # the sender must strip NUL from the query
+
+  local -i cand_gen=0 latched=0
+  if _zrush_cc_subject && _zrush_cc_check; then
+    cand_gen=$_zrush_cc_cand_gen latched=1
+  fi
+
+  _zrush_next_input_gen || return 1
+  local -i gen=$REPLY
+  _zrush_geometry
+  local -i rows=$REPLY_ROWS width=$REPLY_WIDTH delay=$ZRUSH_CFG_DELAY_MS
+  _zrush_encode_message input "$gen" "$cand_gen" "$delay" "$PWD" "$_zrush_fuzzy" \
+    "$ZRUSH_CFG_MODE" "$ZRUSH_CFG_SMART_CASE" "$rows" "$width" "$ZRUSH_CFG_TRAILING_SPACE"
+  # This notification replaces the previous one, so any frame the previous one
+  # left unhanded is removed rather than sent (behavior.md "worker ライフサイクル").
+  _zrush_txq_drop_notifications
+  _zrush_worker_txq+=( "$REPLY" )
+  _zrush_input_gen=$gen _zrush_input_pending=1 _zrush_input_latched=$latched
+  _zlog "worker: queued input input_generation=$gen candidate_generation=$cand_gen delay=$delay query=${(qqqq)_zrush_fuzzy} queued=$#_zrush_worker_txq"
+  _zrush_worker_flush || return 1
+  return 0
+}
+
+# Cut the current input's quiet period short (behavior.md "Tab"). The worker
+# settles it at once and answers with the event it would otherwise have sent
+# when the period expired.
+_zrush_send_flush() {
+  emulate -L zsh
+  setopt localoptions typesetsilent no_monitor no_notify
+  (( _zrush_input_gen > 0 )) || return 1
+  (( !_zrush_worker_stopping && !_zrush_worker_runtime_tainted )) || return 1
+  # Never starts a worker: only the session that received the notification can
+  # have an input to settle, and a fresh one would discard the flush anyway.
+  (( _zrush_worker_rfd >= 0 )) || return 1
+  _zrush_encode_message flush "$_zrush_input_gen"
+  _zrush_worker_txq+=( "$REPLY" )
+  _zlog "worker: queued flush input_generation=$_zrush_input_gen queued=$#_zrush_worker_txq"
+  _zrush_worker_flush || return 1
   return 0
 }
 
@@ -2305,7 +2478,7 @@ _zrush_request_plan_sync() {  # cold snapshot-payload snapshot-head snapshot-cou
   fi
   # cli-protocol.md "history profile": trailing-space is always false, so the
   # inserted text is the history line verbatim.
-  _zrush_request_plan $gen history "$query" false 0 || return 1
+  _zrush_request_plan $gen history "$query" false || return 1
   local -i target=$REPLY cs
   _zlog "history: query request_id=$target generation=$gen limit=$ZRUSH_CFG_HISTORY_LIMIT"
   _zrush_sync_target=$target _zrush_sync_done=0 _zrush_sync_ok=0
@@ -2345,8 +2518,11 @@ _zrush_request_plan_sync() {  # cold snapshot-payload snapshot-head snapshot-cou
 # plan both leave the buffer alone and consume the key.
 _zrush_open_history_menu() {  # ZLE widget context
   emulate -L zsh
-  _zrush_disarm_timer
-  _zrush_cancel_collection
+  # Opening the menu invalidates the current input_generation, which removes its
+  # unhanded notification frames and cancels the collection it started; a late
+  # event for it is dropped on arrival, so no completion result can replace the
+  # menu (behavior.md "履歴メニュー").
+  _zrush_input_invalidate
   _zrush_teardown
   # This action leaves BUFFER/CURSOR alone, so bring the pre-redraw baseline up
   # to date: without it the redraw that follows this very keystroke can be the
@@ -2395,39 +2571,6 @@ _zrush_open_history_menu() {  # ZLE widget context
   return 0
 }
 
-# ---------------------------------------------------------------- Debounce timer
-_zrush_arm_timer() {  # ZLE widget context
-  emulate -L zsh
-  _zrush_disarm_timer
-  local -i delay=$ZRUSH_CFG_DELAY_MS
-  if (( delay <= 0 )); then
-    _zrush_start_request
-    return 0
-  fi
-  local -i cs=$(( delay / 10 ))
-  (( cs < 1 )) && cs=1
-  _zrush_pending_buffer=$BUFFER
-  local tfd
-  exec {tfd}< <( zselect -t $cs; print )
-  _zrush_timer_fd=$tfd
-  zle -F -w $tfd _zrush-timer-fire
-  _zrush_kick
-  return 0
-}
-
-_zrush_timer_fire() {  # zle -F -w handler ($1=fd)
-  emulate -L zsh
-  local -i fd=$1
-  zle -F $fd 2>/dev/null
-  _zrush_close_internal_fd $fd
-  (( fd == _zrush_timer_fd )) && _zrush_timer_fd=-1
-  # Discard if the buffer changed; pre-redraw has armed a newer timer.
-  [[ $BUFFER == "$_zrush_pending_buffer" ]] || return 0
-  (( KEYS_QUEUED_COUNT || PENDING )) && return 0   # defer under input pressure; re-arm on change
-  _zrush_start_request
-  return 0
-}
-
 # ---------------------------------------------------------------- ZLE hooks
 _zrush_line_pre_redraw() {
   emulate -L zsh
@@ -2437,15 +2580,15 @@ _zrush_line_pre_redraw() {
   [[ $BUFFER == "$_zrush_last_buffer" ]] && (( CURSOR == _zrush_last_cursor )) && return 0
   _zrush_last_buffer=$BUFFER
   _zrush_last_cursor=$CURSOR
-  # The previous async request stops being eligible immediately. Waiting for
-  # the next debounce/capture to assign a new id leaves a window where its
-  # delayed response could settle against the new buffer and consume a Tab
-  # intended for that newer query.
-  _zrush_current_request=0
+  # A buffer change invalidates the current input_generation first of all
+  # (behavior.md "候補収集"). Whatever the worker still owes that generation is
+  # discarded on arrival, so a late event can neither settle against the new
+  # buffer nor consume a Tab meant for it.
+  _zrush_input_invalidate
   # Reaching here means the change came from something other than a zrush
   # action (every zrush action tears the listing down itself, leaving kind
   # `none`), so a history menu goes away whole -- listing text included --
-  # before the ordinary debounce flow resumes (behavior.md "履歴メニュー").
+  # before the ordinary input flow resumes (behavior.md "履歴メニュー").
   if [[ $_zrush_plan_kind == history ]]; then
     _zlog "history: menu erased by an external buffer/cursor change"
     _zrush_teardown
@@ -2459,8 +2602,6 @@ _zrush_line_pre_redraw() {
 
   # See docs/internal/specs/behavior.md "候補収集": blank buffers neither collect nor display.
   if [[ -z ${BUFFER//[[:space:]]/} ]]; then
-    _zrush_disarm_timer
-    _zrush_cancel_collection
     _zrush_teardown
     return 0
   fi
@@ -2468,13 +2609,16 @@ _zrush_line_pre_redraw() {
   # Apply min-input to the current word; blank buffers were handled above.
   _zrush_widen "$LBUFFER"
   if (( ${#REPLY_WORD} < ZRUSH_CFG_MIN_INPUT )); then
-    _zrush_disarm_timer
-    _zrush_cancel_collection
     _zrush_teardown
     return 0
   fi
 
-  _zrush_arm_timer
+  # Input pressure is visible to zsh alone, so it is judged here: while keys are
+  # still queued no notification is made, and the change that key causes makes
+  # the next one (behavior.md "候補収集"). The listing is left as it is.
+  (( KEYS_QUEUED_COUNT || PENDING )) && return 0
+
+  _zrush_send_input
   return 0
 }
 
@@ -2483,11 +2627,10 @@ _zrush_line_init() {
   _zrush_last_buffer=
   _zrush_last_cursor=-1
   # A new ZLE session can follow an exit that bypassed _zrush_line_finish
-  # (send-break and similar). Tear down any leftover timer/collection from
-  # the previous session before it can leak a result (and thus a stray
+  # (send-break and similar). Invalidate any input_generation and collection
+  # left by the previous session before it can leak a result (and thus a stray
   # candidate list or a pending-Tab insertion) into this one.
-  _zrush_disarm_timer
-  _zrush_cancel_collection
+  _zrush_input_invalidate
   _zrush_teardown
   _zrush_status_refresh
   return 0
@@ -2496,8 +2639,7 @@ _zrush_line_init() {
 _zrush_line_finish() {
   emulate -L zsh
   (( _zrush_enabled )) || return 0
-  _zrush_disarm_timer
-  _zrush_cancel_collection
+  _zrush_input_invalidate
   _zrush_teardown
   _zlog "line-finish: cleared"
   return 0
@@ -2535,8 +2677,7 @@ _zrush_confirm_pos() {  # $1=one-based position into _zrush_plan_insert
   # change" and stall the recollection.
   _zrush_last_buffer=
   _zrush_last_cursor=-1
-  _zrush_disarm_timer
-  _zrush_cancel_collection
+  _zrush_input_invalidate
   _zrush_teardown
   return 0
 }
@@ -2684,11 +2825,10 @@ _zrush_action_confirm() {
 _zrush_action_dismiss() {
   if (( _zrush_selected > 0 || _zrush_listing )); then
     _zlog "dismiss: closing list"
-    # A still-armed debounce timer or an in-flight collection for a newer
-    # keystroke could otherwise complete after dismiss and silently reopen
-    # the list the user just closed.
-    _zrush_disarm_timer
-    _zrush_cancel_collection
+    # An input_generation still awaiting an event, or an in-flight collection
+    # for a newer keystroke, could otherwise arrive after dismiss and silently
+    # reopen the list the user just closed.
+    _zrush_input_invalidate
     _zrush_teardown          # leave the buffer unchanged
     return 0
   fi
@@ -2731,12 +2871,15 @@ _zrush_action_tab() {
     _zrush_confirm_pos $_zrush_selected   # Tab confirms the selection
     return 0
   fi
-  # During debounce or collection, record Tab, fast-forward collection, and apply on arrival.
-  if (( _zrush_timer_fd >= 0 )); then
-    _zlog "tab: pending (debounce fast-forward)"
+  # Before candidates arrive, Tab records the press and is applied when they
+  # come (behavior.md "Tab"). While the worker is still measuring the quiet
+  # period, a flush cuts it short so the event -- a plan, or the capture request
+  # that leads to one -- comes without waiting; once the capture is running,
+  # that fast-forward has already happened and only the press is recorded.
+  if (( _zrush_input_pending )); then
+    _zlog "tab: pending (quiet-period flush of input_generation=$_zrush_input_gen)"
     _zrush_tab_pending=1
-    _zrush_disarm_timer
-    _zrush_start_request
+    _zrush_send_flush
     return 0
   fi
   if (( _zrush_rfd >= 0 )); then
@@ -2748,7 +2891,7 @@ _zrush_action_tab() {
     _zrush_tab_with_results
     return 0
   fi
-  _zrush_call_prev      # no list or pending request -> predecessor, such as native completion
+  _zrush_call_prev      # no list and nothing in flight -> predecessor, such as native completion
   return 0
 }
 
@@ -2892,7 +3035,6 @@ _zrush_zshexit() {
   _zrush_worker_close_request
   _zrush_worker_close_control
   _zrush_worker_runtime_destroy
-  (( _zrush_timer_fd >= 0 )) && { _zrush_close_internal_fd $_zrush_timer_fd; _zrush_timer_fd=-1 }
   if (( _zrush_rfd >= 0 )); then _zrush_close_internal_fd $_zrush_rfd; _zrush_rfd=-1; fi
   if (( _zrush_wfd >= 0 )); then _zrush_close_internal_fd $_zrush_wfd; _zrush_wfd=-1; fi
   if [[ -n $_zrush_pty ]]; then
@@ -2959,7 +3101,6 @@ _zrush_init() {
   zle -N _zrush-kick-drain _zrush_kick_drain
   _zrush_kick_init
   zle -N _zrush-on-data _zrush_on_data
-  zle -N _zrush-timer-fire _zrush_timer_fire
   zle -N _zrush-capture-entry _zrush_capture_entry
   zle -C _zrush-capture-comp list-choices _zrush_capture_complete
   zle -N _zrush-line-pre-redraw _zrush_line_pre_redraw

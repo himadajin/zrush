@@ -15,11 +15,14 @@ const QUERY: &str = "whic";
 
 /// The frame that carries a candidate record stream; a hit sends none.
 const STORE: &str = "worker: queued store request_id=";
-/// The frame a hit does send.
-const PLAN: &str = "worker: queued request_id=";
-const COLLECTING: &str = "request: collecting";
+/// The listing a hit gets straight from the notification it latched onto.
+const READY: &str = "worker: plan-ready applied";
+const COLLECTING: &str = "collect: collecting";
 const HIT: &str = "cache: hit (generation=";
 const LATCHED: &str = "cache: latched";
+/// The worker answering a latched notification with `capture-required`: the
+/// latch names a generation it does not hold (behavior.md 「空語収集キャッシュ」).
+const LATCH_DROPPED: &str = "cache: latch dropped by capture-required";
 
 /// Type [`QUERY`] and wait until the cache has decided that request: either it
 /// answered from the latch, or it collected and the worker's `ok` turned the
@@ -110,7 +113,8 @@ fn history_menu(host: &mut Host, label: &str) {
 
 /// The first command-position query has nothing to reuse: it collects, hands
 /// the records to the `cache` slot and latches the generation the worker took.
-/// A later one plans straight from that latch -- no fork, and no second store.
+/// A later one names that latch in its notification and gets the listing back
+/// as a `plan-ready` -- no fork, and no second store.
 #[test]
 fn a_command_position_query_latches_and_the_next_one_plans_from_the_latch() {
     let mut host = Host::boot();
@@ -129,7 +133,7 @@ fn a_command_position_query_latches_and_the_next_one_plans_from_the_latch() {
 
     let collecting = host.log_count(COLLECTING);
     let stores = host.log_count(STORE);
-    let plans = host.log_count(PLAN);
+    let ready = host.log_count(READY);
     assert!(
         query(&mut host, "(cc-1c)"),
         "(cc-1c) the steady-state query was not served from the latch"
@@ -146,9 +150,9 @@ fn a_command_position_query_latches_and_the_next_one_plans_from_the_latch() {
         "(cc-1e) a store went out despite the cache hit"
     );
     assert_eq!(
-        host.log_count(PLAN),
-        plans + 1,
-        "(cc-1f) the hit did not send exactly one plan"
+        host.log_count(READY),
+        ready + 1,
+        "(cc-1f) the hit did not yield exactly one listing"
     );
 }
 
@@ -234,9 +238,7 @@ fn the_latch_dies_with_the_worker_session_and_with_a_re_source() {
     let mut host = Host::boot_fake();
     // The fake has to be the worker before the latch is taken, or the death
     // below would kill a session the latch never came from. Its `store` always
-    // succeeds, so the latch is taken exactly as under the real binary; only
-    // the `plan` comes back as an in-band error, which is not a session failure
-    // and leaves the latch alone.
+    // succeeds, so the latch is taken exactly as under the real binary.
     host.fake().set_mode(Mode::Error);
     host.send_line(SHUTDOWN_SEAM);
     host.sync_prompt(Duration::from_secs(5));
@@ -261,12 +263,13 @@ fn the_latch_dies_with_the_worker_session_and_with_a_re_source() {
         "(cc-4a) the entry is not fingerprint- and TTL-valid before the death: {entry}"
     );
 
-    // A hit sends nothing but a plan, so this death costs no generation.
+    // A hit sends nothing but its notification, so this death costs no
+    // generation.
     host.fake().set_mode(Mode::Die);
     let failures = host.log_count("worker: session failure:");
     assert!(
         query(&mut host, "(cc-4b)"),
-        "(cc-4b) the query that was meant to die on a plan-only hit collected instead"
+        "(cc-4b) the query that was meant to die on a notification-only hit collected instead"
     );
     assert!(
         host.wait_log(
@@ -274,7 +277,7 @@ fn the_latch_dies_with_the_worker_session_and_with_a_re_source() {
             failures,
             Duration::from_secs(15)
         ),
-        "(cc-4b) the worker did not die on the hit's plan"
+        "(cc-4b) the worker did not die on the hit's notification"
     );
     host.clear_line();
     host.drain(Duration::from_millis(300));
@@ -395,75 +398,69 @@ fn live_slot_stores_leave_the_cached_generation_intact() {
     );
 }
 
-/// `unknown-generation` is an ordinary terminal error: it costs no session
-/// failure and replays nothing. Only the `plan` that read the latch drops it
-/// and recollects; the one that merely followed its own `store` is dropped and
-/// waits for the next real input
-/// (cli-protocol.md 「応答の検証と zsh 側の適用」).
+/// A `capture-required` answering a notification that named the latch is how a
+/// worker says it does not hold that generation. It is an ordinary event: it
+/// costs no session failure and replays nothing. Only the notification that
+/// named the latch drops it and recollects; one that named the reserved `0`
+/// collects without touching any latch
+/// (behavior.md 「空語収集キャッシュ」, cli-protocol.md 「入力通知と worker event」).
 #[test]
-fn unknown_generation_recollects_only_for_the_plan_that_read_the_latch() {
+fn capture_required_drops_only_the_latch_its_notification_named() {
     let mut host = Host::boot_fake();
     // A worker whose candidate store never holds the referenced generation,
     // while its `store` keeps answering `ok` -- so the latch is taken normally
-    // and every plan, latched or not, comes back with `unknown-generation`.
+    // and every settle, latched or not, comes back as `capture-required`.
     host.fake().set_mode(Mode::UnknownGeneration);
 
-    // A miss: this collection's own store succeeds and latches, and the plan
-    // pipelined behind it never read the latch.
-    let unknown = host.log_count("code=unknown-generation");
+    // A miss: its notification names no generation, and the collection behind
+    // it stores and latches as usual.
+    let dropped = host.log_count(LATCH_DROPPED);
     assert!(
         !query(&mut host, "(cc-6a)"),
         "(cc-6a) the first query of a fresh host was served from a latch"
     );
-    let collecting = host.log_count(COLLECTING);
-    assert!(
-        host.wait_log("code=unknown-generation", unknown, Duration::from_secs(10)),
-        "(cc-6b) the plan was not answered with unknown-generation"
-    );
-    // The recollection, when there is one, is decided before the error is
-    // logged, so the counts either side of that line settle the question.
     let kept = host.worker_state();
     assert!(
-        host.log_count(COLLECTING) == collecting
+        host.log_count(LATCH_DROPPED) == dropped
             && dump_field(&kept, "latch") != "0"
             && state_has(
                 &kept,
                 &["failures=0", "disabled=0", "pending=0", "staged=0"]
             ),
-        "(cc-6c) a plan that never read the latch recollected or dropped the latch: {kept}"
+        "(cc-6c) a notification that named no generation dropped a latch: {kept}"
     );
     host.clear_line();
     host.drain(Duration::from_millis(300));
 
-    // A hit: that plan does read the latch, so its error drops the latch and
-    // starts a fresh collection for the still-current input.
-    let mut read_the_latch = false;
+    // A hit: that notification does name the latch, so its `capture-required`
+    // drops the latch and starts a fresh collection for the still-current input.
+    let mut named_the_latch = false;
     for _ in 0..5 {
         let collecting = host.log_count(COLLECTING);
-        let latchless = host.log_count("cache: miss (latch)");
+        let dropped = host.log_count(LATCH_DROPPED);
         if query(&mut host, "(cc-6d)") {
             assert!(
-                host.wait_log("cache: miss (latch)", latchless, Duration::from_secs(10)),
-                "(cc-6e) the latched plan's unknown-generation did not drop the latch"
+                host.wait_log(LATCH_DROPPED, dropped, Duration::from_secs(10)),
+                "(cc-6e) the latched notification's capture-required did not drop the latch"
             );
             assert!(
                 host.log_count(COLLECTING) > collecting,
-                "(cc-6f) the latched plan's unknown-generation did not recollect"
+                "(cc-6f) the latched notification's capture-required did not recollect"
             );
-            read_the_latch = true;
+            named_the_latch = true;
             break;
         }
         host.clear_line();
         host.drain(Duration::from_millis(300));
     }
     assert!(
-        read_the_latch,
-        "(cc-6d) the cache never hit, so no plan ever read the latch"
+        named_the_latch,
+        "(cc-6d) the cache never hit, so no notification ever named the latch"
     );
 
     let after = host.worker_state();
     assert!(
         state_has(&after, &["failures=0", "disabled=0"]),
-        "(cc-6g) unknown-generation was counted against the worker session: {after}"
+        "(cc-6g) capture-required was counted against the worker session: {after}"
     );
 }

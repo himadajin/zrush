@@ -1,7 +1,8 @@
 //! zrush CLI entry point.
 //!
 //! Subcommands per docs/internal/contracts/cli-protocol.md (source of truth):
-//! - `zrush worker` persistently builds render plans for session requests.
+//! - `zrush worker` persistently serves session requests and turns input
+//!   notifications into render plans once their quiet period expires.
 //! - `zrush config` emits zsh-sourceable settings.
 //! - `zrush init zsh` emits the embedded zle-integration script.
 //!
@@ -99,7 +100,9 @@ fn cmd_worker(control_fd: RawFd) -> ExitCode {
         return ExitCode::from(EXIT_INTERNAL);
     }
 
-    match worker::run(std::io::stdin().lock(), std::io::stdout().lock()) {
+    // The session polls stdin itself so a quiet period can expire while no
+    // message is arriving; no buffered reader sits in front of it.
+    match worker::run(worker::StdinSource, std::io::stdout().lock()) {
         Ok(worker::End::Eof | worker::End::Incompatible) => ExitCode::SUCCESS,
         Err(error) => {
             let _ = writeln!(std::io::stderr().lock(), "zrush worker: {error}");

@@ -47,7 +47,8 @@ pub mod keys {
     pub const DUMP_HIST: &str = "\x18i";
     /// The `$history` event number of the newest fixture line (history rc only).
     pub const DUMP_EVENT: &str = "\x18e";
-    /// Debounce-timer and in-flight-collection fd state (history rc only).
+    /// Current input generation, whether its event is still awaited, and the
+    /// in-flight-collection fd state (history rc only).
     pub const DUMP_FDS: &str = "\x18t";
     /// `CURSOR` position, for the cases that need a delegated widget to have
     /// moved the cursor rather than merely left BUFFER alone (history rc only).
@@ -63,8 +64,8 @@ pub mod keys {
     pub const WORKER_TEARDOWN: &str = "\x18q";
     /// Record the host's fd 0/1/2 targets and emit both stream sentinels.
     pub const STDIO_PROBE: &str = "\x18f";
-    /// Synthesize the timer/ack/drain descriptors and run their shared
-    /// teardown, without depending on timing or kernel backpressure.
+    /// Synthesize the ack/drain descriptors and run their shared teardown,
+    /// without depending on timing or kernel backpressure.
     pub const CLOSE_AUX_FDS: &str = "\x18j";
     /// Arm a production-generated drain handler from a widget; the readiness
     /// dispatch it provokes only happens back in the real ZLE event loop.
@@ -487,10 +488,11 @@ impl Host {
     /// a clean prompt is indistinguishable from landing once. At a call site
     /// whose following assertion depends on a premise that decays on its own
     /// -- an in-flight collection that finishes unprompted after ~0.5s
-    /// (h26d), or a debounce timer that fires unprompted at `delay-ms`
-    /// (h26c) -- a swallowed first press followed by a retry landing after
-    /// that premise has already decayed makes the cleanup assertion pass
-    /// vacuously instead of exercising send-break's own cleanup path. That is
+    /// (h26d), or an input whose quiet period expires unprompted at
+    /// `delay-ms` (h26c) -- a swallowed first press followed by a retry
+    /// landing after that premise has already decayed makes the cleanup
+    /// assertion pass vacuously instead of exercising send-break's own
+    /// cleanup path. That is
     /// the same trade `dump_get` already makes for its own re-press (#47): a
     /// rare flake traded for a rarer vacuous pass, accepted because the
     /// alternative -- a single, unrepeated press -- is the flake this method
@@ -672,10 +674,11 @@ impl Host {
             .unwrap_or_else(|| panic!("{label} listing-kind dump did not run"))
     }
 
-    /// The `^Xt` collection dump: `timer=<fd> rfd=<fd> wfd=<fd> pty=<name>`.
-    pub fn collection_fds(&mut self, label: &str) -> String {
+    /// The `^Xt` dump: `gen=<n> pending=<0|1> collect=<n> rfd=<fd> wfd=<fd>
+    /// pty=<name>`.
+    pub fn input_state(&mut self, label: &str) -> String {
         self.dump_get(keys::DUMP_FDS, "TESTFDS")
-            .unwrap_or_else(|| panic!("{label} collection-fd dump did not run"))
+            .unwrap_or_else(|| panic!("{label} input-state dump did not run"))
     }
 
     /// The `^Xp` POSTDISPLAY dump, unquoted.

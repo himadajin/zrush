@@ -100,7 +100,8 @@ unset ZDOTDIR
     _zrush_worker_txq=() _zrush_worker_pending=() _zrush_cc_staged=()
     _zrush_cc_fp= _zrush_cc_time=0 _zrush_cc_cand_gen=0
     _zrush_hist_reset
-    _zrush_current_request=0 _zrush_sync_target=0 _zrush_sync_done=0 _zrush_sync_ok=0
+    _zrush_sync_target=0 _zrush_sync_done=0 _zrush_sync_ok=0
+    _zrush_input_gen=0 _zrush_input_pending=0 _zrush_input_latched=0
     _zrush_worker_failures=0 _zrush_worker_warned=0 _zrush_build_warned=0
     _zrush_build_following=0 _zrush_build_verifying=0 _zrush_stale_disabled=0
     _zrush_disabled=0 _zrush_disable_reason= _zrush_notice= _zrush_enabled=0
@@ -328,11 +329,12 @@ unset ZDOTDIR
   sysopen -rw -o cloexec -u HOLD_ANCHOR $HOLD_FIFO
   sysopen -r -o cloexec -u HOLD_R $HOLD_FIFO
   sysopen -w -o cloexec -u HOLD_W $HOLD_FIFO
-  # The pipelined pair a finished collection sends: the store that fills a slot
-  # under a fresh generation, then the plan reading that generation back
-  # (cli-protocol.md "要求と応答").
-  _zrush_encode_message store 1 live 1 $'b\1\0'; typeset -g FRAME_A=$REPLY
-  _zrush_encode_message plan 2 1 / compsys q prefix false 1 1 false; typeset -g FRAME_B=$REPLY
+  # Two frames a session really sends in order: the store that fills a slot
+  # under a fresh generation, bound to the input whose capture-required asked
+  # for it, and an input notification behind it
+  # (cli-protocol.md "要求と応答" / "入力通知と worker event").
+  _zrush_encode_message store 1 live 1 7 $'b\1\0'; typeset -g FRAME_A=$REPLY
+  _zrush_encode_message input 8 0 30 / q prefix false 1 1 false; typeset -g FRAME_B=$REPLY
   print -rn -- "$FRAME_A" >| $WORK/a.expected
   print -rn -- "$FRAME_B" >| $WORK/b.expected
   print() {
@@ -369,6 +371,47 @@ unset ZDOTDIR
   command rm -f $REQ_FIFO $HOLD_FIFO
   verdict "writer: ack releases the slot and preserves serial ordering without process EOF"
 
+  # ------------------------------------------- notification frames in the queue
+  # Only frames still waiting in the queue may be dropped or replaced. The one
+  # already handed to a writer child is on its way to the FIFO and is settled by
+  # its ack like any other, while request frames are never removed at all
+  # (behavior.md "worker ライフサイクル").
+  reset_transport
+  REQ_FIFO=$WORK/notify-request.fifo
+  command mkfifo $REQ_FIFO
+  sysopen -rw -o cloexec -u REQ_ANCHOR $REQ_FIFO
+  sysopen -r -o cloexec -u REQ_R $REQ_FIFO
+  sysopen -w -o cloexec -u _zrush_worker_wfd $REQ_FIFO
+  _zrush_worker_ready=1
+  _zrush_encode_message input 5 0 30 / a prefix false 1 1 false
+  typeset -g NOTIFY_A=$REPLY
+  _zrush_encode_message input 6 0 30 / ab prefix false 1 1 false
+  typeset -g NOTIFY_B=$REPLY
+  _zrush_encode_message flush 6; typeset -g NOTIFY_FLUSH=$REPLY
+  _zrush_encode_message store 1 live 1 6 $'b\1\0'; typeset -g REQUEST_FRAME=$REPLY
+  print -rn -- "$NOTIFY_A" >| $WORK/notify.expected
+  _zrush_worker_txq=( "$NOTIFY_A" )
+  _zrush_worker_flush
+  eq "delegated notification left the queue" $#_zrush_worker_txq 0
+  _zrush_worker_txq=( "$REQUEST_FRAME" "$NOTIFY_B" "$NOTIFY_FLUSH" )
+  _zrush_input_gen=6 _zrush_input_pending=1
+  _zrush_input_invalidate
+  eq "queued notifications removed" $#_zrush_worker_txq 1
+  [[ $_zrush_worker_txq[1] == $REQUEST_FRAME ]] || note "invalidation removed a request frame"
+  eq "invalidated generation" $_zrush_input_gen 0
+  drain_exact $REQ_R $WORK/notify.actual ${#NOTIFY_A} ||
+    note "the delegated notification never reached the request FIFO"
+  command cmp -s $WORK/notify.expected $WORK/notify.actual ||
+    note "delegated notification bytes differ"
+  readable $_zrush_worker_ack_fd || note "delegated notification ack did not arrive"
+  _zrush_worker_consume_ack
+  drain_exact $REQ_R $WORK/notify-request.actual ${#REQUEST_FRAME} ||
+    note "the retained request frame did not follow the ack"
+  exec {REQ_R}>&- {REQ_ANCHOR}>&-
+  _zrush_worker_close_request
+  command rm -f $REQ_FIFO
+  verdict "queue: undelegated notifications are dropped, delegated ones and requests are not"
+
   # Report an ack watcher failure only after its watcher was installed. The
   # already-spawned writer may have touched its frame, so its notification fd
   # remains the writer gate and the entire FIFO generation becomes unusable.
@@ -381,7 +424,7 @@ unset ZDOTDIR
   typeset -g writer_failed_ctl=$_zrush_worker_control_path
   typeset -gi writer0 writer1 writer2
   exec {writer0}<&0 {writer1}>&1 {writer2}>&2
-  _zrush_encode_message plan 77 5 / compsys q prefix false 1 1 false
+  _zrush_encode_message plan 77 5 / history q prefix false 1 1 5000
   _zrush_worker_txq=( "$REPLY" never-replayed )
   functions[_zrt_poll_writer]=$functions[_zrush_worker_poll_writer]
   functions[_zrt_poll_eof]=$functions[_zrush_worker_poll_eof]
@@ -686,7 +729,7 @@ unset ZDOTDIR
   # (behavior.md "履歴メニュー").
   reset_transport
   _zrush_worker_ready=1
-  _zrush_worker_pending=( 1 'history-snapshot 1' 2 'plan history 0' 3 'plan compsys 0' )
+  _zrush_worker_pending=( 1 'history-snapshot 1' 2 'plan history' 3 'plan history' )
   _zrush_sync_target=2 _zrush_sync_done=0 _zrush_sync_ok=0
   _zrush_encode_message ok 1 ''; typeset -g SNAPSHOT_OK=$REPLY
   _zrush_encode_message ok 2 $'\0'"0"$'\0'"0"$'\0'"0"$'\0'; typeset -g TARGET=$REPLY
@@ -705,7 +748,7 @@ unset ZDOTDIR
   typeset -g WRITE_FAILURE=
   local kind descriptor
   for kind in store history-snapshot history-append; do
-    [[ $kind == store ]] && descriptor='store live 4' || descriptor="$kind 4"
+    [[ $kind == store ]] && descriptor='store live 4 7' || descriptor="$kind 4"
     reset_transport
     _zrush_worker_ready=1
     _zrush_worker_pending=( 4 "$descriptor" )

@@ -94,22 +94,19 @@ _zrt_probe_stdio() {
 zle -N _zrt-probe-stdio _zrt_probe_stdio
 bindkey '^Xf' _zrt-probe-stdio
 
-# ^Xj: synthesize the timer/ack/drain descriptors and exercise their shared
-# teardown paths without depending on timing or kernel backpressure.
+# ^Xj: synthesize the ack/drain descriptors and exercise their shared teardown
+# paths without depending on timing or kernel backpressure.
 _zrt_close_aux_fds() {
   emulate -L zsh
-  local -i ack_fd drain_fd timer_fd closed=1
+  local -i ack_fd drain_fd closed=1
   exec {ack_fd}< <( print )
   exec {drain_fd}< <( print )
-  exec {timer_fd}< <( print )
   _zrush_worker_ack_fd=$ack_fd
   _zrush_worker_drain_fd=$drain_fd
-  _zrush_timer_fd=$timer_fd
   _zrush_worker_release_writer
   _zrush_worker_disarm_drain
-  _zrush_disarm_timer
-  [[ -e /dev/fd/$ack_fd || -e /dev/fd/$drain_fd || -e /dev/fd/$timer_fd ]] && closed=0
-  _zlog "TESTAUX=closed=$closed ack=$_zrush_worker_ack_fd drain=$_zrush_worker_drain_fd timer=$_zrush_timer_fd"
+  [[ -e /dev/fd/$ack_fd || -e /dev/fd/$drain_fd ]] && closed=0
+  _zlog "TESTAUX=closed=$closed ack=$_zrush_worker_ack_fd drain=$_zrush_worker_drain_fd"
 }
 zle -N _zrt-close-aux-fds _zrt_close_aux_fds
 bindkey '^Xj' _zrt-close-aux-fds

@@ -39,8 +39,8 @@ zrush.zsh(zsh 側)と `zrush` バイナリ(Rust 側)の入出力仕様。
 > 検証: 制御バイトを含む候補・値の除外(送信側の保証)のうち「compsys 捕獲 profile」の分 —
 > `tests/vectors/encode/`(`zsh -f tests/zsh/vectors.zsh`)。他の profile の分を固定するテストは無い。
 
-- 対話シェルごとに `zrush worker` を最大 1 プロセス常駐させ、複数の要求を同じ
-  stdin/stdout セッションで処理する。ワーカーは最初の実要求まで起動しない。
+- 対話シェルごとに `zrush worker` を最大 1 プロセス常駐させ、複数のメッセージを同じ
+  stdin/stdout セッションで処理する。ワーカーは最初の実メッセージ(要求または入力通知)まで起動しない。
   `zrush config` は設定の読み込みごとに、`zrush init` はシェル起動(source)時に、
   それぞれ one-shot で起動する。
 - 文字列はバイト列として扱い、エンコーディング変換をしない(ファイル名は任意バイト列であり得る)。
@@ -76,6 +76,7 @@ zrush.zsh(zsh 側)と `zrush` バイナリ(Rust 側)の入出力仕様。
 候補列を受け取って解析済みのまま保持し、クエリと組み合わせてマッチング・ランキング・
 グループ分割・グリッドレイアウト・ハイライト計算・ナビゲーション表構築・挿入テキスト構築までを行い、
 zsh がそのまま適用できる描画プランを返す。
+入力の静穏判定(デバウンス)と、その結果どの入力に対して描画プランを作るかの決定も worker が持つ。
 
 ### 起動と責務
 
@@ -88,20 +89,28 @@ worker は検証後にこの fd の sole ownership を引き取り、watchdog �
 option の欠落、数字でない/2 以下の値、未知または余分な引数は起動前に exit 2 で拒否する。
 fd が closed / write-only である場合、または watchdog setup に失敗した場合は、`hello` / `ready` や
 request 処理を始める前に startup 診断を stderr へ 1 行書いて exit 1 する。
-起動後は stdin から要求を読み、
+起動後は stdin から要求と入力通知を読み、
 `store` 要求では候補レコードストリームを解析してスロットへ格納し、
 `history-snapshot` / `history-append` 要求では同じ形式のストリームを解析して history index を
 置き換え・追記し、
 `plan` 要求ごとにマッチング・ランキング・グループ分割・グリッドレイアウト・ハイライト計算・
 ナビゲーション表構築・挿入テキスト構築を行って stdout へ応答する。
+`input` 通知は静穏期間で置き換えながら最新の 1 個だけを保持し、期間の満了で描画プランまたは
+捕獲要求を worker event として stdout へ送る(「入力通知と worker event」節)。
+したがって worker は「1 要求を読む → 1 応答を書く」だけの loop ではなく、
+stdin の待機に静穏期間の満了時刻を deadline として与え、新しいメッセージが来なくても
+期間の満了だけで event を送れる session event loop として動く。
 one-shot の `zrush plan` サブコマンドは存在しない。
 
-ワーカーは **config.toml を読まない**。設定スナップショットは要求フィールドで受け取る
+ワーカーは **config.toml を読まない**。設定スナップショットは要求・通知のフィールドで受け取る
 (設定の取得・mtime 監視は zsh 側の責務)。`HISTFILE` も読まず、候補もそのイベント番号も
 `store` / `history-snapshot` / `history-append` 要求で受け取る。
-candidate store のスロットと history index はどちらも worker セッションに属し、
-worker の終了とともに失われる(永続化も再構築もしない)。
-ただしファイルシステムに対しては純粋でない: `f = 1` 候補の `/` 合成判定だけは要求の `cwd` を基準に stat する。
+candidate store のスロットと history index、および静穏判定のための current input はいずれも
+worker セッションに属し、worker の終了とともに失われる(永続化も再構築もしない)。
+ただし純粋な関数ではない: `f = 1` 候補の `/` 合成判定は要求・通知の `cwd` を基準に stat し、
+静穏期間の計測には単調時計を使う。
+マッチング・ランキング・レイアウト・挿入テキスト構築そのものは、時計にも session state にも依存しない
+純粋な計算として保つ。
 
 ### abort control と worker 終了
 
@@ -140,17 +149,18 @@ message   = netstring(netstring(field-1) ... netstring(field-N))
 - 読み取りの分割位置に意味はない。1 回の read に複数メッセージが含まれる場合、壊れた後続メッセージより前に
   完成していたメッセージは先に処理し、OS の read 境界によって配送結果を変えない。
 - 候補レコードストリームは `store` / `history-snapshot` / `history-append` 要求の、
-  描画プランストリームは `plan` の成功応答の、
+  描画プランストリームは `plan` の成功応答と `plan-ready` event の、
   それぞれ 1 個の opaque field として入れ子にする。その内側の NUL フレーミングは後述の規範を保つ。
 - kind・build stamp・request_id・列挙値・真偽値・数値・error code は、以下に示す ASCII バイト列と
   完全一致しなければならない。前後空白、符号、別の大小文字表記を許さない。
 
-起動直後、zsh は最初の要求より前に `hello` を送り、worker はその build stamp を照合して応答する。
+起動直後、zsh は最初の要求・通知より前に `hello` を送り、worker はその build stamp を照合して応答する。
 zsh は kind・フィールド数・build stamp が完全一致する `ready` だけを握手の成立として受け入れる。
-要求は握手応答の到着を待たずに `hello` の後ろへ pipeline してよい。
-pipeline された要求の帰結は握手の結果が定める:
-`ready` を返したセッションは通常の要求として受信順に処理し、
-`incompatible` を返したセッションは request として解釈せず読み捨てる(「要求と応答」の終端応答規範の対象外)。
+要求と入力通知は握手応答の到着を待たずに `hello` の後ろへ pipeline してよい。
+pipeline されたメッセージの帰結は握手の結果が定める:
+`ready` を返したセッションは通常のメッセージとして受信順に処理し、
+`incompatible` を返したセッションは request としても通知としても解釈せず読み捨てる
+(「要求と応答」の終端応答規範の対象外であり、event も生じない)。
 `build_stamp` は非空の lowercase hex ASCII (`[0-9a-f]+`)である。
 
 ```
@@ -169,12 +179,33 @@ zsh は、正しい形の `incompatible` または stamp の異なる `ready` �
 EOF・I/O エラー・非 canonical framing は worker session failure である。
 worker が受ける `hello` の kind・フィールド数・stamp 表記自体が不正な場合は、応答せず終了する。
 
+### メッセージの種別
+
+握手の後にセッション上を流れるメッセージは 3 種類ある。いずれも同じ nested netstring framing を使う。
+
+| 種別 | 向き | 相関の鍵 | 応答 |
+|---|---|---|---|
+| 要求(`store` / `history-snapshot` / `history-append` / `plan`) | zsh → worker | `request_id` | `ok` / `error` をちょうど 1 個 |
+| 入力通知(`input` / `flush`) | zsh → worker | `input_generation` | 無し(帰結は worker event) |
+| worker event(`plan-ready` / `capture-required`) | worker → zsh | `input_generation` | 無し |
+
+- 要求だけが `request_id` を持ち、zsh の未完了要求表に登録される。
+  入力通知は `request_id` を持たず、未完了要求表にも登録しない。
+- worker は通知を静穏期間で置き換えるため、通知 1 個が event 1 個に対応するとは限らない。
+- worker event は必ず対象の `input_generation` を持ち、どの要求とも対応しない。
+  zsh は自分がいま有効としている `input_generation` に一致する event だけを適用する。
+- worker は受信順に処理し、応答と event は生成順に同じ stdout ストリームへ並ぶ。
+  静穏期間の満了で生じる event は、要求とその応答の間にも現れる。
+- 相関の鍵を安全に回収できないメッセージ(要求の `request_id`、通知・event の `input_generation`)は
+  in-band で報告できないため、セッションを終了させる(各節の規範)。
+
 ### 要求と応答
 
 角括弧内は外側 message payload に固定順で並ぶ netstring field を表す。
 
 ```
-store:            ["store", request_id, slot, candidate_generation, candidate_payload]
+store:            ["store", request_id, slot, candidate_generation, input_generation,
+                   candidate_payload]
 history-snapshot: ["history-snapshot", request_id, candidate_generation, candidate_payload]
 history-append:   ["history-append", request_id, candidate_generation, candidate_payload]
 plan:             ["plan", request_id, candidate_generation, cwd, producer, query, mode,
@@ -210,6 +241,12 @@ error:            ["error", request_id, code]
   ヒットした側から描画プランを計算する(index は現 stamp との完全一致でヒットとする)。
   index の revision は index を最後に書いた要求の `candidate_generation` そのものであり、
   別の revision 識別子は存在しない。
+- `input_generation`: zsh が所有する `1..=9223372036854775807`(`i64::MAX`)の canonical ASCII 10 進識別子。
+  先頭ゼロを付けない。
+  `request_id` とも `candidate_generation` とも独立の値である。
+  シェルセッション内で単調増加し、再利用せず、worker の終了・再起動・re-source でもリセットしない。
+  `store` だけが持つフィールドであり、その捕獲がどの入力の `capture-required` に答えたものかを表す
+  (「入力通知と worker event」節)。`store` は必ずこの束縛を持ち、束縛のない `store` は存在しない。
 - `candidate_payload`: 後述の候補レコードストリーム全体をそのまま格納する opaque bytes。
 - `history_limit`: `plan` だけが持つ、先頭ゼロなしの正の canonical ASCII 10 進数
   (`1..=9223372036854775807`)。
@@ -265,6 +302,7 @@ worker は同じ `request_id` の `error` を返してセッションを継続�
 | kind | code | 意味 |
 |---|---|---|
 | `store` | `invalid-request` | kind・固定フィールド・scalar・`slot` 列挙の不正 |
+| `store` | `superseded` | current input の `input_generation` と一致しない束縛 |
 | `store` | `invalid-payload` | 候補レコードストリームの framing error |
 | `history-snapshot` | `invalid-request` | kind・固定フィールド・scalar の不正 |
 | `history-snapshot` | `invalid-payload` | 候補レコードストリームの framing error |
@@ -280,12 +318,18 @@ worker は同じ `request_id` の `error` を返してセッションを継続�
 `plan` では参照先が存在しないことを、`history-snapshot` / `history-append` では
 名乗った `candidate_generation` が index の現 stamp と両立しないこと
 (未初期化の index への追記を含む)を表す。
+`superseded` は、整形としては正しい `store` が答えようとした入力が既に置き換えられていることを表す。
+`store` の coalescing はこの終端応答で表現し、無応答で捨てることはしない。
 `plan` は候補 payload を運ばないため、`invalid-payload` は `plan` の code 集合に現れない。
 `store` と history 2 種の検証順は、`request_id` の回収 → kind・フィールド数・scalar
-(`store` の `slot` 列挙を含む)→ `candidate_payload` の framing →
+(`store` の `slot` 列挙を含む)→(`store` のみ)`input_generation` の束縛 →
+`candidate_payload` の framing →
 (history 2 種のみ)index の受理条件、である。
+`superseded` の判定を payload の framing 検査より前に置くのは、
+置き換えられた入力のための候補ストリームを解析しないためである。
 複数の不正がある要求では、先に検出されるものを返す。
-`error` で終わる `store` は既存のスロットをいっさい変更しない(全スロット無変更のまま終端 error を返す)。
+`error` で終わる `store` は既存のスロットをいっさい変更せず、event も生じない
+(全スロット無変更のまま終端 error を返す)。
 `error` で終わる `history-snapshot` / `history-append` も index の内容と stamp をいっさい変更しない。
 外側または nested netstring framing の破損、あるいは request_id の欠落・非 canonical 表記・範囲外によって
 安全に対応付けられない場合は応答せずセッションを終了する。
@@ -295,15 +339,159 @@ worker は同じ `request_id` の `error` を返してセッションを継続�
 `incompatible` を返したセッションでその後に届くバイトは request ではなく、この規範の対象外である。
 worker は要求を受信順に処理し、応答を黙って省略しない。`error` も正常に形成された終端応答であり、
 worker セッション失敗には数えない。
-zsh は `store` や `history-snapshot` / `history-append` の終端応答を待たずに、
+`superseded` も同じく正常な終端応答であり、失敗にも stale な応答にも数えない。
+zsh は `history-snapshot` / `history-append` の終端応答を待たずに、
 同じ generation を参照する `plan` をその後ろへ pipeline してよい
 (pipeline の許容範囲は握手の規範と同じ)。
+`store` の後ろに `plan` を連送することはない。
+受理された `store` の描画プランは `plan-ready` event として返る(「入力通知と worker event」節)。
 受信順処理の帰結として、generation G を名乗る `plan` は、その `plan` より前に届いた
 `history-snapshot` / `history-append` の効果を**ちょうどすべて**反映した index を参照する
 (後から届く history 要求の効果は含まない)。
 zsh は index への書き込みを query より後ろへ並べ替えず、まとめて後回しにもしない。
 `ok` の `body` は kind で決まる: `store` と history 2 種の成功では空バイト列、
 `plan` の成功では後述の描画プランストリームそのものである。
+
+### 入力通知と worker event
+
+バッファ変化の通知と、その帰結の配送はこの 4 kind で行う。
+角括弧内は外側 message payload に固定順で並ぶ netstring field を表す。
+
+```
+input:            ["input", input_generation, candidate_generation, delay_ms, cwd, query,
+                   mode, smart_case, rows, width, trailing_space]
+flush:            ["flush", input_generation]
+plan-ready:       ["plan-ready", input_generation, plan_body]
+capture-required: ["capture-required", input_generation]
+```
+
+- `input_generation`: 「要求と応答」節と同じ zsh 所有の canonical 10 進識別子。
+  zsh は通知を作るバッファ変化ごとに新しい値を 1 個採番する。
+- `candidate_generation`: この入力を解決できると zsh が考える generation、または
+  「再利用できる候補は無い」を表す `0`。
+  `0` 以外の値は candidate store の 2 つのスロットに対して解決する
+  (history index は `plan` だけが参照する)。
+  `0` は「要求と応答」節の識別子の範囲外にある予約値であり、通知だけが取り得る。
+- `delay_ms`: `0..=10000` の canonical ASCII 10 進数(先頭ゼロなし、`0` は `0`)。
+  この通知に適用する静穏期間をミリ秒で表す(config-schema.md `[display].delay-ms` のスナップショット)。
+- `cwd` / `query` / `mode` / `smart_case` / `rows` / `width` / `trailing_space` は
+  同名の `plan` フィールドと同じ意味・同じ表記であり、通知時点のスナップショットである。
+  通知から作るプランのレイアウトは常に `producer = compsys` のものとし、
+  producer フィールドは持たない。
+  history index を参照しないため `history_limit` も持たない。
+- `plan_body`: `plan` の成功応答と同一形式の描画プランストリーム(「`plan` の `ok` body」節)。
+  空バイト列も 0 マッチのプランではなく不正である(最小のプランは「0 マッチ」節の 4 フィールド)。
+
+#### worker 側の規範
+
+worker は 1 セッションで **current input** を高々 1 個保持する。
+current input は最後に受理した `input` 通知そのもの(その全フィールド)であり、
+静穏期間が満了するまでを **pending**、満了した後を **settled** と呼ぶ。
+
+- **`input` の受理**: `input_generation` はセッション内で厳密に単調増加していなければならない。
+  受理した通知は current input を丸ごと置き換え、その通知自身の `delay_ms` で静穏期間を張り直す。
+  置き換えられた pending の入力は event を生まずに消える。
+  `delay_ms = 0` の通知は受理と同時に settle する。
+- **settle**: 通知の `candidate_generation` が `0` でなく、かつその generation を candidate store が
+  保持していれば、その候補と通知のフィールドから描画プランを計算して `plan-ready` を 1 個送る。
+  そうでなければ `capture-required` を 1 個送る。
+  どちらの event も対象は settle した通知の `input_generation` である。
+- **`flush`**: current input が pending で、その `input_generation` が一致するときだけ、
+  静穏期間の残りを無視して直ちに settle する。
+  効果を持たない `flush` は何も変えずに捨てる。次の 3 つがそれにあたる:
+  current input が無い、current input が既に settled、`input_generation` が一致しない。
+- **`store` の受理**: current input が存在し、その `input_generation` と束縛が一致する `store` だけを受理する。
+  それ以外(current input が無い、`input_generation` が一致しない)の `store` は
+  payload を解析せず `superseded` で終端する(「要求と応答」節)。
+  受理した `store` は current input を直ちに settle させ(pending でも settled でも同じ)、
+  格納した `candidate_generation` の候補と current input のフィールドから計算した
+  `plan-ready` を 1 個送る。
+  順序は固定で、終端 `ok` を先に書いてから `plan-ready` を書く。
+- 1 つの `input_generation` が生む event は、高々 `capture-required` 1 個と `plan-ready` 1 個であり、
+  両方が生じる場合は必ずこの順に並ぶ。
+  これは上の受理規則と、zsh が `capture-required` 1 個につき `store` を 1 個だけ送ること
+  (「zsh 側の規範」)からの帰結であり、worker は event 数を別途カウントして強制しない
+  (同じ generation に束縛された 2 個目の `store` は 2 個目の `plan-ready` を生む)。
+- worker は静穏期間を単調時計で測り、stdin の待機にその満了時刻を deadline として与える。
+  新しいメッセージが来なくても、満了だけで settle して event を送る。
+- 入力通知と worker event は `request_id` を持たないため、in-band の error 応答を持たない。
+  kind・フィールド数・scalar 表記のいずれかが不正な通知と、
+  `input_generation` が単調増加していない `input`(単調性を課すのは `input` の受理だけであり、
+  `flush` は上の規則どおり何も変えずに捨てる)は
+  worker session failure であり、worker は診断を stderr へ 1 行書いて exit 1 する。
+  外側/nested netstring framing の破損も session failure である。
+- 通知の `candidate_generation` が worker の保持しない値であることは失敗ではない。
+  それは `capture-required` として通常どおり観測される。
+- pending の入力を抱えたままでも、frame 境界での stdin EOF は通常どおり exit 0 で終わる
+  (event は送らない)。
+- worker が失われるとき、current input と静穏期間は candidate store・history index と同じく失われる。
+
+#### zsh 側の規範
+
+- zsh は「いま有効な `input_generation`」を高々 1 個持つ。
+  event の `input_generation` がそれと一致しなければ、その event は捨てる。
+  `plan-ready` では **generation の照合を `plan_body` の検証より先に行い**、
+  一致しない body は解析しない。
+- 一致する `plan-ready` の `plan_body` は `plan` の `ok` body と同じ受理条件で検証し、
+  同じ規則で適用する(「応答の検証と zsh 側の適用(規範)」節)。
+- 一致する `capture-required` を受けた `input_generation` について、zsh は compsys 捕獲を
+  ちょうど 1 回開始し、その結果を同じ `input_generation` を束縛した `store` で送る。
+  無効化された `input_generation` のために完走した捕獲の結果は、`store` にせず破棄する
+  (`store` は必ず束縛を持つため、他に適合する形が無い)。
+- 未知の kind、フィールド数違い、非 canonical な `input_generation` を持つ event は
+  worker session failure である。
+- outbound queue では、通知を取り消す・置き換えるときに、まだ writer child へ委譲していない
+  `input` / `flush` frame を除去・置換してよい。
+  要求の frame は除去しない(停止時にセッションごと破棄する場合を除く)。
+  委譲済みの frame は ack か session abort で決着する(behavior.md「worker ライフサイクル」)。
+- session failure・worker の交換・re-source の後、zsh は入力通知も
+  `capture-required` に答える捕獲も自動 replay しない。
+  現在の `input_generation` は無効化され、次のバッファ変化が新しい値を作る
+  (無効化点は behavior.md「worker ライフサイクル」節)。
+
+#### 具体例
+
+いずれも外側 message 1 個ぶんのバイト列である(`\0` は NUL 1 バイト、`\1` は 0x01)。
+
+- `input_generation = 7`、再利用できる候補は無く(`candidate_generation = 0`)、
+  静穏期間 30ms、`cwd = /tmp`、`query = gi`、`mode = typo`、`smart_case = true`、
+  `rows = 10`、`width = 79`、`trailing_space = true` の入力通知:
+
+  ```
+  64:5:input,1:7,1:0,2:30,4:/tmp,2:gi,4:typo,4:true,2:10,2:79,4:true,,
+  ```
+
+- 同じ generation に対する `capture-required`:
+
+  ```
+  24:16:capture-required,1:7,,
+  ```
+
+- その捕獲結果を運ぶ `store`(`request_id = 12`、`live` スロット、
+  `candidate_generation = 41`、`input_generation = 7`、
+  payload は共有フィールド無しのヘッダ 1 個と候補 `ls` 1 件):
+
+  ```
+  40:5:store,2:12,4:live,2:41,1:7,8:b\1\0w\1ls\0,,
+  ```
+
+- 上の `store` が届いた時点で generation 7 が既に置き換えられていた場合の終端応答:
+
+  ```
+  27:5:error,2:12,10:superseded,,
+  ```
+
+- 0 マッチのプラン(「0 マッチ」節の 4 フィールド)を運ぶ `plan-ready`:
+
+  ```
+  28:10:plan-ready,1:7,7:\00\00\00\0,,
+  ```
+
+- generation 7 の即時確定を求める `flush`:
+
+  ```
+  12:5:flush,1:7,,
+  ```
 
 ### `candidate_payload`(候補レコードストリーム)
 
@@ -403,10 +591,14 @@ zpty 内で compsys を駆動して得る payload(behavior.md「候補収集」�
   Rust 側でのスキップは保険であり、通常の入力では発生しない。
 - `store` 要求のフィールド値: `slot` は空語収集キャッシュの対象となる収集なら `cache`、それ以外の収集なら `live`。
   どの収集がキャッシュの対象かは behavior.md「空語収集キャッシュ」節が定める。
-- `plan` 要求のフィールド値: `producer` は `compsys`、`query` は広げ規則が定めるクエリ
-  (behavior.md「候補収集」節)、`trailing_space` は `[insert].trailing-space` の設定値、
-  `history_limit` は `[history].limit` の設定値(history profile と同じ値を常に載せる。
-  generation がスロットに解決する要求では worker が無視する)。
+  `input_generation` は、この収集を始めさせた `capture-required` の対象 generation。
+- `input` 通知のフィールド値: `query` は広げ規則が定めるクエリ(behavior.md「候補収集」節)、
+  `trailing_space` は `[insert].trailing-space`、`delay_ms` は `[display].delay-ms` の設定値、
+  `candidate_generation` は空語収集キャッシュの latch が有効ならその generation、
+  それ以外は `0`(behavior.md「空語収集キャッシュ」節)。
+- この profile の候補は `input` 通知の帰結として一覧になる。
+  `plan` 要求は履歴メニューの同期交換が使う明示操作であり、
+  入力に追従する一覧のために送ることはない。
 
 #### history profile
 
@@ -482,6 +674,8 @@ index から作られた一覧を履歴一覧、その候補を履歴候補と�
 > (レイアウトが listing text の外を指すオフセットを出力しないこと)。上界を破るプランの拒否は「エラー時の zsh 側挙動」節の検証行。
 > ただし、受信側が用いる文字数が Rust 側の文字数以上であるべき規範は、どのテストも固定していない。
 > 制御バイト→スペース正規化(表示テキスト・表示幅・パディング・切り詰め・オフセットへの反映と、挿入テキストが原文のままであること)— `src/plan.rs` の単体テスト。
+
+同じ形式を `plan-ready` event の `plan_body` にも用いる(「入力通知と worker event」節)。
 
 NUL(`\0`)終端フィールドの平坦列。数値は ASCII 10 進表記。順序は固定:
 
@@ -624,7 +818,7 @@ NUL(`\0`)終端フィールドの平坦列。数値は ASCII 10 進表記。順�
   (バッチヘッダの共有フィールド + その候補固有の `w`)。
 - `f = 1` かつ連結結果の末尾が `/` でない候補は、`rd` と match-text
   (`m` があれば `m`、なければ `w`)の生バイト列を連結したパスを、
-  `plan` 要求の `cwd` を基準に、シンボリックリンクを追跡して stat する。
+  そのプランを計算した要求または通知の `cwd` を基準に、シンボリックリンクを追跡して stat する。
   stat が失敗する場合・対象がディレクトリでない場合は `/` を合成しない。
   この判定はプラン計算時点のスナップショットであり、zsh は確定時に再検証しない
   (該当ディレクトリがプラン計算後に削除・変更されていても、返された挿入テキストをそのまま使う)。
@@ -734,31 +928,36 @@ zsh は一覧を消す。
 
 - zsh は応答の外側/nested netstring、固定フィールド数、kind、canonical な request_id、
   および request_id が未完了要求の 1 つに対応することを検証する。不正なら worker セッションを壊れたものとして終了する。
-- `error` の `code` は `invalid-request` / `invalid-payload` / `unknown-generation` のいずれかでなければならない。
+  worker event の検証と適用は「入力通知と worker event」節の zsh 側規範が定める。
+- `error` の `code` は `invalid-request` / `invalid-payload` / `unknown-generation` / `superseded` の
+  いずれかでなければならない。
   それ以外の値は不正な応答であり、worker セッションを壊れたものとして終了する。
 - `error` は相関する要求の正常な終端応答である。その要求の結果を破棄し、それが現在の最新要求なら
   既存一覧も消す。stale 要求なら UI 状態を変えない。どちらの場合も worker は継続利用する。
+  「現在の最新要求」の判定は経路ごとに決まる。
+  非同期経路の要求は `store` だけであり、その束縛の `input_generation` が
+  zsh のいま有効な `input_generation` と一致することが判定になる
+  (`superseded` はこの一致が成り立たないことを表すため、UI 状態を変えない)。
+  `plan` は履歴メニューの同期交換専用であり、同期待ちの対象要求と一致することが判定になる。
 - `unknown-generation` は、`plan` が参照した generation を worker が保持していないこと、または
   `history-snapshot` / `history-append` が名乗った generation が index の現 stamp と両立しないことを表す。
   他の `error` と同じく正常な終端応答であり、worker セッション失敗にも連続失敗回数にも数えない。
   zsh はその要求も先行する `store` / history 要求も replay しない。
-  非同期の補完経路でのその後の扱いは、その `plan` が latch を参照して送ったものかどうかで決まる。
-  - latch を参照して送った `plan`: その candidate store latch を無効化し
-    (latch の所在と無効化点は behavior.md「worker ライフサイクル」節が定める)、
-    入力がまだ current なら新しい収集を開始して新しい generation を作る。
-  - それ以外の `plan`: 同じ収集で直前に送った `store` が `error` で終端した場合に限られる
-    (受信順処理により、成功した `store` の直後へ連送した `plan` が `unknown-generation` を受けることはない)。
-    失敗した要求として捨てるだけで、再収集はせず次の実入力を待つ。
-    決定的な `store` の失敗が再収集を無限に呼び戻さないための限定である。
-  履歴メニューの同期交換では、どちらの場合も他の `error` と同じく交換の失敗として扱う
+  履歴メニューの同期交換では、他の `error` と同じく交換の失敗として扱う
   (behavior.md「履歴メニュー」節)。
   `history-snapshot` / `history-append` が `unknown-generation` で終端した場合は index の同期が
   失われたことを表すため、zsh は history index latch を無効化する
   (latch の所在と無効化点は behavior.md「worker ライフサイクル」節が定める)。
   次の明示的な履歴メニュー操作が `history-snapshot` から作り直すだけで、payload の replay はしない。
+- `superseded` は `store` だけが受ける終端応答で、その捕獲が答えようとした入力が既に
+  置き換えられていることを表す。zsh は候補を保持していないため replay できず、replay もしない。
+  candidate store latch はこの `store` について進めない(latch を進めるのは `ok` だけである)。
+  対象の `input_generation` は既に無効なので UI 状態も変えない。
+  worker セッション失敗にも連続失敗回数にも数えない。
 - `store` と `history-snapshot` / `history-append` の `ok` は body が空バイト列であることを検証する。
   空でなければ仕様を満たさない応答として扱い、プランを破棄する場合と同じく worker セッションを終了する。
-- `plan` の `ok` body が仕様を満たさない場合
+- `plan` の `ok` body、および現在の generation に一致する `plan-ready` の `plan_body` が
+  仕様を満たさない場合
   (最終フィールドの NUL 終端欠落、`L` / `P` / `H` が非負の数字列でない、
   総フィールド数が `4 + L + H + 3P` と一致しない、ハイライト・セル範囲・ナビゲーションの
   各タプルの要素数が不正、`role` が `match` / `heading` / `history-number` 以外、
@@ -767,9 +966,11 @@ zsh は一覧を消す。
   プラン全体を破棄して一覧を消し、worker セッションを終了する。
   同じ session の他の未完了要求も behavior.md「worker ライフサイクル」に従ってすべて破棄する。
   壊れた success を受理してセッションを継続してはならない。
-- 正常に形成された `ok` / `error` は worker セッションの連続失敗回数を 0 に戻す。
+- 正常に形成された `ok` / `error` と正常に形成された worker event は、
+  worker セッションの連続失敗回数を 0 に戻す。
   `ok` であっても、対応する要求より後の実要求を zsh が既に開始していれば stale なので適用せず捨てる。
   stale 応答も正常に形成されていれば終端応答として扱い、失敗回数を戻す。
+  generation が一致せず捨てる event も、kind とフィールド数が正しければ同じく失敗回数を戻す。
 - worker の stderr は端末に流さない(zle 表示を壊さないため)。`ZRUSH_LOG` が設定されていれば
   診断をそこへ追記し、未設定なら `/dev/null` へ送る。
   main request 処理がセッション失敗で終了するときは、その理由を 1 行の診断として stderr に書いてから終了する。
@@ -908,24 +1109,29 @@ typeset -g _ZRUSH_EXPECTED_BUILD_STAMP='<build-stamp>'
    request/response/abort-control FIFO を同期的・transactional に作成してからキーバインドを適用する。
 2. プロンプト表示ごと: config.toml の mtime を確認し、変化していれば
    `zrush config` を再実行して source、キーバインドを再適用、警告があれば表示。
-3. 最初の実要求時: source 時に作成済みの FIFO endpoint だけを開き、abort-control FIFO の read fd を渡して
+3. 最初の実メッセージ時: source 時に作成済みの FIFO endpoint だけを開き、abort-control FIFO の read fd を渡して
    `zrush worker --control-fd N` を起動し、watchdog setup 後に `hello` を送る。
-   最初の要求は `ready` を待たずに `hello` の後ろへ pipeline する(「セッションフレーミングと握手」節)。
+   最初のメッセージは `ready` を待たずに `hello` の後ろへ pipeline する(「セッションフレーミングと握手」節)。
    遅延起動時に runtime directory/FIFO を作成してはならない。spawn 後の parent endpoint/watcher failure と
    writer notification/watcher failure の fail-closed quarantine・runtime taint は behavior.md が定める。
-4. 入力変化 → デバウンス → zpty 収集完了後: zsh が pid レコードを取り除いた捕獲 payload を、
-   新しい `candidate_generation` の `store` 要求(空語収集キャッシュの対象なら `cache`、それ以外は `live`)で送り、
-   続けて同じ generation を参照する `producer = compsys` の `plan` 要求を連送する。
-   `plan` に対応する `ok` の描画プランを POSTDISPLAY / region_highlight に適用する。
+4. 入力変化: zsh は新しい `input_generation` を採番して `input` 通知を直ちに送る。
+   worker は `delay-ms` の静穏期間を張り、打鍵が続く間は新しい通知で置き換え続ける。
+   期間が満了すると、通知が名乗った `candidate_generation` を保持していれば
+   `plan-ready` を返し(空語収集キャッシュのヒットはこの経路になる)、
+   保持していなければ `capture-required` を返す。
+5. `capture-required` 受信後: zsh が zpty 収集を 1 回だけ開始し、完走したら pid レコードを取り除いた
+   捕獲 payload を、新しい `candidate_generation` と対象の `input_generation` を載せた `store` 要求
+   (空語収集キャッシュの対象なら `cache`、それ以外は `live`)で送る。
+   worker は `ok` を返すとともに、同じ入力に対する `plan-ready` を送る。
+   zsh は現在の `input_generation` に一致する `plan-ready` の描画プランを
+   POSTDISPLAY / region_highlight に適用する。
    以降の選択移動・確定は、プラン内のナビゲーション表・セル範囲・挿入テキストの配列引きだけで完結する
    (要求の再送はしない)。
-   空語収集キャッシュがヒットした場合は収集も `store` も行わず、
-   worker が保持している generation を参照する `plan` 要求だけを送る(behavior.md「空語収集キャッシュ」節)。
-5. 非選択での select-prev(既定 ↑): worker の history index が同期済みなら、
+6. 非選択での select-prev(既定 ↑): worker の history index が同期済みなら、
    `producer = history` の `plan` だけを同期交換で送って、返ったプランを同じように適用する。
    index が未初期化または dirty なら、zsh がメモリ上の履歴から payload を合成し、
    `history-snapshot` と `plan` を同じ同期交換で連送する
    (fork も compsys も介さない。behavior.md「履歴メニュー」節)。
-6. コマンド確定後のプロンプトごと: index が同期済みで、直前のコマンドが 1 件の追記として説明できる場合、
+7. コマンド確定後のプロンプトごと: index が同期済みで、直前のコマンドが 1 件の追記として説明できる場合、
    zsh はその 1 件を `history-append` で送る(worker を起動することはない)。
    説明できない変化を見つけた場合は index を dirty とし、次の履歴メニュー操作で作り直す。

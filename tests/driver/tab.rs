@@ -6,21 +6,51 @@ use std::time::Duration;
 
 use crate::host::{Host, PlanShape, keys};
 
+/// The Tab branch that cuts a still-running quiet period short, as opposed to
+/// the one that merely records the press over a collection already in flight
+/// (behavior.md 「Tab」).
+pub const TAB_FLUSHED: &str = "tab: pending (quiet-period flush";
+
+/// Default `[insert].tab = "menu"`, so a Tab that lands before candidates
+/// arrive must, once they arrive, start selection -- not change the buffer.
+///
+/// The Tab has to land while the worker is still measuring the quiet period,
+/// which the contract's longest `delay-ms` makes reachable: the keystrokes are
+/// one burst, whose last one is what makes the notification (input pressure
+/// suppresses the others, behavior.md 「候補収集」), and the Tab follows it as
+/// its own press.
+///
+/// Ten seconds is also what makes the fast-forward observable rather than
+/// merely assumed: the press must take the quiet-period branch by name, and the
+/// selection it starts must arrive inside a deadline that a worker left to time
+/// the period out could not meet (behavior.md 「Tab」).
 #[test]
-fn pending_tab_starts_selection_once_candidates_arrive() {
-    // Default [insert].tab=menu, so a Tab that lands before candidates arrive
-    // must, once they arrive, start selection -- not change the buffer.
+fn pending_tab_flushes_the_quiet_period_and_starts_selection_on_arrival() {
     let mut host = Host::boot();
-    let pending_baseline = host.log_count("tab: pending");
+    host.write_config("[display]\ndelay-ms = 10000\n");
+    host.send_line(":");
+    host.sync_prompt(Duration::from_secs(5));
+
+    let notified_baseline = host.log_count("worker: queued input");
+    let flushed_baseline = host.log_count(TAB_FLUSHED);
     let select_baseline = host.log_count("select: start");
-    host.send_keys("ls fx/basic/al\t"); // Tab in the same burst, before debounce elapses
+    host.send_keys("ls fx/basic/al");
     assert!(
-        host.wait_log("tab: pending", pending_baseline, Duration::from_secs(3)),
-        "(tab-1a) pending path not logged"
+        host.wait_log(
+            "worker: queued input",
+            notified_baseline,
+            Duration::from_secs(5)
+        ),
+        "(tab-1a) the burst never notified an input"
+    );
+    host.press(keys::TAB);
+    assert!(
+        host.wait_log(TAB_FLUSHED, flushed_baseline, Duration::from_secs(3)),
+        "(tab-1b) Tab did not take the quiet-period flush branch"
     );
     assert!(
-        host.wait_log("select: start", select_baseline, Duration::from_secs(5)),
-        "(tab-1b) pending Tab was not applied on arrival"
+        host.wait_log("select: start", select_baseline, Duration::from_secs(3)),
+        "(tab-1c) the flushed quiet period did not deliver candidates in time"
     );
 }
 

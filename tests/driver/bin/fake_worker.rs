@@ -34,6 +34,9 @@ const FAKE_ERROR_STATUS: i32 = 18;
 const DIE_STATUS: i32 = 19;
 /// Exit status when the parent stopped reading the response stream.
 const WRITE_FAILED_STATUS: i32 = 1;
+/// The zero-match render plan of cli-protocol.md 「0 マッチ」: the smallest
+/// body a `plan-ready` can carry, and all this fake ever computes.
+const EMPTY_PLAN: &[u8] = b"\x000\x000\x000\x00";
 
 fn main() {
     let real = env::var_os("ZRUSH_REAL_BIN").expect("ZRUSH_REAL_BIN is set by the harness");
@@ -180,53 +183,90 @@ fn worker(fake: &Fake, control_fd: i32) {
             fake.note(&format!("exit {session}"));
             return;
         };
-        let request = fields(&payload, fake);
-        // The kind is folded onto "a request carrying a payload" and "a
+        let message = fields(&payload, fake);
+        let head = message.first().map(Vec::as_slice);
+        // cli-protocol.md 「メッセージの種別」: an input notification carries
+        // no request_id and gets no terminal response, so field 1 is read as
+        // whichever key correlates this kind -- request_id for a request, and
+        // input_generation for a notification.
+        let notification = matches!(head, Some(b"input" | b"flush"));
+        // The request kinds fold onto "a request carrying a payload" and "a
         // request asking for a plan" so a state line always splits into four
         // fields (`tests/driver/fake.rs`). The history writes join the `store`
         // class: like it they answer with an empty body, and the modes below
         // decide only what the `plan` behind them gets back.
-        let kind = match request.first().map(Vec::as_slice) {
+        let kind = match head {
             Some(b"store" | b"history-snapshot" | b"history-append") => "store",
             Some(b"plan") => "plan",
+            Some(b"input") => "input",
+            Some(b"flush") => "flush",
             _ => "other",
         };
-        let request_id = match request.get(1) {
-            Some(field) => str::from_utf8(field)
-                .unwrap_or_else(|e| panic!("request_id is not UTF-8: {field:?} ({e})"))
-                .to_string(),
-            None => "missing".to_string(),
-        };
-        fake.note(&format!("request {session} {kind} {request_id}"));
+        let key = scalar(&message, 1);
+        fake.note(&format!(
+            "{} {session} {kind} {key}",
+            if notification { "notify" } else { "request" }
+        ));
 
         let mut action = fake.mode();
         if action == "hold" {
-            fake.note(&format!("hold {session} {request_id}"));
+            fake.note(&format!("hold {session} {key}"));
             while action == "hold" {
                 thread::sleep(HOLD_POLL);
                 action = fake.mode();
             }
         }
         if action == "die" {
-            fake.note(&format!("die {session} {request_id}"));
+            fake.note(&format!("die {session} {key}"));
             // SAFETY: an immediate process-wide exit with no unwinding, which
             // is the point: no terminal response ever reaches the parent.
             unsafe { libc::_exit(DIE_STATUS) };
         }
-        if action == "error" || action == "drain" || action == "unknown-generation" {
-            // A `store` always succeeds with the contract's empty body; the
-            // mode decides only what the `plan` referencing it gets back.
-            if kind == "store" {
-                write_message(&[b"ok", request_id.as_bytes(), b""]);
-            } else if action == "unknown-generation" {
-                write_message(&[b"error", request_id.as_bytes(), b"unknown-generation"]);
-            } else {
-                write_message(&[b"error", request_id.as_bytes(), b"invalid-request"]);
+        if action != "error" && action != "drain" && action != "unknown-generation" {
+            fake.fail(&format!("unknown control {action}"));
+        }
+
+        if notification {
+            // This fake parses no candidate payload, so it holds no generation
+            // for any notification to name: every settle is a
+            // `capture-required` (cli-protocol.md 「worker 側の規範」).
+            // `delay_ms` is ignored -- settling at acceptance only makes the
+            // event arrive sooner -- and a `flush` therefore always arrives for
+            // an input that has already settled, which is dropped.
+            if kind == "input" {
+                write_message(&[b"capture-required", key.as_bytes()]);
+                fake.note(&format!("capture-required {session} {key}"));
             }
-            fake.note(&format!("{action} {session} {request_id}"));
             continue;
         }
-        fake.fail(&format!("unknown control {action}"));
+        // A `store` always succeeds with the contract's empty body; the mode
+        // decides only what the `plan` referencing it gets back.
+        if kind == "store" {
+            write_message(&[b"ok", key.as_bytes(), b""]);
+            // An accepted `store` settles the input it is bound to, and the
+            // order is fixed: the terminal `ok`, then the event. Only `store`
+            // carries a binding -- the history writes reach no input at all.
+            if head == Some(b"store") {
+                let binding = scalar(&message, 4);
+                write_message(&[b"plan-ready", binding.as_bytes(), EMPTY_PLAN]);
+                fake.note(&format!("plan-ready {session} {binding}"));
+            }
+        } else if action == "unknown-generation" {
+            write_message(&[b"error", key.as_bytes(), b"unknown-generation"]);
+        } else {
+            write_message(&[b"error", key.as_bytes(), b"invalid-request"]);
+        }
+        fake.note(&format!("{action} {session} {key}"));
+    }
+}
+
+/// One scalar field of a message, as the state lines and the wire spell it.
+fn scalar(message: &[Vec<u8>], index: usize) -> String {
+    match message.get(index) {
+        Some(field) => str::from_utf8(field)
+            .unwrap_or_else(|e| panic!("scalar field {index} is not UTF-8: {field:?} ({e})"))
+            .to_string(),
+        None => "missing".to_string(),
     }
 }
 

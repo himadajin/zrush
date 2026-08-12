@@ -60,7 +60,7 @@ zsh は zle 統合・compsys 呼び出しによる捕獲・プランの適用
   まで保持し、response EOF まで上記の rollback quarantine を続ける。readiness cleanup を保証できない場合は
   fail-closed のまま direct な明示 cleanup または shell exit に委ねてよい。EOF finalization 後も taint は残り、
   同じ source generation で worker を交換しない。
-- worker は最初の実要求で遅延起動し、対話シェルごとに高々 1 個とする。
+- worker は最初の実メッセージ(要求または入力通知)で遅延起動し、対話シェルごとに高々 1 個とする。
   stdin/stdout は request/response FIFO に接続し、abort-control FIFO の read fd を
   `zrush worker --control-fd N` で渡す(詳細は `../contracts/cli-protocol.md`)。
   worker と短命な writer child は対話シェルの job table に登録せず、zsh は両者の numeric PID を
@@ -72,8 +72,8 @@ zsh は zle 統合・compsys 呼び出しによる捕獲・プランの適用
   worker は response FIFO に接続した fd 1 を自身の lifetime 全体で所有し、起動時に cloexec を付けて
   descendant へ継承させない。したがって raw drain 後の response EOF だけを worker completion の oracle とし、
   control channel や request FIFO の EOF、job/exit status から完了を推測しない。
-- request/response の nested-netstring と `hello` / `ready` は
-  `../contracts/cli-protocol.md` が定める。通常の補完経路は cold start・握手・応答を同期的に待たず、
+- request/response・入力通知・worker event の nested-netstring と `hello` / `ready` は
+  `../contracts/cli-protocol.md` が定める。通常の補完経路は cold start・握手・event を同期的に待たず、
   response fd の `zle -F` callback で進める。同期的に起動と応答を待てるのは履歴メニューだけで、
   その 1 本の絶対 100ms deadline に起動・握手・先行 request・
   `history-snapshot` と `plan` の連送(index が同期済みなら `plan` だけ)・
@@ -95,9 +95,14 @@ zsh は zle 統合・compsys 呼び出しによる捕獲・プランの適用
   再利用しない。cleanup 後も同じ source generation では worker を再開せず、新しい source generation の同期 runtime
   setup が成功した後だけ transport を再び有効化する。notification watcher 登録に失敗した場合は direct な明示
   cleanup まで fail-closed でよい。
-- 通常の queue は coalesce・置換・除去せず request_id 順に直列送信する。送信時に stale でも worker の
+- 要求の frame は coalesce・置換・除去せず request_id 順に直列送信する。送信時に stale でも worker の
   終端応答まで読み、UI 適用だけを捨てる。backpressure を受けるのは writer の `syswrite` だけで、
   ZLE callback は ack を同期的に待たず busy loop もしない。
+- queue 内で置換・除去してよいのは、まだ writer child へ委譲していない `input` / `flush` frame だけである。
+  通知を取り消すとき(現在の `input_generation` の無効化)、および新しい通知で置き換えるときに、
+  古い generation の未委譲 frame を取り除いてよい
+  (worker 側でも静穏期間が同じ coalescing を行うため、これは送信量の削減であって正しさの条件ではない)。
+  委譲済みの frame は他と同じく ack か session abort で決着する。
 - response / writer-ack / drain の callback 登録ごとに同じ shell session 内で単調増加する compact generation を
   割り当て、callback は fd と generation が現在の登録に一致するときだけ state を変更する。response と ack の
   watcher は停止開始時にも登録を保ち、callback 自身が stopping gate を見て通常の parse/send ではなく raw drain /
@@ -106,19 +111,37 @@ zsh は zle 統合・compsys 呼び出しによる捕獲・プランの適用
   何もしない。fd/watcher/generation/active state の公開と rollback も transaction とする。
 - transport の停止には、健全な session を手放す **正常 shutdown** と、session を信用できない
   **異常 abort** がある。どちらも最初に stopping gate を立て、normal callback と新しい enqueue/send/start を止め、
-  unhanded frame と session の未完了 request をすべて破棄し、一覧を消して replay しない。
+  unhanded frame と session の未完了 request をすべて破棄し、現在の `input_generation` を無効化し、
+  一覧を消して replay しない。
   zrush の disable policy は stop mode と別に決める。
+- 静穏判定(デバウンス)と入力の coalescing は worker が持つ。
+  zsh は **`input_generation`** を所有し、入力通知を作るバッファ変化ごとに 1 個採番する
+  (`../contracts/cli-protocol.md`「入力通知と worker event」節)。
+  値は shell session 内で単調増加し、再利用せず、worker の起動・交換・re-source でもリセットしない。
+  枯渇は request_id / candidate_generation の枯渇と同じ disable reason になる。
+- zsh は「いま有効な `input_generation`」を高々 1 個持つ。
+  worker の event はこれと一致するときだけ適用し、一致しないものは捨てる。
+  無効化点は次のとおりで、いずれも取り消しメッセージを worker へ送らない
+  (worker は静穏期間の満了で event を送るが、zsh がそれを捨てるだけで足りる):
+  バッファ変化、空バッファ / `min-input` による抑止、入力圧による見送り、
+  履歴メニューを開く操作、dismiss、確定(挿入)、行の確定と初期化、
+  worker の正常 shutdown・異常 abort・session failure・worker の交換・re-source。
+- worker の current input と静穏期間は worker session に属し、session とともに失われる。
+  zsh は失われた入力通知を replay せず、`capture-required` に答えるはずだった捕獲も作り直さない。
+  次のバッファ変化が新しい `input_generation` を作るまで、その入力の一覧は更新されない。
 - 解析済みの候補は worker がスロット(`live` / `cache`)ごとに candidate generation 単位で保持する
   (`../contracts/cli-protocol.md`「要求と応答」節)。
   zsh が要求を跨いで参照するのは `cache` スロットだけであり、
   「現 worker session が `cache` スロットにどの generation を保持しているか」を
   **candidate store latch** として持つ。
-  `live` スロットの store は直後に連送する `plan` からしか参照しないため、latch を持たない。
+  `live` スロットの store は、その store 自身が worker に作らせる `plan-ready` からしか参照されないため、
+  latch を持たない。
   candidate store は worker session に属するため、latch は worker の起動・正常 shutdown・異常 abort・
-  session failure・worker の交換・re-source のたび、および latch を参照して送った `plan` が
-  `unknown-generation` を受けたときに無効化する。
+  session failure・worker の交換・re-source のたび、および latch の generation を名乗った入力通知が
+  `capture-required` を受けたときに無効化する
+  (worker がその generation を保持していないことの通知であり、error ではない)。
   latch を無効化した generation を payload の再送で復元することはせず、
-  失敗した `store` / `plan` も replay しない。
+  `error` / `superseded` で終端した `store` も replay しない。
   新しい generation を作るのは新しい収集だけである。
 - worker はスロットとは別に、履歴候補の **history index** を 1 個保持する
   (`../contracts/cli-protocol.md`「要求と応答」節)。
@@ -139,7 +162,7 @@ zsh は zle 統合・compsys 呼び出しによる捕獲・プランの適用
 - 正常 shutdown は unhanded frame を破棄し、unacked writer があれば full-frame ack を待つ。
   ack を受けると writer が既に自身の request fd を閉じているため、対話シェルの request write fd を閉じて
   frame 境界の EOF を作る。その後も abort-control write fd は閉じず、response FIFO を bytes のまま EOF まで
-  raw drain する。drain 中の `ready` / `ok` / `error` は parse も UI 適用もしない。
+  raw drain する。drain 中の `ready` / `ok` / `error` と worker event は parse も UI 適用もしない。
   response EOF と、writer slot が ack または通知 EOF で解決して通知 watcher/fd も解放済みであることの
   両方で停止完了とする。
 - 異常 abort は abort-control FIFO へ byte 1 個(値は任意)の送信を 1 回だけ試み、その write fd と
@@ -155,19 +178,24 @@ zsh は zle 統合・compsys 呼び出しによる捕獲・プランの適用
   raw response drain を続け、新しい deadline や同期 loop を開始しない。response EOF と writer gate 解決後にだけ
   finalization が fd/session state を解放し、代替 worker を許可する。
 - 外側/nested framing の破損、通常処理中の response EOF/read error、ack なしの writer 通知 EOF、
-  予期しない終了、要求と対応しない応答、仕様を満たさない `ok`、履歴交換の deadline 超過は
+  予期しない終了、要求と対応しない応答、仕様を満たさない `ok`、仕様を満たさない worker event
+  (未知の kind、フィールド数違い、非 canonical な `input_generation`、現在の generation に一致する
+  `plan-ready` の壊れたプラン)、履歴交換の deadline 超過は
   **worker session failure** であり、異常 abort を開始する。その session の未完了 request は
   queue/送信中/送信済みを区別せず破棄して replay しない。
-- 連続 worker session failure 回数は、正常に形成された終端 `ok` / `error` を受けたときだけ 0 に戻す。
-  握手成功だけでは戻さない。1 回目の失敗を finalization した後は worker 不在のままとし、次の実要求で
-  代替 worker を 1 個だけ遅延起動する。終端応答なしの 2 回目でその shell の zrush を無効化し、
+  現在の `input_generation` も無効化し、入力通知を replay しない。
+- 連続 worker session failure 回数は、正常に形成された終端 `ok` / `error` または
+  正常に形成された worker event を受けたときだけ 0 に戻す。
+  握手成功だけでは戻さない。1 回目の失敗を finalization した後は worker 不在のままとし、次の実メッセージで
+  代替 worker を 1 個だけ遅延起動する。終端応答も event も無いままの 2 回目でその shell の zrush を無効化し、
   無限 respawn や one-shot fallback は行わない。ただし taint された runtime generation はこの通常の 1 回交換の
   対象外であり、cleanup 後も fresh re-source まで代替 worker を起動しない。
 - 2 回目の session failure による circuit breaker は `session-failure` の disable reason を持つ。
   worker が健全に finalization された後、ユーザーが明示的に re-source した場合だけ、この reason と
-  failure counter を 0 に戻して新しい worker 起動を許可する。request_id、callback generation、warning latch は
-  戻さず、未完了 request の replay もしない。自動 build-stamp re-source はこの解除を行わない。
-  invalid handshake、request_id または candidate_generation の枯渇、runtime setup failure など
+  failure counter を 0 に戻して新しい worker 起動を許可する。
+  request_id、candidate generation、input generation、callback generation、warning latch は戻さず、
+  未完了 request の replay もしない。自動 build-stamp re-source はこの解除を行わない。
+  invalid handshake、request_id / candidate_generation / input_generation の枯渇、runtime setup failure など
   別の disable reason はこの操作で解除しない。
 - 正しい形の `incompatible`、stamp の異なる `ready`、source/config の build-stamp 不一致は stale build として
   失敗回数を介さず `$ZRUSH_BIN init zsh` の自動 re-source を 1 回だけ試みる。成功時は警告せず診断ログだけを残し、
@@ -204,8 +232,21 @@ zsh は zle 統合・compsys 呼び出しによる捕獲・プランの適用
 
 - バッファ変化の検知は `zle-line-pre-redraw`(前回の `BUFFER`/`CURSOR` との差分)。
   登録は `add-zle-hook-widget` 経由。
-- 変化からデバウンス(`delay-ms`、既定 30ms)後に収集を開始する。
-  タイマー発火時に未処理のキー入力がある場合は見送り、次の変化で再アームする。
+- バッファ変化はまず現在の `input_generation` を無効化する。
+  変化が下の抑止規則を通り、かつ未処理のキー入力が無い(`KEYS_QUEUED_COUNT` と `PENDING` がいずれも 0)場合だけ、
+  新しい `input_generation` を採番して入力通知を直ちに queue する。
+  未処理のキー入力がある間は通知を作らず、そのキーが起こす次の変化で作り直す
+  (入力圧は zsh にしか見えないためここで判定する)。
+- 静穏判定(`delay-ms`、既定 30ms)は worker が持つ。zsh はタイマーを持たず、
+  設定値は通知のフィールドとして運ぶ
+  (`../contracts/cli-protocol.md`「入力通知と worker event」節)。
+  worker は静穏期間中に届いた通知で前の通知を置き換え、満了時に残っていた最新の 1 個だけを採用して
+  `plan-ready` か `capture-required` を返す。
+- 入力通知は、その時点の広げ規則が定めるクエリ・行数/桁数予算・マッチング設定・`cwd`・`delay-ms` と、
+  空語収集キャッシュが提供する candidate generation(提供が無ければ `0`)を運ぶ。
+- 現在の `input_generation` に一致する `capture-required` を受けたときにだけ、compsys 捕獲を 1 回開始する。
+  一致する `plan-ready` を受けたときは捕獲せず、そのプランをそのまま適用する。
+  一致しない event は捨てる(捕獲も表示も起こさない)。
 - **空バッファ(空白のみを含む)では収集も表示もしない**。
   `min-input` はこの抑止規則とは独立に現在語の長さで一律判定する。
   空の引数語も長さ 0 として扱うため、`min-input >= 1` なら `ls ` 直後の一覧は抑止される。
@@ -230,18 +271,28 @@ zsh は zle 統合・compsys 呼び出しによる捕獲・プランの適用
   レコードのタグ構成(バッチヘッダ・`m` タグを含む)は
   `../contracts/cli-protocol.md`「`candidate_payload`(候補レコードストリーム)」の契約に従う。
   キャンセルは worker 自己申告 pid のプロセスグループへの SIGINT → `zpty -d`。
-- 収集が完走したら、その payload を新しい candidate generation の `store` 要求で worker へ渡し、
-  続けて同じ generation を参照する `plan` 要求を連送する
+- 収集が完走したら、その payload を新しい candidate generation の `store` 要求で worker へ渡す。
+  要求にはその収集を始めさせた `capture-required` の `input_generation` を載せる
   (`../contracts/cli-protocol.md`「要求と応答」節)。
   スロットは空語収集キャッシュの対象となる収集が `cache`、それ以外の収集が `live`。
   どの収集がキャッシュの対象かは「空語収集キャッシュ」節が定める。
-  payload を zsh 側に保持することはせず、後続の要求は generation 参照だけで済ませる。
-- 新しいリクエストの開始時に進行中の収集をキャンセルする。
-  **キャンセルされたリクエストの結果は、その後に到着しても表示に使わない**
+  payload を zsh 側に保持することはせず、`plan` 要求も連送しない。
+  worker はその `store` を受理すると同じ入力に対する `plan-ready` を返し、zsh はそれを適用する。
+  入力が既に置き換えられていた場合の `store` は `superseded` で終端し、一覧は変わらない。
+- 新しい `input_generation` の `capture-required` を受けたときは、進行中の収集をキャンセルしてから
+  新しい収集を開始する。
+  現在の `input_generation` を無効化するとき(「worker ライフサイクル」節の無効化点)も、
+  その generation のために進行中の収集をキャンセルする。
+  **キャンセルされた収集の結果は、その後に到着しても表示に使わない**
   (`zpty -d` 後に届く残留データは捨てる)。
-- キャンセルされずに完走したリクエストの結果は、そのリクエストのクエリに基づく表示として適用する
-  (一覧はバッファ変化時に選択ハイライトのみ即解除され、テキストは次の結果が届くか
-  リクエストがキャンセルされるまで残るという「表示」節の規範と整合する)。
+- キャンセルされずに完走した収集の結果は、その収集のクエリに基づく表示として適用する
+  (一覧はバッファ変化時に選択ハイライトのみ即解除され、一覧テキストは次のプランが届くまで残る
+  という「表示」節の規範と整合する)。
+- 一覧テキストを消すのは、一覧そのものを畳む操作のときだけである:
+  空バッファ / `min-input` による抑止、dismiss、確定(挿入)、行の確定と初期化、
+  履歴メニューを開く操作、worker session failure、および
+  いま有効な `input_generation` に束縛された `store` が `superseded` 以外の `error` で終端したとき
+  (`../contracts/cli-protocol.md`「応答の検証と zsh 側の適用(規範)」節)。
 - fork 側の衛生(コードに固定): 継承フック(precmd / preexec / chpwd /
   zshaddhistory / periodic / zshexit)と zle-* フックを無効化し、`SAVEHIST=0` で
   実履歴を保護する。候補データは zpty の擬似端末を経由せず、
@@ -269,15 +320,18 @@ zsh は zle 統合・compsys 呼び出しによる捕獲・プランの適用
 - 解析済みの候補を保持するのは worker の `cache` スロットである(cli-protocol.md「要求と応答」節)。
   zsh が保持するのは**フィンガープリント・保存時刻・`cache` スロットの candidate store latch**
   (現 worker session が保持している generation)の 3 つだけで、生の捕獲 payload は保持しない。
-- 検証は使用時に行う。
+- 検証は入力通知を作る時点で行う。
   ヒットの条件は次の 3 つがすべて成り立つこと:
   **フィンガープリント**(`$PATH` 文字列 + PATH 各ディレクトリの
   mtime + 関数・エイリアス・ビルトインの個数。`autocd` 有効または PATH に相対要素が
   ある場合のみ `$PWD` を含める)の一致、**TTL 300 秒**(固定値)以内、latch が有効であること。
-- ヒット時は compsys の fork も `store` も行わず、latch が指す generation を参照する `plan` 要求だけを送る
+- ヒット時は latch が指す generation を通知の `candidate_generation` に載せる。
+  worker がそれを保持していれば、収集も `store` も起こらないまま `plan-ready` が返る
   (payload の転送も再解析も起こらない)。
-- ミス時は通常どおり収集し、成功時に新しい generation を `cache` スロットへ `store` してから
-  フィンガープリント・保存時刻・latch を更新する。
+  worker が保持していなければ `capture-required` が返るため、zsh は latch を無効化して通常の収集へ落ちる。
+- ミス時は通知の `candidate_generation` を `0` として送り、返る `capture-required` で通常どおり収集する。
+  収集の `store` が `ok` で終端した時点で、フィンガープリント・保存時刻・latch を更新する
+  (`superseded` や他の `error` で終端した `store` では更新しない)。
   worker session を失った後は latch が無効なため、フィンガープリントと TTL が有効でもミスとして再収集する
   (latch の無効化点は「worker ライフサイクル」節)。
 - 既知の癖: compsys が補完関数を遅延ロードすると関数個数が増え、直後の 1 回だけ
@@ -285,7 +339,7 @@ zsh は zle 統合・compsys 呼び出しによる捕獲・プランの適用
 
 ## マッチング
 
-- 常駐 Rust worker の `plan` 要求処理が担う。ティア序列は
+- 常駐 Rust worker のプラン計算(`plan` 要求の処理と入力通知の settle)が担う。ティア序列は
   **prefix > substring > edit(誤字許容)> fuzzy(部分列)** で、`mode` が
   どのティアまで拾うかの上限を決める。prefix / substring は literal、edit / fuzzy は
   approximate とする。`mode` が許す literal マッチが 1 件以上あれば approximate マッチを
@@ -309,8 +363,8 @@ zsh は zle 統合・compsys 呼び出しによる捕獲・プランの適用
   worker が補完一覧ではランキング上位 `rows × 8` 件、履歴一覧では先頭 `rows` 件
   (それぞれのレイアウトが取り得る最大容量)までをレイアウト対象に取る
   (Rust 内部の上限。プロトコルには現れない)。
-- 補完一覧の要求(`store` と `plan`)は、収集完了後の非同期結果経路から worker へ送る。
-  応答は worker stdout の `zle -F` コールバックで受け、キー入力を同期的に待たせない
+- 補完一覧の入力通知は変化の検知と同時に、`store` 要求は収集完了後の非同期結果経路から worker へ送る。
+  応答と worker event は worker stdout の `zle -F` コールバックで受け、キー入力を同期的に待たせない
   (「入力は決してブロックしない」原則)。
   例外は履歴メニューで、こちらは select-prev の押下時に同期実行する(「履歴メニュー」節)。
   ディレクトリ合成 `/` 判定のための stat(cli-protocol.md「挿入テキスト」節)は
@@ -320,9 +374,9 @@ zsh は zle 統合・compsys 呼び出しによる捕獲・プランの適用
   候補テキスト中の制御バイト(C0 と DEL)のスペース置換も Rust worker が行う正規化であり
   (改行が消えることで表示が 1 行化される。規範は cli-protocol.md「表示行の中身」節)、
   挿入テキストは原文のまま返る。
-- 端末リサイズ時: 描画プランは要求時点の `rows` / `width` に基づくスナップショットであり、
+- 端末リサイズ時: 描画プランは通知・要求の時点の `rows` / `width` に基づくスナップショットであり、
   リサイズ直後に自動で再計算されることはない。
-  次の `plan` 要求までのレイアウトのズレは仕様外として許容する。
+  次のプランが届くまでのレイアウトのズレは仕様外として許容する。
 - 装飾は `[display.highlight]` の 4 種(selected / match / heading / history-number)。
   match と history-number の装飾は選択中セルには適用しない
   (実現方法は cli-protocol.md「ハイライト」節: 選択変更のたびに
@@ -353,7 +407,7 @@ zsh は zle 統合・compsys 呼び出しによる捕獲・プランの適用
 - select-left / select-right は選択中のみ列ジャンプ(グリッド行数ぶん移動、
   グループ範囲でクランプ)。
 - dismiss は一覧を閉じる(バッファには触らない)。
-- 選択移動・列ジャンプの実現は、直前の plan 応答が返したナビゲーション表
+- 選択移動・列ジャンプの実現は、直前に適用したプランのナビゲーション表
   (位置ごとの next/prev/left/right。cli-protocol.md)を参照するだけで完結する。
   再収集・再計算は伴わない。
   補完一覧では select-next が `next`、select-prev が `prev` に対応する
@@ -370,11 +424,13 @@ zsh は zle 統合・compsys 呼び出しによる捕獲・プランの適用
   補完一覧を表示中でも、非選択なら履歴メニューが開いて補完一覧を置き換える。
   ctrl-p も既定で同じ挙動になる。ctrl-p を素の履歴移動のまま使いたい場合は
   keybind 設定で select-prev から外す(config-schema.md `[keybind]`)。
-- **開くときの遷移**は不可分に行う: デバウンス待ちのタイマーを解除し、進行中の収集をキャンセルし、
+- **開くときの遷移**は不可分に行う: 現在の `input_generation` を無効化し、
+  未委譲の `input` / `flush` frame を queue から取り除き、進行中の収集をキャンセルし、
   現在の一覧とプランを破棄してから、index の同期確認・(必要なら)snapshot の合成・
   同期 worker 交換・履歴一覧としての表示・位置 1 の選択までを一度に確定させる。
-  キャンセルされた収集の結果は後から届いても表示に使わない(「候補収集」節)ため、
-  遅れて到着した補完結果が履歴メニューを置き換えることはない。
+  キャンセルされた収集の結果は後から届いても表示に使わない(「候補収集」節)。
+  無効化した generation の worker event も同じく捨てるため、
+  同期区間の中で受け取った event を含め、遅れて到着した補完結果が履歴メニューを置き換えることはない。
 - 履歴候補は worker が保持する history index から得る(「worker ライフサイクル」節)。
   開く操作は同期区間の入口で index の同期状態を判定し、2 つの経路のどちらかを取る。
   - **cold**(latch が無効、または index が dirty): zsh がメモリ上の履歴から snapshot payload を合成し
@@ -452,7 +508,11 @@ zsh は zle 統合・compsys 呼び出しによる捕獲・プランの適用
   (先行する `history-snapshot` の終端応答はその途中で消費する)。
   受信済みで未処理の後続応答は同期待ちの中では処理せず、非同期経路が引き取る。
 - 同期待ちの間に先行する非同期要求の応答を受けた場合も通常どおり終端まで読み、stale なら破棄して
-  `plan` 要求の request_id を待ち続ける。先行要求の outbound queue 送信と直列処理に費やす時間も同じ deadline を消費する。
+  `plan` 要求の request_id を待ち続ける。
+  同期区間に入る前に現在の `input_generation` を無効化しているため、
+  この間に届く worker event はすべて generation 不一致として捨てる
+  (プランの解析も捕獲の開始もしない)。
+  先行要求の outbound queue 送信と直列処理に費やす時間も同じ deadline を消費する。
   deadline を要求ごと・write/read ごとに延長しない。超過時は worker プロセスを終了させて消滅を確認し、
   watcher を解除して pipe fd を閉じてから、その session の未完了要求をすべて破棄する。自動 replay しない
   (連続失敗の扱いは「worker ライフサイクル」)。
@@ -506,10 +566,16 @@ zsh は zle 統合・compsys 呼び出しによる捕獲・プランの適用
   (確定ではない。挿入後は通常フローの再収集に任せる)。
   伸びない場合は先頭候補を確定挿入する(insert と同じ確定動作)。
 - pending Tab の結果が候補 0 件なら何もしない。選択中の Tab は確定。
-- 候補未着時(収集中・デバウンス待ち)の Tab は押下を記録して収集を前倒しし、
-  結果到着時に上記の挙動を適用する。素の compsys への同期フォールバックはしない。
-- 一覧がなく、収集中でもデバウンス待ちでもない静止状態の Tab は、
-  前任者チェーン(素の補完など)へフォールバックする。
+- 候補未着時の Tab は押下を記録し、結果到着時に上記の挙動を適用する。
+  素の compsys への同期フォールバックはしない。
+  - 現在の `input_generation` の worker event をまだ受けていない(静穏期間中の)場合は、
+    その generation の `flush` を送って静穏期間を打ち切らせる。
+    worker は直ちに settle し、候補を保持していれば `plan-ready` を、
+    必要なら待たずに `capture-required` を返す(cli-protocol.md「入力通知と worker event」節)。
+  - 既に `capture-required` を受けて収集中の場合は、押下の記録だけを行う(収集自体が前倒しの結果である)。
+- 一覧がなく、event 待ちの `input_generation` も進行中の収集も無い静止状態の Tab は、
+  前任者チェーン(素の補完など)へフォールバックする
+  (候補 0 件の結果を受け取った後もこの静止状態である)。
 
 ## 確定(挿入)
 
@@ -526,7 +592,7 @@ zsh は zle 統合・compsys 呼び出しによる捕獲・プランの適用
 - 履歴候補の確定は行全体の置き換え: `BUFFER` を挿入テキストで置き換え、`CURSOR` を末尾に置く
   (適用規則は cli-protocol.md「適用」節)。
 - 確定後は一覧をいったん消去し、確定による挿入も通常のバッファ変化として扱って
-  再収集をトリガする(デバウンス経由)。trailing-space 付き確定なら次の引数位置、
+  新しい入力通知を送る(静穏期間は worker が測る)。trailing-space 付き確定なら次の引数位置、
   `/` 合成なら当該ディレクトリ内容の候補が非同期で表示される。
 
 ## 設定の反映と警告
