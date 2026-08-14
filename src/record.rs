@@ -51,6 +51,7 @@ pub(crate) struct Batch<'a> {
     pub i_hidden: &'a [u8], // I
     pub ip: &'a [u8],       // ip: IPREFIX
     pub f: &'a [u8],        // f: "1" if a file candidate
+    pub es: &'a [u8],       // es: "1" if `-S` was explicitly given (any value)
     pub rd: &'a [u8],       // rd: real directory (for `-f` "/" synthesis)
     pub x: &'a [u8],        // X: group heading text
     pub j: &'a [u8],        // J: group name
@@ -95,6 +96,7 @@ struct BatchSpans {
     i_hidden: ByteSpan,
     ip: ByteSpan,
     f: ByteSpan,
+    es: ByteSpan,
     rd: ByteSpan,
     x: ByteSpan,
     j: ByteSpan,
@@ -155,6 +157,7 @@ impl Candidates for Stored {
                 i_hidden: self.slice(spans.i_hidden),
                 ip: self.slice(spans.ip),
                 f: self.slice(spans.f),
+                es: self.slice(spans.es),
                 rd: self.slice(spans.rd),
                 x: self.slice(spans.x),
                 j: self.slice(spans.j),
@@ -271,6 +274,7 @@ fn parse_batch_fields<'a>(fields: impl Iterator<Item = (&'a [u8], ByteSpan)>) ->
     let mut i_hidden = None;
     let mut ip = None;
     let mut f = None;
+    let mut es = None;
     let mut rd = None;
     let mut x = None;
     let mut j = None;
@@ -284,6 +288,7 @@ fn parse_batch_fields<'a>(fields: impl Iterator<Item = (&'a [u8], ByteSpan)>) ->
             b"I" => &mut i_hidden,
             b"ip" => &mut ip,
             b"f" => &mut f,
+            b"es" => &mut es,
             b"rd" => &mut rd,
             b"X" => &mut x,
             b"J" => &mut j,
@@ -303,6 +308,7 @@ fn parse_batch_fields<'a>(fields: impl Iterator<Item = (&'a [u8], ByteSpan)>) ->
         i_hidden: i_hidden.unwrap_or_default(),
         ip: ip.unwrap_or_default(),
         f: f.unwrap_or_default(),
+        es: es.unwrap_or_default(),
         rd: rd.unwrap_or_default(),
         x: x.unwrap_or_default(),
         j: j.unwrap_or_default(),
@@ -345,7 +351,7 @@ mod tests {
     fn parser_byte() -> impl Strategy<Value = u8> {
         prop_oneof![
             6 => prop::sample::select(vec![REC_SEP, TAG_SEP, FIELD_SEP]),
-            6 => prop::sample::select(b"bwPpSsiIfrdXJmdn".to_vec()),
+            6 => prop::sample::select(b"bwPpSsiIfesrdXJmdn".to_vec()),
             1 => any::<u8>(),
         ]
     }
@@ -381,8 +387,8 @@ mod tests {
 
     /// Tag order of `BatchSpans` / [`Batch`], for indexing a generated
     /// header's shared values against the parsed views.
-    const SHARED_TAGS: [&[u8]; 11] = [
-        b"P", b"p", b"S", b"s", b"i", b"I", b"ip", b"f", b"rd", b"X", b"J",
+    const SHARED_TAGS: [&[u8]; 12] = [
+        b"P", b"p", b"S", b"s", b"i", b"I", b"ip", b"f", b"es", b"rd", b"X", b"J",
     ];
 
     #[derive(Debug)]
@@ -474,7 +480,7 @@ mod tests {
             for (batch_index, (spec, view)) in batches.iter().zip(&views).enumerate() {
                 let shared: [&[u8]; SHARED_TAGS.len()] = [
                     view.p_vis, view.p_hidden, view.s_vis, view.s_hidden,
-                    view.i_vis, view.i_hidden, view.ip, view.f,
+                    view.i_vis, view.i_hidden, view.ip, view.f, view.es,
                     view.rd, view.x, view.j,
                 ];
                 for ((tag, expected), actual) in SHARED_TAGS.iter().zip(&spec.shared).zip(shared) {
@@ -568,6 +574,7 @@ mod tests {
             field("I", "i2"),
             field("ip", "ipre"),
             field("f", "1"),
+            field("es", "1"),
             field("rd", "/real"),
             field("X", "heading"),
             field("J", "group"),
@@ -584,6 +591,7 @@ mod tests {
         assert_eq!(b.i_hidden, b"i2");
         assert_eq!(b.ip, b"ipre");
         assert_eq!(b.f, b"1");
+        assert_eq!(b.es, b"1");
         assert_eq!(b.rd, b"/real");
         assert_eq!(b.x, b"heading");
         assert_eq!(b.j, b"group");
