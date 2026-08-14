@@ -65,7 +65,7 @@ fi
 # ---------------------------------------------------------------- Global state
 typeset -g  ZRUSH_BIN=${ZRUSH_BIN:-}
 typeset -gi _zrush_enabled=0
-typeset -gi _ZRUSH_EXPECTED_PROTO=7
+typeset -gi _ZRUSH_EXPECTED_PROTO=8
 typeset -g  _zrush_cfg_path= _zrush_cfg_mtime=
 # Shell-session state intentionally survives a manual re-source.
 typeset -gi _zrush_request_seq=${_zrush_request_seq:-0}
@@ -341,8 +341,9 @@ typeset -ga _ZRUSH_COMPADD_SPEC=(
 # Pure encoder for one compadd call: argv plus the captured candidate arrays in,
 # wire bytes out. Emits the compsys 捕獲 profile wire format (cli-protocol.md
 # "compsys 捕獲 profile"):
-# one batch header record (tag `b`, then whichever of P/p/S/s/i/I/ip/f/rd/X/J are
-# non-empty) followed by one thin record per candidate (`w`, optional `m` only
+# one batch header record (tag `b`, then whichever of P/p/S/s/i/I/ip/f/es/rd/X/J
+# apply -- `es` on `-S` being *specified*, the rest when non-empty) followed by
+# one thin record per candidate (`w`, optional `m` only
 # when it differs from `w`, optional `d`). Batch NUL-terminated records once per
 # compadd call because per-record writes caused one read per record and
 # measurably degraded large candidate sets.
@@ -400,10 +401,9 @@ _zrush_encode_batch() {
   [[ -n $_vals[5] ]]  && _hdr+=( "i"$'\1'"$_vals[5]" )
   [[ -n $_vals[6] ]]  && _hdr+=( "I"$'\1'"$_vals[6]" )
   [[ -n $_vals[7] ]]  && _hdr+=( "ip"$'\1'"$_vals[7]" )
-  if (( $#isfile )); then
-    _hdr+=( "f"$'\1'"1" )
-    [[ -n $_vals[8] ]] && _hdr+=( "rd"$'\1'"$_vals[8]" )
-  fi
+  (( $#isfile )) && _hdr+=( "f"$'\1'"1" )
+  (( $#asuf )) && _hdr+=( "es"$'\1'"1" )
+  (( $#isfile )) && [[ -n $_vals[8] ]] && _hdr+=( "rd"$'\1'"$_vals[8]" )
   [[ -n $_vals[9] ]]  && _hdr+=( "X"$'\1'"$_vals[9]" )
   [[ -n $_vals[10] ]] && _hdr+=( "J"$'\1'"$_vals[10]" )
   local _out="${(pj:\2:)_hdr}"$'\0'

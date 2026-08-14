@@ -18,8 +18,9 @@ use crate::record::{Batch, Candidate};
 /// `is_dir(path)` answers "does `path`, resolved against the current
 /// directory with symlinks followed, exist and name a directory?"
 /// (cli-protocol.md: stat failure or a non-directory both read as
-/// `false`). Called at most once, and only when `batch.f == "1"` and the
-/// plain concatenation doesn't already end in `/`.
+/// `false`). Called at most once, and only when `batch.f == "1"`, `es`
+/// is absent, `s` is empty, and `w` doesn't already end in `/`
+/// (cli-protocol.md "挿入テキスト").
 pub(crate) fn build(
     batch: &Batch<'_>,
     candidate: &Candidate<'_>,
@@ -27,24 +28,25 @@ pub(crate) fn build(
     is_dir: &dyn Fn(&[u8]) -> bool,
 ) -> Vec<u8> {
     // Concatenation order is the contract's, not record.rs's field
-    // names: ip, i(i_vis), P(p_vis), p(p_hidden), w, s(s_hidden),
-    // S(s_vis), I(i_hidden).
+    // names: ip, i(i_vis), P(p_vis), p(p_hidden), w, [synthesized /],
+    // s(s_hidden), S(s_vis), I(i_hidden) -- the synthesized `/`, when
+    // present, lands right after `w` and before every suffix.
     let mut out = Vec::new();
     out.extend_from_slice(batch.ip);
     out.extend_from_slice(batch.i_vis);
     out.extend_from_slice(batch.p_vis);
     out.extend_from_slice(batch.p_hidden);
     out.extend_from_slice(candidate.w);
-    out.extend_from_slice(batch.s_hidden);
-    out.extend_from_slice(batch.s_vis);
-    out.extend_from_slice(batch.i_hidden);
 
-    // nospace: any visible/hidden/ignored suffix is present, or a `/`
-    // got synthesized below (cli-protocol.md "末尾スペース").
-    let mut nospace =
-        !batch.s_vis.is_empty() || !batch.s_hidden.is_empty() || !batch.i_hidden.is_empty();
-
-    if batch.f == b"1" && !out.ends_with(b"/") {
+    // Synthesis is suppressed whenever an explicit suffix would already
+    // supply the boundary: `es` present (an explicit `-S`, value
+    // irrelevant) or `s` non-empty (cli-protocol.md "挿入テキスト").
+    let mut synthesized = false;
+    if batch.f == b"1"
+        && batch.es.is_empty()
+        && batch.s_hidden.is_empty()
+        && !candidate.w.ends_with(b"/")
+    {
         // stat path = rd + match-text, raw bytes (cli-protocol.md
         // "合成 `/`"); match-text prefers `m`, falling back to `w`.
         let mut path = Vec::with_capacity(batch.rd.len() + candidate.match_text().len());
@@ -52,9 +54,20 @@ pub(crate) fn build(
         path.extend_from_slice(candidate.match_text());
         if is_dir(&path) {
             out.push(b'/');
-            nospace = true;
+            synthesized = true;
         }
     }
+
+    out.extend_from_slice(batch.s_hidden);
+    out.extend_from_slice(batch.s_vis);
+    out.extend_from_slice(batch.i_hidden);
+
+    // nospace: any visible/hidden/ignored suffix is present, or a `/`
+    // got synthesized above (cli-protocol.md "末尾スペース").
+    let nospace = synthesized
+        || !batch.s_vis.is_empty()
+        || !batch.s_hidden.is_empty()
+        || !batch.i_hidden.is_empty();
 
     if trailing_space && !nospace {
         out.push(b' ');
@@ -186,6 +199,83 @@ mod tests {
         };
         let c = cand(b"word", None);
         build(&batch, &c, true, &never_called);
+    }
+
+    #[test]
+    fn explicit_visible_suffix_suppresses_slash_synthesis() {
+        // `-S ' '` (git-worktree-remove-style): `es = 1`, `S` non-empty.
+        let batch = Batch {
+            f: b"1",
+            es: b"1",
+            s_vis: b" ",
+            rd: b"/proj/",
+            ..Batch::default()
+        };
+        let c = cand(b"mydir", None);
+        let out = build(&batch, &c, true, &never_called);
+        assert_eq!(out, b"mydir ");
+    }
+
+    #[test]
+    fn explicit_empty_visible_suffix_still_suppresses_slash_synthesis() {
+        // `-S ''`: `es = 1` even though the value itself is empty, which
+        // is the asymmetry with `-s ''` fixed below.
+        let batch = Batch {
+            f: b"1",
+            es: b"1",
+            rd: b"/proj/",
+            ..Batch::default()
+        };
+        let c = cand(b"mydir", None);
+        let out = build(&batch, &c, true, &never_called);
+        // `S` itself is empty, so it doesn't contribute to nospace; only
+        // `/`-synthesis is suppressed here.
+        assert_eq!(out, b"mydir ");
+    }
+
+    #[test]
+    fn nonempty_hidden_suffix_suppresses_slash_synthesis() {
+        // `-s ' '`: no `es` (only `-S` sets it), but `s` is non-empty.
+        let batch = Batch {
+            f: b"1",
+            s_hidden: b" ",
+            rd: b"/proj/",
+            ..Batch::default()
+        };
+        let c = cand(b"mydir", None);
+        let out = build(&batch, &c, true, &never_called);
+        assert_eq!(out, b"mydir ");
+    }
+
+    #[test]
+    fn empty_hidden_suffix_does_not_suppress_slash_synthesis_unlike_empty_visible_suffix() {
+        // `-s ''`: `s` is present but empty, so it does not count as
+        // "non-empty" and does not suppress synthesis -- unlike `-S ''`
+        // (`explicit_empty_visible_suffix_still_suppresses_slash_synthesis`),
+        // which suppresses it via `es` regardless of value.
+        let batch = Batch {
+            f: b"1",
+            rd: b"/proj/",
+            ..Batch::default()
+        };
+        let c = cand(b"mydir", None);
+        let out = build(&batch, &c, true, &|_| true);
+        assert_eq!(out, b"mydir/");
+    }
+
+    #[test]
+    fn synthesized_slash_lands_before_ignored_suffix() {
+        // `-I ' '`: synthesis still runs, and the `/` lands right after
+        // `w`, ahead of the ignored suffix `I`.
+        let batch = Batch {
+            f: b"1",
+            i_hidden: b" ",
+            rd: b"/proj/",
+            ..Batch::default()
+        };
+        let c = cand(b"mydir", None);
+        let out = build(&batch, &c, true, &|_| true);
+        assert_eq!(out, b"mydir/ ");
     }
 
     #[test]

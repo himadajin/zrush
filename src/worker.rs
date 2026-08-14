@@ -411,7 +411,7 @@ mod tests {
 
     #[test]
     fn handshake_and_multiple_requests_share_one_session() {
-        let hello = message(&[b"hello", b"7"]);
+        let hello = message(&[b"hello", b"8"]);
         let first = request(b"1", b"/", b"");
         let second = request(b"2", b"/", b"");
         let input = [hello, message(&first), message(&second)].concat();
@@ -419,7 +419,7 @@ mod tests {
 
         assert_eq!(run(Cursor::new(input), &mut output).unwrap(), End::Eof);
         let decoded = messages(&output);
-        assert_eq!(decoded[0], [b"ready".to_vec(), b"7".to_vec()]);
+        assert_eq!(decoded[0], [b"ready".to_vec(), b"8".to_vec()]);
         assert_eq!(&decoded[1][..2], [b"ok".as_slice(), b"1".as_slice()]);
         assert_eq!(&decoded[2][..2], [b"ok".as_slice(), b"2".as_slice()]);
         assert_eq!(decoded[1][2], b"\0\x30\0\x30\0\x30\0");
@@ -434,14 +434,14 @@ mod tests {
         );
         assert_eq!(
             messages(&output),
-            [vec![b"incompatible".to_vec(), b"7".to_vec()]]
+            [vec![b"incompatible".to_vec(), b"8".to_vec()]]
         );
     }
 
     #[test]
     fn correlatable_shape_and_payload_errors_are_in_band() {
-        let hello = message(&[b"hello", b"7"]);
-        let bad_shape = message(&[b"other", b"7"]);
+        let hello = message(&[b"hello", b"8"]);
+        let bad_shape = message(&[b"other", b"8"]);
         let bad_payload = message(&request(b"8", b"/", b"unterminated"));
         let mut output = Vec::new();
 
@@ -453,10 +453,10 @@ mod tests {
         assert_eq!(
             messages(&output),
             [
-                vec![b"ready".to_vec(), b"7".to_vec()],
+                vec![b"ready".to_vec(), b"8".to_vec()],
                 vec![
                     b"error".to_vec(),
-                    b"7".to_vec(),
+                    b"8".to_vec(),
                     b"invalid-request".to_vec()
                 ],
                 vec![
@@ -475,7 +475,7 @@ mod tests {
             vec![b"plan".as_slice(), b"01".as_slice()],
             vec![b"plan".as_slice(), b"9223372036854775808".as_slice()],
         ] {
-            let input = [message(&[b"hello", b"7"]), message(&fields)].concat();
+            let input = [message(&[b"hello", b"8"]), message(&fields)].concat();
             let mut output = Vec::new();
             assert!(matches!(
                 run(Cursor::new(input), &mut output),
@@ -488,7 +488,7 @@ mod tests {
     #[test]
     fn completed_prefix_is_written_before_later_outer_corruption() {
         let input = [
-            message(&[b"hello", b"7"]),
+            message(&[b"hello", b"8"]),
             message(&request(b"1", b"/", b"")),
             b"1:x!".to_vec(),
         ]
@@ -504,7 +504,7 @@ mod tests {
     #[test]
     fn nested_framing_corruption_is_fatal() {
         let malformed_nested = framing::encode(b"4:plan,1:1");
-        let input = [message(&[b"hello", b"7"]), malformed_nested].concat();
+        let input = [message(&[b"hello", b"8"]), malformed_nested].concat();
         let mut output = Vec::new();
         let Err(Error::Framing(error)) = run(Cursor::new(input), &mut output) else {
             panic!("expected a framing error");
@@ -520,7 +520,7 @@ mod tests {
         };
         assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
 
-        let Err(Error::Io(error)) = run(Cursor::new(message(&[b"hello", b"7"])), FailingWriter)
+        let Err(Error::Io(error)) = run(Cursor::new(message(&[b"hello", b"8"])), FailingWriter)
         else {
             panic!("expected an I/O error");
         };

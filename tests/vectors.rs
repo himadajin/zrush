@@ -192,7 +192,7 @@ fn run_vector_raw(path: &Path) -> std::process::Output {
         .stdin
         .take()
         .expect("vector child stdin")
-        .write_all(&[msg(&[b"hello", b"7"]), request].concat());
+        .write_all(&[msg(&[b"hello", b"8"]), request].concat());
     if let Err(error) = write_result {
         assert_eq!(
             error.kind(),
@@ -390,7 +390,7 @@ fn reject_vectors_match_expected_in_band_errors() {
         };
         let valid = output.status.code() == Some(0)
             && frames.len() == 2
-            && decode_fields_strict(&frames[0]) == vec![b"ready".to_vec(), b"7".to_vec()]
+            && decode_fields_strict(&frames[0]) == vec![b"ready".to_vec(), b"8".to_vec()]
             && decode_fields_strict(&frames[1])
                 == vec![b"error".to_vec(), b"1".to_vec(), expected.to_vec()];
         if !valid {

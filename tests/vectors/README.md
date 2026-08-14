@@ -60,6 +60,7 @@ These vectors exist because the guarantees below are the sender's, never appear 
 | `newline-in-candidate` | a newline is not a framing byte and passes through `w` and `d` unchanged |
 | `file-real-dir-tilde` | `-f` adds `f` and `rd`; `rd` is `IPREFIX` + `-p` with tilde expansion applied |
 | `file-real-dir-param` | `rd` also resolves parameter expansion, while `p` keeps the raw form |
+| `explicit-empty-visible-suffix-sets-es` | `-S ''` still emits `es = 1` -- presence of `-S`, not its value, drives `es` |
 
 `plan/encoder-chain/payload` is identical to `encode/shared-tags-all/expected`, so one byte string runs the whole chain: encoder out, decoder in.
 `zsh -f tests/zsh/vectors.zsh` fails if the two files ever diverge.
@@ -70,7 +71,7 @@ A generated `expected` is a proposal, not an answer -- read it against cli-proto
 
 ## Who checks what
 
-`cargo test` checks `plan/`, `reject/`, and `reject-plan/` against the Rust worker and the `wire` reference parser. Reject vectors structurally validate exactly `[ready,7]` plus one terminal in-band `error`; no process exit 2/3 compatibility is tested.
+`cargo test` checks `plan/`, `reject/`, and `reject-plan/` against the Rust worker and the `wire` reference parser. Reject vectors structurally validate exactly `[ready,8]` plus one terminal in-band `error`; no process exit 2/3 compatibility is tested.
 Both runners independently implement the file format above, check every corpus file for canonical spelling, and hold their own codec to a round trip over arbitrary byte strings.
 `zsh -f tests/zsh/vectors.zsh` checks `encode/` against the zsh encoder `_zrush_encode_batch`,
 the history sender's line/event-number pairing and filtering against `_zrush_history_payload`,

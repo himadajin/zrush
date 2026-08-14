@@ -282,7 +282,7 @@ unset ZDOTDIR
   # ------------------------------------------------ real watchdog control byte
   reset_transport
   ZRUSH_BIN=$REAL_BIN
-  start_ready || note "real worker did not reach protocol-7 ready"
+  start_ready || note "real worker did not reach protocol-8 ready"
   typeset -gi byte_rfd=$_zrush_worker_rfd
   _zrush_worker_abort $(( EPOCHREALTIME + 2.0 )); typeset -gi byte_st=$?
   eq "abort byte status" $byte_st 0

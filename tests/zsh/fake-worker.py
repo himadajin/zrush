@@ -100,9 +100,9 @@ def worker(control_fd: int) -> None:
     session = next_session()
     note(f"start {session}")
     hello = read_netstring(sys.stdin.buffer)
-    if hello is None or fields(hello) != [b"hello", b"7"]:
+    if hello is None or fields(hello) != [b"hello", b"8"]:
         fail("bad hello")
-    sys.stdout.buffer.write(message(b"ready", b"7"))
+    sys.stdout.buffer.write(message(b"ready", b"8"))
     sys.stdout.buffer.flush()
     note(f"ready {session}")
 

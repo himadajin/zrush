@@ -35,6 +35,7 @@ pub(crate) struct Batch<'a> {
     pub i_hidden: &'a [u8], // I
     pub ip: &'a [u8],       // ip: IPREFIX
     pub f: &'a [u8],        // f: "1" if a file candidate
+    pub es: &'a [u8],       // es: "1" if `-S` was explicitly given (any value)
     pub rd: &'a [u8],       // rd: real directory (for `-f` "/" synthesis)
     pub x: &'a [u8],        // X: group heading text
     pub j: &'a [u8],        // J: group name
@@ -145,6 +146,7 @@ fn parse_batch_fields<'a>(fields: impl Iterator<Item = (&'a [u8], &'a [u8])>) ->
     let mut i_hidden = None;
     let mut ip = None;
     let mut f = None;
+    let mut es = None;
     let mut rd = None;
     let mut x = None;
     let mut j = None;
@@ -158,6 +160,7 @@ fn parse_batch_fields<'a>(fields: impl Iterator<Item = (&'a [u8], &'a [u8])>) ->
             b"I" => &mut i_hidden,
             b"ip" => &mut ip,
             b"f" => &mut f,
+            b"es" => &mut es,
             b"rd" => &mut rd,
             b"X" => &mut x,
             b"J" => &mut j,
@@ -177,6 +180,7 @@ fn parse_batch_fields<'a>(fields: impl Iterator<Item = (&'a [u8], &'a [u8])>) ->
         i_hidden: present(i_hidden),
         ip: present(ip),
         f: present(f),
+        es: present(es),
         rd: present(rd),
         x: present(x),
         j: present(j),
@@ -219,7 +223,7 @@ mod tests {
     fn parser_byte() -> impl Strategy<Value = u8> {
         prop_oneof![
             6 => prop::sample::select(vec![REC_SEP, TAG_SEP, FIELD_SEP]),
-            6 => prop::sample::select(b"bwPpSsiIfrdXJmdn".to_vec()),
+            6 => prop::sample::select(b"bwPpSsiIfesrdXJmdn".to_vec()),
             1 => any::<u8>(),
         ]
     }
@@ -324,6 +328,7 @@ mod tests {
             field("I", "i2"),
             field("ip", "ipre"),
             field("f", "1"),
+            field("es", "1"),
             field("rd", "/real"),
             field("X", "heading"),
             field("J", "group"),
@@ -340,6 +345,7 @@ mod tests {
         assert_eq!(b.i_hidden, b"i2");
         assert_eq!(b.ip, b"ipre");
         assert_eq!(b.f, b"1");
+        assert_eq!(b.es, b"1");
         assert_eq!(b.rd, b"/real");
         assert_eq!(b.x, b"heading");
         assert_eq!(b.j, b"group");

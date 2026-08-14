@@ -7,7 +7,7 @@ use crate::layout;
 
 /// Protocol version shared by config output and the worker handshake
 /// (cli-protocol.md "プロトコル版").
-pub(crate) const PROTOCOL_VERSION: &str = "7";
+pub(crate) const PROTOCOL_VERSION: &str = "8";
 
 /// Incremental, overflow-checked ASCII decimal accumulation shared by the
 /// protocol's complete-field parsers and streaming netstring decoder.

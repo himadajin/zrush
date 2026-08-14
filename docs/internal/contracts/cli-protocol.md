@@ -18,7 +18,7 @@ zrush.zsh(zsh 側)と `zrush` バイナリ(Rust 側)の入出力仕様。
 
 > 検証: 版番号のコピーの一致 — `src/wire.rs` のテスト `protocol_version_matches_docs_and_zsh`。
 
-- **PROTOCOL_VERSION = 7**
+- **PROTOCOL_VERSION = 8**
 - `zrush config` の出力に `ZRUSH_PROTOCOL_VERSION` が含まれる。
   zrush.zsh は自身が期待する版番号と照合し、不一致なら警告を 1 回表示して zrush を無効化する。
   zrush.zsh はバイナリに埋め込まれて配布される(「zrush init」節)ため、
@@ -55,9 +55,11 @@ zrush.zsh(zsh 側)と `zrush` バイナリ(Rust 側)の入出力仕様。
    (形式は `tests/vectors/README.md`)。
    `tests/vectors/reject-plan/` は生成物ではないので手で書く。
 4. zsh 側のランナーと E2E ドライバを通す:
-   `zsh -f tests/zsh/vectors.zsh` と、`cargo build --release` の後に
+   `zsh -f tests/zsh/vectors.zsh`、`zsh -f tests/zsh/transport.zsh` と、`cargo build --release` の後に
    `zsh -f tests/zsh/driver.zsh <playground-dir>`
    (`zsh/` に触れる変更なので `tests/zsh/driver-coexist.zsh` も。AGENTS.md「Build and test」)。
+   これらは `cargo test` の外なので、追従漏れは手順 2 の落ちたテスト一覧には現れない。
+   握手を演じる `tests/zsh/fake-worker.py` にも版番号のコピーがあり、`transport.zsh` はこれ経由で落ちる。
 5. 版番号を名指ししている記述(`grep -rnE '\bv[0-9]+\b' src zsh tests docs`)を確認する。
    どのテストも検出しないので、ここだけは手で追従させる。
 
@@ -167,8 +169,8 @@ message   = netstring(netstring(field-1) ... netstring(field-N))
 zsh は kind・フィールド数・版番号が完全一致する `ready` を受けたときだけセッションを利用する。
 
 ```
-hello:        ["hello", "7"]
-ready:        ["ready", "7"]
+hello:        ["hello", "8"]
+ready:        ["ready", "8"]
 incompatible: ["incompatible", worker_version]
 ```
 
@@ -262,10 +264,16 @@ worker セッション失敗には数えない。`ok` の `render_plan` は後�
 
 - 第 1 フィールドはタグ `b`(値は空)。
 - 続けて、そのバッチに属する候補が共有するフィールドのうち非空のものを載せる:
-  `P` `p` `S` `s` `i` `I` `ip` `f` `rd` `X` `J`。
+  `P` `p` `S` `s` `i` `I` `ip` `f` `es` `rd` `X` `J`。
   - `P` / `p` / `S` / `s` / `i` / `I`: 可視・隠しの接頭辞/接尾辞。
   - `ip`: 挿入テキストの最も外側に置く接頭辞。
   - `f`(値 `1`): ファイル候補であることを示す。
+  - `es`(値 `1`): 明示サフィックス指定があることを示す。
+    「そのバッチに可視サフィックス(`S`)が明示的に指定された」ことを意味し、
+    値の空・非空とは独立である(`S` が空文字列でも `es = 1` になる。
+    `S` が非空なら `es` は必ず存在する)。隠しサフィックス(`s`)は `es` に関与しない。
+    ファイル候補の合成 `/` を抑止する(「挿入テキスト」節)。
+    該当しないときはフィールドを発行しない。
   - `rd`: チルダ・パラメータ展開済みの実ディレクトリ(ファイル候補の合成 `/` 判定に使う)。
   - `X`: グループ見出し文字列。`J`: グループ名。
     グループキーの決定規則は `render_plan`「表示行の中身」節。
@@ -315,6 +323,9 @@ zpty 内で compsys を駆動して得る payload(behavior.md「候補収集」�
 - compadd 呼び出し 1 回が 1 バッチに対応する。
 - 共有フィールドの写像: `P` `p` `S` `s` `i` `I` `X` `J` は compadd の
   `-P` `-p` `-S` `-s` `-i` `-I` `-X` `-J`、`ip` は `IPREFIX`。
+- `es` は compadd の `-S` の**指定有無**から来る:
+  `-S` が指定されていれば(値が空文字列 `-S ''` であっても)`es = 1` を発行し、
+  指定されていなければ発行しない。`-s` の指定有無は `es` に影響しない。
 - 重複候補(同一の match-text/display-text 組)は除去せずそのまま送ってよい。
 - 制御バイト(`\0` `\1` `\2`)を含む候補・値の除外は fork 内の compadd フックが保証する。
 - ワーカーの pid レコード(`pid\1<pid>\0` としてストリーム先頭に流れる)は、
@@ -500,17 +511,22 @@ NUL(`\0`)終端フィールドの平坦列。数値は ASCII 10 進表記。順�
 #### 挿入テキスト
 
 > 検証(この節のうち、上の節のゴールデンが届かない `/` 合成の判定):
-> 連結順・stat パス(`rd` + match-text)の構築・`f` が `1` でない候補を stat しないこと・nospace 条件 — `src/insert.rs` の単体テスト(`is_dir` を注入する)。
+> 連結順・合成 `/` の挿入位置・stat パス(`rd` + match-text)の構築・`f` が `1` でない候補と
+> 抑止条件(`es = 1` / `s` が非空)に該当するバッチを stat しないこと・nospace 条件 —
+> `src/insert.rs` の単体テスト(`is_dir` を注入する)。
 > stat するのは表示位置として採用された `f = 1` の候補だけであること、および stat 失敗・非ディレクトリ時の扱い — `src/plan.rs`。
 > 実ファイルシステムに対する `/` 合成 — `tests/cli.rs`。
 
 - 位置ごとに、確定時にそのまま使える完成済みの挿入テキストを 1 個ずつ返す。
 - 構築規則: `ip + i + P + p + w + s + S + I` の連結
   (バッチヘッダの共有フィールド + その候補固有の `w`)。
-- `f = 1` かつ連結結果の末尾が `/` でない候補は、`rd` と match-text
-  (`m` があれば `m`、なければ `w`)の生バイト列を連結したパスを、
+  ディレクトリ合成 `/` は `w` の**直後**、すなわち `s` / `S` / `I` のいずれよりも前に入るため、
+  合成する場合の連結は `ip + i + P + p + w + / + s + S + I` になる。
+- `f = 1` かつ `es` が不在(可視サフィックスの明示指定が無い)かつ `s` が空
+  かつ `w` の末尾が `/` でない候補は、`rd` と match-text(`m` があれば `m`、なければ `w`)の生バイト列を連結したパスを、
   plan 要求の `cwd` を基準に、シンボリックリンクを追跡して stat する。
   stat が失敗する場合・対象がディレクトリでない場合は `/` を合成しない。
+  `es = 1` のバッチ、および `s` が非空のバッチの候補は、`f = 1` であっても stat せず `/` を合成しない。
   この判定はプラン計算時点のスナップショットであり、zsh は確定時に再検証しない
   (該当ディレクトリがプラン計算後に削除・変更されていても、返された挿入テキストをそのまま使う)。
 - 末尾スペースは `trailing_space = true` かつ nospace 条件
@@ -662,7 +678,7 @@ zrush config
 ### stdout(zsh source 形式)
 
 ```zsh
-typeset -g  ZRUSH_PROTOCOL_VERSION='7'
+typeset -g  ZRUSH_PROTOCOL_VERSION='8'
 typeset -g  ZRUSH_CFG_MAX_LINES='10'
 typeset -g  ZRUSH_CFG_DELAY_MS='30'
 typeset -g  ZRUSH_CFG_MIN_INPUT='0'

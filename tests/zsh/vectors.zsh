@@ -303,7 +303,7 @@ reserialize_plan() {  # -> REPLY=bytes, or return 1 with REPLY=reason
   # Exercise the same incremental loop as _zrush_worker_read without a process
   # or zle. Every byte boundary is tried, and two responses deliberately share
   # one stream so delivery cannot depend on read chunking.
-  _zrush_encode_message ready 7
+  _zrush_encode_message ready 8
   local ready_frame=$REPLY
   _zrush_encode_message error 41 invalid-request
   local error_frame=$REPLY
@@ -330,7 +330,7 @@ reserialize_plan() {  # -> REPLY=bytes, or return 1 with REPLY=reason
         fi
       done
     done
-    [[ -z $rx && $delivered == 2 && $got[1] == 'ready|7' \
+    [[ -z $rx && $delivered == 2 && $got[1] == 'ready|8' \
        && $got[2] == 'error|41|invalid-request' ]] || { framing_ok=0; break }
   done
   (( framing_ok )) \

@@ -42,7 +42,7 @@ fn complete_handshake(child: &mut Child) {
         .stdin
         .as_mut()
         .expect("request stdin")
-        .write_all(b"12:5:hello,1:7,,")
+        .write_all(b"12:5:hello,1:8,,")
         .expect("write hello");
     let mut ready = [0_u8; 16];
     child
@@ -51,7 +51,7 @@ fn complete_handshake(child: &mut Child) {
         .expect("response stdout")
         .read_exact(&mut ready)
         .expect("read ready");
-    assert_eq!(&ready, b"12:5:ready,1:7,,");
+    assert_eq!(&ready, b"12:5:ready,1:8,,");
 }
 
 fn wait_bounded(child: &mut Child) -> ExitStatus {
