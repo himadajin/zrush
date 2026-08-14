@@ -64,7 +64,7 @@ These vectors exist because the guarantees below are the sender's, never appear 
 
 | vector | rule it fixes |
 |---|---|
-| `shared-tags-all` | `-P -p -S -s -i -I -X -J` and `IPREFIX` map to the `P p S s i I X J ip` header fields |
+| `shared-tags-all` | `-P -p -S -s -i -I -X -J` and `IPREFIX` map to the `P p S s i I X J ip` header fields; `-S` also sets `es` |
 | `shared-tags-none` | the header record is emitted even when every shared field is empty |
 | `no-candidates` | a `compadd` call producing no candidate emits nothing at all, header included |
 | `all-candidates-dropped` | when every candidate is dropped the header is still emitted (the contract permits either) |
@@ -77,6 +77,7 @@ These vectors exist because the guarantees below are the sender's, never appear 
 | `newline-in-candidate` | a newline is not a framing byte and passes through `w` and `d` unchanged |
 | `file-real-dir-tilde` | `-f` adds `f` and `rd`; `rd` is `IPREFIX` + `-p` with tilde expansion applied |
 | `file-real-dir-param` | `rd` also resolves parameter expansion, while `p` keeps the raw form |
+| `explicit-empty-visible-suffix-sets-es` | `-S ''` still emits `es = 1` even though `S` itself is omitted as empty |
 
 `plan/encoder-chain/payload` is identical to `encode/shared-tags-all/expected`, so one byte string runs the whole chain: encoder out, decoder in.
 `zsh -f tests/zsh/vectors.zsh` fails if the two files ever diverge.

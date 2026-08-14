@@ -210,8 +210,9 @@ mod tests {
 
     impl GeneratedCapture {
         fn payload(&self) -> Vec<u8> {
-            const SHARED_TAGS: [&[u8]; 10] =
-                [b"P", b"p", b"S", b"s", b"i", b"I", b"ip", b"rd", b"X", b"J"];
+            const SHARED_TAGS: [&[u8]; 11] = [
+                b"P", b"p", b"S", b"s", b"i", b"I", b"ip", b"es", b"rd", b"X", b"J",
+            ];
 
             let mut out = b"b\x01".to_vec();
             for (tag, value) in SHARED_TAGS.iter().zip(&self.shared) {
@@ -265,7 +266,7 @@ mod tests {
 
     fn generated_capture() -> impl Strategy<Value = GeneratedCapture> {
         (
-            prop::collection::vec(prop::option::of(capture_value(8)), 10..=10),
+            prop::collection::vec(prop::option::of(capture_value(8)), 11..=11),
             any::<bool>(),
             prop::collection::vec(generated_candidate(), 0..=16),
         )
