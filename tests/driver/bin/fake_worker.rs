@@ -3,7 +3,7 @@
 //! Every invocation delegates to the real binary named by `$ZRUSH_REAL_BIN`
 //! unless it is `worker --control-fd N` and the control file selects a mode
 //! other than `proxy`. In that case this process becomes the worker and speaks
-//! docs/internal/contracts/cli-protocol.md 「セッションフレーミングと握手」
+//! docs/internal/contracts/cli-protocol.md "Session Framing and Handshake"
 //! faithfully enough to reach the failure the mode asks for.
 //!
 //! The tests never read this process's stdout. They observe the append-only
@@ -34,7 +34,7 @@ const FAKE_ERROR_STATUS: i32 = 18;
 const DIE_STATUS: i32 = 19;
 /// Exit status when the parent stopped reading the response stream.
 const WRITE_FAILED_STATUS: i32 = 1;
-/// The zero-match render plan of cli-protocol.md 「0 マッチ」: the smallest
+/// The zero-match render plan of cli-protocol.md "Zero Matches": the smallest
 /// body a `plan-ready` can carry, and all this fake ever computes.
 const EMPTY_PLAN: &[u8] = b"\x000\x000\x000\x00";
 
@@ -139,7 +139,7 @@ fn atomic_write(path: &Path, contents: &str) {
 }
 
 fn worker(fake: &Fake, control_fd: i32) {
-    // cli-protocol.md 「abort control と worker 終了」: stdout is the response
+    // cli-protocol.md "Abort Control and Worker Termination": stdout is the response
     // stream and descendants must not inherit it.
     set_cloexec(1);
     thread::spawn(move || watchdog(control_fd));
@@ -165,7 +165,7 @@ fn worker(fake: &Fake, control_fd: i32) {
         atomic_write(&fake.control, "proxy");
         write_message(&[b"incompatible", b"cafebabe"]);
         fake.note(&format!("mismatch {session}"));
-        // cli-protocol.md 「セッションフレーミングと握手」: the post-`incompatible`
+        // cli-protocol.md "Session Framing and Handshake": the post-`incompatible`
         // discard state.
         io::copy(&mut input, &mut io::sink()).ok();
         return;
@@ -185,7 +185,7 @@ fn worker(fake: &Fake, control_fd: i32) {
         };
         let message = fields(&payload, fake);
         let head = message.first().map(Vec::as_slice);
-        // cli-protocol.md 「メッセージの種別」: an input notification carries
+        // cli-protocol.md "Message Types": an input notification carries
         // no request_id and gets no terminal response, so field 1 is read as
         // whichever key correlates this kind -- request_id for a request, and
         // input_generation for a notification.
@@ -229,7 +229,7 @@ fn worker(fake: &Fake, control_fd: i32) {
         if notification {
             // This fake parses no candidate payload, so it holds no generation
             // for any notification to name: every settle is a
-            // `capture-required` (cli-protocol.md 「worker 側の規範」).
+            // `capture-required` (cli-protocol.md "Worker-Side Norms").
             // `delay_ms` is ignored -- settling at acceptance only makes the
             // event arrive sooner -- and a `flush` therefore always arrives for
             // an input that has already settled, which is dropped.
@@ -293,7 +293,7 @@ fn set_cloexec(fd: i32) {
     }
 }
 
-// ---- netstring framing (cli-protocol.md 「セッションフレーミングと握手」) ----
+// ---- netstring framing (cli-protocol.md "Session Framing and Handshake") ----
 
 /// One canonical netstring, or `None` at a clean message boundary EOF.
 fn read_netstring<R: Read>(input: &mut R, fake: &Fake) -> Option<Vec<u8>> {

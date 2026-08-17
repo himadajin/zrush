@@ -1,6 +1,6 @@
 # Host rc for the headless history-menu regression scenarios, loaded through
 # ZDOTDIR by the Rust pty harness (tests/driver/) (issue #9:
-# docs/internal/specs/behavior.md "履歴メニュー",
+# docs/internal/specs/behavior.md "History Menu",
 # docs/internal/contracts/cli-protocol.md "history profile").
 # Required environment: ZRUSH_REAL_BIN, ZRUSH_TEST_TMP (see tests/zsh/rc/minimal.zshrc).
 # Isolated HISTFILE + SAVEHIST=0: the fixture history below lives only in this
@@ -26,7 +26,7 @@ bindkey '^Xp' _zrt-dump-postdisplay
 # ^Xk: listing kind/selection/position-count. Not observable from
 # BUFFER/POSTDISPLAY alone -- several scenarios need to tell a history listing
 # apart from a completion listing, or confirm the kind resets to 'none'
-# (behavior.md "履歴メニュー").
+# (behavior.md "History Menu").
 _zrt_dump_kind() { _zlog "TESTKIND=kind=$_zrush_plan_kind sel=$_zrush_selected listing=$_zrush_listing npos=$_zrush_plan_npos" }
 zle -N _zrt-dump-kind _zrt_dump_kind
 bindkey '^Xk' _zrt-dump-kind
@@ -36,7 +36,7 @@ bindkey '^Xk' _zrt-dump-kind
 # tell "the worker's index is usable" from "the next menu op re-snapshots".
 # A generation of 0 is the single unusable state (an invalid latch and a dirty
 # index are one thing), so there is no separate dirty field to dump
-# (behavior.md "履歴メニュー").
+# (behavior.md "History Menu").
 _zrt_dump_hist() { _zlog "TESTHIST=gen=$_zrush_hist_gen head=$_zrush_hist_head count=$_zrush_hist_count unacked=$_zrush_hist_unacked" }
 zle -N _zrt-dump-hist _zrt_dump_hist
 bindkey '^Xi' _zrt-dump-hist
@@ -44,7 +44,7 @@ bindkey '^Xi' _zrt-dump-hist
 # ^Xu: raw history movement that bypasses zrush entirely, used to put HISTNO
 # into "browsing" state (HISTNO != HISTCMD) ahead of testing zrush's
 # select-prev/select-next delegation rule for that state
-# (behavior.md "選択・キーバインド").
+# (behavior.md "Selection and Keybindings").
 bindkey '^Xu' up-line-or-history
 
 # ^Xl: a plain cursor-movement widget zrush never binds (not one of the six
@@ -94,7 +94,7 @@ zle -N _zrt-dump-newest-event _zrt_dump_newest_event
 bindkey '^Xe' _zrt-dump-newest-event
 
 # Slow fake completion, for the scenarios that act while a collection is still
-# in flight (behavior.md "候補収集" cancellation semantics). Defined here as
+# in flight (behavior.md "Candidate Collection" cancellation semantics). Defined here as
 # plain script rather than a typed command, so this definition and its compdef
 # registration never become history entries themselves (they would otherwise
 # coincidentally contain "zrushtestslow"/"slowcand" and confuse the very query

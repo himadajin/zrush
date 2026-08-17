@@ -1,7 +1,7 @@
 //! What sourcing zrush leaves behind: a stopped persistent worker
-//! (docs/internal/specs/behavior.md 「worker ライフサイクル」の遅延起動) and a
+//! (docs/internal/specs/behavior.md "Worker Lifecycle" の遅延起動) and a
 //! host whose own stdio is untouched by the transport's fd bookkeeping
-//! (docs/internal/contracts/cli-protocol.md 「起動と責務」).
+//! (docs/internal/contracts/cli-protocol.md "Startup and Responsibilities").
 
 use std::time::Duration;
 

@@ -1,14 +1,14 @@
 //! Insertion-text construction for one selectable position.
 //!
-//! Semantics: docs/internal/contracts/cli-protocol.md "挿入テキスト"
+//! Semantics: docs/internal/contracts/cli-protocol.md "Insertion Text"
 //! (source of truth). Byte concatenation only, in the contract's fixed
 //! tag order; no zsh quoting semantics are reproduced here (whether `w`
 //! is pre-quoted is a producer-profile concern, per cli-protocol.md
-//! "compsys 捕獲 profile" / "history profile").
+//! "compsys Capture Profile" / "history profile").
 //!
 //! The `-f` directory-synthesis stat is injected as a predicate rather
 //! than performed here: plan.rs owns the "stat only the P displayed `f=1`
-//! candidates" budget (cli-protocol.md "起動"), so this module stays a
+//! candidates" budget (cli-protocol.md "Startup and Responsibilities"), so this module stays a
 //! pure per-candidate builder and is trivially unit-testable with a fake.
 
 use crate::record::{Batch, Candidate};
@@ -20,7 +20,7 @@ use crate::record::{Batch, Candidate};
 /// (cli-protocol.md: stat failure or a non-directory both read as
 /// `false`). Called at most once, and only when `batch.f == "1"`, `es`
 /// is absent, `s` is empty, and `w` doesn't already end in `/`
-/// (cli-protocol.md "挿入テキスト").
+/// (cli-protocol.md "Insertion Text").
 pub(crate) fn build(
     batch: &Batch<'_>,
     candidate: &Candidate<'_>,
@@ -40,7 +40,7 @@ pub(crate) fn build(
 
     // Synthesis is suppressed whenever an explicit suffix would already
     // supply the boundary: `es` present (an explicit `-S`, value
-    // irrelevant) or `s` non-empty (cli-protocol.md "挿入テキスト").
+    // irrelevant) or `s` non-empty (cli-protocol.md "Insertion Text").
     let mut synthesized = false;
     if batch.f == b"1"
         && batch.es.is_empty()

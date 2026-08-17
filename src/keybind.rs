@@ -1,6 +1,6 @@
 //! Keybind notation normalization.
 //!
-//! Notation table: config-schema.md "キー記法". Output forms
+//! Notation table: config-schema.md "Key Notation". Output forms
 //! (cli-protocol.md):
 //! - `seq:<bindkey sequence>` — fully normalized here (e.g. ctrl-g -> seq:^G).
 //! - `key:<symbolic name>`    — terminal-dependent keys (up, shift-tab, ...);
@@ -51,7 +51,7 @@ pub(crate) fn default_desc(i: usize) -> String {
 }
 
 /// Normalize a config key notation into its `seq:`/`key:` form.
-/// Returns None for notation outside the config-schema.md table
+/// Returns None for notation outside the config-schema.md "Key Notation" table
 /// (validation error: caller falls back to the action's default).
 pub fn normalize(notation: &str) -> Option<String> {
     // Named keys first: "tab" the name wins over a literal-char reading,
@@ -92,7 +92,8 @@ pub fn normalize(notation: &str) -> Option<String> {
     };
     if is_plain_char(*b) {
         // `^` and `\` would be misread by bindkey as the start of a
-        // caret/backslash escape; emit them escaped (config-schema.md).
+        // caret/backslash escape; emit them escaped (config-schema.md
+        // "Key Notation").
         return Some(match *b {
             b'^' => "seq:\\^".into(),
             b'\\' => "seq:\\\\".into(),
@@ -103,7 +104,8 @@ pub fn normalize(notation: &str) -> Option<String> {
 }
 
 /// Single-character notation class: a-z, 0-9, symbols (notation is
-/// written in lowercase per config-schema.md, so uppercase is invalid).
+/// written in lowercase per config-schema.md "Key Notation", so uppercase is
+/// invalid).
 fn is_plain_char(b: u8) -> bool {
     b.is_ascii_graphic() && !b.is_ascii_uppercase()
 }

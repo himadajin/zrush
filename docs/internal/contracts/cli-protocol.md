@@ -1,9 +1,9 @@
-# cli-protocol: zsh ↔ Rust CLI の境界仕様
+# cli-protocol: zsh ↔ Rust CLI Boundary Specification
 
 zrush.zsh(zsh 側)と `zrush` バイナリ(Rust 側)の入出力仕様。
 この文書が真実であり、コードはこれに追従する。
 
-## この文書の読み方
+## How to Read This Document
 
 節の冒頭に「検証:」行がある節は、そこに挙げたテストがその節の規範を機械検証している。
 挙げられた規範を破れば、そのテストが落ちる。
@@ -14,7 +14,7 @@ zrush.zsh(zsh 側)と `zrush` バイナリ(Rust 側)の入出力仕様。
 検証行が挙げるのはテストの所在(ディレクトリまたはファイル)までで、個々のベクタ名は挙げない。
 ゴールデンベクタ群の構成・追加手順・カバー範囲は `tests/vectors/README.md`。
 
-## ビルドスタンプ
+## Build Stamp
 
 - `BUILD_STAMP` は Cargo build script が実際の package rebuild ごとに生成する一意な lowercase hex ASCII 値である。
   同じバイナリに含まれる Rust worker、`zrush config`、`zrush init zsh` は必ず同じ値を使う。
@@ -34,9 +34,9 @@ zrush.zsh(zsh 側)と `zrush` バイナリ(Rust 側)の入出力仕様。
 - 未知の引数を渡された `zrush` は exit 2 で拒否する(前方互換より誤用の早期検出を優先する意図的選択。
   build 不整合は上記のスタンプ照合で検知される)。
 
-## 共通事項
+## Common Conventions
 
-> 検証: 制御バイトを含む候補・値の除外(送信側の保証)のうち「compsys 捕獲 profile」の分 —
+> 検証: 制御バイトを含む候補・値の除外(送信側の保証)のうち「compsys Capture Profile」の分 —
 > `tests/vectors/encode/`(`zsh -f tests/zsh/vectors.zsh`)。他の profile の分を固定するテストは無い。
 
 - 対話シェルごとに `zrush worker` を最大 1 プロセス常駐させ、複数のメッセージを同じ
@@ -48,13 +48,13 @@ zrush.zsh(zsh 側)と `zrush` バイナリ(Rust 側)の入出力仕様。
   それはオフセット計算(文字数の数え上げ)のためだけに用いる。
   実際に返すバイト列を Rust 側が再エンコードすることはない:
   挿入テキストは由来となった候補語の原バイト列をそのまま保持し、
-  表示行テキストは制御バイト→スペース正規化(「表示行の中身」節)だけを施したバイト列を保持する。
+  表示行テキストは制御バイト→スペース正規化(「Display Row Contents」節)だけを施したバイト列を保持する。
 - 候補 payload 内部のフレーミングには制御バイト(`\0` `\1` `\2`)を使う。
   これらのバイトを含む候補・値の除外は送信側(zsh)が保証し、
   Rust 側はフィールド内にこれらのバイトが出現しないことを前提としてよい。
   どの機構が除外を担うかは producer profile が定める。詳細は「`zrush worker`」節。
 
-### 終了コード
+### Exit Codes
 
 > 検証: `zrush worker` の in-band エラー応答 — `tests/vectors/plan/`(ランナーは `tests/vectors.rs`)。
 > `--help` の exit 0、未知サブコマンドと `zrush config` への余計な引数の exit 2 — `tests/cli.rs`。
@@ -78,7 +78,7 @@ zrush.zsh(zsh 側)と `zrush` バイナリ(Rust 側)の入出力仕様。
 zsh がそのまま適用できる描画プランを返す。
 入力の静穏判定(デバウンス)と、その結果どの入力に対して描画プランを作るかの決定も worker が持つ。
 
-### 起動と責務
+### Startup and Responsibilities
 
 ```
 zrush worker --control-fd N
@@ -96,7 +96,7 @@ request 処理を始める前に startup 診断を stderr へ 1 行書いて exi
 `plan` 要求ごとにマッチング・ランキング・グループ分割・グリッドレイアウト・ハイライト計算・
 ナビゲーション表構築・挿入テキスト構築を行って stdout へ応答する。
 `input` 通知は静穏期間で置き換えながら最新の 1 個だけを保持し、期間の満了で描画プランまたは
-捕獲要求を worker event として stdout へ送る(「入力通知と worker event」節)。
+捕獲要求を worker event として stdout へ送る(「Input Notifications and Worker Events」節)。
 したがって worker は「1 要求を読む → 1 応答を書く」だけの loop ではなく、
 stdin の待機に静穏期間の満了時刻を deadline として与え、新しいメッセージが来なくても
 期間の満了だけで event を送れる session event loop として動く。
@@ -112,7 +112,7 @@ worker セッションに属し、worker の終了とともに失われる(永�
 マッチング・ランキング・レイアウト・挿入テキスト構築そのものは、時計にも session state にも依存しない
 純粋な計算として保つ。
 
-### abort control と worker 終了
+### Abort Control and Worker Termination
 
 `--control-fd` は request/response protocol と独立した private control byte stream で、message framing を持たない。
 worker は通常の request 処理を始める前に watchdog thread を起動し、control fd を blocking read する。
@@ -132,7 +132,7 @@ worker が起動する descendant は fd 1 を継承しないため、zsh は bu
 stdout EOF を worker completion の唯一の oracle にできる。control channel は supervisor process でも
 request/response の shutdown message でもなく、request/response の netstring fields は変更しない。
 
-### セッションフレーミングと握手
+### Session Framing and Handshake
 
 stdin/stdout は pty を介さないバイトストリームである。両方向の各メッセージは canonical netstring 1 個で、
 その payload はフィールドを表す canonical netstring の連結である。したがってメッセージは再帰的に netstring で囲む。
@@ -160,7 +160,7 @@ zsh は kind・フィールド数・build stamp が完全一致する `ready` �
 pipeline されたメッセージの帰結は握手の結果が定める:
 `ready` を返したセッションは通常のメッセージとして受信順に処理し、
 `incompatible` を返したセッションは request としても通知としても解釈せず読み捨てる
-(「要求と応答」の終端応答規範の対象外であり、event も生じない)。
+(「Requests and Responses」の終端応答規範の対象外であり、event も生じない)。
 `build_stamp` は非空の lowercase hex ASCII (`[0-9a-f]+`)である。
 
 ```
@@ -179,7 +179,7 @@ zsh は、正しい形の `incompatible` または stamp の異なる `ready` �
 EOF・I/O エラー・非 canonical framing は worker session failure である。
 worker が受ける `hello` の kind・フィールド数・stamp 表記自体が不正な場合は、応答せず終了する。
 
-### メッセージの種別
+### Message Types
 
 握手の後にセッション上を流れるメッセージは 3 種類ある。いずれも同じ nested netstring framing を使う。
 
@@ -199,7 +199,7 @@ worker が受ける `hello` の kind・フィールド数・stamp 表記自体�
 - 相関の鍵を安全に回収できないメッセージ(要求の `request_id`、通知・event の `input_generation`)は
   in-band で報告できないため、セッションを終了させる(各節の規範)。
 
-### 要求と応答
+### Requests and Responses
 
 角括弧内は外側 message payload に固定順で並ぶ netstring field を表す。
 
@@ -246,7 +246,7 @@ error:            ["error", request_id, code]
   `request_id` とも `candidate_generation` とも独立の値である。
   シェルセッション内で単調増加し、再利用せず、worker の終了・再起動・re-source でもリセットしない。
   `store` だけが持つフィールドであり、その捕獲がどの入力の `capture-required` に答えたものかを表す
-  (「入力通知と worker event」節)。`store` は必ずこの束縛を持ち、束縛のない `store` は存在しない。
+  (「Input Notifications and Worker Events」節)。`store` は必ずこの束縛を持ち、束縛のない `store` は存在しない。
 - `candidate_payload`: 後述の候補レコードストリーム全体をそのまま格納する opaque bytes。
 - `history_limit`: `plan` だけが持つ、先頭ゼロなしの正の canonical ASCII 10 進数
   (`1..=9223372036854775807`)。
@@ -263,19 +263,19 @@ error:            ["error", request_id, code]
 - `producer`: `compsys` または `history`。
   結果順に加えてレイアウト方針を選ぶ: `compsys` は最大 8 列・上から下、
   `history` は 1 列・下から上。レコード解釈・ハイライト・挿入テキスト構築は共通である
-  (「表示行の中身」「マッチング・ランキングの意味論」節)。
+  (「Display Row Contents」「Matching and Ranking Semantics」節)。
 - `query`: マッチングに用いるユーザーの as-typed バイト列(NUL 除去済み)。空も有効
   (空クエリは全候補が最高同点マッチになる)。
-  渡す値は producer profile(「compsys 捕獲 profile」「history profile」)が定める。
+  渡す値は producer profile(「compsys Capture Profile」「history profile」)が定める。
 - `mode` は `prefix` / `substring` / `typo`、`smart_case` は `true` / `false`。
   マッチング設定のスナップショットであり、
-  意味論は後述「マッチング・ランキングの意味論」節。
+  意味論は後述「Matching and Ranking Semantics」節。
 - `rows`: 先頭ゼロなしの正の ASCII 10 進数。表示行の最終予算。zsh が `min(max-lines, $LINES - 1)` を計算し、
   1 以上にクランプして渡す(Rust は端末サイズを知らない)。
 - `width`: 先頭ゼロなしの正の ASCII 10 進数。zsh が `$COLUMNS - 1` を 1 以上にクランプして渡す。
 - `trailing_space`: `true` / `false`。挿入テキストへ末尾スペースを焼き込むかどうかの指定
   (対応する設定は config-schema.md `[insert].trailing-space`)。
-  渡す値は producer profile(「compsys 捕獲 profile」「history profile」)が定める。
+  渡す値は producer profile(「compsys Capture Profile」「history profile」)が定める。
 - `cwd`: 要求時点の `$PWD` の生バイト列。`f = 1` 候補の stat パスが相対パスなら、このディレクトリを
   基準に解決する。worker 自身の起動時 cwd は判定に使わない。絶対 stat パスはそのまま使い、
   シンボリックリンクは追跡する。`~` は展開しない。cwd または対象パスを stat できない場合は
@@ -350,7 +350,7 @@ zsh は `history-snapshot` / `history-append` の終端応答を待たずに、
 同じ generation を参照する `plan` をその後ろへ pipeline してよい
 (pipeline の許容範囲は握手の規範と同じ)。
 `store` の後ろに `plan` を連送することはない。
-受理された `store` の描画プランは `plan-ready` event として返る(「入力通知と worker event」節)。
+受理された `store` の描画プランは `plan-ready` event として返る(「Input Notifications and Worker Events」節)。
 受信順処理の帰結として、generation G を名乗る `plan` は、その `plan` より前に届いた
 `history-snapshot` / `history-append` の効果を**ちょうどすべて**反映した index を参照する
 (後から届く history 要求の効果は含まない)。
@@ -358,7 +358,7 @@ zsh は index への書き込みを query より後ろへ並べ替えず、ま�
 `ok` の `body` は kind で決まる: `store` と history 2 種の成功では空バイト列、
 `plan` の成功では後述の描画プランストリームそのものである。
 
-### 入力通知と worker event
+### Input Notifications and Worker Events
 
 バッファ変化の通知と、その帰結の配送はこの 4 kind で行う。
 角括弧内は外側 message payload に固定順で並ぶ netstring field を表す。
@@ -371,13 +371,13 @@ plan-ready:       ["plan-ready", input_generation, plan_body]
 capture-required: ["capture-required", input_generation]
 ```
 
-- `input_generation`: 「要求と応答」節と同じ zsh 所有の canonical 10 進識別子。
+- `input_generation`: 「Requests and Responses」節と同じ zsh 所有の canonical 10 進識別子。
   zsh は通知を作るバッファ変化ごとに新しい値を 1 個採番する。
 - `candidate_generation`: この入力を解決できると zsh が考える generation、または
   「再利用できる候補は無い」を表す `0`。
   `0` 以外の値は candidate store の 2 つのスロットに対して解決する
   (history index は `plan` だけが参照する)。
-  `0` は「要求と応答」節の識別子の範囲外にある予約値であり、通知だけが取り得る。
+  `0` は「Requests and Responses」節の識別子の範囲外にある予約値であり、通知だけが取り得る。
 - `delay_ms`: `0..=10000` の canonical ASCII 10 進数(先頭ゼロなし、`0` は `0`)。
   この通知に適用する静穏期間をミリ秒で表す(config-schema.md `[display].delay-ms` のスナップショット)。
 - `cwd` / `query` / `mode` / `smart_case` / `rows` / `width` / `trailing_space` は
@@ -385,10 +385,10 @@ capture-required: ["capture-required", input_generation]
   通知から作るプランのレイアウトは常に `producer = compsys` のものとし、
   producer フィールドは持たない。
   history index を参照しないため `history_limit` も持たない。
-- `plan_body`: `plan` の成功応答と同一形式の描画プランストリーム(「`plan` の `ok` body」節)。
-  空バイト列も 0 マッチのプランではなく不正である(最小のプランは「0 マッチ」節の 4 フィールド)。
+- `plan_body`: `plan` の成功応答と同一形式の描画プランストリーム(「`plan` `ok` body (Render Plan Stream)」節)。
+  空バイト列も 0 マッチのプランではなく不正である(最小のプランは「Zero Matches」節の 4 フィールド)。
 
-#### worker 側の規範
+#### Worker-Side Norms
 
 worker は 1 セッションで **current input** を高々 1 個保持する。
 current input は最後に受理した `input` 通知そのもの(その全フィールド)であり、
@@ -408,7 +408,7 @@ current input は最後に受理した `input` 通知そのもの(その全フ�
   current input が無い、current input が既に settled、`input_generation` が一致しない。
 - **`store` の受理**: current input が存在し、その `input_generation` と束縛が一致する `store` だけを受理する。
   それ以外(current input が無い、`input_generation` が一致しない)の `store` は
-  payload を解析せず `superseded` で終端する(「要求と応答」節)。
+  payload を解析せず `superseded` で終端する(「Requests and Responses」節)。
   受理した `store` は current input を直ちに settle させ(pending でも settled でも同じ)、
   格納した `candidate_generation` の候補と current input のフィールドから計算した
   `plan-ready` を 1 個送る。
@@ -416,7 +416,7 @@ current input は最後に受理した `input` 通知そのもの(その全フ�
 - 1 つの `input_generation` が生む event は、高々 `capture-required` 1 個と `plan-ready` 1 個であり、
   両方が生じる場合は必ずこの順に並ぶ。
   これは上の受理規則と、zsh が `capture-required` 1 個につき `store` を 1 個だけ送ること
-  (「zsh 側の規範」)からの帰結であり、worker は event 数を別途カウントして強制しない
+  (「zsh-Side Norms」)からの帰結であり、worker は event 数を別途カウントして強制しない
   (同じ generation に束縛された 2 個目の `store` は 2 個目の `plan-ready` を生む)。
 - worker は静穏期間を単調時計で測り、stdin の待機にその満了時刻を deadline として与える。
   新しいメッセージが来なくても、満了だけで settle して event を送る。
@@ -432,14 +432,14 @@ current input は最後に受理した `input` 通知そのもの(その全フ�
   (event は送らない)。
 - worker が失われるとき、current input と静穏期間は candidate store・history index と同じく失われる。
 
-#### zsh 側の規範
+#### zsh-Side Norms
 
 - zsh は「いま有効な `input_generation`」を高々 1 個持つ。
   event の `input_generation` がそれと一致しなければ、その event は捨てる。
   `plan-ready` では **generation の照合を `plan_body` の検証より先に行い**、
   一致しない body は解析しない。
 - 一致する `plan-ready` の `plan_body` は `plan` の `ok` body と同じ受理条件で検証し、
-  同じ規則で適用する(「応答の検証と zsh 側の適用(規範)」節)。
+  同じ規則で適用する(「Response Validation and zsh-Side Application (Normative)」節)。
 - 一致する `capture-required` を受けた `input_generation` について、zsh は compsys 捕獲を
   ちょうど 1 回開始し、その結果を同じ `input_generation` を束縛した `store` で送る。
   無効化された `input_generation` のために完走した捕獲の結果は、`store` にせず破棄する
@@ -449,13 +449,13 @@ current input は最後に受理した `input` 通知そのもの(その全フ�
 - outbound queue では、通知を取り消す・置き換えるときに、まだ writer child へ委譲していない
   `input` / `flush` frame を除去・置換してよい。
   要求の frame は除去しない(停止時にセッションごと破棄する場合を除く)。
-  委譲済みの frame は ack か session abort で決着する(behavior.md「worker ライフサイクル」)。
+  委譲済みの frame は ack か session abort で決着する(behavior.md「Worker Lifecycle」)。
 - session failure・worker の交換・re-source の後、zsh は入力通知も
   `capture-required` に答える捕獲も自動 replay しない。
   現在の `input_generation` は無効化され、次のバッファ変化が新しい値を作る
-  (無効化点は behavior.md「worker ライフサイクル」節)。
+  (無効化点は behavior.md「Worker Lifecycle」節)。
 
-#### 具体例
+#### Concrete Examples
 
 いずれも外側 message 1 個ぶんのバイト列である(`\0` は NUL 1 バイト、`\1` は 0x01)。
 
@@ -487,7 +487,7 @@ current input は最後に受理した `input` 通知そのもの(その全フ�
   27:5:error,2:12,10:superseded,,
   ```
 
-- 0 マッチのプラン(「0 マッチ」節の 4 フィールド)を運ぶ `plan-ready`:
+- 0 マッチのプラン(「Zero Matches」節の 4 フィールド)を運ぶ `plan-ready`:
 
   ```
   28:10:plan-ready,1:7,7:\00\00\00\0,,
@@ -499,7 +499,7 @@ current input は最後に受理した `input` 通知そのもの(その全フ�
   12:5:flush,1:7,,
   ```
 
-### `candidate_payload`(候補レコードストリーム)
+### `candidate_payload` (Candidate Record Stream)
 
 > 検証(この節と以下の小節): 送信側(zsh のエンコーダ)の発行規範 — `tests/vectors/encode/`(`zsh -f tests/zsh/vectors.zsh`)。
 > worker セッションを通した受信側(Rust のパーサ)の解釈規範と、候補ストリーム framing error の
@@ -507,20 +507,20 @@ current input は最後に受理した `input` 通知そのもの(その全フ�
 > パーサの全域性 — `src/record.rs` の proptest。
 > 「history profile」の送信側規範(イベント番号との対応、制御バイト行の除外、バイト上限での打ち切り) —
 > `tests/zsh/vectors.zsh`。受信側の解釈は上記のベクタが覆う。
-> 「compsys 捕獲 profile」の transport 側の規範(pid レコードの除去)も上記の検証の範囲外。
+> 「compsys Capture Profile」の transport 側の規範(pid レコードの除去)も上記の検証の範囲外。
 
 `store` / `history-snapshot` / `history-append` の `candidate_payload` は、すべてこの形式である。
 
 フレーミングは NUL(`\0`)終端のレコードが連続する形式。
 レコード内は `\2` で連結した `<tag>\1<value>` 形式のフィールドの並び。
-制御バイト(`\0` `\1` `\2`)を含む候補語・付随テキストの除外は送信側が保証する(「共通事項」参照)。
+制御バイト(`\0` `\1` `\2`)を含む候補語・付随テキストの除外は送信側が保証する(「Common Conventions」参照)。
 
 レコードモデルは payload の由来(producer)に依らない。
-「レコード解釈の規律」「バッチヘッダレコード」「候補レコード」「スキップ規律」の各小節は
+「Record Interpretation Rules (Normative)」「Batch Header Record」「Candidate Record」「Skip Rules (Normative)」の各小節は
 すべての payload に適用され、Rust 側は payload の由来を知らない。
-由来ごとの追加規約は「compsys 捕獲 profile」「history profile」が定める。
+由来ごとの追加規約は「compsys Capture Profile」「history profile」が定める。
 
-#### レコード解釈の規律(規範)
+#### Record Interpretation Rules (Normative)
 
 - レコード内に未知のタグが含まれる場合、そのフィールドは無視する
   (将来のタグ追加に対する前方許容)。
@@ -530,7 +530,7 @@ current input は最後に受理した `input` 通知そのもの(その全フ�
   (規範: 送信側が直列化を保証する)。
   ヘッダの効力(共有フィールド)は次の `b` ヘッダが現れるまで持続する。
 
-#### バッチヘッダレコード
+#### Batch Header Record
 
 バッチごとに、その先頭へヘッダレコードを 1 つ発行する。
 
@@ -543,17 +543,17 @@ current input は最後に受理した `input` 通知そのもの(その全フ�
   - `es`(値 `1`): 可視サフィックス(`S`)が明示的に指定されたことを示す。
     値の空・非空とは独立である(`S` が空文字列でも `es = 1` になる。
     `S` が非空なら `es` は必ず存在する)。隠しサフィックス(`s`)は `es` に関与しない。
-    ファイル候補の合成 `/` を抑止する(「挿入テキスト」節)。
+    ファイル候補の合成 `/` を抑止する(「Insertion Text」節)。
     該当しないときはフィールドを発行しない。
   - `rd`: チルダ・パラメータ展開済みの実ディレクトリ(ファイル候補の合成 `/` 判定に使う)。
   - `X`: グループ見出し文字列。`J`: グループ名。
-    グループキーの決定規則は「描画プランストリーム」の「表示行の中身」節。
+    グループキーの決定規則は「`plan` `ok` body (Render Plan Stream)」の「Display Row Contents」節。
 - 共有フィールドが全て空でも、ヘッダレコードは必ず発行する
   (バッチ境界を一意に識別するため)。
 - 候補レコードを 1 件も発行しないバッチについては、
   ヘッダごと発行を省略してよい(受信側はヘッダの無いバッチを観測しない)。
 
-#### 候補レコード
+#### Candidate Record
 
 ヘッダに続けて、そのバッチの候補ごとに 1 レコードを発行する。
 フィールドは以下の 4 種のみ:
@@ -566,7 +566,7 @@ current input は最後に受理した `input` 通知そのもの(その全フ�
 `m` / `d` / `n` は値が非空のときのみ発行する。
 フィールドが無いことと値が空文字列であることは同義に扱う(いずれも「不在」)。
 送信側は空の `w` を持つレコードを送出しない
-(受信側の空 `w` スキップ規律は保険として維持する。「スキップ規律」節)。
+(受信側の空 `w` スキップ規律は保険として維持する。「Skip Rules (Normative)」節)。
 
 match-text(マッチング・ハイライト計算・表示の対象テキスト)の決定規則:
 `m` があれば `m`、なければ `w` のバイト列そのもの。
@@ -576,9 +576,9 @@ Rust は zsh のクォート規則を一切実装しない
 レコードストリームの解析そのものは重複候補(同一の match-text/display-text 組)を除去しない
 (送信側の発行順の情報を保つ)。
 重複を送出してよいか、解析結果に profile 固有の重複除去を掛けるかは producer profile が定める
-(「history profile」は index の query 時に除去し、「compsys 捕獲 profile」は除去しない)。
+(「history profile」は index の query 時に除去し、「compsys Capture Profile」は除去しない)。
 
-#### スキップ規律(規範)
+#### Skip Rules (Normative)
 
 - 候補レコードの第 1 フィールドが非空の値を持つ `w` タグでない場合、
   そのレコードはスキップする(空の `w` は候補として無効)。
@@ -586,9 +586,9 @@ Rust は zsh のクォート規則を一切実装しない
 - 先頭タグが `b` / `w` のいずれでもないレコードは黙ってスキップする
   (compsys 捕獲のワーカー `pid` レコードなど)。
 
-#### compsys 捕獲 profile
+#### compsys Capture Profile
 
-zpty 内で compsys を駆動して得る payload(behavior.md「候補収集」節)。
+zpty 内で compsys を駆動して得る payload(behavior.md「Candidate Collection」節)。
 
 - `w` は compsys の挿入用にクォート済みの候補語(例: `space\ name.txt`)。
   `m` はそのクォート復元形 `${(Q)w}`、`d` は compadd `-d` の表示文字列。
@@ -604,12 +604,12 @@ zpty 内で compsys を駆動して得る payload(behavior.md「候補収集」�
   zsh が受信中に取り除いてから `store` 要求の `candidate_payload` へ入れる。
   Rust 側でのスキップは保険であり、通常の入力では発生しない。
 - `store` 要求のフィールド値: `slot` は空語収集キャッシュの対象となる収集なら `cache`、それ以外の収集なら `live`。
-  どの収集がキャッシュの対象かは behavior.md「空語収集キャッシュ」節が定める。
+  どの収集がキャッシュの対象かは behavior.md「Empty-Word Collection Cache」節が定める。
   `input_generation` は、この収集を始めさせた `capture-required` の対象 generation。
-- `input` 通知のフィールド値: `query` は広げ規則が定めるクエリ(behavior.md「候補収集」節)、
+- `input` 通知のフィールド値: `query` は広げ規則が定めるクエリ(behavior.md「Candidate Collection」節)、
   `trailing_space` は `[insert].trailing-space`、`delay_ms` は `[display].delay-ms` の設定値、
   `candidate_generation` は空語収集キャッシュの latch が有効ならその generation、
-  それ以外は `0`(behavior.md「空語収集キャッシュ」節)。
+  それ以外は `0`(behavior.md「Empty-Word Collection Cache」節)。
 - この profile の候補は `input` 通知の帰結として一覧になる。
   `plan` 要求は履歴メニューの同期交換が使う明示操作であり、
   入力に追従する一覧のために送ることはない。
@@ -634,11 +634,11 @@ index から作られた一覧を履歴一覧、その候補を履歴候補と�
   zsh が payload を合成する時点で**行ごと**除外する(バイトだけを削って残りを送ることはしない)。
   空の履歴行も送らない。
   それ以外の制御バイト(ESC・CR・TAB など)を含む履歴行は除外せず原バイト列のまま送り、
-  表示側の制御バイト→スペース正規化(「表示行の中身」節)に委ねる。
+  表示側の制御バイト→スペース正規化(「Display Row Contents」節)に委ねる。
 - 送信側は重複除去をせず、`[history].limit` による絞り込みもしない。
   index には受け取った列がそのまま入り、重複除去も走査範囲の制限も query 時に worker が行う(下記)。
 - `history-snapshot` の payload の総バイト数には固定の上限があり、
-  次の候補レコードを加えると上限を超える時点で合成を打ち切る(上限値は behavior.md「履歴メニュー」節)。
+  次の候補レコードを加えると上限を超える時点で合成を打ち切る(上限値は behavior.md「History Menu」節)。
   打ち切りは候補レコードの境界で行い、レコードの途中では切らない。
   打ち切った場合、発行するレコードは新しい側の連続した一部になる。
 - `history-append` にはこのバイト上限を課さない。
@@ -656,17 +656,17 @@ index から作られた一覧を履歴一覧、その候補を履歴候補と�
   残った候補はその出現の位置と `n` を持つ。
   走査範囲の外から補充はしないため、一覧の対象になる行数は `window` より少なくなり得る
   (重複が走査枠を消費する)。
-- `producer = history` は走査順(新しい順)をそのまま保つため(「マッチング・ランキングの意味論」節)、
+- `producer = history` は走査順(新しい順)をそのまま保つため(「Matching and Ranking Semantics」節)、
   この順序がそのまま位置番号順になり、位置 1 は**マッチした候補のうち最も新しい履歴行**になる
   (クエリにマッチしない履歴行は位置を持たないため、位置 1 が index の先頭エントリとは限らない。
   クエリが非空でもマッチ品質で並べ替わらない)。
   画面上では単一列を下から上へ配置するため、位置 1 が最下行になり、位置番号が大きいほど上に来る
-  (「表示行の中身」節)。
+  (「Display Row Contents」節)。
 
 **要求のフィールド値**:
 
 - `history-snapshot` / `history-append`: `candidate_generation` は zsh が新しく採番した値
-  (index の現 stamp より厳密に大きい。「要求と応答」節)。
+  (index の現 stamp より厳密に大きい。「Requests and Responses」節)。
 - `plan`: `producer` は `history`、`query` はバッファ全体(as-typed)、
   `trailing_space` は常に `false`(挿入テキストを履歴行の原文と一致させるため)、
   `history_limit` は `[history].limit` の設定値(config-schema.md)、
@@ -676,21 +676,21 @@ index から作られた一覧を履歴一覧、その候補を履歴候補と�
 `history-snapshot` の payload の合成は、全履歴の値の一括展開 1 回(履歴の総件数に線形)と、
 打ち切りまでに読んだ行数と行長に線形な処理からなり、同期経路で行う。
 `history-append` の payload は該当イベントの読み出しだけで作り、履歴の総件数に依存しない
-(どちらをいつ送るかは behavior.md「履歴メニュー」節)。
+(どちらをいつ送るかは behavior.md「History Menu」節)。
 
-### `plan` の `ok` body(描画プランストリーム)
+### `plan` `ok` body (Render Plan Stream)
 
-> 検証(この節と以下の小節。ただし「適用(zsh 側の規範)」を除く):
+> 検証(この節と以下の小節。ただし「Plan Application (zsh-Side Normative)」を除く):
 > ワイヤ形式とプランの中身 — `tests/vectors/plan/` を、Rust のシリアライザと参照パーサ `src/wire.rs`(`tests/vectors.rs`)、
 > および zsh のデコーダ `_zrush_parse_plan`(`zsh -f tests/zsh/vectors.zsh`。パース後に再直列化して往復させる)の双方で検査する。
 > 任意の入力に対して出力がワイヤ形状の不変条件を満たすことは `src/plan.rs` の proptest。
-> ゴールデンは `f = 1` の候補を含まないため、`/` 合成だけはこの検証の対象外(`tests/vectors/README.md`)。その検証手段は「挿入テキスト」節の検証行。
-> 「オフセット規律」の範囲の上界は、この proptest が生成した任意の入力について参照パーサ側で検査される
-> (レイアウトが listing text の外を指すオフセットを出力しないこと)。上界を破るプランの拒否は「エラー時の zsh 側挙動」節の検証行。
+> ゴールデンは `f = 1` の候補を含まないため、`/` 合成だけはこの検証の対象外(`tests/vectors/README.md`)。その検証手段は「Insertion Text」節の検証行。
+> 「Offset Rules」の範囲の上界は、この proptest が生成した任意の入力について参照パーサ側で検査される
+> (レイアウトが listing text の外を指すオフセットを出力しないこと)。上界を破るプランの拒否は「zsh-Side Behavior on Errors (Normative)」節の検証行。
 > ただし、受信側が用いる文字数が Rust 側の文字数以上であるべき規範は、どのテストも固定していない。
 > 制御バイト→スペース正規化(表示テキスト・表示幅・パディング・切り詰め・オフセットへの反映と、挿入テキストが原文のままであること)— `src/plan.rs` の単体テスト。
 
-同じ形式を `plan-ready` event の `plan_body` にも用いる(「入力通知と worker event」節)。
+同じ形式を `plan-ready` event の `plan_body` にも用いる(「Input Notifications and Worker Events」節)。
 
 NUL(`\0`)終端フィールドの平坦列。数値は ASCII 10 進表記。順序は固定:
 
@@ -709,18 +709,18 @@ NUL(`\0`)終端フィールドの平坦列。数値は ASCII 10 進表記。順�
 総フィールド数は `4 + L + H + 3P`。
 選択可能位置は 1 始まりで `1..P` の番号を持つ(0 は「未選択」を表す予約値)。
 
-#### オフセット規律
+#### Offset Rules
 
 - 文字オフセットと表示幅は同一の lossy UTF-8 スカラー列ビューの上で計算する
   (対象のバイト列を 1 回だけ lossy UTF-8 解釈し、その文字列に対して
   文字数・表示幅の両方を数える。解釈のズレを単一箇所に閉じ込めるための統一)。
-- 切り詰め(接頭辞の選択)は、制御バイト→スペース正規化(「表示行の中身」節)を施した
+- 切り詰め(接頭辞の選択)は、制御バイト→スペース正規化(「Display Row Contents」節)を施した
   **表示テキストに対して**行い、「lossy 表示幅が予算に収まる最大の接頭辞」を返す
   (不正 UTF-8 バイト列を `U+FFFD` などへ再エンコードすることはしない)。
   パディングは ASCII スペースで行う。
   したがって表示行テキストは正規化後のバイト列の部分列であり、
   制御バイトを含んでいた候補では原バイト列の部分列にはならない。
-  原バイト列をそのまま返す保証が課されるのは挿入テキストのみである(「共通事項」節)。
+  原バイト列をそのまま返す保証が課されるのは挿入テキストのみである(「Common Conventions」節)。
 - ハイライト範囲・セル実テキスト範囲の `start` / `len` はすべて**文字数**
   (match-text 等を lossy UTF-8 解釈したときの Unicode スカラー値の並びに対する
   0 始まり・長さ表現。match-spans と同じベストエフォート)。
@@ -732,7 +732,7 @@ NUL(`\0`)終端フィールドの平坦列。数値は ASCII 10 進表記。順�
   `start + len <= listing text の文字数`(`L = 0` のときこの文字数は 0)。
   各範囲は 1 本の表示行の内側に収まるが、契約が課す上界は listing text 全体の文字数であり、
   行ごとの内訳ではない(受信側に行の切り出しを要求しないため)。
-  受信側はこれを満たさないプランを破棄する(「エラー時の zsh 側挙動」)。
+  受信側はこれを満たさないプランを破棄する(「zsh-Side Behavior on Errors (Normative)」)。
   受信側が自身の文字数の数え方を使うことは許す
   (zsh の `$#` はロケール依存であり、不正 UTF-8 バイトを個別に数える)。
   ただし正当なプランを弾かないよう、受信側が用いる上界は Rust 側の文字数以上でなければならない。
@@ -741,7 +741,7 @@ NUL(`\0`)終端フィールドの平坦列。数値は ASCII 10 進表記。順�
   zsh の `$terminfo`/wcwidth 実装との差(East Asian 曖昧幅など)によるズレは
   ベストエフォートとして許容する(仕様外)。
 
-#### ハイライト
+#### Highlights
 
 - `role` ∈ `match` | `heading` | `history-number`。zsh が `role` を
   `[display.highlight]` の該当スペックへ写像する
@@ -756,7 +756,7 @@ NUL(`\0`)終端フィールドの平坦列。数値は ASCII 10 進表記。順�
   (display-text 表示セルには発行されない)。
   切り詰め済みセルへのクリップも Rust 側で計算済み。
 
-#### 表示行の中身
+#### Display Row Contents
 
 - **セルの表示テキストの決定規則**: `d` があれば `d`、なければ match-text
   (候補データの解釈規則。描画層の実装に依らない)。
@@ -802,7 +802,7 @@ NUL(`\0`)終端フィールドの平坦列。数値は ASCII 10 進表記。順�
   (match-text 上で計算したハイライト範囲が正規化でずれない)。
   表示幅・パディング・切り詰めは正規化後のテキストに対して計算する。
 
-#### ナビ
+#### Navigation
 
 位置ごとに `next prev left right` の絶対遷移先(位置番号、または 0 = 未選択)を返す。
 
@@ -811,7 +811,7 @@ NUL(`\0`)終端フィールドの平坦列。数値は ASCII 10 進表記。順�
 - `left` = 窓の prev 側に続きがあるなら 0、なければ
   `max(グループ先頭位置, p - grows)`。
   `right` = `min(グループ末尾位置, p + grows)`
-  (`grows` は所属グループの行数。「表示行の中身」節参照)。
+  (`grows` は所属グループの行数。「Display Row Contents」節参照)。
   単一列のグループ(`cols = 1`)で窓の外へ出ないとき、`grows` がグループのメンバー数に等しいため、
   `left` はグループ先頭位置へ、`right` はグループ末尾位置へのジャンプになる
   (一般式から導かれる帰結であり、特例ではない)。
@@ -820,13 +820,13 @@ NUL(`\0`)終端フィールドの平坦列。数値は ASCII 10 進表記。順�
   zsh は自己参照を no-op として扱う(規範)。
 - 遷移先 0 は、このプランの窓からその方向へ出ることを表す。
   どのキーがどの遷移に対応するか、および 0 を受けたときの扱いは zsh 側の規範であり、
-  behavior.md「選択・キーバインド」「履歴メニュー」節が定める
+  behavior.md「Selection and Keybindings」「History Menu」節が定める
   (補完一覧の `prev = 0` は選択解除。履歴一覧では端越えの `plan` 再要求、
   または位置 1 かつ窓先頭でのメニュー消去)。
 - ナビゲーション表は producer に依らず同じ意味を持つ。
   補完一覧は窓を持たないため、最終位置の `next` は自己参照のまま、`left` が 0 になることもない。
 
-#### 挿入テキスト
+#### Insertion Text
 
 > 検証(この節のうち、上の節のゴールデンが届かない `/` 合成の判定):
 > 連結順・合成 `/` の挿入位置・stat パス(`rd` + match-text)の構築・`f` が `1` でない候補と
@@ -851,31 +851,31 @@ NUL(`\0`)終端フィールドの平坦列。数値は ASCII 10 進表記。順�
   (`S` / `s` / `I` のいずれかが非空、または `/` 合成に該当)に該当しないとき、
   この時点で付与済みとして返す。
 
-#### 適用(zsh 側の規範)
+#### Plan Application (zsh-Side Normative)
 
 > 検証: いずれも実際の zle 配線に対するスモークテスト(`cargo test --test driver`)。
 > `POSTDISPLAY` の組み立て — `tests/driver/apply.rs`。
 > 補完一覧の確定時の `LBUFFER` 置換と `RBUFFER` 保持 — `tests/driver/confirm.rs`。
 
 - **表示**: `L > 0` なら `POSTDISPLAY` を「改行 1 個 + L 個の表示行テキストを改行で連結したもの」に
-  置き換える(オフセット規律の `$#BUFFER + 1` 加算は、この先頭の改行 1 個に対応する)。
+  置き換える(Offset Rules の `$#BUFFER + 1` 加算は、この先頭の改行 1 個に対応する)。
   `L = 0` なら `POSTDISPLAY` を消去する。
 - **確定**: 置換の規則は一覧の種類(補完一覧 / 履歴一覧)ごとに 2 つある。
   プランの出力形式はどちらでも同じであり、どちらを適用するかは
-  zsh が保持する現在の一覧の種類で決める(種類の遷移は behavior.md「履歴メニュー」節)。
-  - 補完一覧: `pre` を「`LBUFFER` から現在語(広げ規則が対象にした語。behavior.md「候補収集」節)を
+  zsh が保持する現在の一覧の種類で決める(種類の遷移は behavior.md「History Menu」節)。
+  - 補完一覧: `pre` を「`LBUFFER` から現在語(広げ規則が対象にした語。behavior.md「Candidate Collection」節)を
     除いた前半部分」とし、`LBUFFER = pre + 挿入テキスト` で置き換える
     (`RBUFFER` は変更しない)。
   - 履歴一覧: `BUFFER = 挿入テキスト` で行全体を置き換え、`CURSOR` を末尾に置く。
 
-#### 0 マッチ
+#### Zero Matches
 
 common-prefix(空も可)+ `L = 0` + `P = 0` + `H = 0` の、ちょうど 4 フィールドを出力して exit 0
 (総フィールド数の式 `4 + L + H + 3P` と整合する)。
 表示行・ハイライトエントリ・セル範囲・ナビゲーション・挿入テキストのいずれのフィールドも存在しない。
 zsh は一覧を消す。
 
-#### common-prefix の意味論
+#### common-prefix Semantics
 
 - **prefix 階層のマッチ**(match-text がクエリで始まる候補)の match-text の
   バイト単位最長共通接頭辞。空クエリでは全マッチが prefix 階層。
@@ -891,7 +891,7 @@ zsh は一覧を消す。
 
 - 総マッチ件数は返さない(「+truncated 表示」の導入は wire contract の拡張として意図的に保留する)。
 
-### マッチング・ランキングの意味論
+### Matching and Ranking Semantics
 
 > 検証: モードの累積性・ティアの序列と literal / approximate グループ分類・smart-case の真偽両方・誤字許容の範囲(候補の接頭辞に対する 1 編集、1 文字クエリでは不適用)・非 UTF-8 バイト列でもマッチすること —
 > `src/matching.rs` の単体テスト(小さなアルファベット上での DP 参照実装との網羅照合を含む)。
@@ -902,7 +902,7 @@ zsh は一覧を消す。
 
 - **隠し候補の除外**: クエリの先頭バイトが `.` でないとき、`f = 1` のバッチに属し match-text が `.` で始まる候補を、ティア判定より前に除外する(空クエリも「`.` で始まらない」に含む)。
   除外した候補は一覧にも common-prefix にも入らない。
-  捕獲 fork が `globdots` でドットファイル候補を無条件に生成する(behavior.md「候補収集」)ため、隠しファイルをドット入力まで伏せる判断はこの規則が一手に担う。
+  捕獲 fork が `globdots` でドットファイル候補を無条件に生成する(behavior.md「Candidate Collection」)ため、隠しファイルをドット入力まで伏せる判断はこの規則が一手に担う。
   除外を `f = 1` に限るのは、`globdots` が増やすのが glob 由来のファイル候補だけであり、ドット始まりでもファイル候補でないものの見え方を変えないため。
 - モードは累積的に広がる: `typo` ⊇ `substring` ⊇ `prefix`。
   - `prefix`: match-text がクエリで始まる。
@@ -924,7 +924,7 @@ zsh は一覧を消す。
   - literal のマッチが 0 件なら、`mode` が許す edit と fuzzy のマッチを除外せず残す。
   この規則は `producer = compsys` と `producer = history` の両方に同一に適用する。
   絞り込みを通過した候補のマッチハイライトは各候補のティアから計算し、
-  common-prefix は prefix ティアだけから計算する(「common-prefix の意味論」節)。
+  common-prefix は prefix ティアだけから計算する(「common-prefix Semantics」節)。
 - `smart-case = true`: クエリが全て小文字なら大文字小文字を無視、
   大文字を含むなら区別する。`false`: 常に区別しない。
   大文字小文字の畳み込みは **ASCII の範囲のみ**(非 ASCII はバイト安全のため区別される。
@@ -945,7 +945,7 @@ zsh は一覧を消す。
   同一ティア内の順位付け(語頭・境界で始まる一致の優遇など)は実装詳細とし、
   スコアの数値自体もプロトコルに含まれない。
 
-### 応答の検証と zsh 側の適用(規範)
+### Response Validation and zsh-Side Application (Normative)
 
 > 検証: プランの受理条件(下記の拒否条件)— `tests/vectors/reject-plan/` を、
 > Rust の参照パーサ `src/wire.rs`(`tests/vectors.rs`)と zsh の `_zrush_parse_plan`(`zsh -f tests/zsh/vectors.zsh`)の双方が拒否することを検査する。
@@ -953,7 +953,7 @@ zsh は一覧を消す。
 
 - zsh は応答の外側/nested netstring、固定フィールド数、kind、canonical な request_id、
   および request_id が未完了要求の 1 つに対応することを検証する。不正なら worker セッションを壊れたものとして終了する。
-  worker event の検証と適用は「入力通知と worker event」節の zsh 側規範が定める。
+  worker event の検証と適用は「Input Notifications and Worker Events」節の zsh 側規範が定める。
 - `error` の `code` は `invalid-request` / `invalid-payload` / `unknown-generation` / `superseded` の
   いずれかでなければならない。
   それ以外の値は不正な応答であり、worker セッションを壊れたものとして終了する。
@@ -969,10 +969,10 @@ zsh は一覧を消す。
   他の `error` と同じく正常な終端応答であり、worker セッション失敗にも連続失敗回数にも数えない。
   zsh はその要求も先行する `store` / history 要求も replay しない。
   履歴メニューの同期交換では、他の `error` と同じく交換の失敗として扱う
-  (behavior.md「履歴メニュー」節)。
+  (behavior.md「History Menu」節)。
   `history-snapshot` / `history-append` が `unknown-generation` で終端した場合は index の同期が
   失われたことを表すため、zsh は history index latch を無効化する
-  (latch の所在と無効化点は behavior.md「worker ライフサイクル」節が定める)。
+  (latch の所在と無効化点は behavior.md「Worker Lifecycle」節が定める)。
   次の明示的な履歴メニュー操作が `history-snapshot` から作り直すだけで、payload の replay はしない。
 - `superseded` は `store` だけが受ける終端応答で、その捕獲が答えようとした入力が既に
   置き換えられていることを表す。zsh は候補を保持していないため replay できず、replay もしない。
@@ -989,7 +989,7 @@ zsh は一覧を消す。
   位置・ナビゲーション値が `0..P` の範囲外、
   ハイライト範囲・セル実テキスト範囲の `start + len` が listing text の文字数を超える)は、
   プラン全体を破棄して一覧を消し、worker セッションを終了する。
-  同じ session の他の未完了要求も behavior.md「worker ライフサイクル」に従ってすべて破棄する。
+  同じ session の他の未完了要求も behavior.md「Worker Lifecycle」に従ってすべて破棄する。
   壊れた success を受理してセッションを継続してはならない。
 - 正常に形成された `ok` / `error` と正常に形成された worker event は、
   worker セッションの連続失敗回数を 0 に戻す。
@@ -1001,9 +1001,9 @@ zsh は一覧を消す。
   main request 処理がセッション失敗で終了するときは、その理由を 1 行の診断として stderr に書いてから終了する。
   control byte / EOF / fatal read error の watchdog abort は `_exit(1)` を使うため、この診断を要求しない。
   この行の内容は契約の対象外であり、zsh が解析してはならない。
-- セッション失敗時の破棄・再起動・無効化・警告は behavior.md「worker ライフサイクル」が定める。
+- セッション失敗時の破棄・再起動・無効化・警告は behavior.md「Worker Lifecycle」が定める。
 
-## zrush config
+## `zrush config`
 
 > 検証: 既定出力 — `src/config.rs` の `default_output_matches_contract_example` が**下の出力例そのものを読んで** `zrush config` の出力と突き合わせる(この文書が唯一のコピー)。
 > 同じ出力を実プロセスで — `tests/cli.rs`(独立したコピーを持つ)。
@@ -1013,7 +1013,7 @@ zsh は一覧を消す。
 
 config.toml を解決・検証し、zsh が `source` できる形で設定値とキーバインド定義を出力する。
 
-### 起動
+### `zrush config` Startup
 
 ```
 zrush config
@@ -1024,7 +1024,7 @@ zrush config
   (XDG 仕様の「空文字列は未設定扱い」に従う)。
   ファイル不在は正常(全既定値で出力、警告なし)。
 
-### stdout(zsh source 形式)
+### `zrush config` stdout (zsh Source Format)
 
 ```zsh
 typeset -g  ZRUSH_BUILD_STAMP='<build-stamp>'
@@ -1067,13 +1067,13 @@ typeset -ga ZRUSH_CFG_WARNINGS=()
   - `key:<シンボリック名>`: 端末依存キー(例: `up`, `down`, `shift-tab`)。
     zsh 側が `$terminfo` を参照して解決する(矢印は CSI/SS3 両系統を bindkey)。
   - 正規化の詳細と対応キー一覧は config-schema.md。
-  - 要素数が奇数の場合(異常出力)、出力全体をロード失敗として扱う(「エラー時の zsh 側挙動」参照)。
+  - 要素数が奇数の場合(異常出力)、出力全体をロード失敗として扱う(「zsh-Side Behavior on Errors (Normative)」参照)。
   - bindkey の適用先はメインキーマップ(`main`)のみ。
 - `ZRUSH_CFG_WARNINGS` は設定エラーの人間可読メッセージの配列(正常時は空)。
-  表示のタイミング・体裁は zsh 側の責務(config-schema.md「検証とエラーの扱い」)。
+  表示のタイミング・体裁は zsh 側の責務(config-schema.md「Validation and Error Handling」)。
 - 不正な設定値があっても exit 0 で全項目を出力する(該当項目は既定値)。
 
-### エラー時の zsh 側挙動(規範)
+### zsh-Side Behavior on Errors (Normative)
 
 - exit 非 0、出力が source 不能、または source 結果が出力仕様を満たさない場合
   (zsh が消費する変数の欠落、`ZRUSH_CFG_KEYBINDS` の奇数長)、ロード失敗として扱う:
@@ -1082,7 +1082,7 @@ typeset -ga ZRUSH_CFG_WARNINGS=()
   (フック・キーバインドを登録しない。既定値表を zsh 側へ複製すると真実の二重化になるため)。
 - `zrush config` の stderr は端末に流さない(警告は `ZRUSH_CFG_WARNINGS` 経由が唯一の経路)。
 
-## zrush init
+## `zrush init`
 
 > 検証: 起動パースと exit 2(未指定・未知シェル・余計な引数)、2 本の prelude 行の形とその後に続く
 > 埋め込みスクリプト本体がリポジトリの `zsh/zrush.zsh` とバイト一致すること — `tests/cli.rs`。
@@ -1093,7 +1093,7 @@ typeset -ga ZRUSH_CFG_WARNINGS=()
 zsh 側の `.zshrc` が source する zle 統合スクリプトを標準出力へ書き出す。
 スクリプト本体はビルド時にバイナリへ埋め込まれる。
 
-### 起動
+### `zrush init` Startup
 
 ```
 zrush init zsh
@@ -1102,7 +1102,7 @@ zrush init zsh
 - 受け付けるシェル値は `zsh` のみ。シェル引数の未指定・`zsh` 以外の値・余計な引数は
   起動前に exit 2 で拒否する。
 
-### stdout
+### `zrush init` stdout
 
 1 行目は `ZRUSH_BIN` の prelude:
 
@@ -1111,7 +1111,7 @@ typeset -g ZRUSH_BIN=${ZRUSH_BIN:-'<自身の絶対パス>'}
 ```
 
 - `<自身の絶対パス>` の既定値は、この `zrush init` を実行したプロセス自身の絶対パス
-  (`current_exe` 相当)。クォート規律は「zrush config」節と同じ(`'...'` で囲み、値中の `'` を `'\''` に
+  (`current_exe` 相当)。クォート規律は「`zrush config`」節と同じ(`'...'` で囲み、値中の `'` を `'\''` に
   エスケープする)。パスは非 UTF-8 バイト列であり得るため、バイト単位でクォートする。
 - 既に `$ZRUSH_BIN` が設定されている呼び出し元シェルでは、上記の zsh パラメータ展開
   `${ZRUSH_BIN:-...}` によりその値が優先される(prelude 側は常にこの展開形で出力するのみで、
@@ -1127,7 +1127,7 @@ typeset -g _ZRUSH_EXPECTED_BUILD_STAMP='<build-stamp>'
 自身の絶対パスの解決、または標準出力への書き込みに失敗した場合は exit 1
 (`zrush config` の内部エラーと同じ扱い)。
 
-## 想定シーケンス(参考・規範ではない)
+## Expected Sequence (Reference; Non-Normative)
 
 1. source 時: `.zshrc` の `source <(zrush init zsh)` が `$ZRUSH_BIN` / build-stamp prelude と埋め込みスクリプトを読み込む。
    埋め込みスクリプト自身の source 時処理として `zrush config` を実行し、build stamp を照合し、private runtime directory と
@@ -1136,7 +1136,7 @@ typeset -g _ZRUSH_EXPECTED_BUILD_STAMP='<build-stamp>'
    `zrush config` を再実行して source、キーバインドを再適用、警告があれば表示。
 3. 最初の実メッセージ時: source 時に作成済みの FIFO endpoint だけを開き、abort-control FIFO の read fd を渡して
    `zrush worker --control-fd N` を起動し、watchdog setup 後に `hello` を送る。
-   最初のメッセージは `ready` を待たずに `hello` の後ろへ pipeline する(「セッションフレーミングと握手」節)。
+   最初のメッセージは `ready` を待たずに `hello` の後ろへ pipeline する(「Session Framing and Handshake」節)。
    遅延起動時に runtime directory/FIFO を作成してはならない。spawn 後の parent endpoint/watcher failure と
    writer notification/watcher failure の fail-closed quarantine・runtime taint は behavior.md が定める。
 4. 入力変化: zsh は新しい `input_generation` を採番して `input` 通知を直ちに送る。
@@ -1156,7 +1156,7 @@ typeset -g _ZRUSH_EXPECTED_BUILD_STAMP='<build-stamp>'
    `producer = history` の `plan`(`offset = 0`)だけを同期交換で送って、返ったプランを同じように適用する。
    index が未初期化または dirty なら、zsh がメモリ上の履歴から payload を合成し、
    `history-snapshot` と `plan` を同じ同期交換で連送する
-   (fork も compsys も介さない。behavior.md「履歴メニュー」節)。
+   (fork も compsys も介さない。behavior.md「History Menu」節)。
    表示中にナビ表が遷移先 0 を返したとき、zsh はメニューを開き直さず、同じ generation の
    `plan` を新しい `offset` で同期再要求して適用する。
 7. コマンド確定後のプロンプトごと: index が同期済みで、直前のコマンドが 1 件の追記として説明できる場合、

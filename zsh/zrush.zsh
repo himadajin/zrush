@@ -2,7 +2,7 @@
 #
 # Requirements: zsh 5.8+, source after compinit, after zsh-abbr, and before
 # zsh-syntax-highlighting. This file is embedded into the `zrush` binary and
-# loaded via `source <(zrush init zsh)` (cli-protocol.md "zrush init"), which
+# loaded via `source <(zrush init zsh)` (cli-protocol.md "`zrush init`"), which
 # injects $ZRUSH_BIN ahead of this file; an already-set $ZRUSH_BIN overrides it.
 #
 # zsh captures compsys candidates in a forked shell and hands the raw
@@ -70,11 +70,11 @@ typeset -g  _zrush_cfg_path= _zrush_cfg_mtime=
 typeset -gi _zrush_request_seq=${_zrush_request_seq:-0}
 # candidate_generation is independent of request_id and shares its survival
 # rule: monotonic per shell session, never reused, never reset by a worker
-# restart or a re-source (cli-protocol.md "要求と応答").
+# restart or a re-source (cli-protocol.md "Requests and Responses").
 typeset -gi _zrush_cand_gen_seq=${_zrush_cand_gen_seq:-0}
 # input_generation is the third shell-owned counter, independent of the two
-# above and sharing their survival rule (cli-protocol.md "入力通知と worker
-# event"): monotonic per shell session, never reused, never reset by a worker
+# above and sharing their survival rule (cli-protocol.md "Input Notifications and Worker Events"):
+# monotonic per shell session, never reused, never reset by a worker
 # restart or a re-source.
 typeset -gi _zrush_input_gen_seq=${_zrush_input_gen_seq:-0}
 typeset -gi _zrush_worker_warned=${_zrush_worker_warned:-0}
@@ -91,7 +91,7 @@ else
   typeset -gi _zrush_build_verifying=0
   if (( _zrush_disabled )) && [[ $_zrush_disable_reason == session-failure ]]; then
     # A user-requested re-source starts a new recovery epoch. Automatic build
-    # following keeps this state latched; see behavior.md "worker ライフサイクル".
+    # following keeps this state latched; see behavior.md "Worker Lifecycle".
     _zrush_disabled=0
     _zrush_disable_reason=
     _zrush_worker_failures=0
@@ -123,7 +123,7 @@ typeset -gi _zrush_last_cursor=-1
 # The one input_generation this shell currently treats as valid (0 = none), and
 # what is still expected of it. Declared without `${...:-}` preservation, so a
 # re-source starts without one -- one of its invalidation points
-# (behavior.md "worker ライフサイクル").
+# (behavior.md "Worker Lifecycle").
 typeset -gi _zrush_input_gen=0
 typeset -gi _zrush_input_pending=0   # no worker event has answered it yet
 typeset -gi _zrush_input_latched=0   # its notification named the cache latch's generation
@@ -151,10 +151,10 @@ typeset -gi _zrush_sync_target=0 _zrush_sync_done=0 _zrush_sync_ok=0
 # Lifecycle stops may block briefly, but each operation uses one 100ms
 # absolute budget, matching the existing synchronous history exchange.
 typeset -gi _ZRUSH_WORKER_SHUTDOWN_MS=100
-# Byte ceiling on one synthesized history payload (behavior.md "履歴メニュー").
+# Byte ceiling on one synthesized history payload (behavior.md "History Menu").
 typeset -gi _ZRUSH_HISTORY_PAYLOAD_MAX_BYTES=262144
 
-# Render plan received from the Rust worker (cli-protocol.md "plan の ok body").
+# Render plan received from the Rust worker (cli-protocol.md "`plan` `ok` body (Render Plan Stream)").
 # zsh applies these verbatim; it never recomputes layout, offsets, or spans.
 typeset -g  _zrush_plan_text=          # L display-row texts, \n-joined
 typeset -gi _zrush_plan_nlines=0       # L
@@ -166,7 +166,7 @@ typeset -ga _zrush_plan_insert=()      # P entries, completed insertion text
 typeset -g  _zrush_plan_cp=            # common-prefix
 typeset -gi _zrush_listing=0
 # Which producer the current plan came from: none (no plan) | compsys | history.
-# Single source for the listing kind (behavior.md "履歴メニュー"): confirmation
+# Single source for the listing kind (behavior.md "History Menu"): confirmation
 # rule and key mapping branch on this and on nothing else.
 typeset -g  _zrush_plan_kind=none
 # Window start of the current history plan (cli-protocol.md `offset`).
@@ -182,7 +182,7 @@ typeset -g  _zrush_hl_memo=   # ' memo=zrush' on zsh 5.9+
 typeset -gi _zrush_selected=0      # 0=unselected; >0=one-based, column-major display position
 typeset -gi _zrush_tab_pending=0   # Tab was pressed before candidates arrived
 
-# See docs/internal/specs/behavior.md "空語収集キャッシュ".
+# See docs/internal/specs/behavior.md "Empty-Word Collection Cache".
 # Cache storage is separate from working state and survives across prompts.
 # The parsed candidates live in the worker's `cache` slot; this side keeps only
 # the fingerprint, the save time and the candidate store latch. An empty
@@ -191,14 +191,14 @@ typeset -g  _zrush_cc_fp=          # fingerprint at save time
 typeset -gi _zrush_cc_time=0       # save time (EPOCHSECONDS)
 # Candidate store latch: the generation this worker session holds in its
 # `cache` slot, 0 when there is none. Belongs to the worker session, so a
-# source starts without one (behavior.md "worker ライフサイクル").
+# source starts without one (behavior.md "Worker Lifecycle").
 typeset -gi _zrush_cc_cand_gen=0
 # Cache entries whose `store` is still outstanding, by request_id ->
 # "<save time> <fingerprint>"; they become the latch on that store's `ok`.
 typeset -gA _zrush_cc_staged=()
 typeset -gi _ZRUSH_CC_TTL=300      # seconds; catches same-count replacement and is not configurable
 
-# See docs/internal/specs/behavior.md "履歴メニュー".
+# See docs/internal/specs/behavior.md "History Menu".
 # The worker owns the history index; this side keeps only the history index
 # latch -- the generation that index holds -- and the baseline the two-level
 # fingerprint compares against. Declared without `${...:-}` preservation, so a
@@ -210,7 +210,7 @@ typeset -gi _zrush_hist_head=0     # newest event number the index was told abou
 typeset -gi _zrush_hist_count=0    # ${#history} when that baseline was recorded
 typeset -gi _zrush_hist_unacked=0  # appends enqueued whose terminal response is outstanding
 # Bound on unacknowledged appends: past it the index goes dirty rather than
-# queueing (behavior.md "履歴メニュー"). Internal constant, not configurable.
+# queueing (behavior.md "History Menu"). Internal constant, not configurable.
 typeset -gi _ZRUSH_HIST_MAX_UNACKED=8
 
 # Key bindings (dispatch widget -> predecessor/action)
@@ -306,7 +306,8 @@ _zrush_kick_drain() {  # zle -F -w handler ($1=fd)
 }
 
 # ---------------------------------------------------------------- Widening
-# See docs/internal/specs/behavior.md "候補収集" and cli-protocol.md "起動".
+# See docs/internal/specs/behavior.md "Candidate Collection" and cli-protocol.md
+# "Startup and Responsibilities".
 _zrush_widen() {  # $1=buffer through the cursor
                   # → REPLY_WIDENED / REPLY_QUERY / REPLY_KEEP / REPLY_WORD
   emulate -L zsh
@@ -472,7 +473,7 @@ _zrush_precmd() {
   emulate -L zsh
   (( _zrush_enabled )) || return 0
   # Ahead of the config block, whose reload branches return early: the index
-  # must not skip a prompt (behavior.md "履歴メニュー" 更新経路).
+  # must not skip a prompt (behavior.md "History Menu" 更新経路).
   _zrush_hist_reconcile
   _zrush_config_mtime
   if [[ $REPLY != $_zrush_cfg_mtime ]]; then
@@ -504,8 +505,8 @@ typeset -ga _ZRUSH_COMPADD_SPEC=(
 )
 
 # Pure encoder for one compadd call: argv plus the captured candidate arrays in,
-# wire bytes out. Emits the compsys 捕獲 profile wire format (cli-protocol.md
-# "compsys 捕獲 profile"):
+# wire bytes out. Emits the compsys capture-profile wire format (cli-protocol.md
+# "compsys Capture Profile"):
 # one batch header record (tag `b`, then whichever of P/p/S/s/i/I/ip/f/es/rd/X/J
 # apply -- `es` on `-S` being *specified*, the rest when non-empty) followed by
 # one thin record per candidate (`w`, optional `m` only
@@ -556,7 +557,7 @@ _zrush_encode_batch() {
   _vals=( "${(@)_vals//(#s)*($'\0'|$'\1'|$'\2')*(#e)/}" )
 
   # Batch header: shared fields for this compadd call, always emitted even
-  # when every field is empty (cli-protocol.md "バッチヘッダレコード": the
+  # when every field is empty (cli-protocol.md "Batch Header Record": the
   # receiver needs it to delimit batch boundaries).
   local -a _hdr=( "b"$'\1' )
   [[ -n $_vals[1] ]]  && _hdr+=( "P"$'\1'"$_vals[1]" )
@@ -674,7 +675,7 @@ _zrush_capture_worker() {
   done
   builtin unset HISTFILE 2>/dev/null
   SAVEHIST=0
-  # behavior.md "候補収集": generate dotfile candidates unconditionally; keeping
+  # behavior.md "Candidate Collection": generate dotfile candidates unconditionally; keeping
   # them out of the listing until the query opts in is the matcher's rule.
   setopt globdots
   _zlog "fork: start wfd=$_zrush_wfd"
@@ -717,11 +718,11 @@ _zrush_cancel_collection() {
 }
 
 # Drop the current input_generation. Every invalidation point named in
-# behavior.md "worker ライフサイクル" goes through here: the worker keeps
+# behavior.md "Worker Lifecycle" goes through here: the worker keeps
 # measuring its quiet period and may still send an event, but this shell no
 # longer has a generation for it to match, so it is discarded on arrival. No
 # cancellation message is sent. The collection that generation started, if any,
-# is cancelled with it (behavior.md "候補収集").
+# is cancelled with it (behavior.md "Candidate Collection").
 _zrush_input_invalidate() {
   emulate -L zsh
   _zrush_input_gen=0 _zrush_input_pending=0 _zrush_input_latched=0
@@ -805,7 +806,7 @@ _zrush_teardown() {
 }
 
 # ---------------------------------------------------------------- Empty-word collection cache
-# See docs/internal/specs/behavior.md "空語収集キャッシュ".
+# See docs/internal/specs/behavior.md "Empty-Word Collection Cache".
 # Do not use $#commands: lazy command hashing changes its size independently of the
 # candidate set. Directory mtimes detect executable additions and removals.
 # The function names are counted through their keys: $#functions would expand
@@ -836,7 +837,7 @@ _zrush_cc_fingerprint() {
 }
 
 # The worker no longer holds the cache slot's generation. Called from every
-# invalidation point named in behavior.md "worker ライフサイクル".
+# invalidation point named in behavior.md "Worker Lifecycle".
 _zrush_cc_latch_drop() {
   _zrush_cc_cand_gen=0
   return 0
@@ -857,7 +858,7 @@ _zrush_cc_subject() {
   [[ -z $_zrush_query ]]
 }
 
-# Checked when the notification is made (behavior.md "空語収集キャッシュ").
+# Checked when the notification is made (behavior.md "Empty-Word Collection Cache").
 _zrush_cc_check() {  # 0=usable hit; on a miss, log the reason and return nonzero
   emulate -L zsh
   if [[ -z $_zrush_cc_fp ]]; then
@@ -885,7 +886,7 @@ _zrush_cc_check() {  # 0=usable hit; on a miss, log the reason and return nonzer
 }
 
 # The latch may only name a generation the worker actually holds
-# (behavior.md "空語収集キャッシュ"), so an entry is staged when the `cache`
+# (behavior.md "Empty-Word Collection Cache"), so an entry is staged when the `cache`
 # store goes out and committed when that store's `ok` comes back. The
 # fingerprint and the save time are snapshotted here, at collection time:
 # computing them on arrival would describe an environment the capture never saw.
@@ -910,7 +911,7 @@ _zrush_cc_commit() {  # $1=store request_id $2=generation the worker accepted
 
 # Start the compsys collection for the current input_generation, from a widget
 # or handler context. Only a `capture-required` event matching that generation
-# gets here (behavior.md "候補収集"); the query and the widened collection
+# gets here (behavior.md "Candidate Collection"); the query and the widened collection
 # string are the ones snapshotted when its notification was made, because any
 # buffer change since would have invalidated the generation.
 _zrush_start_collection() {
@@ -996,7 +997,7 @@ _zrush_on_data() {  # zle -F -w handler ($1=fd)
 # an accepted store with the `plan-ready` for that same input. A successful
 # empty-word command-position collection is the cache's subject, so it stores
 # into the `cache` slot; the latch itself is staged here and taken only once
-# that store answers `ok` (behavior.md "空語収集キャッシュ").
+# that store answers `ok` (behavior.md "Empty-Word Collection Cache").
 _zrush_finalize() {
   emulate -L zsh
   setopt localoptions no_monitor no_notify
@@ -1008,7 +1009,7 @@ _zrush_finalize() {
   # Every store carries the binding of the input this capture answers, and only
   # an input this shell still treats as valid has an answer worth sending: a
   # capture that outlived its generation is dropped rather than stored
-  # (behavior.md "候補収集").
+  # (behavior.md "Candidate Collection").
   local -i bound=$_zrush_collect_gen
   _zrush_collect_gen=0
   (( bound > 0 && bound == _zrush_input_gen )) || {
@@ -1290,7 +1291,7 @@ _zrush_worker_begin_stop() {
   _zrush_worker_stopping=1
   # The candidate store and the history index die with the session, whether
   # this is a normal shutdown, an abort, or a session failure
-  # (behavior.md "worker ライフサイクル": one invalidation set for both latches).
+  # (behavior.md "Worker Lifecycle": one invalidation set for both latches).
   _zrush_cc_latch_drop
   _zrush_hist_invalidate session-stop
   # The worker's current input dies with the session too, so the generation it
@@ -1654,7 +1655,7 @@ _zrush_worker_handle_message() {  # message [absolute-deadline]
 
   # The three message kinds are told apart by the kind field alone: worker
   # events carry an input_generation and no request_id, and are correlated and
-  # applied entirely on their own terms (cli-protocol.md "メッセージの種別").
+  # applied entirely on their own terms (cli-protocol.md "Message Types").
   local kind=$f[1]
   case $kind in
     plan-ready|capture-required)
@@ -1686,7 +1687,7 @@ _zrush_worker_handle_message() {  # message [absolute-deadline]
     *)                               producer=${req[2]:-} ;;
   esac
   # A terminal response, whatever it says, retires the frame from the bound on
-  # unacknowledged appends (behavior.md "履歴メニュー" 更新経路).
+  # unacknowledged appends (behavior.md "History Menu" 更新経路).
   if [[ $reqkind == history-append ]] && (( _zrush_hist_unacked > 0 )); then
     (( --_zrush_hist_unacked ))
   fi
@@ -1704,16 +1705,16 @@ _zrush_worker_handle_message() {  # message [absolute-deadline]
     fi
     unset "_zrush_worker_pending[$id]"
     # A store that ends in error changed no slot, so its staged entry never
-    # becomes a latch -- `superseded` included (cli-protocol.md "応答の検証と
-    # zsh 側の適用": only an `ok` moves the latch).
+    # becomes a latch -- `superseded` included (cli-protocol.md
+    # "Response Validation and zsh-Side Application (Normative)": only an `ok` moves the latch).
     unset "_zrush_cc_staged[$id]"
     _zrush_worker_failures=0
     _zrush_status_set ""
-    # cli-protocol.md "応答の検証と zsh 側の適用": unknown-generation is an
+    # cli-protocol.md "Response Validation and zsh-Side Application (Normative)": unknown-generation is an
     # ordinary terminal error, and nothing is replayed. The index refused a
     # write, or answered for a generation it does not hold: the latch was
     # optimistic and is now known wrong, so the next menu op starts from a
-    # snapshot (behavior.md "worker ライフサイクル").
+    # snapshot (behavior.md "Worker Lifecycle").
     if [[ $code == unknown-generation ]] &&
        [[ $reqkind == history-* || $producer == history ]]; then
       _zrush_hist_invalidate unknown-generation
@@ -1725,7 +1726,7 @@ _zrush_worker_handle_message() {  # message [absolute-deadline]
       # No plan-ready can follow a store that failed, so the input this capture
       # answered gets no listing at all. `superseded` is the exception the
       # contract names: the input it answered is already gone, and the listing
-      # showing belongs to whatever replaced it (behavior.md "候補収集").
+      # showing belongs to whatever replaced it (behavior.md "Candidate Collection").
       _zrush_teardown
       zle -R 2>/dev/null
     fi
@@ -1734,7 +1735,7 @@ _zrush_worker_handle_message() {  # message [absolute-deadline]
   fi
 
   if [[ $reqkind == store || $reqkind == history-* ]]; then
-    # cli-protocol.md "要求と応答": a successful store or history write answers
+    # cli-protocol.md "Requests and Responses": a successful store or history write answers
     # with an empty body.
     [[ -z $f[3] ]] || {
       _zrush_worker_session_fail "$reqkind ok carries a body request_id=$id"
@@ -1744,7 +1745,7 @@ _zrush_worker_handle_message() {  # message [absolute-deadline]
     _zrush_worker_failures=0
     _zrush_status_set ""
     # The worker now holds this generation, so the entry staged for it becomes
-    # the latch (behavior.md "空語収集キャッシュ"). The history index latch is
+    # the latch (behavior.md "Empty-Word Collection Cache"). The history index latch is
     # not staged: it already moved optimistically when the frame was enqueued.
     [[ $slot == cache ]] && _zrush_cc_commit $id $stored_gen
     _zlog "worker: ok $reqkind request_id=$id slot=$slot generation=$stored_gen binding=$bound_gen"
@@ -1753,7 +1754,7 @@ _zrush_worker_handle_message() {  # message [absolute-deadline]
 
   # Only the synchronous history exchange sends a `plan`, so a plan response is
   # either the one it is waiting for or a stale one it must leave the UI alone
-  # for (behavior.md "履歴メニュー").
+  # for (behavior.md "History Menu").
   local old_text=$_zrush_plan_text old_cp=$_zrush_plan_cp old_kind=$_zrush_plan_kind
   local -i old_l=$_zrush_plan_nlines old_p=$_zrush_plan_npos
   local -a old_hl=( "${(@)_zrush_plan_hl}" ) old_cells=( "${(@)_zrush_plan_cells}" )
@@ -1779,7 +1780,7 @@ _zrush_worker_handle_message() {  # message [absolute-deadline]
   return 0
 }
 
-# A worker event (cli-protocol.md "入力通知と worker event"). Events carry no
+# A worker event (cli-protocol.md "Input Notifications and Worker Events"). Events carry no
 # request_id, get no response, and are never registered anywhere: the whole
 # correlation is the input_generation, and only the one this shell still treats
 # as valid is applied. A malformed shape is a session failure, because an event
@@ -1799,7 +1800,7 @@ _zrush_worker_handle_event() {  # kind input_generation [plan_body]
   }
   # A well-formed event counts like a terminal response for the consecutive
   # failure streak, whether or not its generation still matches
-  # (cli-protocol.md "応答の検証と zsh 側の適用").
+  # (cli-protocol.md "Response Validation and zsh-Side Application (Normative)").
   _zrush_worker_failures=0
   _zrush_status_set ""
   if (( gen != _zrush_input_gen )); then
@@ -1810,7 +1811,7 @@ _zrush_worker_handle_event() {  # kind input_generation [plan_body]
   if [[ $kind == capture-required ]]; then
     # The notification named the cache latch's generation and the worker turns
     # out not to hold it: the latch is wrong, and this is a notification of that
-    # rather than an error (behavior.md "空語収集キャッシュ").
+    # rather than an error (behavior.md "Empty-Word Collection Cache").
     if (( _zrush_input_latched )); then
       _zrush_input_latched=0
       _zrush_cc_latch_drop
@@ -1820,7 +1821,7 @@ _zrush_worker_handle_event() {  # kind input_generation [plan_body]
     return 0
   fi
   # The generation is matched above, before the body is parsed, and an accepted
-  # body is applied exactly as a plan response's is (cli-protocol.md "zsh 側の規範").
+  # body is applied exactly as a plan response's is (cli-protocol.md "zsh-Side Norms").
   # zle -F -w callers require an explicit redraw.
   _zrush_parse_plan "$3" || {
     _zrush_worker_session_fail "malformed render plan input_generation=$gen"
@@ -1981,7 +1982,7 @@ _zrush_next_input_gen() {  # -> REPLY
 }
 
 # The row and column budgets every plan-bearing message carries
-# (cli-protocol.md "要求と応答"): rows = min(max-lines, LINES - 1), clamped to
+# (cli-protocol.md "Requests and Responses"): rows = min(max-lines, LINES - 1), clamped to
 # >= 1 unconditionally (not just when LINES > 1 -- LINES <= 1 must still clamp
 # down to the 1-row floor, not silently keep max-lines).
 _zrush_geometry() {  # -> REPLY_ROWS / REPLY_WIDTH
@@ -1996,7 +1997,7 @@ _zrush_geometry() {  # -> REPLY_ROWS / REPLY_WIDTH
 
 # Undelegated notification frames may be removed or replaced when the
 # notification they carry is cancelled or superseded; request frames never are
-# (behavior.md "worker ライフサイクル"). A queued frame is a notification when
+# (behavior.md "Worker Lifecycle"). A queued frame is a notification when
 # its outer payload opens with the `input` or `flush` kind netstring, which is
 # the whole wire identity of one -- no parallel bookkeeping to keep in step
 # with the queue, and no decoding of a store's candidate payload to find out.
@@ -2026,7 +2027,7 @@ _zrush_worker_ensure_session() {
 }
 
 # Hand a candidate record stream to one slot of the worker's candidate store
-# (cli-protocol.md "要求と応答"). Every store binds the input_generation whose
+# (cli-protocol.md "Requests and Responses"). Every store binds the input_generation whose
 # `capture-required` asked for this capture; the worker answers an accepted one
 # with the `plan-ready` for that input, so nothing is pipelined behind it.
 _zrush_request_store() {  # slot payload input-generation -> REPLY = candidate generation
@@ -2052,11 +2053,11 @@ _zrush_request_store() {  # slot payload input-generation -> REPLY = candidate g
 
 # Hand a candidate record stream to the worker's history index: the whole index
 # for `history-snapshot`, one event for `history-append` (cli-protocol.md
-# "要求と応答"). The caller moves the history index latch optimistically once
+# "Requests and Responses"). The caller moves the history index latch optimistically once
 # this returns, and the plan that reads the generation back is pipelined behind
 # the frame without waiting for its terminal response.
 #
-# Unlike a store this never starts a worker (behavior.md "履歴メニュー": the
+# Unlike a store this never starts a worker (behavior.md "History Menu": the
 # update path must not defeat lazy start). The cold menu path starts one
 # explicitly, inside its deadline, before it gets here.
 _zrush_request_history() {  # kind payload [event] -> REPLY = candidate generation
@@ -2084,7 +2085,7 @@ _zrush_request_history() {  # kind payload [event] -> REPLY = candidate generati
 }
 
 # The explicit query the history menu's synchronous exchange sends
-# (behavior.md "履歴メニュー"). Listings that follow the input are made from
+# (behavior.md "History Menu"). Listings that follow the input are made from
 # `input` notifications instead, so nothing else sends a `plan`.
 _zrush_request_plan() {  # candidate-generation producer query trailing-space [offset]
   emulate -L zsh
@@ -2103,7 +2104,7 @@ _zrush_request_plan() {  # candidate-generation producer query trailing-space [o
   _zrush_worker_ensure_session || return 1
   # history_limit and offset are mandatory on every plan whichever store the
   # generation resolves to; the worker ignores them unless that is a history
-  # listing (cli-protocol.md "要求と応答").
+  # listing (cli-protocol.md "Requests and Responses").
   _zrush_encode_message plan "$id" "$gen" "$PWD" "$producer" "$query" \
     "$ZRUSH_CFG_MODE" "$ZRUSH_CFG_SMART_CASE" "$rows" "$width" "$tspace" \
     "$ZRUSH_CFG_HISTORY_LIMIT" "$offset"
@@ -2114,22 +2115,22 @@ _zrush_request_plan() {  # candidate-generation producer query trailing-space [o
   return 0
 }
 
-# Tell the worker the buffer changed (cli-protocol.md "入力通知と worker
-# event"). A notification carries no request_id and gets no terminal response:
+# Tell the worker the buffer changed (cli-protocol.md "Input Notifications and Worker Events").
+# A notification carries no request_id and gets no terminal response:
 # the worker replaces it while its quiet period runs and answers the survivor
 # with one event. The caller has already applied the suppression rules and the
 # input-pressure check, so reaching here means a notification is owed.
 #
 # The quiet period itself is `delay-ms`, measured by the worker; this side has
 # no timer. The candidate generation is the empty-word cache's latch when it
-# hits and the reserved 0 otherwise (behavior.md "空語収集キャッシュ").
+# hits and the reserved 0 otherwise (behavior.md "Empty-Word Collection Cache").
 _zrush_send_input() {
   emulate -L zsh
   setopt localoptions typesetsilent no_monitor no_notify
   (( !_zrush_worker_stopping && !_zrush_worker_runtime_tainted )) || return 1
   # A notification is a real message, so it is what starts the worker when none
   # is running. It happens before the cache is consulted because a fresh session
-  # holds no slots and drops the latch (behavior.md "worker ライフサイクル").
+  # holds no slots and drops the latch (behavior.md "Worker Lifecycle").
   _zrush_worker_ensure_session || return 1
 
   _zrush_widen "$LBUFFER"
@@ -2148,7 +2149,7 @@ _zrush_send_input() {
   _zrush_encode_message input "$gen" "$cand_gen" "$delay" "$PWD" "$_zrush_fuzzy" \
     "$ZRUSH_CFG_MODE" "$ZRUSH_CFG_SMART_CASE" "$rows" "$width" "$ZRUSH_CFG_TRAILING_SPACE"
   # This notification replaces the previous one, so any frame the previous one
-  # left unhanded is removed rather than sent (behavior.md "worker ライフサイクル").
+# left unhanded is removed rather than sent (behavior.md "Worker Lifecycle").
   _zrush_txq_drop_notifications
   _zrush_worker_txq+=( "$REPLY" )
   _zrush_input_gen=$gen _zrush_input_pending=1 _zrush_input_latched=$latched
@@ -2196,7 +2197,7 @@ _zrush_dec_le_all() {  # $1=bound, $2.. = values, all matched by <->
 }
 
 # Validate and split one render-plan buffer into _zrush_plan_*.
-# Field layout is fixed (cli-protocol.md "plan の ok body"):
+# Field layout is fixed (cli-protocol.md "`plan` `ok` body (Render Plan Stream)"):
 #   common-prefix, L, P, L rows, H, H "role pos start len", P "start len",
 #   P "next prev left right", P insert texts -- total 4 + L + H + 3P fields.
 _zrush_parse_plan() {  # $1=raw render-plan bytes
@@ -2263,7 +2264,7 @@ _zrush_parse_plan() {  # $1=raw render-plan bytes
     ranged+=( "${(@)tok}" )
   done
   _zrush_dec_le_all $P "${(@)ranged}" || return 1
-  # cli-protocol.md "オフセット規律": ranges stay inside the listing text.
+  # cli-protocol.md "Offset Rules": ranges stay inside the listing text.
   # Bound each value on its own first -- string compare, no arithmetic -- so
   # the sum below cannot truncate a wide digit string or overflow.
   _zrush_dec_le_all $N "${(@)offs}" || return 1
@@ -2286,7 +2287,7 @@ _zrush_parse_plan() {  # $1=raw render-plan bytes
 # ---------------------------------------------------------------- Apply the plan
 # Call only from a ZLE widget context. Applies the last successfully parsed
 # plan (_zrush_plan_*) to POSTDISPLAY and region_highlight without any
-# further computation (cli-protocol.md "適用(zsh 側の規範)").
+# further computation (cli-protocol.md "Plan Application (zsh-Side Normative)").
 _zrush_apply_plan() {
   emulate -L zsh
   (( _zrush_selected > _zrush_plan_npos )) && _zrush_selected=$_zrush_plan_npos
@@ -2304,7 +2305,7 @@ _zrush_apply_plan() {
 
 # Call only from a ZLE widget context. Rebuilds region_highlight from
 # _zrush_plan_hl/_zrush_plan_cells for the current _zrush_selected, without
-# re-fetching or recomputing the plan (cli-protocol.md "ハイライト": match
+# re-fetching or recomputing the plan (cli-protocol.md "Highlights": match
 # decoration is skipped for the selected cell and replaced by the selected
 # spec built from that position's cell range).
 _zrush_apply_highlights() {
@@ -2343,7 +2344,7 @@ _zrush_apply_highlights() {
 }
 
 # ---------------------------------------------------------------- History index and menu
-# See docs/internal/specs/behavior.md "履歴メニュー" and cli-protocol.md
+# See docs/internal/specs/behavior.md "History Menu" and cli-protocol.md
 # "history profile".
 
 # Forget what the index held. The generation is the whole readiness question:
@@ -2362,7 +2363,7 @@ _zrush_hist_invalidate() {  # reason
 }
 
 # The optimistic latch and the Level B baseline move together, at the moment a
-# write is enqueued (behavior.md "履歴メニュー": a frame that never arrives
+# write is enqueued (behavior.md "History Menu": a frame that never arrives
 # surfaces as the next query's unknown-generation, not as a silent stale index).
 # HISTCMD at that moment is head + 1, so head carries both halves of the
 # recorded (HISTCMD, ${#history}) pair.
@@ -2394,7 +2395,7 @@ _zrush_history_snapshot_payload() {  # -> REPLY = payload, REPLY_HEAD/REPLY_COUN
   local LC_ALL=C
   # Recorded before the walk: the head a snapshot establishes is HISTCMD - 1 as
   # observed at synthesis, not the largest `n` that made it into the payload
-  # (behavior.md "履歴メニュー": the newest events may be excluded or cut).
+  # (behavior.md "History Menu": the newest events may be excluded or cut).
   typeset -g REPLY_HEAD=$(( HISTCMD - 1 )) REPLY_COUNT=$#history
   local -a kv=( "${(@kv)history}" )   # one bulk expansion: event/line pairs, newest first
   local event line block=b$'\1'
@@ -2427,7 +2428,7 @@ _zrush_history_append_payload() {  # event line -> REPLY = payload bytes
 }
 
 # Level A, once per prompt: O(1) continuity between the newest event and the
-# newest event the index was told about (behavior.md "履歴メニュー" 更新経路).
+# newest event the index was told about (behavior.md "History Menu" 更新経路).
 # Everything expensive -- ${#history}, the bulk expansion, the fingerprint --
 # stays out of the path a prompt with no new event takes.
 _zrush_hist_reconcile() {
@@ -2464,7 +2465,7 @@ _zrush_hist_reconcile() {
   return 0
 }
 
-# behavior.md "履歴メニュー": one absolute deadline, anchored here -- once the
+# behavior.md "History Menu": one absolute deadline, anchored here -- once the
 # payload is synthesized, on the cold path -- covers the lazy worker start, the
 # handshake, the optional history-snapshot and the plan pipelined behind it, and
 # ends on the plan's terminal response (the snapshot's is consumed on the way
@@ -2480,7 +2481,7 @@ _zrush_request_plan_sync() {  # cold snapshot-payload snapshot-head snapshot-cou
   local -i gen=$_zrush_hist_gen
   if (( cold )); then
     # The one path allowed to start a worker synchronously; the update path is
-    # not (behavior.md "worker ライフサイクル").
+    # not (behavior.md "Worker Lifecycle").
     _zrush_worker_ensure_session || return 1
     _zrush_request_history history-snapshot "$payload" || return 1
     gen=$REPLY
@@ -2532,7 +2533,7 @@ _zrush_open_history_menu() {  # ZLE widget context
   # Opening the menu invalidates the current input_generation, which removes its
   # unhanded notification frames and cancels the collection it started; a late
   # event for it is dropped on arrival, so no completion result can replace the
-  # menu (behavior.md "履歴メニュー").
+# menu (behavior.md "History Menu").
   _zrush_input_invalidate
   _zrush_teardown
   # This action leaves BUFFER/CURSOR alone, so bring the pre-redraw baseline up
@@ -2593,14 +2594,14 @@ _zrush_line_pre_redraw() {
   _zrush_last_buffer=$BUFFER
   _zrush_last_cursor=$CURSOR
   # A buffer change invalidates the current input_generation first of all
-  # (behavior.md "候補収集"). Whatever the worker still owes that generation is
+  # (behavior.md "Candidate Collection"). Whatever the worker still owes that generation is
   # discarded on arrival, so a late event can neither settle against the new
   # buffer nor consume a Tab meant for it.
   _zrush_input_invalidate
   # Reaching here means the change came from something other than a zrush
   # action (every zrush action tears the listing down itself, leaving kind
   # `none`), so a history menu goes away whole -- listing text included --
-  # before the ordinary input flow resumes (behavior.md "履歴メニュー").
+  # before the ordinary input flow resumes (behavior.md "History Menu").
   if [[ $_zrush_plan_kind == history ]]; then
     _zlog "history: menu erased by an external buffer/cursor change"
     _zrush_teardown
@@ -2612,7 +2613,7 @@ _zrush_line_pre_redraw() {
   _zrush_tab_pending=0
   _zrush_rh_clear_sel
 
-  # See docs/internal/specs/behavior.md "候補収集": blank buffers neither collect nor display.
+  # See docs/internal/specs/behavior.md "Candidate Collection": blank buffers neither collect nor display.
   if [[ -z ${BUFFER//[[:space:]]/} ]]; then
     _zrush_teardown
     return 0
@@ -2627,7 +2628,7 @@ _zrush_line_pre_redraw() {
 
   # Input pressure is visible to zsh alone, so it is judged here: while keys are
   # still queued no notification is made, and the change that key causes makes
-  # the next one (behavior.md "候補収集"). The listing is left as it is.
+  # the next one (behavior.md "Candidate Collection"). The listing is left as it is.
   (( KEYS_QUEUED_COUNT || PENDING )) && return 0
 
   _zrush_send_input
@@ -2658,7 +2659,8 @@ _zrush_line_finish() {
 }
 
 # ---------------------------------------------------------------- Confirmation
-# See docs/internal/specs/behavior.md "確定(挿入)" and cli-protocol.md "適用".
+# See docs/internal/specs/behavior.md "Confirmation (Insertion)" and cli-protocol.md
+# "Plan Application (zsh-Side Normative)".
 # The insertion text (IPREFIX+ipre+apre+hpre+word+hsuf+asuf+isuf, `-f`
 # directory '/' synthesis, trailing-space) is already fully built by
 # the worker; this only computes the replacement boundary and swaps it in.
@@ -2668,7 +2670,7 @@ _zrush_confirm_pos() {  # $1=one-based position into _zrush_plan_insert
   (( pos >= 1 && pos <= $#_zrush_plan_insert )) || return 1
   local text=$_zrush_plan_insert[pos]
 
-  # cli-protocol.md "適用": the listing kind picks the replacement rule.
+  # cli-protocol.md "Plan Application (zsh-Side Normative)": the listing kind picks the replacement rule.
   if [[ $_zrush_plan_kind == history ]]; then
     BUFFER=$text
     CURSOR=$#BUFFER
@@ -2682,7 +2684,7 @@ _zrush_confirm_pos() {  # $1=one-based position into _zrush_plan_insert
 
   # After confirmation, clear selection/list and invalidate the pre-redraw
   # baseline, so the next pre-redraw always treats the insertion as a buffer
-  # change and triggers recollection (behavior.md "確定(挿入)"), matching the
+  # change and triggers recollection (behavior.md "Confirmation (Insertion)"), matching the
   # common-prefix insertion path. Leaving the baseline alone would not do: an
   # insertion identical to what the baseline already records -- confirming the
   # history candidate that equals the current line, say -- would read as "no
@@ -2705,9 +2707,9 @@ _zrush_select_start() {
 }
 
 # Move the current selection using the last plan's navigation table
-# (cli-protocol.md "ナビ"). A self-referencing transition is a no-op.
+# (cli-protocol.md "Navigation"). A self-referencing transition is a no-op.
 # Transition 0 leaves the current window in that direction: completions
-# deselect, a history listing replans or closes (behavior.md "履歴メニュー").
+# deselect, a history listing replans or closes (behavior.md "History Menu").
 _zrush_select_dir() {  # $1=next|prev|left|right (navigation-table transition)
   emulate -L zsh
   local -i p=$_zrush_selected
@@ -2744,7 +2746,7 @@ _zrush_select_dir() {  # $1=next|prev|left|right (navigation-table transition)
   return 0
 }
 
-# Warm re-layout of an open history menu (behavior.md "履歴メニュー").
+# Warm re-layout of an open history menu (behavior.md "History Menu").
 # Not an open: no snapshot, no input invalidation, same generation.
 _zrush_history_replan() {  # $1=offset $2=1|last
   emulate -L zsh
@@ -2770,7 +2772,7 @@ _zrush_history_replan() {  # $1=offset $2=1|last
 # The one place the select-prev/select-next keys are mapped onto navigation-table
 # transitions. A completion listing maps them straight through; a history listing
 # inverts them, because there ↑ moves away from the prompt into older history and
-# ↓ moves back toward it (behavior.md "履歴メニュー").
+# ↓ moves back toward it (behavior.md "History Menu").
 _zrush_select_move() {  # $1=select-prev|select-next
   emulate -L zsh
   local t
@@ -2804,7 +2806,7 @@ _zrush_action_next() {
     _zrush_select_move select-next
     return 0
   fi
-  # See docs/internal/specs/behavior.md "選択・キーバインド" for this priority order.
+  # See docs/internal/specs/behavior.md "Selection and Keybindings" for this priority order.
   if [[ $BUFFER == *$'\n'* && ${BUFFER[CURSOR+1,-1]} == *$'\n'* ]]; then
     _zlog "next: multiline-branch"
     _zrush_call_prev; return 0            # 1. middle line in multiline buffer -> cursor movement
@@ -2825,7 +2827,7 @@ _zrush_action_prev() {
     _zrush_select_move select-prev
     return 0
   fi
-  # See docs/internal/specs/behavior.md "選択・キーバインド" for this priority order.
+  # See docs/internal/specs/behavior.md "Selection and Keybindings" for this priority order.
   if [[ $LBUFFER == *$'\n'* ]]; then
     _zlog "prev: multiline-branch"
     _zrush_call_prev; return 0            # 1. not on the first line -> cursor movement
@@ -2892,7 +2894,7 @@ _zrush_tab_with_results() {  # Tab behavior when results are available
       (( _zrush_plan_npos > 0 )) && _zrush_confirm_pos 1
       ;;
     common-prefix)
-      # See cli-protocol.md "common-prefix の意味論" and behavior.md "Tab".
+      # See cli-protocol.md "common-prefix Semantics" and behavior.md "Tab".
       local cp=$_zrush_plan_cp q=$_zrush_fuzzy
       if [[ -n $cp && $cp != "$q" && $cp == "$q"* ]]; then
         _zrush_widen "$LBUFFER"
@@ -2961,7 +2963,7 @@ _zrush_dispatch() {  # $1=action $2=predecessor $3=dispatcher name
 }
 
 # ---------------------------------------------------------------- Apply key bindings
-# behavior.md "プラグイン共存": caller has restored a directly owned layer.
+# behavior.md "Plugin Coexistence": caller has restored a directly owned layer.
 _zrush_release_dispatch() {  # $1=unbound dispatch widget name
   emulate -L zsh
   local w=$1
@@ -2995,7 +2997,7 @@ _zrush_key_seqs() {  # $1=key:<name> -> reply=(sequences...)
 
 # Bind one key sequence to an action's dispatch widget.
 # If already bound to our dispatcher, retain its recorded predecessor so reload does not
-# capture this layer as its own predecessor; see behavior.md "プラグイン共存".
+# capture this layer as its own predecessor; see behavior.md "Plugin Coexistence".
 _zrush_bind_one() {  # $1=action $2=key sequence in bindkey notation or raw form
   emulate -L zsh
   local action=$1 seq=$2

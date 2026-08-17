@@ -1,5 +1,5 @@
 //! Plan application: POSTDISPLAY assembly and region_highlight
-//! (docs/internal/contracts/cli-protocol.md "適用(zsh 側の規範)").
+//! (docs/internal/contracts/cli-protocol.md "Plan Application (zsh-Side Normative)").
 
 use crate::host::{Host, PlanShape, keys};
 

@@ -201,7 +201,7 @@ encode_vector() {  # $1=vector directory -> REPLY=wire bytes, or return 1 with R
 }
 
 # Re-serialize the parsed _zrush_plan_* state back into plan bytes, following
-# the field order of cli-protocol.md "plan の ok body".
+# the field order of cli-protocol.md "`plan` `ok` body (Render Plan Stream)".
 # Fails (return 1, reason in REPLY) when _zrush_plan_text does not split back
 # into exactly L rows -- that split is only reversible because display rows are
 # guaranteed to contain no newline, so checking it tests that guarantee too.
@@ -431,7 +431,7 @@ reserialize_plan() {  # -> REPLY=bytes, or return 1 with REPLY=reason
 
   # A store's terminal response is consumed on its own: it carries no body and
   # never touches the plan the worker will deliver as an event
-  # (cli-protocol.md "要求と応答").
+  # (cli-protocol.md "Requests and Responses").
   _zrush_worker_ready=1 _zrush_worker_failures=1 _zrush_enabled=1
   typeset -gA _zrush_worker_pending=( 50 'store live 50 7' )
   _zrush_input_gen=7
@@ -449,10 +449,10 @@ reserialize_plan() {  # -> REPLY=bytes, or return 1 with REPLY=reason
   _zrush_plan_text= _zrush_plan_nlines=0
 
   # unknown-generation is a normal terminal error: it never fails the session
-  # and nothing is replayed (cli-protocol.md "応答の検証と zsh 側の適用").
+  # and nothing is replayed (cli-protocol.md "Response Validation and zsh-Side Application (Normative)").
   # Only the history menu's synchronous exchange sends a plan, so that is where
   # it lands -- as an exchange failure that starts no collection and leaves the
-  # empty-word cache's latch alone (behavior.md "履歴メニュー").
+  # empty-word cache's latch alone (behavior.md "History Menu").
   local saved_start_collection=$functions[_zrush_start_collection]
   typeset -gi _zrt_collections=0
   functions[_zrush_start_collection]='(( ++_zrt_collections )); return 0'
@@ -579,7 +579,7 @@ reserialize_plan() {  # -> REPLY=bytes, or return 1 with REPLY=reason
   # ---------------- Empty-word collection cache latch ----------------
   # The latch is the worker session's, not the shell's: a lost session drops it
   # and the entry misses even while fingerprint and TTL are still good
-  # (behavior.md "空語収集キャッシュ" / "worker ライフサイクル").
+  # (behavior.md "Empty-Word Collection Cache" / "Worker Lifecycle").
   zmodload -F zsh/stat b:zstat 2>/dev/null
   ZRUSH_LOG=$WORK/cache.log
   local -i cache_ok=1
@@ -767,7 +767,7 @@ reserialize_plan() {  # -> REPLY=bytes, or return 1 with REPLY=reason
   # ---- History index requests, observed on the same outbound queue ----
   # The index is generation-addressed like a slot, but it is written by its own
   # two kinds and read by a plan with producer=history
-  # (cli-protocol.md "要求と応答" / "history profile").
+  # (cli-protocol.md "Requests and Responses" / "history profile").
   local -i hist_wire=1
   local -i snap_gen=0 ev=0
   wire_reset
@@ -867,7 +867,7 @@ reserialize_plan() {  # -> REPLY=bytes, or return 1 with REPLY=reason
 
   # unknown-generation on either write kind or on the history plan drops the
   # index latch; other producers leave it alone
-  # (behavior.md "worker ライフサイクル").
+  # (behavior.md "Worker Lifecycle").
   local -i unknown_wire=1
   local kind
   for kind in history-snapshot history-append plan; do
@@ -900,7 +900,7 @@ reserialize_plan() {  # -> REPLY=bytes, or return 1 with REPLY=reason
   _zrush_hist_reset
 
   # ---- Notification and event frames (tests/vectors/message/) ----
-  # cli-protocol.md "入力通知と worker event" spells six complete messages and
+  # cli-protocol.md "Input Notifications and Worker Events" spells six complete messages and
   # the corpus holds those bytes; both directions run against them here.
   local frame_input= frame_flush= frame_store= frame_capture=
   local frame_plan_ready= frame_superseded= vname=
@@ -1078,7 +1078,7 @@ reserialize_plan() {  # -> REPLY=bytes, or return 1 with REPLY=reason
 
   # Queue discipline: a newer notification replaces the notification frames the
   # older one left unhanded, invalidation removes them, and request frames are
-  # never touched (behavior.md "worker ライフサイクル").
+  # never touched (behavior.md "Worker Lifecycle").
   local -i queue_wire=1
   wire_reset
   _zrush_cc_fp= _zrush_cc_time=0 _zrush_cc_cand_gen=0 _zrush_cc_staged=()
@@ -1111,7 +1111,7 @@ reserialize_plan() {  # -> REPLY=bytes, or return 1 with REPLY=reason
   # The suppression rules are judged where the notification would be made: a
   # blank buffer, a current word under min-input, and unprocessed key input all
   # invalidate the current generation and produce no notification at all
-  # (behavior.md "候補収集"). Only the first two also clear the listing; input
+  # (behavior.md "Candidate Collection"). Only the first two also clear the listing; input
   # pressure merely defers, so what is showing stays until a result replaces it.
   local -i suppress_wire=1
   local why=

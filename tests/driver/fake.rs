@@ -18,7 +18,7 @@ pub const DRAIN_TAIL_BYTES: usize = 8 * 1024 * 1024;
 /// candidate payload and so holds no generation, which makes every input
 /// notification settle into a `capture-required` whatever the mode -- and an
 /// accepted `store` answer `ok` and then the `plan-ready` for the input it was
-/// bound to (cli-protocol.md 「入力通知と worker event」).
+/// bound to (cli-protocol.md "Input Notifications and Worker Events").
 #[derive(Clone, Copy, Debug)]
 pub enum Mode {
     /// Delegate every invocation to the real binary (`execv`); no fake session.
@@ -132,7 +132,7 @@ impl Fake {
 
     /// The same accounting over `notify <session> <kind> <input_generation>`:
     /// a notification is no more replayable than a request
-    /// (cli-protocol.md 「zsh 側の規範」).
+    /// (cli-protocol.md "zsh-Side Norms").
     pub fn notifications_for(&self, input_generation: &str) -> usize {
         self.arrivals_for("notify", input_generation)
     }

@@ -1,4 +1,4 @@
-# config-schema: config.toml の仕様
+# config-schema: config.toml Specification
 
 `~/.config/zrush/config.toml`(`$XDG_CONFIG_HOME` 優先。cli-protocol.md 参照)の
 テーブル・キー・型・既定値・検証規則。この文書が真実であり、コードはこれに追従する。
@@ -19,7 +19,7 @@
 - `delay-ms` の待ちは worker 側で起こる。
   zsh は抑止規則を通ったバッファ変化を直ちに入力通知として送り、その通知が運ぶ `delay-ms` の分だけ
   worker が新しい通知を待って、最新のものだけを採用する
-  (cli-protocol.md「入力通知と worker event」、behavior.md「候補収集」)。
+  (cli-protocol.md「Input Notifications and Worker Events」、behavior.md「Candidate Collection」)。
   分解能は 1 ミリ秒で、指定した値がそのまま静穏期間になる。
   静穏期間中に届いた新しい通知は期間を張り直すため、打鍵が続く間は通知が採用されない。
   `delay-ms = 0` は通知を受理と同時に採用することを意味し、打鍵ごとに settle する
@@ -71,7 +71,7 @@
 - `limit` が有界化するのは**走査する履歴エントリ数だけ**である
   (1 行の長さに上限を設けないため、`limit` だけでは走査するバイト量が決まらない)。
 - index を作り直すときに zsh が合成する payload の総バイト数は、`limit` とは別に置いた固定上限で
-  有界化する(behavior.md「履歴メニュー」)。
+  有界化する(behavior.md「History Menu」)。
   合成は `limit` で絞らないため、`limit` をいくつにしても同期経路が扱うバイト量はその固定上限を超えない。
 - 履歴候補の表示行数は `[display].max-lines` を共用する(履歴専用のキーは設けない)。
 
@@ -99,7 +99,7 @@
 - `select-left` / `select-right` を含む全アクションは原則として**選択中のみ**キーを奪う。
   例外は 3 つ: `dismiss` は非選択でも一覧表示中なら一覧を閉じ、
   `select-next` は一覧表示中なら非選択でも選択を開始し(behavior.md の優先順位規則に従う)、
-  `select-prev` は非選択時に履歴メニューを開く(behavior.md「履歴メニュー」節)。
+  `select-prev` は非選択時に履歴メニューを開く(behavior.md「History Menu」節)。
   それ以外の非選択時は前任者チェーンへフォールバックするため、既定の ← → / ctrl-b / ctrl-f は
   カーソル移動、ctrl-n は履歴移動のまま(ctrl-n は ↓ と同じ優先順位規則に従う)。
 - 既定では ↑ と ctrl-p の両方が `select-prev` であり、どちらも非選択時に履歴メニューを開く。
@@ -111,7 +111,7 @@
 - `dismiss` の既定は `ctrl-g`(Escape 単独は `\e` プレフィックスと曖昧で
   KEYTIMEOUT 待ちが発生するため既定にしない。ユーザーが明示設定することは可能)。
 
-### キー記法
+### Key Notation
 
 小文字で書く。修飾は `ctrl-` / `alt-` を前置(`alt` は ESC プレフィックス送出を仮定)。
 
@@ -138,7 +138,7 @@
   端末の terminfo に該当エントリが無い場合(例: `$terminfo[kcbt]` が空)、
   zsh 側はそのキーの bindkey をスキップして警告する(他のキーは通常どおり適用)。
 
-## 検証とエラーの扱い
+## Validation and Error Handling
 
 - config ファイルが存在しない場合は正常として警告せず、全既定値で動作する。
   それ以外の読み取り失敗(権限エラーなど)は警告を出し、全既定値にフォールバックする。

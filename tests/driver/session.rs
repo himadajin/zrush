@@ -101,7 +101,7 @@ fn a_resized_terminal_takes_effect_on_the_next_render() {
     let wide = widest_line(&host.postdisplay("(ses-4) before resize"));
 
     // The kernel raises SIGWINCH on the resize; the next request reads the new
-    // COLUMNS (docs/internal/contracts/cli-protocol.md 「起動」), so a following
+    // COLUMNS (docs/internal/contracts/cli-protocol.md "Startup and Responsibilities"), so a following
     // keystroke is what makes the narrower layout appear.
     host.resize(NARROW_COLS, 24);
     host.send_keys_wait_plan(PlanShape::Nonempty, "-");

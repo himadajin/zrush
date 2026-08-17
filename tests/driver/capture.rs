@@ -1,8 +1,8 @@
 //! Capture fork -> candidate records -> persistent worker, and the worker
 //! lifecycle transitions that ride on it: lazy start, reuse, build-stamp
 //! follow, and the two re-source shutdown paths
-//! (docs/internal/contracts/cli-protocol.md 「ビルドスタンプ」, 「起動と責務」,
-//! docs/internal/specs/behavior.md 「worker ライフサイクル」).
+//! (docs/internal/contracts/cli-protocol.md "Build Stamp", "Startup and Responsibilities",
+//! docs/internal/specs/behavior.md "Worker Lifecycle").
 
 use std::path::Path;
 use std::time::Duration;
@@ -29,7 +29,7 @@ fn fork_capture_round_trip_reuses_one_worker() {
     // One collection spends one request id and one candidate generation: the
     // `store` that hands the records over. Its listing arrives as the
     // `plan-ready` that store settles, which is no request at all
-    // (cli-protocol.md 「入力通知と worker event」).
+    // (cli-protocol.md "Input Notifications and Worker Events").
     assert!(
         first_rfd > 2
             && state_has(
@@ -201,7 +201,7 @@ fn build_stamp_mismatch_re_sources_and_restarts_the_worker() {
 
 /// An explicit re-source tears the transport down and observes response EOF
 /// before it replaces the old runtime generation, while the monotonic request
-/// counter survives (cli-protocol.md 「要求と応答」 request_id).
+/// counter survives (cli-protocol.md "Requests and Responses" request_id).
 #[test]
 fn re_source_tears_down_the_transport_and_keeps_the_request_counter() {
     let mut host = Host::boot();
@@ -253,8 +253,8 @@ fn re_source_tears_down_the_transport_and_keeps_the_request_counter() {
 
 /// Re-source a healthy fake session whose final stdout bytes are deliberately
 /// not a protocol frame: healthy transport shutdown must keep stdout open and
-/// drain raw bytes without parsing them (cli-protocol.md 「abort control と
-/// worker 終了」). The fake records stdin EOF, the tail write, and clean return
+/// drain raw bytes without parsing them (cli-protocol.md "Abort Control and Worker Termination").
+/// The fake records stdin EOF, the tail write, and clean return
 /// in that order, so the observation does not depend on whether a real worker
 /// happened to have an outstanding response.
 #[test]
@@ -345,7 +345,7 @@ fn healthy_re_source_drains_a_raw_stdout_tail() {
 }
 
 /// w vs m: a candidate whose quoted form differs from its raw text. The listing
-/// shows the raw text (m, cli-protocol.md 「候補レコード」) and confirming
+/// shows the raw text (m, cli-protocol.md "Candidate Record") and confirming
 /// inserts the quoted form (w) so the shell word stays valid.
 #[test]
 fn listing_shows_raw_text_and_confirming_inserts_the_quoted_form() {
@@ -389,8 +389,8 @@ fn a_zero_candidate_prefix_leaves_compsys_state_intact() {
 }
 
 /// Hidden files: the fork collects them unconditionally (globdots,
-/// behavior.md 「候補収集」) and the matcher keeps them out until the query
-/// starts with a dot (cli-protocol.md 「隠し候補の除外」).
+/// behavior.md "Candidate Collection") and the matcher keeps them out until the query
+/// starts with a dot (cli-protocol.md "隠し候補の除外").
 #[test]
 fn hidden_entries_stay_out_until_the_query_starts_with_a_dot() {
     let mut host = Host::boot();

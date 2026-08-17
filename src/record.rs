@@ -31,16 +31,16 @@ impl ByteSpan {
 }
 
 /// Shared fields from a batch header record, inherited by every candidate
-/// up to the next header (cli-protocol.md "バッチヘッダレコード").
+/// up to the next header (cli-protocol.md "Batch Header Record").
 ///
 /// The sender only emits a shared field when it is non-empty, and per the
 /// contract's general rule "absent field" and "empty value" are
 /// equivalent -- so every field here reads as the empty slice when the
 /// header omitted it (or, defensively, sent it empty). Field names mirror
-/// their wire tags directly (cli-protocol.md "バッチヘッダレコード"); the
+/// their wire tags directly (cli-protocol.md "Batch Header Record"); the
 /// compadd option each visible/hidden prefix/suffix tag corresponds to is
-/// a compsys 捕獲 profile convention (cli-protocol.md "compsys 捕獲
-/// profile"), not a fact of this producer-independent record layer.
+/// a compsys Capture Profile convention (cli-protocol.md "compsys Capture
+/// Profile"), not a fact of this producer-independent record layer.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct Batch<'a> {
     pub p_vis: &'a [u8],    // P
@@ -62,14 +62,14 @@ pub(crate) struct Batch<'a> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Candidate<'a> {
     /// Candidate body used to build the insertion text (cli-protocol.md
-    /// `w`, "候補レコード"). Never empty -- the parser skips records that
+    /// `w`, "Candidate Record"). Never empty -- the parser skips records that
     /// would produce one. Producer-profile-specific: see cli-protocol.md
-    /// "compsys 捕獲 profile" / "history profile".
+    /// "compsys Capture Profile" / "history profile".
     pub w: &'a [u8],
     /// match-text (cli-protocol.md `m`), present only when it differs
     /// from `w`.
     pub m: Option<&'a [u8]>,
-    /// Display text (cli-protocol.md `d`, "候補レコード").
+    /// Display text (cli-protocol.md `d`, "Candidate Record").
     pub d: Option<&'a [u8]>,
     /// History event number (cli-protocol.md `n`), emitted only by the
     /// history profile as non-empty ASCII decimal digits.
@@ -79,7 +79,7 @@ pub(crate) struct Candidate<'a> {
 }
 
 impl<'a> Candidate<'a> {
-    /// match-text: `m` if present, else `w` (cli-protocol.md "候補レコード").
+    /// match-text: `m` if present, else `w` (cli-protocol.md "Candidate Record").
     pub fn match_text(&self) -> &'a [u8] {
         self.m.unwrap_or(self.w)
     }
@@ -200,7 +200,7 @@ pub(crate) fn parse(bytes: Vec<u8>) -> Result<Stored, FramingError> {
     let mut batches: Vec<BatchSpans> = Vec::new();
     let mut candidates: Vec<CandidateSpans> = Vec::new();
     // None until the first header is seen; candidate records before that
-    // point are skipped (cli-protocol.md "スキップ規律").
+    // point are skipped (cli-protocol.md "Skip Rules (Normative)").
     let mut current_batch: Option<usize> = None;
 
     for (at, record) in split_spans(&bytes[..body_len], REC_SEP, 0) {

@@ -1,8 +1,8 @@
 //! config.toml parsing, validation, and zsh-sourceable output.
 //!
 //! Schema: docs/internal/contracts/config-schema.md (source of truth).
-//! Validation and error handling: config-schema.md.
-//! Output format: cli-protocol.md "zrush config" — typeset assignments
+//! Validation and error handling: config-schema.md "Validation and Error Handling".
+//! Output format: cli-protocol.md "`zrush config`" — typeset assignments
 //! only, every value single-quoted with `'` escaped as `'\''`.
 
 use std::path::PathBuf;
@@ -96,7 +96,7 @@ pub struct LoadResult {
     pub warnings: Vec<String>,
 }
 
-/// Load per config-schema.md validation and error handling.
+/// Load per config-schema.md "Validation and Error Handling".
 /// File absence is normal and uses defaults without a warning.
 pub fn load() -> LoadResult {
     let Some(path) = config_path() else {
@@ -115,7 +115,7 @@ pub fn load() -> LoadResult {
     }
 }
 
-/// Config path resolution per cli-protocol.md.
+/// Config path resolution per cli-protocol.md "`zrush config` Startup".
 fn config_path() -> Option<PathBuf> {
     let base = match std::env::var_os("XDG_CONFIG_HOME") {
         Some(x) if !x.is_empty() => PathBuf::from(x),
@@ -715,13 +715,14 @@ mod tests {
     const CONTRACT: &str = "docs/internal/contracts/cli-protocol.md";
 
     /// The default `zrush config` output as the contract specifies it: the
-    /// fenced zsh block that opens the "stdout" section of "zrush config".
+    /// fenced zsh block under the "`zrush config` stdout (zsh Source Format)"
+    /// heading.
     /// Reading it keeps the doc the only copy on this side; every failure
     /// mode of the extraction panics with the anchor it could not find, so
     /// restructuring the doc breaks this loudly instead of quietly turning
     /// the check into a no-op.
     fn contract_default_output() -> String {
-        const HEADING: &str = "### stdout(zsh source 形式)";
+        const HEADING: &str = "### `zrush config` stdout (zsh Source Format)";
         const OPEN: &str = "```zsh\n";
         const CLOSE: &str = "```";
 

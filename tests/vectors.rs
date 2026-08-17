@@ -182,7 +182,7 @@ fn run_vector_raw(path: &Path) -> std::process::Output {
     // opens with an `input` notification (input_generation 1) whose quiet period
     // outlives the session: it is still pending when the `store` arrives, and
     // the `store` settles it into one `plan-ready`
-    // (cli-protocol.md 「入力通知と worker event」).
+    // (cli-protocol.md "Input Notifications and Worker Events").
     let source = vector_source(path);
     let mut requests = match source.as_bytes() {
         b"store" => [
@@ -480,7 +480,7 @@ fn reject_vectors_match_expected_in_band_errors() {
         };
         // Only an accepted `store` settles the notification its session opened
         // with, so only then does a `plan-ready` sit between the two terminal
-        // responses (cli-protocol.md 「入力通知と worker event」).
+        // responses (cli-protocol.md "Input Notifications and Worker Events").
         let settles = write_reply.is_empty() && vector_source(&path) == *"store";
         let event_is_plan_ready = |frame: &[u8]| {
             let event = decode_fields_strict(frame);

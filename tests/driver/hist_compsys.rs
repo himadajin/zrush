@@ -2,8 +2,8 @@
 //! opening it over a live compsys listing, disarming or cancelling whatever
 //! collection is under way, resuming the pipeline after a confirm, and the
 //! cleanup left behind by a worker death or a send-break
-//! (docs/internal/specs/behavior.md 「履歴メニュー」「候補収集」,
-//! docs/internal/contracts/cli-protocol.md 「history profile」).
+//! (docs/internal/specs/behavior.md "History Menu", "Candidate Collection",
+//! docs/internal/contracts/cli-protocol.md "history profile").
 //!
 //! Every test here runs on a host booted from `tests/zsh/rc/history.zshrc`.
 
@@ -107,7 +107,7 @@ fn an_up_inside_the_quiet_period_opens_the_menu_and_drops_the_input() {
 
 /// Opening the history menu cancels an in-flight completion collection, and the
 /// cancelled collection's late-arriving result never overwrites the menu
-/// (behavior.md 「候補収集」). Confirming that same menu then leaves no residual
+/// (behavior.md "Candidate Collection"). Confirming that same menu then leaves no residual
 /// history state behind, and the very next completion request resumes the
 /// normal pipeline -- which is what the confirm has to be observed against, so
 /// the two run as one chain with no reset in between.
@@ -160,10 +160,10 @@ fn opening_the_menu_cancels_an_in_flight_collection_and_confirm_resumes_it() {
 
 /// Regression (f6fcf2e): confirming a history candidate byte-identical to the
 /// current BUFFER must still trigger recollection. Opening the menu snapshots
-/// BUFFER/CURSOR as the pre-redraw baseline (behavior.md 「履歴メニュー」); if
+/// BUFFER/CURSOR as the pre-redraw baseline (behavior.md "History Menu"); if
 /// confirm left that baseline untouched, an insertion identical to the pre-open
 /// buffer would read as "no change" on the next pre-redraw and silently stall
-/// recollection (behavior.md 「確定(挿入)」).
+/// recollection (behavior.md "Confirmation (Insertion)").
 #[test]
 fn confirming_an_entry_identical_to_the_buffer_recollects_via_enter() {
     assert_exact_match_confirm_recollects(keys::ENTER, "(h22-setup-enter)", "(h22a)");
@@ -212,7 +212,7 @@ fn the_fixtures_own_injection_commands_are_not_history_candidates() {
 
 /// A synchronous history request assigned to a ready worker which then dies
 /// leaves no menu, no residual kind/listing, the buffer untouched and the shell
-/// responsive (cli-protocol.md 「エラー時の zsh 側挙動」 covers the history
+/// responsive (cli-protocol.md "zsh-Side Behavior on Errors (Normative)" covers the history
 /// producer's synchronous exchange exactly as it does the asynchronous compsys
 /// one). Once that failure has finished unwinding, send-break with the history
 /// menu open must not leak kind/listing state into the next line either -- the

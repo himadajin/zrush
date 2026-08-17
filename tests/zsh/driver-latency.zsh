@@ -308,7 +308,7 @@ start_hist_latency() {  # $1=host label $2=N fixture entries $3=long(0/1) [$4=hi
   export XDG_CONFIG_HOME=$CURXDG ZRUSH_LOG=$HOSTLOG
   export ZRUSH_HIST_N=$2 ZRUSH_HIST_LONG=$3
   # No ZRUSH_HISTORY_DEADLINE_MS seam: the payload byte ceiling (behavior.md
-  # "履歴メニュー") keeps the exchange inside the production deadline at every
+  # "History Menu") keeps the exchange inside the production deadline at every
   # scan window this driver measures, so these numbers are production ones.
   mkdir -p $ZDOTDIR $ZRUSH_TEST_TMP $CURXDG/zrush
   if [[ -n ${4:-} ]]; then
@@ -336,7 +336,7 @@ paint_history_once() {  # $1=pattern $2=timeout -> REPLY=ms (NA if not reached)
   paint_once $'\e[A' $1 ${2:-20}
 }
 
-# Phases of one open transition, from the checkpoints behavior.md "履歴メニュー"
+# Phases of one open transition, from the checkpoints behavior.md "History Menu"
 # prescribes, in the order they are emitted:
 #   history: fingerprint cold|warm  -- the Level A/B verdict at the entrance
 #   history: snapshot ... bytes=N   -- cold only: payload synthesized and enqueued
@@ -424,7 +424,7 @@ history_class() {  # $1=host-label $2=case-label $3=pattern $4=mode $5=resync-be
 }
 
 # ------------------------------------------------- Per-prompt index update tax
-# behavior.md "履歴メニュー" 更新経路: what every prompt pays, whether or not it
+# behavior.md "History Menu" 更新経路: what every prompt pays, whether or not it
 # has anything to send. Two of the three classes emit no checkpoint of their own
 # (they return on arithmetic alone), so the host rc brackets _zrush_precmd with
 # MEAS-precmd / MEAS-precmd-end and this reads the first bracket of the window.
@@ -520,7 +520,7 @@ history_tax_suite() {  # $1=host-label
   out "==== min-zrush (isolated + default delay-ms=30) ===="
   if start_min_zrush min-zrush $WORK/xdg-default; then
     host_rss; out "INFO: RSS=${REPLY}KB"
-    # Command position is the only cached one (behavior.md "空語収集キャッシュ"),
+    # Command position is the only cached one (behavior.md "Empty-Word Collection Cache"),
     # so the miss case is this host's first collection and the hit case is
     # whatever it latched. Every cache-hit case has to come before the file and
     # git cases, which measure uncached collection.
@@ -550,7 +550,7 @@ history_tax_suite() {  # $1=host-label
   stop_host
 
   # ============ history-menu first paint ============
-  # behavior.md "履歴メニュー" bounds the synchronous exchange (100ms deadline,
+  # behavior.md "History Menu" bounds the synchronous exchange (100ms deadline,
   # payload byte ceiling) but sets no first-paint target: synthesis is outside
   # the deadline and stays linear in total history size, so this reports
   # measurements only -- same convention as the cases above.

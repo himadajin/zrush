@@ -1,4 +1,4 @@
-# behavior: zrush の挙動仕様
+# behavior: zrush Behavior Specification
 
 zrush の挙動の規範。
 コンポーネント境界の詳細は `../contracts/cli-protocol.md`(zsh ↔ Rust CLI)と
@@ -17,13 +17,13 @@ zsh は zle 統合・compsys 呼び出しによる捕獲・プランの適用
 対象環境: zsh 5.8 以上(macOS / Linux)。
 `KEYS_QUEUED_COUNT` は 5.9 追加のため、5.8 では入力圧の見送り(後述)が縮退する。
 
-## 原則(コードに固定。設定項目にしない)
+## Principles (Fixed in Code; Not Configurable)
 
 - **勝手に何かをしない**: 明示操作なしに入力内容を書き換えない。
   `~` は入力中も確定時も展開しない。
   補完候補の確定はカーソル以降のテキスト(RBUFFER)に触らない。
   履歴候補の確定は行全体の置き換えを求める明示操作であり、RBUFFER も含めて置き換える
-  (規範は `../contracts/cli-protocol.md`「適用」節)。
+  (規範は `../contracts/cli-protocol.md`「Plan Application (zsh-Side Normative)」節)。
 - **入力は決してブロックしない**: 候補収集は非同期で行う。
   収集が遅い場合も「一覧が遅れて出る」だけで、打鍵は常に即応する。
   この原則に対する同期的な例外は、ユーザーが明示した履歴メニュー(後述)と、
@@ -36,7 +36,7 @@ zsh は zle 統合・compsys 呼び出しによる捕獲・プランの適用
 - **確定は挿入のみ**: コマンドは実行しない(実行はもう一度 Enter)。
 - zrush は compinit を実行しない。compsys 未初期化を検知したら警告のみ表示する。
 
-## worker ライフサイクル
+## Worker Lifecycle
 
 - zsh script の source generation ごとに、mode 0700 の private runtime directory を 1 個同期的に作り、
   その中に mode 0600 の request / response / abort-control FIFO を 1 個ずつ持つ。
@@ -116,7 +116,7 @@ zsh は zle 統合・compsys 呼び出しによる捕獲・プランの適用
   zrush の disable policy は stop mode と別に決める。
 - 静穏判定(デバウンス)と入力の coalescing は worker が持つ。
   zsh は **`input_generation`** を所有し、入力通知を作るバッファ変化ごとに 1 個採番する
-  (`../contracts/cli-protocol.md`「入力通知と worker event」節)。
+  (`../contracts/cli-protocol.md`「Input Notifications and Worker Events」節)。
   値は shell session 内で単調増加し、再利用せず、worker の起動・交換・re-source でもリセットしない。
   枯渇は request_id / candidate_generation の枯渇と同じ disable reason になる。
 - zsh は「いま有効な `input_generation`」を高々 1 個持つ。
@@ -130,7 +130,7 @@ zsh は zle 統合・compsys 呼び出しによる捕獲・プランの適用
   zsh は失われた入力通知を replay せず、`capture-required` に答えるはずだった捕獲も作り直さない。
   次のバッファ変化が新しい `input_generation` を作るまで、その入力の一覧は更新されない。
 - 解析済みの候補は worker がスロット(`live` / `cache`)ごとに candidate generation 単位で保持する
-  (`../contracts/cli-protocol.md`「要求と応答」節)。
+  (`../contracts/cli-protocol.md`「Requests and Responses」節)。
   zsh が要求を跨いで参照するのは `cache` スロットだけであり、
   「現 worker session が `cache` スロットにどの generation を保持しているか」を
   **candidate store latch** として持つ。
@@ -144,13 +144,13 @@ zsh は zle 統合・compsys 呼び出しによる捕獲・プランの適用
   `error` / `superseded` で終端した `store` も replay しない。
   新しい generation を作るのは新しい収集だけである。
 - worker はスロットとは別に、履歴候補の **history index** を 1 個保持する
-  (`../contracts/cli-protocol.md`「要求と応答」節)。
+  (`../contracts/cli-protocol.md`「Requests and Responses」節)。
   index も worker session に属し、worker の終了とともに失われる。zsh はそれを再構築させず、
   次の明示的な履歴メニュー操作が `history-snapshot` で作り直すまで未初期化のままにする。
   index の内容を zsh 側に複製して保持することもしない。
 - zsh は「現 worker session の index がどの generation を保持しているか」を
   **history index latch** として持つ。latch が有効であることが履歴一覧を query だけで開ける条件であり、
-  無効な間の履歴メニュー操作は `history-snapshot` から始める(「履歴メニュー」節)。
+  無効な間の履歴メニュー操作は `history-snapshot` から始める(「History Menu」節)。
   latch の無効化点は candidate store latch と同一の集合(worker の起動・正常 shutdown・異常 abort・
   session failure・worker の交換・re-source)に加えて、
   `history-snapshot` / `history-append` / 履歴の `plan` が `unknown-generation` を受けたときである。
@@ -228,7 +228,7 @@ zsh は zle 統合・compsys 呼び出しによる捕獲・プランの適用
   internal fd 操作は対話シェル自身の fd 0 / 1 / 2 の open/closed 状態と接続先を変えない。
   internal close error の抑止を shell stderr へ恒久適用しない。
 
-## 候補収集
+## Candidate Collection
 
 - バッファ変化の検知は `zle-line-pre-redraw`(前回の `BUFFER`/`CURSOR` との差分)。
   登録は `add-zle-hook-widget` 経由。
@@ -239,7 +239,7 @@ zsh は zle 統合・compsys 呼び出しによる捕獲・プランの適用
   (入力圧は zsh にしか見えないためここで判定する)。
 - 静穏判定(`delay-ms`、既定 30ms)は worker が持つ。zsh はタイマーを持たず、
   設定値は通知のフィールドとして運ぶ
-  (`../contracts/cli-protocol.md`「入力通知と worker event」節)。
+  (`../contracts/cli-protocol.md`「Input Notifications and Worker Events」節)。
   worker は静穏期間中に届いた通知で前の通知を置き換え、満了時に残っていた最新の 1 個だけを採用して
   `plan-ready` か `capture-required` を返す。
 - 入力通知は、その時点の広げ規則が定めるクエリ・行数/桁数予算・マッチング設定・`cwd`・`delay-ms` と、
@@ -269,30 +269,30 @@ zsh は zle 統合・compsys 呼び出しによる捕獲・プランの適用
   候補レコードを継承 pipe fd へ NUL 区切りで搬出する(終端 = EOF)。
   フレーミングに使う制御バイト(NUL、`\1`、`\2`)を含む候補は一覧に載らない。
   レコードのタグ構成(バッチヘッダ・`m` タグを含む)は
-  `../contracts/cli-protocol.md`「`candidate_payload`(候補レコードストリーム)」の契約に従う。
+  `../contracts/cli-protocol.md`「`candidate_payload` (Candidate Record Stream)」の契約に従う。
   キャンセルは worker 自己申告 pid のプロセスグループへの SIGINT → `zpty -d`。
 - 収集が完走したら、その payload を新しい candidate generation の `store` 要求で worker へ渡す。
   要求にはその収集を始めさせた `capture-required` の `input_generation` を載せる
-  (`../contracts/cli-protocol.md`「要求と応答」節)。
+  (`../contracts/cli-protocol.md`「Requests and Responses」節)。
   スロットは空語収集キャッシュの対象となる収集が `cache`、それ以外の収集が `live`。
-  どの収集がキャッシュの対象かは「空語収集キャッシュ」節が定める。
+  どの収集がキャッシュの対象かは「Empty-Word Collection Cache」節が定める。
   payload を zsh 側に保持することはせず、`plan` 要求も連送しない。
   worker はその `store` を受理すると同じ入力に対する `plan-ready` を返し、zsh はそれを適用する。
   入力が既に置き換えられていた場合の `store` は `superseded` で終端し、一覧は変わらない。
 - 新しい `input_generation` の `capture-required` を受けたときは、進行中の収集をキャンセルしてから
   新しい収集を開始する。
-  現在の `input_generation` を無効化するとき(「worker ライフサイクル」節の無効化点)も、
+  現在の `input_generation` を無効化するとき(「Worker Lifecycle」節の無効化点)も、
   その generation のために進行中の収集をキャンセルする。
   **キャンセルされた収集の結果は、その後に到着しても表示に使わない**
   (`zpty -d` 後に届く残留データは捨てる)。
 - キャンセルされずに完走した収集の結果は、その収集のクエリに基づく表示として適用する
   (一覧はバッファ変化時に選択ハイライトのみ即解除され、一覧テキストは次のプランが届くまで残る
-  という「表示」節の規範と整合する)。
+  という「Display」節の規範と整合する)。
 - 一覧テキストを消すのは、一覧そのものを畳む操作のときだけである:
   空バッファ / `min-input` による抑止、dismiss、確定(挿入)、行の確定と初期化、
   履歴メニューを開く操作、worker session failure、および
   いま有効な `input_generation` に束縛された `store` が `superseded` 以外の `error` で終端したとき
-  (`../contracts/cli-protocol.md`「応答の検証と zsh 側の適用(規範)」節)。
+  (`../contracts/cli-protocol.md`「Response Validation and zsh-Side Application (Normative)」節)。
 - fork 側の衛生(コードに固定): 継承フック(precmd / preexec / chpwd /
   zshaddhistory / periodic / zshexit)と zle-* フックを無効化し、`SAVEHIST=0` で
   実履歴を保護する。候補データは zpty の擬似端末を経由せず、
@@ -307,7 +307,7 @@ zsh は zle 統合・compsys 呼び出しによる捕獲・プランの適用
 - compsys 初期化済みの検知は `$+functions[_main_complete]` による
   (zsh-autocomplete が compinit を代行する構成も検出できる)。
 
-## 空語収集キャッシュ
+## Empty-Word Collection Cache
 
 行頭のコマンド位置(広げ結果が空文字列)の収集は最重量ケース(全コマンド名)のため、
 結果をプロンプトを跨いでキャッシュする。
@@ -316,8 +316,8 @@ zsh は zle 統合・compsys 呼び出しによる捕獲・プランの適用
   `sudo ` 後などのコマンド位置は広げ結果が非空になるため対象外である。
   広げ結果が空文字列でも、捕獲した payload が空の収集は対象外とする。
   ここで対象とした収集だけが `cache` スロットを使い、それ以外の収集は `live` スロットを使う
-  (cli-protocol.md「要求と応答」節)。
-- 解析済みの候補を保持するのは worker の `cache` スロットである(cli-protocol.md「要求と応答」節)。
+  (cli-protocol.md「Requests and Responses」節)。
+- 解析済みの候補を保持するのは worker の `cache` スロットである(cli-protocol.md「Requests and Responses」節)。
   zsh が保持するのは**フィンガープリント・保存時刻・`cache` スロットの candidate store latch**
   (現 worker session が保持している generation)の 3 つだけで、生の捕獲 payload は保持しない。
 - 検証は入力通知を作る時点で行う。
@@ -335,9 +335,9 @@ zsh は zle 統合・compsys 呼び出しによる捕獲・プランの適用
   収集の `store` が `ok` で終端した時点で、フィンガープリント・保存時刻・latch を更新する
   (`superseded` や他の `error` で終端した `store` では更新しない)。
   worker session を失った後は latch が無効なため、フィンガープリントと TTL が有効でもミスとして再収集する
-  (latch の無効化点は「worker ライフサイクル」節)。
+  (latch の無効化点は「Worker Lifecycle」節)。
 
-## マッチング
+## Matching
 
 - 常駐 Rust worker のプラン計算(`plan` 要求の処理と入力通知の settle)が担う。ティア序列は
   **prefix > substring > edit(誤字許容)> fuzzy(部分列)** で、`mode` が
@@ -345,10 +345,10 @@ zsh は zle 統合・compsys 呼び出しによる捕獲・プランの適用
   approximate とする。`mode` が許す literal マッチが 1 件以上あれば approximate マッチを
   すべて除外し、literal マッチがなければ `mode` が許す approximate マッチを残す。
   この規則は補完一覧と履歴一覧の両方に適用する。`smart-case` はクエリが全小文字のとき大小を無視する。
-  結果順を含む意味論の規範は cli-protocol.md「マッチング・ランキングの意味論」節。
+  結果順を含む意味論の規範は cli-protocol.md「Matching and Ranking Semantics」節。
 - common-prefix は prefix 階層マッチのバイト単位 LCP(cli-protocol.md)。
 
-## 表示
+## Display
 
 - 候補一覧はプロンプト下に POSTDISPLAY + region_highlight で描画する。
 - 更新は POSTDISPLAY の**置き換え**(消してから描かない。空白・点滅を見せない)。
@@ -364,31 +364,31 @@ zsh は zle 統合・compsys 呼び出しによる捕獲・プランの適用
   (グリッドが取り得る最大容量)までをレイアウト対象に取る
   (Rust 内部の上限。プロトコルには現れない)。
   履歴一覧では走査範囲のマッチを切り捨てず、要求の `offset` から `rows` 件の窓をレイアウトする
-  (cli-protocol.md「要求と応答」「ナビ」)。
+  (cli-protocol.md「Requests and Responses」「Navigation」)。
 - 補完一覧の入力通知は変化の検知と同時に、`store` 要求は収集完了後の非同期結果経路から worker へ送る。
   応答と worker event は worker stdout の `zle -F` コールバックで受け、キー入力を同期的に待たせない
   (「入力は決してブロックしない」原則)。
-  例外は履歴メニューで、こちらは select-prev の押下時に同期実行する(「履歴メニュー」節)。
-  ディレクトリ合成 `/` 判定のための stat(cli-protocol.md「挿入テキスト」節)は
+  例外は履歴メニューで、こちらは select-prev の押下時に同期実行する(「History Menu」節)。
+  ディレクトリ合成 `/` 判定のための stat(cli-protocol.md「Insertion Text」節)は
   表示位置として採用された候補数に有界であるため、この非同期実行を妨げない。
 - ワイド文字の整列: プラン内のオフセット(ハイライト範囲・セル実テキスト範囲)は文字数、
   セルのパディング・切り詰めは表示幅(unicode-width)で計算済み(cli-protocol.md)。
   候補テキスト中の制御バイト(C0 と DEL)のスペース置換も Rust worker が行う正規化であり
-  (改行が消えることで表示が 1 行化される。規範は cli-protocol.md「表示行の中身」節)、
+  (改行が消えることで表示が 1 行化される。規範は cli-protocol.md「Display Row Contents」節)、
   挿入テキストは原文のまま返る。
 - 端末リサイズ時: 描画プランは通知・要求の時点の `rows` / `width` に基づくスナップショットであり、
   リサイズ直後に自動で再計算されることはない。
   次のプランが届くまでのレイアウトのズレは仕様外として許容する。
 - 装飾は `[display.highlight]` の 4 種(selected / match / heading / history-number)。
   match と history-number の装飾は選択中セルには適用しない
-  (実現方法は cli-protocol.md「ハイライト」節: 選択変更のたびに
+  (実現方法は cli-protocol.md「Highlights」節: 選択変更のたびに
   プランからエントリを再構築し、選択エントリへ差し替える)。空文字列は装飾なし。
 - region_highlight の自エントリは帳簿で管理し、zsh 5.9+ では `memo=zrush` を付与して
   他プラグイン(zsh-syntax-highlighting 0.8+ など)のエントリと区別する。
   5.8 では memo が使えないため、バッファ編集後の選択ハイライト解除が
   次の描画まで遅れる劣化を許容する。
 
-## 選択・キーバインド
+## Selection and Keybindings
 
 - zrush がキーを奪うのは次の 4 つの場合だけで、それ以外は zrush 適用前に
   そのキーへ束縛されていたウィジェット(前任者チェーン)へフォールバックする:
@@ -402,7 +402,7 @@ zsh は zle 統合・compsys 呼び出しによる捕獲・プランの適用
 - 非選択時の select-prev(既定 ↑ / ctrl-p)も優先順位規則で解決する:
   ① `LBUFFER` に改行を含む(複数行バッファの先頭行以外にカーソル)→ カーソル移動、
   ② 履歴移動中(`HISTNO != HISTCMD`)→ 前任者(素の履歴移動を続ける)、
-  ③ それ以外 → 履歴メニューを開く(「履歴メニュー」節)。
+  ③ それ以外 → 履歴メニューを開く(「History Menu」節)。
   ① は select-next の複数行規則と対称で、どちらもカーソルが動くべき場面を優先する。
 - 補完一覧の先頭候補での select-prev は選択を解除して通常状態に戻る(一覧テキストは残る)。
   そこでもう一度押すと、非選択時の規則に従って履歴メニューが開く。
@@ -413,17 +413,17 @@ zsh は zle 統合・compsys 呼び出しによる捕獲・プランの適用
   (位置ごとの next/prev/left/right。cli-protocol.md)を参照する。
   窓の中では再収集・再計算は伴わない。
   履歴一覧の窓の端で遷移先 0 を受けたときだけ、同じ generation の `plan` を
-  `offset` 付きで再要求し、返ったプランを適用する(「履歴メニュー」節)。
+  `offset` 付きで再要求し、返ったプランを適用する(「History Menu」節)。
   補完一覧では select-next が `next`、select-prev が `prev` に対応する
-  (履歴一覧での写像は「履歴メニュー」節)。
+  (履歴一覧での写像は「History Menu」節)。
 - アクションと既定キー・記法・検証規則は config-schema.md の `[keybind]`。
 
-## 履歴メニュー
+## History Menu
 
 現在の入力で絞り込んだ履歴を一覧表示し、選んで挿入するための明示操作。
 
 - 一覧には種別があり、**補完一覧**か**履歴一覧**のどちらか一方である(両方が同時に存在することはない)。
-  確定規則(cli-protocol.md「適用」節)とキーの写像は種別で決まる。
+  確定規則(cli-protocol.md「Plan Application (zsh-Side Normative)」節)とキーの写像は種別で決まる。
 - **開く操作**は非選択時の select-prev(既定 ↑ / ctrl-p)。専用のアクションは設けない。
   補完一覧を表示中でも、非選択なら履歴メニューが開いて補完一覧を置き換える。
   ctrl-p も既定で同じ挙動になる。ctrl-p を素の履歴移動のまま使いたい場合は
@@ -432,10 +432,10 @@ zsh は zle 統合・compsys 呼び出しによる捕獲・プランの適用
   未委譲の `input` / `flush` frame を queue から取り除き、進行中の収集をキャンセルし、
   現在の一覧とプランを破棄してから、index の同期確認・(必要なら)snapshot の合成・
   同期 worker 交換・履歴一覧としての表示・位置 1 の選択までを一度に確定させる。
-  キャンセルされた収集の結果は後から届いても表示に使わない(「候補収集」節)。
+  キャンセルされた収集の結果は後から届いても表示に使わない(「Candidate Collection」節)。
   無効化した generation の worker event も同じく捨てるため、
   同期区間の中で受け取った event を含め、遅れて到着した補完結果が履歴メニューを置き換えることはない。
-- 履歴候補は worker が保持する history index から得る(「worker ライフサイクル」節)。
+- 履歴候補は worker が保持する history index から得る(「Worker Lifecycle」節)。
   開く操作は同期区間の入口で index の同期状態を判定し、2 つの経路のどちらかを取る。
   - **cold**(latch が無効、または index が dirty): zsh がメモリ上の履歴から snapshot payload を合成し
     (fork も compsys も介さない。合成規則は cli-protocol.md「history profile」)、
@@ -481,7 +481,7 @@ zsh は zle 統合・compsys 呼び出しによる捕獲・プランの適用
   `history-append` 1 件として送る。確定直後のフック(`zshaddhistory`)は使わない
   (その時点では格納の可否とテキストが確定しておらず、予測は恒久的にずれるため)。
   - 更新は新しい candidate generation を採番して送り、latch はその値へ楽観的に進める
-    (「worker ライフサイクル」節)。
+    (「Worker Lifecycle」節)。
   - 追記は snapshot に課すバイト上限(後述)の対象外である
     (deadline の外側で 1 イベントぶんだけを運ぶため。cli-protocol.md「history profile」)。
   - 更新は worker を起動しない(遅延起動の原則を保つ)。
@@ -500,7 +500,7 @@ zsh は zle 統合・compsys 呼び出しによる捕獲・プランの適用
   上限内に収まる相異なる行の数は少なくなる。
   index の作り直しは worker session ごとに最初の履歴メニュー操作で 1 回起き、
   その後は dirty になるまで起きない(以降の操作は warm 経路になる)。
-  最も新しい候補レコード 1 件だけで上限を超える場合は index が 0 件になり、後述の「マッチ 0 件」に従う。
+  最も新しい候補レコード 1 件だけで上限を超える場合は index が 0 件になり、後述の「Zero Matches」に従う。
 - 同期区間の開始(cold なら snapshot の合成が完了した直後)から、`plan` 要求の完全な終端応答を
   受け取るまでを **1 本の絶対 100ms deadline**で制限する。worker が未起動なら、その起動・
   `hello` / `ready` 握手・要求の送信・先行要求の終端応答の消費・完全な `plan` 応答の受信を
@@ -519,7 +519,7 @@ zsh は zle 統合・compsys 呼び出しによる捕獲・プランの適用
   先行要求の outbound queue 送信と直列処理に費やす時間も同じ deadline を消費する。
   deadline を要求ごと・write/read ごとに延長しない。超過時は worker プロセスを終了させて消滅を確認し、
   watcher を解除して pipe fd を閉じてから、その session の未完了要求をすべて破棄する。自動 replay しない
-  (連続失敗の扱いは「worker ライフサイクル」)。
+  (連続失敗の扱いは「Worker Lifecycle」)。
 - クエリは `BUFFER` 全体。`min-input` と空バッファ抑止規則は適用しないため、
   空バッファの ↑ は全履歴の一覧を出す。
 - 一覧の対象になるのは、index の新しい側から `[history].limit` 件までを走査した範囲である
@@ -528,7 +528,7 @@ zsh は zle 統合・compsys 呼び出しによる捕獲・プランの適用
 - 並びは新しい順のままで、位置 1 はマッチした候補のうち最も新しい履歴行
   (クエリにマッチしない履歴行は一覧に含まれないため、必ずしも履歴全体の最新行ではない)。
   マッチングのティア(prefix > substring > edit > fuzzy)と smart-case は、
-  候補を一覧に含めるかの判定とハイライトにのみ効く(cli-protocol.md「マッチング・ランキングの意味論」節)。
+  候補を一覧に含めるかの判定とハイライトにのみ効く(cli-protocol.md「Matching and Ranking Semantics」節)。
 - 履歴一覧は単一列で、スクロールバックのように上へ伸びる。表示は行予算 `rows` の窓であり、
   位置 1 は窓内の最新(最下行)、最終位置は窓内の最古(最上行)である。
   位置番号が大きくなるほど古い履歴として 1 行ずつ上へ配置する。
@@ -550,7 +550,7 @@ zsh は zle 統合・compsys 呼び出しによる捕獲・プランの適用
   - select-left は一致したうち最も新しい履歴へ移る。窓がずれていれば `offset = 0` の再要求になる。
   - select-right は表示中の最も古い履歴へ移る(窓内。再要求しない)。
 - ブラウズ中は `BUFFER` に触らない(移動のたびに挿入することはしない)。
-- confirm(既定 Enter)は行全体の置き換えで挿入する(実行はしない。「確定(挿入)」節)。
+- confirm(既定 Enter)は行全体の置き換えで挿入する(実行はしない。「Confirmation (Insertion)」節)。
   選択中の Tab も同じく確定。確定後は通常のバッファ変化として再収集へ戻り、履歴一覧は残らない。
 - dismiss(既定 ctrl-g)は履歴メニューを閉じる(バッファは変えない)。
 - 履歴メニューを消して通常状態へ戻る条件:
@@ -558,13 +558,13 @@ zsh は zle 統合・compsys 呼び出しによる捕獲・プランの適用
     キーは消費してバッファは変えない。素の履歴移動へのフォールバックはしない。
   - **同期 worker 交換の失敗**(`history-snapshot` または `plan` の `error` 応答、
     worker セッション失敗、deadline 超過、または仕様を満たさない `ok`)→ 一覧と種別を破棄し、
-    バッファは変えない(cli-protocol.md「応答の検証と zsh 側の適用(規範)」)。
+    バッファは変えない(cli-protocol.md「Response Validation and zsh-Side Application (Normative)」)。
     deadline 超過は worker session failure であるため index も失われ、
     次の履歴メニュー操作は cold 経路から始まる。要求の replay はしない。
   - **zrush のアクション以外の要因による `BUFFER` / `CURSOR` の変化**
     (文字入力・編集・カーソル移動・他ウィジェット)→ 履歴メニューを全消去して通常フローへ戻る。
     補完一覧のように一覧テキストを残すことはしない。
-- 履歴行が複数行コマンドの場合、表示は 1 行化され(「表示」節)、
+- 履歴行が複数行コマンドの場合、表示は 1 行化され(「Display」節)、
   確定で入る `BUFFER` は改行を含む原文になる。
 
 ## Tab
@@ -582,31 +582,31 @@ zsh は zle 統合・compsys 呼び出しによる捕獲・プランの適用
   - 現在の `input_generation` の worker event をまだ受けていない(静穏期間中の)場合は、
     その generation の `flush` を送って静穏期間を打ち切らせる。
     worker は直ちに settle し、候補を保持していれば `plan-ready` を、
-    必要なら待たずに `capture-required` を返す(cli-protocol.md「入力通知と worker event」節)。
+    必要なら待たずに `capture-required` を返す(cli-protocol.md「Input Notifications and Worker Events」節)。
   - 既に `capture-required` を受けて収集中の場合は、押下の記録だけを行う(収集自体が前倒しの結果である)。
 - 一覧がなく、event 待ちの `input_generation` も進行中の収集も無い静止状態の Tab は、
   前任者チェーン(素の補完など)へフォールバックする
   (候補 0 件の結果を受け取った後もこの静止状態である)。
 
-## 確定(挿入)
+## Confirmation (Insertion)
 
 - 各位置の挿入テキストは Rust worker が構築済みで返す
   (`IPREFIX + ipre + apre + hpre + word + hsuf + asuf + isuf` の連結、
   `-f` 候補のディレクトリ合成 `/`、`trailing-space` の焼き込みまで含む。
-  構築規則は cli-protocol.md「挿入テキスト」節)。
+  構築規則は cli-protocol.md「Insertion Text」節)。
 - 補完候補の確定は**単一規則**: `LBUFFER` を `pre + 挿入テキスト` で置き換える
   (`pre` = `LBUFFER` から現在語を除いた前半部分。`RBUFFER` は変更しない。
-  適用規則は cli-protocol.md「適用」節)。
+  適用規則は cli-protocol.md「Plan Application (zsh-Side Normative)」節)。
   候補の捕獲接頭辞(IPREFIX + hpre)が広げ規則の保持末尾と一致する場合、
   この置換は結果的に末尾のみの置換とバイト同一になり、as-typed の `~` などが保たれる。
   一致しない場合(部分パス略記の展開など)も同じ規則で置換する。
 - 履歴候補の確定は行全体の置き換え: `BUFFER` を挿入テキストで置き換え、`CURSOR` を末尾に置く
-  (適用規則は cli-protocol.md「適用」節)。
+  (適用規則は cli-protocol.md「Plan Application (zsh-Side Normative)」節)。
 - 確定後は一覧をいったん消去し、確定による挿入も通常のバッファ変化として扱って
   新しい入力通知を送る(静穏期間は worker が測る)。trailing-space 付き確定なら次の引数位置、
   `/` 合成なら当該ディレクトリ内容の候補が非同期で表示される。
 
-## 設定の反映と警告
+## Configuration Application and Warnings
 
 - 設定はプロンプト表示ごとに config.toml の mtime を確認して自動反映する
   (明示リロードなし。検証・フォールバック規則は config-schema.md)。
@@ -615,7 +615,7 @@ zsh は zle 統合・compsys 呼び出しによる捕獲・プランの適用
 - zsh スクリプトとバイナリの build stamp が不一致の場合は自動 re-source を 1 回試みる。
   成功時は警告せず、ガード失敗時だけ警告を 1 回表示して zrush を無効化する。
 
-## プラグイン共存
+## Plugin Coexistence
 
 - キーのフォールバックは前任者チェーン(builtin 直呼びはしない)。
   config リロードでの再適用時に自分自身を前任者として捕まえない。

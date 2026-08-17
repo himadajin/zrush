@@ -15,6 +15,7 @@ The `docs/` directory records intended behavior — a commitment, not a descript
   When unsure which case it is, ask instead of picking a side.
 - Behavior the docs don't cover is not guaranteed and may change freely; to rely on it, spec it first.
 - Code comments never restate the docs; at most they point to the relevant doc.
+- Code comments that cite a doc section use the exact English heading and never add a parallel alias.
 
 Layout: `docs/user/` (install, configuration, usage), `docs/internal/specs/` (settled behavior specs), `docs/internal/contracts/` (component boundaries such as the zsh ↔ Rust CLI protocol and config schema).
 
