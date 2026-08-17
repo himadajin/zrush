@@ -209,7 +209,7 @@ store:            ["store", request_id, slot, candidate_generation, input_genera
 history-snapshot: ["history-snapshot", request_id, candidate_generation, candidate_payload]
 history-append:   ["history-append", request_id, candidate_generation, candidate_payload]
 plan:             ["plan", request_id, candidate_generation, cwd, producer, query, mode,
-                   smart_case, rows, width, trailing_space, history_limit]
+                   smart_case, rows, width, trailing_space, history_limit, offset]
 ok:               ["ok", request_id, body]
 error:            ["error", request_id, code]
 ```
@@ -254,6 +254,12 @@ error:            ["error", request_id, code]
   worker はこれを retention cap へクランプする(走査の意味論は「history profile」節)。
   スロットを参照する `plan` では無視する
   (`producer = history` 以外の要求でも値は必須であり、欠落・非 canonical 表記は不正である)。
+- `offset`: `plan` だけが持つ、先頭ゼロなしの非負 canonical ASCII 10 進数
+  (`0..=18446744073709551615`。`0` は有効)。
+  `producer = history` のとき、ランキング後のマッチ列における窓の先頭(0 始まり)である。
+  worker は走査範囲のマッチ件数と `rows` から有効な最大値へクランプする。
+  `producer = compsys` では無視する
+  (`history_limit` と同じく、どの producer でも値は必須であり、欠落・非 canonical 表記は不正である)。
 - `producer`: `compsys` または `history`。
   結果順に加えてレイアウト方針を選ぶ: `compsys` は最大 8 列・上から下、
   `history` は 1 列・下から上。レコード解釈・ハイライト・挿入テキスト構築は共通である
@@ -663,7 +669,8 @@ index から作られた一覧を履歴一覧、その候補を履歴候補と�
   (index の現 stamp より厳密に大きい。「要求と応答」節)。
 - `plan`: `producer` は `history`、`query` はバッファ全体(as-typed)、
   `trailing_space` は常に `false`(挿入テキストを履歴行の原文と一致させるため)、
-  `history_limit` は `[history].limit` の設定値(config-schema.md)。
+  `history_limit` は `[history].limit` の設定値(config-schema.md)、
+  `offset` は表示窓の先頭(開くときは `0`。端越えの再要求ではずれた位置)。
 - 履歴候補は `f = 1` を持たないため、`cwd` は履歴一覧の計算に影響しない。
 
 `history-snapshot` の payload の合成は、全履歴の値の一括展開 1 回(履歴の総件数に線形)と、
@@ -799,20 +806,25 @@ NUL(`\0`)終端フィールドの平坦列。数値は ASCII 10 進表記。順�
 
 位置ごとに `next prev left right` の絶対遷移先(位置番号、または 0 = 未選択)を返す。
 
-- `next` = 位置 + 1(末尾でクランプ、すなわち最終位置では自己参照)。
-- `prev` = 位置 - 1。ただし位置 1 の `prev` は 0(選択解除)。
-- `left` = `max(グループ先頭位置, p - grows)`、`right` = `min(グループ末尾位置, p + grows)`
+- `next` = 位置 + 1。最終位置では、その方向に窓の外の続きがあるなら 0、なければ自己参照。
+- `prev` = 位置 - 1。位置 1 の `prev` は常に 0(窓の prev 側へ出る)。
+- `left` = 窓の prev 側に続きがあるなら 0、なければ
+  `max(グループ先頭位置, p - grows)`。
+  `right` = `min(グループ末尾位置, p + grows)`
   (`grows` は所属グループの行数。「表示行の中身」節参照)。
-  単一列のグループ(`cols = 1`)では `grows` がグループのメンバー数に等しいため、
+  単一列のグループ(`cols = 1`)で窓の外へ出ないとき、`grows` がグループのメンバー数に等しいため、
   `left` はグループ先頭位置へ、`right` はグループ末尾位置へのジャンプになる
   (一般式から導かれる帰結であり、特例ではない)。
-- `next` / `left` / `right` のクランプは自己参照(遷移先 = 自分自身)で表現する。
-  zsh は自己参照(遷移先 == 現在位置)を no-op として扱う(規範)。
-  `prev` のみ、位置 1 での特例として 0(選択解除)を返す。
+- 自己参照(遷移先 = 自分自身)は、このプランの中ではその方向へ進めないこと
+  (走査範囲の端、またはその方向に続きがないこと)を表す。
+  zsh は自己参照を no-op として扱う(規範)。
+- 遷移先 0 は、このプランの窓からその方向へ出ることを表す。
+  どのキーがどの遷移に対応するか、および 0 を受けたときの扱いは zsh 側の規範であり、
+  behavior.md「選択・キーバインド」「履歴メニュー」節が定める
+  (補完一覧の `prev = 0` は選択解除。履歴一覧では端越えの `plan` 再要求、
+  または位置 1 かつ窓先頭でのメニュー消去)。
 - ナビゲーション表は producer に依らず同じ意味を持つ。
-  どのキーがどの遷移に対応するか、および遷移先 0 を受けたときの扱い
-  (補完一覧は選択解除、履歴一覧は一覧全体の消去)は zsh 側の規範であり、
-  behavior.md「選択・キーバインド」「履歴メニュー」節が定める。
+  補完一覧は窓を持たないため、最終位置の `next` は自己参照のまま、`left` が 0 になることもない。
 
 #### 挿入テキスト
 
@@ -1141,10 +1153,12 @@ typeset -g _ZRUSH_EXPECTED_BUILD_STAMP='<build-stamp>'
    以降の選択移動・確定は、プラン内のナビゲーション表・セル範囲・挿入テキストの配列引きだけで完結する
    (要求の再送はしない)。
 6. 非選択での select-prev(既定 ↑): worker の history index が同期済みなら、
-   `producer = history` の `plan` だけを同期交換で送って、返ったプランを同じように適用する。
+   `producer = history` の `plan`(`offset = 0`)だけを同期交換で送って、返ったプランを同じように適用する。
    index が未初期化または dirty なら、zsh がメモリ上の履歴から payload を合成し、
    `history-snapshot` と `plan` を同じ同期交換で連送する
    (fork も compsys も介さない。behavior.md「履歴メニュー」節)。
+   表示中にナビ表が遷移先 0 を返したとき、zsh はメニューを開き直さず、同じ generation の
+   `plan` を新しい `offset` で同期再要求して適用する。
 7. コマンド確定後のプロンプトごと: index が同期済みで、直前のコマンドが 1 件の追記として説明できる場合、
    zsh はその 1 件を `history-append` で送る(worker を起動することはない)。
    説明できない変化を見つけた場合は index を dirty とし、次の履歴メニュー操作で作り直す。

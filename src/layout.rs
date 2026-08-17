@@ -52,6 +52,17 @@ impl Style {
     }
 }
 
+/// Layout options taken from one plan request (cli-protocol.md "表示行の中身",
+/// "ナビ").
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Options {
+    pub row_budget: usize,
+    pub width: usize,
+    pub style: Style,
+    pub more_prev: bool,
+    pub more_next: bool,
+}
+
 /// A computed highlight whose `span` is a char range over the full listing
 /// text (rows joined by `\n`, no leading newline). The wire boundary converts
 /// this end-exclusive range to its serialized form.
@@ -151,17 +162,18 @@ struct OffsetState {
 /// spans()`'s char ranges over `candidates[i].match_text()`, aligned by
 /// index; a missing or empty entry means no match decoration for that
 /// candidate.
-/// `row_budget`/`width` are `--rows`/`--width` (cli-protocol.md
-/// "起動"), assumed >= 1 by the caller but handled gracefully at 0 too.
-/// `style` is the producer-specific geometry from the contract.
+/// `options.row_budget`/`options.width` are `--rows`/`--width`
+/// (cli-protocol.md "起動"), assumed >= 1 by the caller but handled
+/// gracefully at 0 too. `options.style` is the producer-specific
+/// geometry. `more_prev` / `more_next` mark a history window that can
+/// leave this plan in that direction (cli-protocol.md "ナビ"); both are
+/// false for a completion listing.
 pub(crate) fn build(
     candidates: &[Candidate<'_>],
     batches: &[Batch<'_>],
     sources: &[CellSource],
     spans: &[Vec<CharSpan>],
-    row_budget: usize,
-    width: usize,
-    style: Style,
+    options: Options,
 ) -> Plan {
     assert_eq!(
         candidates.len(),
@@ -170,9 +182,20 @@ pub(crate) fn build(
     );
 
     let groups = group_candidates(candidates, batches);
-    let grid = render_grid(&groups, sources, row_budget, width, style);
+    let grid = render_grid(
+        &groups,
+        sources,
+        options.row_budget,
+        options.width,
+        options.style,
+    );
     let offsets = compute_offsets(sources, spans, &grid);
-    let nav = build_navigation(&grid.group_bounds, grid.positions.len());
+    let nav = build_navigation(
+        &grid.group_bounds,
+        grid.positions.len(),
+        options.more_prev,
+        options.more_next,
+    );
 
     Plan {
         rows: grid.rows,
@@ -408,13 +431,26 @@ fn row_starts(row_lens: &[usize]) -> Vec<usize> {
 
 /// Build position-indexed navigation from the bounds produced by the grid
 /// phase. Each position owns one complete, typed group-bound record.
-fn build_navigation(bounds: &[GroupBounds], positions: usize) -> Vec<Nav> {
+fn build_navigation(
+    bounds: &[GroupBounds],
+    positions: usize,
+    more_prev: bool,
+    more_next: bool,
+) -> Vec<Nav> {
     let mut nav = Vec::with_capacity(positions);
     for pos in 1..=positions {
-        let next = if pos == positions { pos } else { pos + 1 };
+        let next = if pos == positions {
+            if more_next { 0 } else { pos }
+        } else {
+            pos + 1
+        };
         let prev = if pos == 1 { 0 } else { pos - 1 };
         let group = bounds[pos - 1];
-        let left = group.start.max(pos.saturating_sub(group.grows));
+        let left = if more_prev {
+            0
+        } else {
+            group.start.max(pos.saturating_sub(group.grows))
+        };
         let right = group.end.min(pos + group.grows);
         nav.push(Nav {
             next,
@@ -641,9 +677,13 @@ mod tests {
             batches,
             &sources,
             spans,
-            row_budget,
-            width,
-            Style::Grid,
+            Options {
+                row_budget,
+                width,
+                style: Style::Grid,
+                more_prev: false,
+                more_next: false,
+            },
         )
     }
 
@@ -1241,9 +1281,13 @@ mod tests {
             &batches,
             &sources,
             &spans_none(5),
-            5,
-            40,
-            Style::History,
+            Options {
+                row_budget: 5,
+                width: 40,
+                style: Style::History,
+                more_prev: false,
+                more_next: false,
+            },
         );
 
         // Logical positions and insertion lookup stay newest-first even
@@ -1289,6 +1333,35 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn history_nav_marks_window_edges() {
+        let batches = [batch(b"", b"")];
+        let cands: Vec<Candidate<'_>> = ["a", "b", "c"]
+            .iter()
+            .map(|w| cand(w.as_bytes(), None, None, 0))
+            .collect();
+        let sources = crate::plan::compose_cell_sources(&cands);
+        let plan = super::build(
+            &cands,
+            &batches,
+            &sources,
+            &spans_none(3),
+            Options {
+                row_budget: 3,
+                width: 40,
+                style: Style::History,
+                more_prev: true,
+                more_next: true,
+            },
+        );
+        assert_eq!(plan.nav[0].prev, 0);
+        assert_eq!(plan.nav[0].left, 0);
+        assert_eq!(plan.nav[0].next, 2);
+        assert_eq!(plan.nav[2].next, 0);
+        assert_eq!(plan.nav[2].left, 0);
+        assert_eq!(plan.nav[2].right, 3);
     }
 
     #[test]

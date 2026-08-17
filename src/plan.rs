@@ -4,12 +4,14 @@
 //! (score every remaining candidate + common-prefix over the *untruncated*
 //! prefix-tier matches)
 //! -> ranking::rank (suppress approximate tiers when a literal exists,
-//! then use the producer's ordering and absolute layout capacity: rows*8
-//! for compsys, rows for history)
-//! -> matching::QueryMatcher::spans (only for the ranked subset) ->
+//! then use the producer's ordering; compsys is then capped at rows*8,
+//! history keeps every match and takes a rows-tall window at `offset`)
+//! -> matching::QueryMatcher::spans (only for the ranked subset that
+//! reaches layout) ->
 //! layout::build (the producer's grid direction/column cap plus shared
 //! grouping/highlights/nav, further truncated to the real per-group row
-//! budget) -> insert::build per displayed position
+//! budget; history also marks window edges on the nav table) ->
+//! insert::build per displayed position
 //! (this is where `-f` directory-synthesis stat happens, and only for
 //! positions layout actually kept) -> wire::serialize.
 //!
@@ -34,6 +36,7 @@ pub(crate) struct Params {
     pub rows: usize,
     pub width: usize,
     pub trailing_space: bool,
+    pub offset: usize,
 }
 
 /// Producer profile policy selected by the request.
@@ -92,12 +95,19 @@ pub(crate) fn compute(
     }
     let common_prefix = crate::matching::common_prefix(prefix_texts.into_iter());
 
-    // behavior.md "表示": cap ranking at the selected layout's absolute
-    // capacity. layout::build applies the real, per-group row budget on
-    // top of this coarse cap.
+    // behavior.md "表示": compsys ranking is capped at the grid's absolute
+    // capacity; history keeps every match and takes a rows-tall window.
+    // layout::build applies the real, per-group row budget on top of this.
     let style = params.producer.layout_style();
-    let cap = params.rows.saturating_mul(style.max_cols());
+    let cap = match params.producer {
+        Producer::Compsys => params.rows.saturating_mul(style.max_cols()),
+        Producer::History => usize::MAX,
+    };
     let ranked = ranking::rank(&matched, cap, params.producer.order());
+    let (ranked, more_prev, more_next) = match params.producer {
+        Producer::History => history_window(ranked, params.offset, params.rows),
+        Producer::Compsys => (ranked, false, false),
+    };
     let candidates: Vec<record::Candidate<'_>> = ranked
         .iter()
         .map(|&(idx, _)| source.candidate(idx))
@@ -122,9 +132,13 @@ pub(crate) fn compute(
         &batches,
         &sources,
         &spans,
-        params.rows,
-        params.width,
-        style,
+        layout::Options {
+            row_budget: params.rows,
+            width: params.width,
+            style,
+            more_prev,
+            more_next,
+        },
     );
 
     // Insertion text, and thus the `-f` stat, is built only for the
@@ -140,6 +154,17 @@ pub(crate) fn compute(
         .collect();
 
     wire::serialize(common_prefix, &built, &insert_texts)
+}
+
+/// Slide a rows-tall window over the ranked history matches
+/// (cli-protocol.md "要求と応答" `offset`, behavior.md "履歴メニュー").
+fn history_window<T: Clone>(ranked: Vec<T>, offset: usize, rows: usize) -> (Vec<T>, bool, bool) {
+    let total = ranked.len();
+    let offset = offset.min(total.saturating_sub(rows));
+    let end = offset.saturating_add(rows).min(total);
+    let more_prev = offset > 0;
+    let more_next = end < total;
+    (ranked[offset..end].to_vec(), more_prev, more_next)
 }
 
 /// Compose the display source for every candidate before the layout phase.
@@ -300,6 +325,7 @@ mod tests {
                 rows,
                 width,
                 trailing_space,
+                offset: 0,
             };
             let stdin = capture.payload();
             let output = run(&params, &stdin, &no_dir).expect("generated payload is framed");
@@ -359,6 +385,7 @@ mod tests {
                 rows,
                 width,
                 trailing_space: false,
+                offset: 0,
             };
             let output = compute(&params, &index.window(limit), &no_dir);
             let parsed = wire::parse(&output);
@@ -379,6 +406,7 @@ mod tests {
             rows,
             width,
             trailing_space,
+            offset: 0,
         }
     }
 
@@ -902,6 +930,63 @@ mod tests {
         let p = parse_wire(&out);
         assert_eq!(p.rows, vec![b"newer ".to_vec(), b"newest".to_vec()]);
         assert_eq!(p.inserts, vec![b"newest".to_vec(), b"newer".to_vec()]);
+        assert_eq!(p.navigation[0].prev, 0);
+        assert_eq!(p.navigation[0].left, 1);
+        assert_eq!(p.navigation[1].next, 0);
+        assert_eq!(p.navigation[1].left, 1);
+    }
+
+    #[test]
+    fn history_offset_slides_the_row_window() {
+        let mut stdin = header(&[]);
+        for w in ["newest", "newer", "older", "oldest"] {
+            stdin.extend(word(w));
+        }
+
+        let out = run(
+            &Params {
+                offset: 1,
+                ..history_params("", Mode::Typo, 2, 80)
+            },
+            &stdin,
+            &no_dir,
+        )
+        .unwrap();
+        let p = parse_wire(&out);
+        assert_eq!(p.rows, vec![b"older".to_vec(), b"newer".to_vec()]);
+        assert_eq!(p.inserts, vec![b"newer".to_vec(), b"older".to_vec()]);
+        assert_eq!(p.navigation[0].prev, 0);
+        assert_eq!(p.navigation[0].left, 0);
+        assert_eq!(p.navigation[1].next, 0);
+        assert_eq!(p.navigation[1].left, 0);
+
+        let out = run(
+            &Params {
+                offset: 2,
+                ..history_params("", Mode::Typo, 2, 80)
+            },
+            &stdin,
+            &no_dir,
+        )
+        .unwrap();
+        let p = parse_wire(&out);
+        assert_eq!(p.rows, vec![b"oldest".to_vec(), b"older ".to_vec()]);
+        assert_eq!(p.inserts, vec![b"older".to_vec(), b"oldest".to_vec()]);
+        assert_eq!(p.navigation[0].left, 0);
+        assert_eq!(p.navigation[1].next, 2);
+        assert_eq!(p.navigation[1].left, 0);
+
+        let out = run(
+            &Params {
+                offset: 99,
+                ..history_params("", Mode::Typo, 2, 80)
+            },
+            &stdin,
+            &no_dir,
+        )
+        .unwrap();
+        let p = parse_wire(&out);
+        assert_eq!(p.inserts, vec![b"older".to_vec(), b"oldest".to_vec()]);
     }
 
     #[test]

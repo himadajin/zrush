@@ -169,6 +169,9 @@ typeset -gi _zrush_listing=0
 # Single source for the listing kind (behavior.md "履歴メニュー"): confirmation
 # rule and key mapping branch on this and on nothing else.
 typeset -g  _zrush_plan_kind=none
+# Window start of the current history plan (cli-protocol.md `offset`).
+# Completions do not use a window; teardown resets this with the plan.
+typeset -gi _zrush_plan_offset=0
 
 # Rendering (POSTDISPLAY + region_highlight)
 typeset -ga _zrush_rh=()      # ledger of entries added to region_highlight
@@ -797,6 +800,7 @@ _zrush_teardown() {
   _zrush_plan_hl=() _zrush_plan_cells=() _zrush_plan_nav=() _zrush_plan_insert=()
   _zrush_plan_cp=
   _zrush_plan_kind=none
+  _zrush_plan_offset=0
   return 0
 }
 
@@ -2082,11 +2086,12 @@ _zrush_request_history() {  # kind payload [event] -> REPLY = candidate generati
 # The explicit query the history menu's synchronous exchange sends
 # (behavior.md "履歴メニュー"). Listings that follow the input are made from
 # `input` notifications instead, so nothing else sends a `plan`.
-_zrush_request_plan() {  # candidate-generation producer query trailing-space
+_zrush_request_plan() {  # candidate-generation producer query trailing-space [offset]
   emulate -L zsh
   setopt localoptions typesetsilent no_monitor no_notify
   local -i gen=$1
   local producer=$2 query=$3 tspace=$4
+  local -i offset=${5:-0}
   (( !_zrush_worker_stopping && !_zrush_worker_runtime_tainted )) || return 1
 
   _zrush_geometry
@@ -2096,14 +2101,14 @@ _zrush_request_plan() {  # candidate-generation producer query trailing-space
   local -i id=$REPLY
   _zrush_worker_pending[$id]="plan $producer"
   _zrush_worker_ensure_session || return 1
-  # history_limit is mandatory on every plan whichever store the generation
-  # resolves to; the worker ignores it unless that is the history index
-  # (cli-protocol.md "要求と応答").
+  # history_limit and offset are mandatory on every plan whichever store the
+  # generation resolves to; the worker ignores them unless that is a history
+  # listing (cli-protocol.md "要求と応答").
   _zrush_encode_message plan "$id" "$gen" "$PWD" "$producer" "$query" \
     "$ZRUSH_CFG_MODE" "$ZRUSH_CFG_SMART_CASE" "$rows" "$width" "$tspace" \
-    "$ZRUSH_CFG_HISTORY_LIMIT"
+    "$ZRUSH_CFG_HISTORY_LIMIT" "$offset"
   _zrush_worker_txq+=( "$REPLY" )
-  _zlog "worker: queued request_id=$id producer=$producer generation=$gen bytes=${#REPLY} queued=$#_zrush_worker_txq"
+  _zlog "worker: queued request_id=$id producer=$producer generation=$gen offset=$offset bytes=${#REPLY} queued=$#_zrush_worker_txq"
   _zrush_worker_flush || return 1
   typeset -g REPLY=$id
   return 0
@@ -2464,12 +2469,13 @@ _zrush_hist_reconcile() {
 # handshake, the optional history-snapshot and the plan pipelined behind it, and
 # ends on the plan's terminal response (the snapshot's is consumed on the way
 # there). Cold does not get a second deadline.
-_zrush_request_plan_sync() {  # cold snapshot-payload snapshot-head snapshot-count query
+_zrush_request_plan_sync() {  # cold snapshot-payload snapshot-head snapshot-count query [offset]
   emulate -L zsh
   local -i cold=$1
   local payload=$2
   local -i head=$3 count=$4
   local query=$5
+  local -i offset=${6:-0}
   local -F deadline=$(( EPOCHREALTIME + ${ZRUSH_HISTORY_DEADLINE_MS:-100} / 1000.0 )) remaining
   local -i gen=$_zrush_hist_gen
   if (( cold )); then
@@ -2483,9 +2489,9 @@ _zrush_request_plan_sync() {  # cold snapshot-payload snapshot-head snapshot-cou
   fi
   # cli-protocol.md "history profile": trailing-space is always false, so the
   # inserted text is the history line verbatim.
-  _zrush_request_plan $gen history "$query" false || return 1
+  _zrush_request_plan $gen history "$query" false $offset || return 1
   local -i target=$REPLY cs
-  _zlog "history: query request_id=$target generation=$gen limit=$ZRUSH_CFG_HISTORY_LIMIT"
+  _zlog "history: query request_id=$target generation=$gen offset=$offset limit=$ZRUSH_CFG_HISTORY_LIMIT"
   _zrush_sync_target=$target _zrush_sync_done=0 _zrush_sync_ok=0
   while (( !_zrush_sync_done )); do
     remaining=$(( deadline - EPOCHREALTIME ))
@@ -2564,8 +2570,9 @@ _zrush_open_history_menu() {  # ZLE widget context
   fi
   # cli-protocol.md "history profile": the whole buffer is the query (the
   # sender strips NUL from --query).
-  if _zrush_request_plan_sync $cold "$payload" $head $count "${BUFFER//$'\0'/}" &&
+  if _zrush_request_plan_sync $cold "$payload" $head $count "${BUFFER//$'\0'/}" 0 &&
      (( _zrush_plan_npos > 0 )); then
+    _zrush_plan_offset=0
     _zrush_selected=1
     _zrush_apply_plan
     _zlog "history: menu opened P=$_zrush_plan_npos"
@@ -2698,9 +2705,9 @@ _zrush_select_start() {
 }
 
 # Move the current selection using the last plan's navigation table
-# (cli-protocol.md "ナビ"); no re-fetch or re-layout involved. A
-# self-referencing transition (next/left/right clamped at the boundary) is a
-# no-op per the contract; a transition to 0 is what the listing kind decides.
+# (cli-protocol.md "ナビ"). A self-referencing transition is a no-op.
+# Transition 0 leaves the current window in that direction: completions
+# deselect, a history listing replans or closes (behavior.md "履歴メニュー").
 _zrush_select_dir() {  # $1=next|prev|left|right (navigation-table transition)
   emulate -L zsh
   local -i p=$_zrush_selected
@@ -2716,14 +2723,47 @@ _zrush_select_dir() {  # $1=next|prev|left|right (navigation-table transition)
   esac
   (( new == p )) && return 0
   if (( new == 0 )) && [[ $_zrush_plan_kind == history ]]; then
-    # No unselected history menu exists, so losing the selection erases it.
-    _zlog "history: menu closed at position 1"
-    _zrush_teardown
+    case $1 in
+      next) _zrush_history_replan $((_zrush_plan_offset + 1)) last ;;
+      prev)
+        if (( _zrush_plan_offset > 0 )); then
+          _zrush_history_replan $((_zrush_plan_offset - 1)) 1
+        else
+          _zlog "history: menu closed at position 1"
+          _zrush_teardown
+        fi
+        ;;
+      left) _zrush_history_replan 0 1 ;;
+      *) return 0 ;;
+    esac
     return 0
   fi
   _zrush_selected=$new
   _zrush_apply_highlights
   _zlog "select: dir=$1 pos=$_zrush_selected"
+  return 0
+}
+
+# Warm re-layout of an open history menu (behavior.md "履歴メニュー").
+# Not an open: no snapshot, no input invalidation, same generation.
+_zrush_history_replan() {  # $1=offset $2=1|last
+  emulate -L zsh
+  local -i offset=$1
+  local sel=$2
+  if ! _zrush_request_plan_sync 0 '' 0 0 "${BUFFER//$'\0'/}" $offset ||
+     (( _zrush_plan_npos < 1 )); then
+    _zrush_teardown
+    _zlog "history: replan failed offset=$offset"
+    return 0
+  fi
+  _zrush_plan_offset=$offset
+  if [[ $sel == last ]]; then
+    _zrush_selected=$_zrush_plan_npos
+  else
+    _zrush_selected=$sel
+  fi
+  _zrush_apply_plan
+  _zlog "history: scrolled offset=$offset P=$_zrush_plan_npos sel=$_zrush_selected"
   return 0
 }
 

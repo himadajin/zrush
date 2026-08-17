@@ -731,6 +731,7 @@ fn parse_input(fields: Vec<Vec<u8>>, now: Instant) -> Option<CurrentInput> {
             rows,
             width,
             trailing_space,
+            offset: 0,
         },
         expiry: (!delay.is_zero()).then(|| now + delay),
     })
@@ -765,8 +766,9 @@ fn parse_plan(fields: Vec<Vec<u8>>) -> Request {
             width,
             trailing_space,
             history_limit,
+            offset,
         ],
-    ) = <[Vec<u8>; 12]>::try_from(fields)
+    ) = <[Vec<u8>; 13]>::try_from(fields)
     else {
         return Request::Invalid;
     };
@@ -797,6 +799,9 @@ fn parse_plan(fields: Vec<Vec<u8>>) -> Request {
     let Some(history_limit) = parse_identifier(&history_limit) else {
         return Request::Invalid;
     };
+    let Some(offset) = parse_nonneg_usize(&offset) else {
+        return Request::Invalid;
+    };
 
     Request::Plan {
         generation,
@@ -810,6 +815,7 @@ fn parse_plan(fields: Vec<Vec<u8>>) -> Request {
             rows,
             width,
             trailing_space,
+            offset,
         },
     }
 }
@@ -861,6 +867,10 @@ fn parse_delay(value: &[u8]) -> Option<Duration> {
 fn parse_positive_usize(value: &[u8]) -> Option<usize> {
     let parsed = parse_canonical_u64(value)?;
     usize::try_from(parsed).ok().filter(|number| *number > 0)
+}
+
+fn parse_nonneg_usize(value: &[u8]) -> Option<usize> {
+    usize::try_from(parse_canonical_u64(value)?).ok()
 }
 
 fn is_build_stamp(value: &[u8]) -> bool {
@@ -1154,7 +1164,7 @@ mod tests {
     fn plan_request<'a>(id: &'a [u8], generation: &'a [u8]) -> Vec<&'a [u8]> {
         vec![
             b"plan", id, generation, b"/", b"compsys", b"", b"typo", b"true", b"10", b"40",
-            b"true", b"5000",
+            b"true", b"5000", b"0",
         ]
     }
 
@@ -1164,6 +1174,15 @@ mod tests {
         id: &'a [u8],
         generation: &'a [u8],
         history_limit: &'a [u8],
+    ) -> Vec<&'a [u8]> {
+        history_plan_request_at(id, generation, history_limit, b"0")
+    }
+
+    fn history_plan_request_at<'a>(
+        id: &'a [u8],
+        generation: &'a [u8],
+        history_limit: &'a [u8],
+        offset: &'a [u8],
     ) -> Vec<&'a [u8]> {
         vec![
             b"plan",
@@ -1178,6 +1197,7 @@ mod tests {
             b"40",
             b"false",
             history_limit,
+            offset,
         ]
     }
 
@@ -1860,6 +1880,28 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_plan_without_a_canonical_offset_is_invalid() {
+        let mut requests = Vec::new();
+        for (id, offset) in [
+            (b"1".as_slice(), b"".as_slice()),
+            (b"2", b"00"),
+            (b"3", b" 0"),
+        ] {
+            requests.push(message(&history_plan_request_at(id, b"9", b"5000", offset)));
+        }
+        // The 12-field plan of the previous wire is not a request either.
+        requests.push(message(&[
+            b"plan", b"4", b"9", b"/", b"compsys", b"", b"typo", b"true", b"10", b"40", b"true",
+            b"5000",
+        ]));
+        let decoded = session(&requests);
+
+        for id in [b"1".as_slice(), b"2", b"3", b"4"] {
+            assert_eq!(reply(&decoded, id), error(id, b"invalid-request"));
+        }
+    }
+
     /// cli-protocol.md 「history profile」: the request's scan bound is
     /// clamped to the retention cap, and a slot-resolved `plan` ignores it.
     #[test]
@@ -1972,6 +2014,11 @@ mod tests {
         }
         for value in [b"".as_slice(), b"0", b"01", b"+1", b"-1", b" 1"] {
             assert_eq!(parse_positive_usize(value), None, "{value:?}");
+        }
+        assert_eq!(parse_nonneg_usize(b"0"), Some(0));
+        assert_eq!(parse_nonneg_usize(b"3"), Some(3));
+        for value in [b"".as_slice(), b"00", b"01", b"+1", b"-1", b" 0"] {
+            assert_eq!(parse_nonneg_usize(value), None, "{value:?}");
         }
         // The reserved `0` is a notification's alone.
         assert_eq!(parse_reference(b"0"), Some(0));

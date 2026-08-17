@@ -17,9 +17,10 @@ Two flags select what the session does with `payload` rather than what the `plan
 |---|---|
 | `--source` | the write kind: `store` (the default: slot `live`), `history` (`history-snapshot`), or `history-append` |
 | `--history-limit` | the `plan`'s scan bound over the history index; omitted, it is the `[history].limit` default of `5000` |
+| `--offset` | the `plan`'s window start over the ranked matches; omitted, it is `0` |
 
 An `append` file adds a `history-append` (request_id 2, generation 2) between the write and the `plan`, so a vector can fix how appended records order and dedup against the snapshot's.
-`history_limit` is a mandatory `plan` field whichever store the generation resolves to, so every vector carries one whether or not it reads the index.
+`history_limit` and `offset` are mandatory `plan` fields whichever store the generation resolves to, so every vector carries them whether or not it reads the index. The runner supplies the defaults above when a vector omits the flags.
 
 Reject vectors expect that session to answer with a terminal response per request, exactly one of which is an `error`.
 A candidate-stream framing violation fails the write with `invalid-payload`, and a `history-append` against the uninitialized index fails it with `unknown-generation`; either leaves no generation for the `plan` to reference (`unknown-generation`).
