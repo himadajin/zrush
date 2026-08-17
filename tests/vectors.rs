@@ -219,6 +219,10 @@ fn run_vector_raw(path: &Path) -> std::process::Output {
         limit if limit.is_empty() => OsString::from("5000"),
         limit => limit,
     };
+    let offset = match value("--offset") {
+        value if value.is_empty() => OsString::from("0"),
+        value => value,
+    };
     requests.extend(msg(&[
         b"plan",
         plan_id,
@@ -232,6 +236,7 @@ fn run_vector_raw(path: &Path) -> std::process::Output {
         value("--width").as_bytes(),
         value("--trailing-space").as_bytes(),
         history_limit.as_bytes(),
+        offset.as_bytes(),
     ]));
     let (control_read, _control_write) = UnixStream::pair().expect("create control channel");
     let control_fd = control_read.as_raw_fd();

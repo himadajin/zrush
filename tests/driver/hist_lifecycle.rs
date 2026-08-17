@@ -309,3 +309,135 @@ fn a_zero_match_query_opens_nothing_and_leaves_the_buffer() {
         "(h12b) buffer changed on a zero-match query (key consumed, no native fallback)",
     );
 }
+
+/// The unfiltered menu is a `max-lines` window over 13 eligible fixture
+/// entries. select-prev at the oldest visible row slides that window toward
+/// the past; select-next at the newest visible row slides it back; left
+/// jumps to the newest match; right stays on the oldest row still in view.
+#[test]
+fn the_history_menu_scrolls_past_the_row_budget() {
+    let mut host = Host::boot_history();
+    host.press(keys::UP);
+    assert_eq!(
+        host.listing_kind("(h28a)"),
+        "kind=history sel=1 listing=1 npos=10",
+        "(h28a) empty-buffer Up did not open the max-lines window:"
+    );
+
+    let opened = listing_rows(&mut host, "(h28a')");
+    assert!(
+        numbered_row(opened.last().expect("bottom row"), "echo newest")
+            && numbered_row(opened.first().expect("top row"), "aa zqx bb"),
+        "(h28a') the opening window is not newest..aa zqx bb: {opened:?}"
+    );
+
+    for _ in 0..9 {
+        host.press(keys::UP);
+    }
+    assert_eq!(
+        host.listing_kind("(h28b)"),
+        "kind=history sel=10 listing=1 npos=10",
+        "(h28b) nine Ups did not land on the oldest visible row:"
+    );
+    assert_eq!(
+        listing_rows(&mut host, "(h28b')"),
+        opened,
+        "(h28b') moving inside the window scrolled it"
+    );
+
+    let scrolled = host.log_count("history: scrolled");
+    host.press(keys::UP);
+    assert!(
+        host.wait_log("history: scrolled", scrolled, Duration::from_secs(3)),
+        "(h28c) Up at the oldest visible row did not replan"
+    );
+    assert_eq!(
+        host.listing_kind("(h28c')"),
+        "kind=history sel=10 listing=1 npos=10",
+        "(h28c') the scrolled window did not keep the new oldest selected:"
+    );
+    let after_one = listing_rows(&mut host, "(h28c'')");
+    assert!(
+        numbered_row(
+            after_one.last().expect("bottom row"),
+            "note: zrushtestslow is a fixture completion function"
+        ) && numbered_row(after_one.first().expect("top row"), "echo mid1"),
+        "(h28c'') the window did not slide one row older: {after_one:?}"
+    );
+
+    host.press(keys::UP);
+    host.press(keys::UP);
+    let at_end = listing_rows(&mut host, "(h28d)");
+    assert!(
+        numbered_row(at_end.first().expect("top row"), "echo oldest"),
+        "(h28d) two more Ups did not reveal the oldest match: {at_end:?}"
+    );
+    host.press(keys::UP);
+    assert_eq!(
+        listing_rows(&mut host, "(h28d')"),
+        at_end,
+        "(h28d') Up at the scan-range end moved the window"
+    );
+    assert_eq!(
+        host.listing_kind("(h28d'')"),
+        "kind=history sel=10 listing=1 npos=10",
+        "(h28d'') Up at the scan-range end left the menu:"
+    );
+
+    host.press(keys::LEFT);
+    assert_eq!(
+        host.listing_kind("(h28e)"),
+        "kind=history sel=1 listing=1 npos=10",
+        "(h28e) Left did not jump to the newest match:"
+    );
+    assert_eq!(
+        listing_rows(&mut host, "(h28e')"),
+        opened,
+        "(h28e') Left did not restore the opening window"
+    );
+
+    host.press(keys::RIGHT);
+    assert_eq!(
+        host.listing_kind("(h28f)"),
+        "kind=history sel=10 listing=1 npos=10",
+        "(h28f) Right did not jump to the oldest visible row:"
+    );
+    assert_eq!(
+        listing_rows(&mut host, "(h28f')"),
+        opened,
+        "(h28f') Right scrolled instead of staying in the window"
+    );
+
+    host.press(keys::UP);
+    for _ in 0..9 {
+        host.press(keys::DOWN);
+    }
+    assert_eq!(
+        host.listing_kind("(h28g)"),
+        "kind=history sel=1 listing=1 npos=10",
+        "(h28g) Down did not walk back to the newest visible row:"
+    );
+    let back = host.log_count("history: scrolled");
+    host.press(keys::DOWN);
+    assert!(
+        host.wait_log("history: scrolled", back, Duration::from_secs(3)),
+        "(h28h) Down at the newest visible row of a shifted window did not replan"
+    );
+    assert_eq!(
+        host.listing_kind("(h28h')"),
+        "kind=history sel=1 listing=1 npos=10",
+        "(h28h') scrolling newer did not select the newly revealed newest:"
+    );
+    assert_eq!(
+        listing_rows(&mut host, "(h28h'')"),
+        opened,
+        "(h28h'') Down did not restore the opening window"
+    );
+}
+
+fn listing_rows(host: &mut Host, label: &str) -> Vec<String> {
+    let post = host.postdisplay(label);
+    let listing = post.strip_prefix('\n').unwrap_or(&post);
+    assert!(!listing.is_empty(), "{label}: the listing is empty");
+    listing.split('\n').map(str::to_string).collect()
+}

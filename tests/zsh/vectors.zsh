@@ -779,13 +779,16 @@ reserialize_plan() {  # -> REPLY=bytes, or return 1 with REPLY=reason
   [[ $sf[1] == history-snapshot && $sf[3] == $snap_gen && $sf[4] == $'b\1\0w\1ls\2n\17\0' ]] || hist_wire=0
   [[ ${_zrush_worker_pending[$sf[2]]} == "history-snapshot $snap_gen" ]] || hist_wire=0
   # The query behind it: producer=history, the whole buffer as the query,
-  # trailing-space false, and the configured history_limit.
+  # trailing-space false, the configured history_limit, and offset 0.
   _zrush_request_plan $snap_gen history 'ls -l' false || hist_wire=0
   wire_fields "$_zrush_worker_txq[2]" && pf=( "${(@)reply}" ) || hist_wire=0
-  (( $#pf == 12 )) || hist_wire=0
+  (( $#pf == 13 )) || hist_wire=0
   [[ $pf[1] == plan && $pf[3] == $snap_gen && $pf[5] == history && $pf[6] == 'ls -l' \
-     && $pf[11] == false && $pf[12] == 1234 ]] || hist_wire=0
+     && $pf[11] == false && $pf[12] == 1234 && $pf[13] == 0 ]] || hist_wire=0
   [[ ${_zrush_worker_pending[$pf[2]]} == 'plan history' ]] || hist_wire=0
+  _zrush_request_plan $snap_gen history 'ls -l' false 3 || hist_wire=0
+  wire_fields "$_zrush_worker_txq[3]" && pf=( "${(@)reply}" ) || hist_wire=0
+  (( $#pf == 13 && pf[13] == 3 )) || hist_wire=0
   if (( hist_wire )); then
     ok "history wiring: a snapshot frame and the history plan that reads it back"
   else
