@@ -117,7 +117,7 @@ pub(crate) enum Chunk {
 }
 
 /// The session's byte stream together with the monotonic clock that measures
-/// quiet periods (cli-protocol.md 「入力通知と worker event」).
+/// quiet periods (cli-protocol.md "Input Notifications and Worker Events").
 ///
 /// The event loop reads time and bytes through this one seam, so tests drive
 /// it with a deterministic clock and the matching/ranking/layout side stays
@@ -304,7 +304,7 @@ enum Slot {
     Cache,
 }
 
-/// The two writes of the history index (cli-protocol.md 「要求と応答」).
+/// The two writes of the history index (cli-protocol.md "Requests and Responses").
 #[derive(Clone, Copy)]
 enum HistoryWrite {
     Snapshot,
@@ -314,7 +314,7 @@ enum HistoryWrite {
 const SLOT_COUNT: usize = 2;
 
 /// At most one parsed candidate generation per slot, for the lifetime of
-/// this session (cli-protocol.md 「要求と応答」).
+/// this session (cli-protocol.md "Requests and Responses").
 #[derive(Default)]
 struct CandidateStore {
     slots: [Option<(i64, record::Stored)>; SLOT_COUNT],
@@ -337,7 +337,7 @@ impl CandidateStore {
 }
 
 /// The last `input` notification the session accepted, whole
-/// (cli-protocol.md 「入力通知と worker event」).
+/// (cli-protocol.md "Input Notifications and Worker Events").
 ///
 /// `expiry` carries the pending/settled distinction: `Some` is the instant its
 /// quiet period ends, `None` means it has already settled.
@@ -352,7 +352,7 @@ struct CurrentInput {
 
 /// Everything one session retains: the candidate store's slots, the history
 /// index -- which is not a slot, `store` never reaches it and the history
-/// writes never reach a slot (cli-protocol.md 「要求と応答」) -- and the one
+/// writes never reach a slot (cli-protocol.md "Requests and Responses") -- and the one
 /// current input the quiet period is measured for.
 #[derive(Default)]
 struct Session {
@@ -410,7 +410,7 @@ impl Session {
         }
     }
 
-    /// cli-protocol.md 「入力通知と worker event」: an accepted `input`
+    /// cli-protocol.md "Input Notifications and Worker Events": an accepted `input`
     /// replaces the current one whole and restarts the quiet period with its
     /// own `delay_ms`; `0` settles at acceptance.
     fn accept_input<W: Write>(
@@ -441,7 +441,7 @@ impl Session {
         Ok(())
     }
 
-    /// cli-protocol.md 「入力通知と worker event」: a `flush` cuts the quiet
+    /// cli-protocol.md "Input Notifications and Worker Events": a `flush` cuts the quiet
     /// period short for a pending current input of the same generation, and is
     /// dropped when it would have no effect.
     fn accept_flush<W: Write>(
@@ -465,7 +465,7 @@ impl Session {
     }
 
     /// Whether a `store` answers the input the worker is still holding
-    /// (cli-protocol.md 「入力通知と worker event」).
+    /// (cli-protocol.md "Input Notifications and Worker Events").
     fn binds_current_input(&self, input_generation: i64) -> bool {
         self.input
             .as_ref()
@@ -475,7 +475,7 @@ impl Session {
 
 /// The session event loop: stdin's wait carries the quiet period's expiry as
 /// its deadline, so an event can be emitted with no message arriving
-/// (cli-protocol.md 「起動と責務」).
+/// (cli-protocol.md "Startup and Responsibilities").
 pub(crate) fn run<S: Source, W: Write>(mut source: S, mut output: W) -> Result<End, Error> {
     let mut decoder = Decoder::new();
     let mut handshake = Handshake::Awaiting;
@@ -525,7 +525,7 @@ pub(crate) fn run<S: Source, W: Write>(mut source: S, mut output: W) -> Result<E
 }
 
 /// The post-`incompatible` discard state of cli-protocol.md
-/// 「セッションフレーミングと握手」.
+/// "Session Framing and Handshake".
 fn discard_requests<S: Source>(source: &mut S) {
     let mut buffer = [0; READ_BUFFER_SIZE];
     while let Ok(Chunk::Data(_)) = source.read_until(None, &mut buffer) {}
@@ -593,7 +593,7 @@ fn process_request<W: Write>(
             input_generation,
             payload,
         } => {
-            // cli-protocol.md 「要求と応答」: the binding is checked before the
+            // cli-protocol.md "Requests and Responses": the binding is checked before the
             // payload's framing, so a superseded input's candidate stream is
             // never parsed.
             if !session.binds_current_input(input_generation) {
@@ -640,7 +640,7 @@ fn process_request<W: Write>(
             params,
         } => {
             let is_dir = |path: &[u8]| is_dir_from(&cwd, path);
-            // cli-protocol.md 「要求と応答」: one generation namespace spanning
+            // cli-protocol.md "Requests and Responses": one generation namespace spanning
             // both slots and the index. The index answers only for its
             // current stamp, and builds the query window per request because
             // the scan bound is the request's.
@@ -693,7 +693,7 @@ fn parse_store(fields: Vec<Vec<u8>>) -> Request {
     }
 }
 
-/// cli-protocol.md 「入力通知と worker event」: an `input` notification, whose
+/// cli-protocol.md "Input Notifications and Worker Events": an `input` notification, whose
 /// plan fields are always laid out as `producer = compsys`.
 fn parse_input(fields: Vec<Vec<u8>>, now: Instant) -> Option<CurrentInput> {
     let [
@@ -795,7 +795,7 @@ fn parse_plan(fields: Vec<Vec<u8>>) -> Request {
         return Request::Invalid;
     };
     // Same grammar as an identifier, and mandatory whichever store the
-    // generation resolves to (cli-protocol.md 「要求と応答」).
+    // generation resolves to (cli-protocol.md "Requests and Responses").
     let Some(history_limit) = parse_identifier(&history_limit) else {
         return Request::Invalid;
     };
@@ -852,7 +852,7 @@ fn parse_identifier(value: &[u8]) -> Option<i64> {
 }
 
 /// A notification's `candidate_generation`: an identifier, or the reserved `0`
-/// meaning "no reusable candidates" (cli-protocol.md 「入力通知と worker event」).
+/// meaning "no reusable candidates" (cli-protocol.md "Input Notifications and Worker Events").
 fn parse_reference(value: &[u8]) -> Option<i64> {
     i64::try_from(parse_canonical_u64(value)?).ok()
 }
@@ -1383,7 +1383,7 @@ mod tests {
         assert_eq!(reply(&decoded, b"13"), error(b"13", b"invalid-request"));
     }
 
-    /// cli-protocol.md 「要求と応答」: a `store` whose scalars *and* payload
+    /// cli-protocol.md "Requests and Responses": a `store` whose scalars *and* payload
     /// are both invalid answers with the error detected first.
     #[test]
     fn store_scalar_validation_precedes_payload_framing() {
@@ -1401,7 +1401,7 @@ mod tests {
         assert_eq!(reply(&decoded, b"1"), error(b"1", b"invalid-request"));
     }
 
-    /// cli-protocol.md 「入力通知と worker event」: the binding is checked
+    /// cli-protocol.md "Input Notifications and Worker Events": the binding is checked
     /// before the payload, so a superseded capture is never parsed.
     #[test]
     fn an_unbound_store_is_superseded_before_its_payload_is_read() {
@@ -1470,7 +1470,7 @@ mod tests {
         assert_eq!(reply(&decoded, b"1"), error(b"1", b"superseded"));
     }
 
-    /// cli-protocol.md 「入力通知と worker event」: the quiet period is
+    /// cli-protocol.md "Input Notifications and Worker Events": the quiet period is
     /// restarted by every accepted notification, and only the last one settles.
     #[test]
     fn notifications_coalesce_to_the_latest_generation() {
@@ -1518,7 +1518,7 @@ mod tests {
         assert_eq!(events[2], capture_required(b"3"));
     }
 
-    /// cli-protocol.md 「入力通知と worker event」: a notification's
+    /// cli-protocol.md "Input Notifications and Worker Events": a notification's
     /// `candidate_generation` resolves against the two slots alone -- the
     /// history index answers `plan` requests only.
     #[test]
@@ -1609,7 +1609,7 @@ mod tests {
     }
 
     /// Notifications carry no `request_id`, so a malformed one has no in-band
-    /// answer: it ends the session (cli-protocol.md 「入力通知と worker event」).
+    /// answer: it ends the session (cli-protocol.md "Input Notifications and Worker Events").
     #[test]
     fn malformed_notifications_end_the_session() {
         let mut malformed: Vec<Vec<Vec<u8>>> = Vec::new();
@@ -1685,7 +1685,7 @@ mod tests {
         );
     }
 
-    /// cli-protocol.md 「要求と応答」: a `plan` sees exactly the history
+    /// cli-protocol.md "Requests and Responses": a `plan` sees exactly the history
     /// writes that preceded it in the byte stream, and the index answers only
     /// for its current stamp.
     #[test]
@@ -1791,7 +1791,7 @@ mod tests {
         assert_eq!(reply(&decoded, b"3"), error(b"3", b"unknown-generation"));
     }
 
-    /// cli-protocol.md 「要求と応答」: `store` never reaches the index and the
+    /// cli-protocol.md "Requests and Responses": `store` never reaches the index and the
     /// history writes never reach a slot.
     #[test]
     fn history_writes_and_slots_are_independent() {
@@ -2044,7 +2044,7 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    /// The byte strings of cli-protocol.md 「具体例」, decoded and re-emitted
+    /// The byte strings of cli-protocol.md "Concrete Examples", decoded and re-emitted
     /// by this session verbatim.
     #[test]
     fn the_contract_examples_are_this_wire() {

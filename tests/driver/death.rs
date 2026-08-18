@@ -1,8 +1,8 @@
 //! Active persistent-worker death: a session that dies with an assigned
 //! request, the retry that follows, the circuit breaker two consecutive deaths
 //! open, and the explicit re-source that starts a new recovery epoch
-//! (docs/internal/specs/behavior.md 「worker ライフサイクル」,
-//! docs/internal/contracts/cli-protocol.md 「応答の検証と zsh 側の適用」).
+//! (docs/internal/specs/behavior.md "Worker Lifecycle",
+//! docs/internal/contracts/cli-protocol.md "Response Validation and zsh-Side Application (Normative)").
 
 use std::time::Duration;
 
@@ -93,7 +93,7 @@ fn active_session_deaths_open_the_breaker_and_a_re_source_recovers() {
     );
     // The first message of a collection is the `input` notification the
     // keystroke makes, so that is what this session died on
-    // (cli-protocol.md 「入力通知と worker event」).
+    // (cli-protocol.md "Input Notifications and Worker Events").
     let dead_generation = host
         .fake()
         .last(&format!("die {first} "))
@@ -121,7 +121,7 @@ fn active_session_deaths_open_the_breaker_and_a_re_source_recovers() {
     // The fake parks on the first message it reads, which is the `input`
     // notification the keystroke makes: it answers with no event, so nothing is
     // ever collected and no request goes out behind it
-    // (cli-protocol.md 「入力通知と worker event」).
+    // (cli-protocol.md "Input Notifications and Worker Events").
     host.fake().set_mode(Mode::Hold);
     let held0 = host.fake().count(&format!("hold {second} "));
     host.send_keys("ls fx/basic/");
@@ -197,7 +197,7 @@ fn active_session_deaths_open_the_breaker_and_a_re_source_recovers() {
 
     // Tab once the death has unwound: no listing, no input awaiting an event
     // and no collection, so it falls through to the predecessor chain and
-    // inserts nothing of its own (behavior.md 「Tab」).
+    // inserts nothing of its own (behavior.md "Tab").
     host.press(keys::TAB);
     host.drain(Duration::from_millis(500));
     host.assert_buffer(
@@ -281,12 +281,12 @@ fn active_session_deaths_open_the_breaker_and_a_re_source_recovers() {
 /// A well-formed terminal `error` ends its request for good: neither that
 /// `plan` nor the `history-snapshot` it was pipelined behind is sent again, and
 /// no candidate generation is spent recovering. Only the next real input makes
-/// the next generation (cli-protocol.md 「応答の検証と zsh 側の適用」,
-/// behavior.md 「worker ライフサイクル」).
+/// the next generation (cli-protocol.md "Response Validation and zsh-Side Application (Normative)",
+/// behavior.md "Worker Lifecycle").
 ///
 /// The history menu is where a `plan` request still goes. The input-following
 /// listing sends none: its candidates arrive as the event an accepted `store`
-/// settles (cli-protocol.md 「入力通知と worker event」).
+/// settles (cli-protocol.md "Input Notifications and Worker Events").
 #[test]
 fn a_failed_request_is_not_replayed_and_only_new_input_makes_a_generation() {
     let mut host = Host::boot_history_fake();
@@ -394,7 +394,7 @@ fn a_failed_request_is_not_replayed_and_only_new_input_makes_a_generation() {
 /// A Tab recorded while the worker still owed an event, on a session that then
 /// dies: the failure drops the input generation, so the press it left behind
 /// has nothing to resolve against and the buffer is never touched
-/// (behavior.md 「Tab」「worker ライフサイクル」).
+/// (behavior.md "Tab", "Worker Lifecycle").
 ///
 /// `Hold` is what makes that window deterministic. The parked `input`
 /// notification cannot be answered while the mode holds, so the Tab provably

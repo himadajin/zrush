@@ -1,4 +1,4 @@
-//! `zrush init zsh` (cli-protocol.md "zrush init").
+//! `zrush init zsh` (cli-protocol.md "`zrush init`").
 //!
 //! Emits `ZRUSH_BIN` and build-stamp prelude lines followed by the zle-integration script,
 //! embedded into the binary at build time (`.zshrc` sources this command's

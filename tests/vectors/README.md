@@ -44,7 +44,7 @@ Every file here except `env` holds one byte string, written as escaped text so i
 
 `plan/` and `reject/` fix what the `zrush worker` process produces, so both run the binary.
 `reject-plan/` fixes the opposite direction: each `plan` is a byte string that is not a valid plan, and every receiver must reject it.
-One vector breaks exactly one acceptance condition from cli-protocol.md "エラー時の zsh 側挙動", and its name says which one.
+One vector breaks exactly one acceptance condition from cli-protocol.md "zsh-Side Behavior on Errors (Normative)", and its name says which one.
 The corpus covers each condition at digit widths both within and beyond a receiver's integer type, because a receiver that evaluates a digit string arithmetically can wrap an out-of-range value back into range.
 Where a condition constrains a sum (`start + len` against the listing text), a vector also fixes the case where each value alone is in range and only the sum escapes.
 No process runs and no golden output is derived, so `UPDATE_GOLDEN` does not apply: write `plan` by hand.
@@ -90,7 +90,7 @@ A generated `expected` is a proposal, not an answer -- read it against cli-proto
 ## `message/`
 
 `message/` fixes whole outer messages of the session that carry no candidate stream and no render plan of their own: the input notifications zsh sends, the events the worker sends back, and the terminal response that tells zsh a capture arrived too late.
-Each `frame` is one complete outer message, byte for byte as cli-protocol.md "入力通知と worker event" spells it, so the six examples in that section and this corpus are one set of bytes.
+Each `frame` is one complete outer message, byte for byte as cli-protocol.md "Input Notifications and Worker Events" spells it, so the six examples in that section and this corpus are one set of bytes.
 
 | vector | message it fixes |
 |---|---|

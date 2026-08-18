@@ -1,5 +1,5 @@
 //! Tab: pending-before-candidates and `tab = "common-prefix"` over a
-//! leading dash run (docs/internal/specs/behavior.md "Tab", "候補収集"
+//! leading dash run (docs/internal/specs/behavior.md "Tab", "Candidate Collection"
 //! 「広げ規則」).
 
 use std::time::Duration;
@@ -8,7 +8,7 @@ use crate::host::{Host, PlanShape, keys};
 
 /// The Tab branch that cuts a still-running quiet period short, as opposed to
 /// the one that merely records the press over a collection already in flight
-/// (behavior.md 「Tab」).
+/// (behavior.md "Tab").
 pub const TAB_FLUSHED: &str = "tab: pending (quiet-period flush";
 
 /// Default `[insert].tab = "menu"`, so a Tab that lands before candidates
@@ -17,13 +17,13 @@ pub const TAB_FLUSHED: &str = "tab: pending (quiet-period flush";
 /// The Tab has to land while the worker is still measuring the quiet period,
 /// which the contract's longest `delay-ms` makes reachable: the keystrokes are
 /// one burst, whose last one is what makes the notification (input pressure
-/// suppresses the others, behavior.md 「候補収集」), and the Tab follows it as
+/// suppresses the others, behavior.md "Candidate Collection"), and the Tab follows it as
 /// its own press.
 ///
 /// Ten seconds is also what makes the fast-forward observable rather than
 /// merely assumed: the press must take the quiet-period branch by name, and the
 /// selection it starts must arrive inside a deadline that a worker left to time
-/// the period out could not meet (behavior.md 「Tab」).
+/// the period out could not meet (behavior.md "Tab").
 #[test]
 fn pending_tab_flushes_the_quiet_period_and_starts_selection_on_arrival() {
     let mut host = Host::boot();

@@ -332,7 +332,7 @@ unset ZDOTDIR
   # Two frames a session really sends in order: the store that fills a slot
   # under a fresh generation, bound to the input whose capture-required asked
   # for it, and an input notification behind it
-  # (cli-protocol.md "要求と応答" / "入力通知と worker event").
+  # (cli-protocol.md "Requests and Responses" / "Input Notifications and Worker Events").
   _zrush_encode_message store 1 live 1 7 $'b\1\0'; typeset -g FRAME_A=$REPLY
   _zrush_encode_message input 8 0 30 / q prefix false 1 1 false; typeset -g FRAME_B=$REPLY
   print -rn -- "$FRAME_A" >| $WORK/a.expected
@@ -375,7 +375,7 @@ unset ZDOTDIR
   # Only frames still waiting in the queue may be dropped or replaced. The one
   # already handed to a writer child is on its way to the FIFO and is settled by
   # its ack like any other, while request frames are never removed at all
-  # (behavior.md "worker ライフサイクル").
+  # (behavior.md "Worker Lifecycle").
   reset_transport
   REQ_FIFO=$WORK/notify-request.fifo
   command mkfifo $REQ_FIFO
@@ -726,7 +726,7 @@ unset ZDOTDIR
   # ------------------------------------------- synchronous history read seam
   # The cold history exchange sends history-snapshot + plan and ends on the
   # plan's terminal response; the snapshot's is consumed on the way there
-  # (behavior.md "履歴メニュー").
+  # (behavior.md "History Menu").
   reset_transport
   _zrush_worker_ready=1
   _zrush_worker_pending=( 1 'history-snapshot 1' 2 'plan history' 3 'plan history' )

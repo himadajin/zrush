@@ -1,6 +1,6 @@
 //! History menu: opening, navigating, confirming and dismissing it, and the
 //! hygiene of the entries it offers (docs/internal/specs/behavior.md
-//! 「履歴メニュー」, docs/internal/contracts/cli-protocol.md 「history profile」).
+//! "History Menu", docs/internal/contracts/cli-protocol.md "history profile").
 //!
 //! Every test here runs on a host booted from `tests/zsh/rc/history.zshrc`,
 //! whose fixture history is what the queries below select from.

@@ -1,5 +1,5 @@
 //! Coexistence with third-party zle plugins
-//! (docs/internal/specs/behavior.md 「プラグイン共存」, and the
+//! (docs/internal/specs/behavior.md "Plugin Coexistence", and the
 //! abbr -> zrush -> z-sy-h load order docs/user/install.md documents).
 //!
 //! The other side of each scenario is a double: an rc fragment reproducing the
@@ -56,7 +56,7 @@ add-zle-hook-widget zle-line-pre-redraw _zrt_double_zsyh
 "#;
 
 /// zsh-autosuggestions' shape: a `compadd` wrapper living in the interactive
-/// shell. behavior.md 「プラグイン共存」 requires the capture fork to strip such
+/// shell. behavior.md "Plugin Coexistence" requires the capture fork to strip such
 /// wrappers before calling compsys, and to confine that removal to the fork.
 const COMPADD_DOUBLE: &str = r#"
 typeset -gi _zrt_double_compadd_calls=0
@@ -166,7 +166,7 @@ fn a_wrapper_above_zrush_survives_re_source_and_keybind_reapply() {
     assert_listing_selection_and_confirm(&mut host, "(cox-3b)");
 
     // A config reload reapplies the binding set. With a third-party wrapper
-    // present it must layer rather than overwrite (behavior.md 「プラグイン共存」).
+    // present it must layer rather than overwrite (behavior.md "Plugin Coexistence").
     host.send_line("_zrush_apply_keybinds");
     host.sync_prompt(Duration::from_secs(5));
     assert_listing_selection_and_confirm(&mut host, "(cox-3c)");

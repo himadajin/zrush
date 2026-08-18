@@ -1,7 +1,7 @@
 //! End-exclusive char-offset spans.
 //!
 //! Char intervals travel in two shapes: the render-plan wire format writes
-//! `start len` (cli-protocol.md "ハイライト"), while everything that
+//! `start len` (cli-protocol.md "Highlights"), while everything that
 //! computes offsets -- matching's match spans, layout's cell ranges --
 //! works in `[start, end)`. Both are pairs of usize, so reading one as the
 //! other type-checks and has produced real bugs (layout.rs's
@@ -12,7 +12,7 @@
 //! derive `len` from it.
 
 /// A `[start, end)` range of chars over the lossy UTF-8 reading of some
-/// text -- the offset unit of cli-protocol.md "オフセット規律", never a
+/// text -- the offset unit of cli-protocol.md "Offset Rules", never a
 /// display width.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) struct CharSpan {

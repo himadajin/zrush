@@ -11,7 +11,7 @@ _zrt_dump_buffer() { _zlog "TESTBUF=${(qqqq)BUFFER}" }
 zle -N _zrt-dump-buffer _zrt_dump_buffer
 bindkey '^Xb' _zrt-dump-buffer
 
-# ^Xp: POSTDISPLAY, quoted (cli-protocol.md "適用": leading \n + listing text).
+# ^Xp: POSTDISPLAY, quoted (cli-protocol.md "Plan Application (zsh-Side Normative)": leading \n + listing text).
 _zrt_dump_postdisplay() { _zlog "TESTPOST=${(qqqq)POSTDISPLAY}" }
 zle -N _zrt-dump-postdisplay _zrt_dump_postdisplay
 bindkey '^Xp' _zrt-dump-postdisplay
@@ -41,7 +41,7 @@ bindkey '^Xw' _zrt-dump-worker
 # stored -- whether the saved fingerprint still describes this environment, and
 # how old the entry is. ^Xw carries the third (the latch) as raw state. A test
 # that expects a recollection needs to show which condition forced it
-# (behavior.md "空語収集キャッシュ").
+# (behavior.md "Empty-Word Collection Cache").
 _zrt_dump_cache() {
   emulate -L zsh
   local -i match=0 age=-1

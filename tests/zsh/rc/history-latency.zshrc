@@ -14,7 +14,7 @@ compinit -u -d ${ZRUSH_TEST_TMP:-${TMPDIR:-/tmp}}/zcompdump-zrush-histlat
 source <($ZRUSH_REAL_BIN init zsh)
 
 # Bulk-generate fixture history rather than writing thousands of literal
-# print -s lines; behavior.md "履歴メニュー" measures against realistic
+# print -s lines; behavior.md "History Menu" measures against realistic
 # history sizes ([history].limit's default and max, config-schema.md), not
 # against this driver's small hand-written fixture sets.
 typeset _zrt_pad=
@@ -29,7 +29,7 @@ print -sr -- 'echo needle-latency-target'
 
 # Force the worker's history index back to cold, from the outside: injecting one
 # event makes HISTCMD advance by two (this command plus the injected line),
-# which Level A reads as a discontinuity (behavior.md "履歴メニュー"). No
+# which Level A reads as a discontinuity (behavior.md "History Menu"). No
 # _zrush_hist_* internal is touched, so the driver measures the same cold path a
 # real discontinuity takes. The injected line is the needle itself, so the next
 # empty-buffer Up still paints a known string.

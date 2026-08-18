@@ -2,7 +2,7 @@
 //! the `[history].limit` scan window, `[display].min-input` not gating the
 //! menu, and -- through a deliberately slow `[display].delay-ms` -- send-break
 //! against an input whose quiet period is still running in the worker
-//! (docs/internal/specs/behavior.md 「履歴メニュー」「候補収集」,
+//! (docs/internal/specs/behavior.md "History Menu" "Candidate Collection",
 //! docs/internal/contracts/config-schema.md).
 //!
 //! Each test writes its own config before its host boots, so the variant is in
@@ -60,8 +60,8 @@ fn send_break_clears_a_merely_pending_input() {
 /// `[history].limit` bounds the worker's scan window over the *index*, not a
 /// window over `$history`: the window is the newest `limit` index entries, the
 /// duplicate inside it is collapsed to its newest occurrence, and nothing is
-/// backfilled from outside it (cli-protocol.md 「history profile」,
-/// config-schema.md 「[history]」).
+/// backfilled from outside it (cli-protocol.md "history profile",
+/// config-schema.md "[history]").
 ///
 /// This is the end-to-end proof that the window moved. The rc file's fixture
 /// history is, newest first, dupA, dupA, an excluded framing-byte line, keep3,
@@ -99,7 +99,7 @@ fn the_history_limit_bounds_the_index_scan_window() {
 /// `[history].limit`: with the default limit far larger than this fixture
 /// history, what ends the walk is the ceiling, and the entries past it never
 /// reach the index -- so no later query can name them, whatever its window
-/// (behavior.md 「履歴メニュー」, cli-protocol.md 「history profile」).
+/// (behavior.md "History Menu", cli-protocol.md "history profile").
 ///
 /// Both queries name a marker that exists exactly once in the fixture, so each
 /// assertion is about that one entry reaching the payload or not. The bulk

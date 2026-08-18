@@ -1,6 +1,6 @@
 //! Ranking of matched candidates.
 //!
-//! Semantics (cli-protocol.md "マッチング・ランキングの意味論"): the
+//! Semantics (cli-protocol.md "Matching and Ranking Semantics"): the
 //! result order is one policy selected by the request producer; this module owns
 //! that ordering policy while layout.rs owns the separately selected
 //! geometry. Matching and insertion remain producer-independent.

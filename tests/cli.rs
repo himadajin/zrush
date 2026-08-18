@@ -89,7 +89,7 @@ fn run_plan(extra: &[&str], stdin: &[u8]) -> (i32, Vec<u8>) {
     // the worker's current input, so the session opens with an `input`
     // notification whose quiet period outlives the whole exchange: it is still
     // pending when the `store` arrives, and the `store` settles it
-    // (cli-protocol.md 「入力通知と worker event」).
+    // (cli-protocol.md "Input Notifications and Worker Events").
     let req = [
         msg(&[
             b"input",
@@ -118,7 +118,7 @@ fn run_plan(extra: &[&str], stdin: &[u8]) -> (i32, Vec<u8>) {
             value("--width").as_bytes(),
             value("--trailing-space").as_bytes(),
             // Mandatory on every `plan`; these vectors read a slot, which
-            // ignores them (cli-protocol.md 「要求と応答」).
+            // ignores them (cli-protocol.md "Requests and Responses").
             b"5000",
             b"0",
         ]),
@@ -154,7 +154,7 @@ fn run_plan(extra: &[&str], stdin: &[u8]) -> (i32, Vec<u8>) {
     (out.status.code().expect("exit code"), response)
 }
 
-/// The full required flag set (cli-protocol.md "起動"); tests override
+/// The full required flag set (cli-protocol.md "Startup and Responsibilities"); tests override
 /// individual values as needed.
 fn plan_args<'a>(
     producer: &'a str,
@@ -187,7 +187,7 @@ const FIELD_SEP: u8 = 2;
 const TAG_SEP: u8 = 1;
 
 /// A batch header record: tag `b` plus the given shared tag/value pairs
-/// (cli-protocol.md "バッチヘッダレコード").
+/// (cli-protocol.md "Batch Header Record").
 fn header(fields: &[(&str, &str)]) -> Vec<u8> {
     let mut r = b"b".to_vec();
     for (tag, val) in fields {
@@ -312,7 +312,7 @@ fn plan_literal_matches_suppress_approximate_and_keep_common_prefix() {
 
 #[test]
 fn plan_history_producer_keeps_stdin_order() {
-    // cli-protocol.md "マッチング・ランキングの意味論": --producer history
+    // cli-protocol.md "Matching and Ranking Semantics": --producer history
     // keeps the payload's (newest-first) order among literal survivors,
     // while --producer compsys ranks the same survivors by tier.
     let mut stdin = header(&[]);
@@ -667,7 +667,7 @@ fn config_rejects_arguments_with_exit_2() {
 // ---- zrush init ----
 
 /// Independent copy of the byte-level quoting discipline (cli-protocol.md
-/// "zrush init" / "zrush config") for cross-checking the real process's
+/// "`zrush init`" / "`zrush config`") for cross-checking the real process's
 /// output, matching the golden-copy pattern used for "zrush config" below.
 fn sq_bytes(s: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(s.len() + 2);
@@ -743,7 +743,7 @@ fn init_missing_or_unknown_shell_or_extra_args_exit_2() {
 
 #[test]
 fn help_flag_exits_0() {
-    // Human-facing affordance (cli-protocol.md "終了コード"): zsh never
+    // Human-facing affordance (cli-protocol.md "Exit Codes"): zsh never
     // invokes --help, but it must not read as a usage error.
     let out = zrush()
         .arg("--help")

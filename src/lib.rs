@@ -38,7 +38,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 /// arguments or subcommand) are exit 2, handled by clap's default error
 /// path (`Cli::parse()` calls `std::process::exit(2)` on a parse failure,
 /// and exit 0 on `--help`/`help`, matching the contract's "human-facing
-/// affordance" note in the 終了コード section).
+/// affordance" note in the "Exit Codes" section).
 const EXIT_INTERNAL: u8 = 1;
 
 /// zrush: live completion candidates for zsh, computed per keystroke.
@@ -57,10 +57,10 @@ enum Command {
         #[arg(long, value_parser = parse_control_fd)]
         control_fd: RawFd,
     },
-    /// Emit zsh-sourceable settings (cli-protocol.md "zrush config").
+    /// Emit zsh-sourceable settings (cli-protocol.md "`zrush config`").
     Config,
     /// Emit the zsh integration script for `.zshrc` to source
-    /// (cli-protocol.md "zrush init"): `source <(zrush init zsh)`.
+    /// (cli-protocol.md "`zrush init`"): `source <(zrush init zsh)`.
     Init {
         /// Shell to emit an integration script for. Only `zsh` is supported.
         shell: Shell,
@@ -111,7 +111,7 @@ fn cmd_worker(control_fd: RawFd) -> ExitCode {
     }
 }
 
-/// Per cli-protocol.md "zrush config", including config-error fallback.
+/// Per cli-protocol.md "`zrush config`", including config-error fallback.
 fn cmd_config() -> ExitCode {
     let result = config::load();
     let out = config::to_zsh(&result);
@@ -121,7 +121,7 @@ fn cmd_config() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// Per cli-protocol.md "zrush init": the `ZRUSH_BIN` prelude defaults to
+/// Per cli-protocol.md "`zrush init`": the `ZRUSH_BIN` prelude defaults to
 /// this process's own path, so failing to resolve it is an internal error
 /// like `cmd_config`'s stdout-write failure.
 fn cmd_init_zsh() -> ExitCode {

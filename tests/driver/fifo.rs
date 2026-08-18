@@ -3,7 +3,7 @@
 //! (docs/internal/specs/behavior.md:81, "writer は 1 回の `syswrite` で
 //! frame 全体を書き"). The payload rides the `store` request; the `plan`
 //! pipelined behind it only names the generation
-//! (docs/internal/contracts/cli-protocol.md 「要求と応答」).
+//! (docs/internal/contracts/cli-protocol.md "Requests and Responses").
 
 use std::time::Duration;
 

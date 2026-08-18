@@ -75,7 +75,7 @@ pub(crate) fn compute(
     let mut matched: Vec<(usize, crate::matching::TierHit)> = Vec::new();
     // Prefix-tier match-texts, pre-truncation: common-prefix must reflect
     // every match, not just the ones the grid ends up displaying
-    // (cli-protocol.md "common-prefix の意味論").
+    // (cli-protocol.md "common-prefix Semantics").
     let mut prefix_texts: Vec<&[u8]> = Vec::new();
     // cli-protocol.md "隠し候補の除外": excluded before tier classification, so
     // hidden files reach neither the listing nor common-prefix.
@@ -95,7 +95,7 @@ pub(crate) fn compute(
     }
     let common_prefix = crate::matching::common_prefix(prefix_texts.into_iter());
 
-    // behavior.md "表示": compsys ranking is capped at the grid's absolute
+    // behavior.md "Display": compsys ranking is capped at the grid's absolute
     // capacity; history keeps every match and takes a rows-tall window.
     // layout::build applies the real, per-group row budget on top of this.
     let style = params.producer.layout_style();
@@ -157,7 +157,7 @@ pub(crate) fn compute(
 }
 
 /// Slide a rows-tall window over the ranked history matches
-/// (cli-protocol.md "要求と応答" `offset`, behavior.md "履歴メニュー").
+/// (cli-protocol.md "Requests and Responses" `offset`, behavior.md "History Menu").
 fn history_window<T: Clone>(ranked: Vec<T>, offset: usize, rows: usize) -> (Vec<T>, bool, bool) {
     let total = ranked.len();
     let offset = offset.min(total.saturating_sub(rows));

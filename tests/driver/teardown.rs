@@ -1,8 +1,7 @@
 //! Letting the interactive shell exit for real, with a live persistent worker
-//! behind it: the worker is never the shell's job (behavior.md 「worker
-//! ライフサイクル」), and a teardown that lands while a frame is still delegated
-//! to a writer child stays just as quiet (cli-protocol.md 「abort control と
-//! worker 終了」).
+//! behind it: the worker is never the shell's job (behavior.md "Worker Lifecycle"),
+//! and a teardown that lands while a frame is still delegated to a writer child
+//! stays just as quiet (cli-protocol.md "Abort Control and Worker Termination").
 //!
 //! Both tests read the pty to hang-up instead of killing the host, so what they
 //! assert is what a user would have seen on the way out.
@@ -88,7 +87,7 @@ fn exit_with_a_delegated_frame_stays_quiet_and_pid_free() {
     // spawn as possible, before its ack can land. ^U discards only the
     // uncommitted `ls fx/overflow/` buffer text so that `exit` runs on an empty
     // line -- the capture is what queued the frame and already finished, and an
-    // empty buffer collects nothing (behavior.md 「候補収集」), so no new
+    // empty buffer collects nothing (behavior.md "Candidate Collection"), so no new
     // request races the exit. ^C would clear the buffer just as well but must
     // not be used: zsh 5.9 defers a SIGINT that arrives while a `zle -F`
     // callback is running -- precisely this window -- until the next input

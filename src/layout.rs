@@ -1,8 +1,9 @@
 //! Grid layout, highlight, and navigation engine for worker plan requests.
 //!
-//! Semantics: docs/internal/contracts/cli-protocol.md 「`plan` の `ok` body」,
-//! specifically "表示行の中身" (grouping/grid), "オフセット規律"
-//! (char-count vs display-width split), "ハイライト", and "ナビ". This
+//! Semantics: docs/internal/contracts/cli-protocol.md
+//! "`plan` `ok` body (Render Plan Stream)", specifically "Display Row
+//! Contents" (grouping/grid), "Offset Rules" (char-count vs display-width
+//! split), "Highlights", and "Navigation". This
 //! module owns grouping, the column-major grid, cell truncation/padding,
 //! and every offset computed against the listing text; it does not know
 //! about matching -- match spans (char offsets over a candidate's
@@ -32,7 +33,7 @@ use crate::wire::{Navigation as Nav, Role};
 const MAX_COLS: usize = 8;
 const GUTTER: usize = 2;
 
-/// Producer-selected geometry (cli-protocol.md "表示行の中身").
+/// Producer-selected geometry (cli-protocol.md "Display Row Contents").
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Style {
     Grid,
@@ -52,8 +53,8 @@ impl Style {
     }
 }
 
-/// Layout options taken from one plan request (cli-protocol.md "表示行の中身",
-/// "ナビ").
+/// Layout options taken from one plan request (cli-protocol.md "Display Row Contents",
+/// "Navigation").
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Options {
     pub row_budget: usize,
@@ -163,10 +164,10 @@ struct OffsetState {
 /// index; a missing or empty entry means no match decoration for that
 /// candidate.
 /// `options.row_budget`/`options.width` are `--rows`/`--width`
-/// (cli-protocol.md "起動"), assumed >= 1 by the caller but handled
+/// (cli-protocol.md "Startup and Responsibilities"), assumed >= 1 by the caller but handled
 /// gracefully at 0 too. `options.style` is the producer-specific
 /// geometry. `more_prev` / `more_next` mark a history window that can
-/// leave this plan in that direction (cli-protocol.md "ナビ"); both are
+/// leave this plan in that direction (cli-protocol.md "Navigation"); both are
 /// false for a completion listing.
 pub(crate) fn build(
     candidates: &[Candidate<'_>],

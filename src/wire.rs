@@ -6,7 +6,7 @@ use std::io::Write as _;
 use crate::layout;
 
 /// Per-build identity shared by init output, config output, and the worker
-/// handshake (cli-protocol.md "ビルドスタンプ").
+/// handshake (cli-protocol.md "Build Stamp").
 pub(crate) const BUILD_STAMP: &str = env!("ZRUSH_BUILD_STAMP");
 
 /// Incremental, overflow-checked ASCII decimal accumulation shared by the
@@ -299,7 +299,7 @@ pub fn parse(output: &[u8]) -> Result<Plan, Error> {
     index += l;
     index += 1;
 
-    // cli-protocol.md "オフセット規律": highlight and cell-range offsets are
+    // cli-protocol.md "Offset Rules": highlight and cell-range offsets are
     // char counts over the listing text -- the L rows joined by `\n`, no
     // leading newline. `\n` is a char boundary in every row's lossy reading,
     // so joining first cannot merge an invalid tail into the next row.
@@ -351,7 +351,7 @@ fn count(value: &[u8], field: &'static str) -> Result<usize, Error> {
 }
 
 /// `start + len` must stay inside the listing text (cli-protocol.md
-/// "オフセット規律"). An overflowing sum is out of range by definition.
+/// "Offset Rules"). An overflowing sum is out of range by definition.
 fn check_range(
     field: &'static str,
     start: usize,
@@ -702,7 +702,7 @@ mod tests {
         );
     }
 
-    // ---- ranges against the listing text (contract "オフセット規律") ----
+    // ---- ranges against the listing text (contract "Offset Rules") ----
 
     /// One row `alpha` (5 chars), one position, one highlight.
     fn ranged_plan(highlight: &[u8], cell: &[u8]) -> Vec<u8> {

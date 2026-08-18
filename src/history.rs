@@ -1,6 +1,6 @@
 //! The worker's history index and the query window a `plan` reads from it.
 //!
-//! Contract: docs/internal/contracts/cli-protocol.md 「要求と応答」 (write
+//! Contract: docs/internal/contracts/cli-protocol.md "Requests and Responses" (write
 //! kinds, generation stamp, retention cap) and 「history profile」 (payload
 //! order, the query window). The index is a third generation-addressable
 //! source of candidates beside the candidate store's slots, it lives and dies

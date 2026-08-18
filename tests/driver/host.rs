@@ -91,7 +91,7 @@ pub const SHUTDOWN_SEAM: &str = "_ZRUSH_WORKER_SHUTDOWN_MS=5000";
 /// Default `ZRUSH_HISTORY_DEADLINE_MS` for every host: 5000 ms matches this
 /// harness's other bounded waits, so a loaded machine cannot turn a healthy
 /// synchronous history exchange into the deadline branch. The production
-/// default is 100 ms (docs/internal/specs/behavior.md 「履歴メニュー」).
+/// default is 100 ms (docs/internal/specs/behavior.md "History Menu").
 const HISTORY_DEADLINE_SEAM: u32 = 5000;
 
 pub struct Host {
@@ -515,7 +515,7 @@ impl Host {
     /// Resize the host terminal. The host learns the new geometry through the
     /// SIGWINCH the kernel raises, and picks it up on its next render, which
     /// reads `COLUMNS` per request (docs/internal/contracts/cli-protocol.md
-    /// 「起動」); provoke that render with a following keystroke.
+    /// "Startup and Responsibilities"); provoke that render with a following keystroke.
     pub fn resize(&mut self, cols: u16, rows: u16) {
         self.pty.resize(cols, rows).expect("resize the host pty");
     }
@@ -731,7 +731,7 @@ impl Host {
     /// `gen=<n> head=<n> count=<n> unacked=<n>`. `gen=0` is the single
     /// "index unusable" state -- an invalid latch and a dirty index are one
     /// thing -- so there is no separate dirty field to read
-    /// (docs/internal/specs/behavior.md 「履歴メニュー」).
+    /// (docs/internal/specs/behavior.md "History Menu").
     pub fn history_state(&mut self) -> String {
         self.dump_get(keys::DUMP_HIST, "TESTHIST")
             .expect("history-index dump did not run")
@@ -847,7 +847,7 @@ impl Host {
     // ---- per-test config (tab: `[insert].tab` needs a non-default value) ----
 
     /// Config lives solely at `$XDG_CONFIG_HOME/zrush/config.toml`
-    /// (docs/internal/specs/config-schema.md); write it directly rather than
+    /// (docs/internal/contracts/config-schema.md); write it directly rather than
     /// exercising `zrush config`'s own CLI, since that path is `tests/cli.rs`'s.
     pub fn write_config(&self, toml: &str) {
         fs::write(self.config_path(), toml).expect("write config.toml");

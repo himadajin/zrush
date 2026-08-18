@@ -23,7 +23,7 @@ nucleo-matcher = "0.3"
 toml = { version = "1", default-features = false, features = ["parse", "serde"] }
 # Terminal display width for grid cell padding/truncation (layout.rs).
 # Character-count offsets (spans, highlight ranges) stay separate from
-# width (cli-protocol.md "オフセット規律") -- this crate is only consulted
+# width (cli-protocol.md "Offset Rules") -- this crate is only consulted
 # for the width side of that split.
 unicode-width = "0.2"
 

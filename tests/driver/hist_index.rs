@@ -1,8 +1,8 @@
 //! The worker's history index as the shell drives it: the cold bootstrap, the
 //! warm path that only queries, the per-prompt append, every way the index goes
 //! dirty, and what a synchronous exchange that runs out of time leaves behind
-//! (docs/internal/specs/behavior.md 「履歴メニュー」「worker ライフサイクル」,
-//! docs/internal/contracts/cli-protocol.md 「要求と応答」「history profile」).
+//! (docs/internal/specs/behavior.md "History Menu", "Worker Lifecycle",
+//! docs/internal/contracts/cli-protocol.md "Requests and Responses" "history profile").
 //!
 //! Nothing here is asserted against wall-clock time. The shell logs one
 //! checkpoint per decision on this path, and every assertion counts those
@@ -191,7 +191,7 @@ fn the_first_menu_builds_the_index_and_the_next_one_only_queries() {
 /// The index belongs to the worker session: a session that dies mid-exchange
 /// takes it with it, the next menu rebuilds it from scratch, and the generation
 /// counter the rebuild spends is past everything the dead session held
-/// (cli-protocol.md 「要求と応答」 candidate_generation).
+/// (cli-protocol.md "Requests and Responses" candidate_generation).
 #[test]
 fn the_index_dies_with_the_worker_session_and_the_next_menu_rebuilds_it() {
     let mut host = Host::boot_history_fake();
@@ -527,8 +527,8 @@ fn a_command_accepted_before_up_is_position_1() {
 /// This is deterministic rather than a race. The Up sits in the terminal's
 /// input buffer while the command runs, so zle reads it only after the prompt
 /// hook that enqueues the append has run, and the queue that carries both is
-/// serial and never reordered or coalesced (behavior.md 「worker ライフ
-/// サイクル」) -- the append is ahead of the query, whoever answers first.
+/// serial and never reordered or coalesced (behavior.md "Worker Lifecycle") --
+/// the append is ahead of the query, whoever answers first.
 #[test]
 fn a_command_accepted_before_up_is_position_1_without_waiting_for_the_append() {
     let mut host = Host::boot_history();

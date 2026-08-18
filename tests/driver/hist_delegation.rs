@@ -1,7 +1,7 @@
 //! When select-prev/select-next do *not* open or move the history menu but
 //! fall through to what the key was bound to before zrush, or to plain cursor
-//! movement (docs/internal/specs/behavior.md 「選択・キーバインド」 priority
-//! rules, docs/internal/contracts/config-schema.md 「[keybind]」).
+//! movement (docs/internal/specs/behavior.md "Selection and Keybindings" priority
+//! rules, docs/internal/contracts/config-schema.md "[keybind]").
 //!
 //! Every test here runs on a host booted from `tests/zsh/rc/history.zshrc`.
 

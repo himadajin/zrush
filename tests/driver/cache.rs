@@ -1,8 +1,8 @@
 //! Empty-word collection cache: what a hit skips, what forces a miss, and how
 //! the candidate store latch dies with the worker session it belongs to
-//! (docs/internal/specs/behavior.md 「空語収集キャッシュ」「worker ライフ
-//! サイクル」, docs/internal/contracts/cli-protocol.md 「要求と応答」
-//! 「応答の検証と zsh 側の適用」).
+//! (docs/internal/specs/behavior.md "Empty-Word Collection Cache", "Worker Lifecycle",
+//! docs/internal/contracts/cli-protocol.md "Requests and Responses"
+//! and "Response Validation and zsh-Side Application (Normative)").
 
 use std::time::{Duration, Instant};
 
@@ -10,7 +10,7 @@ use crate::fake::Mode;
 use crate::host::{Host, PlanShape, SHUTDOWN_SEAM, dump_field, keys, state_has};
 
 /// A command-position word: the widening rule empties it, so the collection it
-/// provokes is the cache's subject (behavior.md 「候補収集」「空語収集キャッシュ」).
+/// provokes is the cache's subject (behavior.md "Candidate Collection", "Empty-Word Collection Cache").
 const QUERY: &str = "whic";
 
 /// The frame that carries a candidate record stream; a hit sends none.
@@ -21,7 +21,7 @@ const COLLECTING: &str = "collect: collecting";
 const HIT: &str = "cache: hit (generation=";
 const LATCHED: &str = "cache: latched";
 /// The worker answering a latched notification with `capture-required`: the
-/// latch names a generation it does not hold (behavior.md 「空語収集キャッシュ」).
+/// latch names a generation it does not hold (behavior.md "Empty-Word Collection Cache").
 const LATCH_DROPPED: &str = "cache: latch dropped by capture-required";
 
 /// Type [`QUERY`] and wait until the cache has decided that request: either it
@@ -95,7 +95,7 @@ fn argument_completion(host: &mut Host) {
 }
 
 /// Open the history menu on an empty buffer and dismiss it again. An empty
-/// buffer collects nothing (behavior.md 「候補収集」), and the menu writes the
+/// buffer collects nothing (behavior.md "Candidate Collection"), and the menu writes the
 /// worker's history index rather than any candidate slot, so the only thing
 /// this adds is a `history-snapshot` (cold) or nothing at all (warm) plus the
 /// `history` plan.
@@ -231,7 +231,7 @@ fn a_changed_environment_expires_the_fingerprint() {
 /// does a re-source, both while the fingerprint matches and the entry is well
 /// inside its TTL, and recollection is the only way back. The candidate
 /// generation counter is what neither of them may rewind
-/// (cli-protocol.md 「要求と応答」 candidate_generation).
+/// (cli-protocol.md "Requests and Responses" candidate_generation).
 #[test]
 fn the_latch_dies_with_the_worker_session_and_with_a_re_source() {
     let mut host = Host::boot_fake();
@@ -350,7 +350,7 @@ fn the_latch_dies_with_the_worker_session_and_with_a_re_source() {
 /// zrush generates one handler function per armed `zle -F` watcher, so its own
 /// function table moves whenever a worker session starts or stops. None of that
 /// is a candidate-set change, and the fingerprint counts only the names outside
-/// zrush's namespace so that it says so (behavior.md 「空語収集キャッシュ」).
+/// zrush's namespace so that it says so (behavior.md "Empty-Word Collection Cache").
 /// A restart still costs one recollection -- through the latch, which is the
 /// worker's own state -- but the fingerprint must survive it untouched.
 #[test]
@@ -416,7 +416,7 @@ fn a_worker_restart_leaves_the_fingerprint_alone() {
 /// other traffic that used to share the `live` slot and now writes the history
 /// index instead -- a third generation-addressable place that is not a slot at
 /// all -- so it must not touch the cached generation either
-/// (cli-protocol.md 「要求と応答」 slot and index semantics).
+/// (cli-protocol.md "Requests and Responses" slot and index semantics).
 #[test]
 fn live_slot_stores_leave_the_cached_generation_intact() {
     let mut host = Host::boot_history();
@@ -462,7 +462,7 @@ fn live_slot_stores_leave_the_cached_generation_intact() {
 /// costs no session failure and replays nothing. Only the notification that
 /// named the latch drops it and recollects; one that named the reserved `0`
 /// collects without touching any latch
-/// (behavior.md 「空語収集キャッシュ」, cli-protocol.md 「入力通知と worker event」).
+/// (behavior.md "Empty-Word Collection Cache", cli-protocol.md "Input Notifications and Worker Events").
 #[test]
 fn capture_required_drops_only_the_latch_its_notification_named() {
     let mut host = Host::boot_fake();

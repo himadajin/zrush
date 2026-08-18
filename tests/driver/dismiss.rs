@@ -1,7 +1,7 @@
 //! Dismiss and accept-line: closing a list leaves the buffer untouched, a
 //! dismiss wins a race against an in-flight collection, and accept-line
 //! resets zrush's line-scoped state (docs/internal/specs/behavior.md
-//! "選択・キーバインド", "確定(挿入)").
+//! "Selection and Keybindings", "Confirmation (Insertion)").
 
 use std::time::Duration;
 

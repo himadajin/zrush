@@ -49,7 +49,7 @@ fn selection_starts_moves_and_releases() {
 #[test]
 fn selection_left_right_jump_within_a_single_column_group() {
     // Why a one-column group turns left/right into a jump to the group's
-    // ends: cli-protocol.md "ナビ".
+    // ends: cli-protocol.md "Navigation".
     let mut host = Host::boot();
     host.send_keys_wait_plan(PlanShape::Nonempty, "ls fx/longcol/item");
     host.press(keys::DOWN);

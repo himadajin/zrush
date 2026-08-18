@@ -1,7 +1,7 @@
 # Host rc for the payload byte-ceiling scenario in the Rust pty harness
 # (tests/driver/hist_config.rs). Same isolation as tests/zsh/rc/history.zshrc,
 # but with a fixture history whose newest-first byte total crosses the ceiling
-# of behavior.md 「履歴メニュー」 partway through, so the scan provably stops
+# of behavior.md "History Menu" partway through, so the scan provably stops
 # before the oldest entry. Required environment: ZRUSH_REAL_BIN, ZRUSH_TEST_TMP.
 PS1='HP> '
 HISTFILE=$ZRUSH_TEST_TMP/histfile-hist-budget
