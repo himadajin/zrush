@@ -165,7 +165,7 @@ typeset -ga _zrush_plan_nav=()         # P entries, each "next prev left right"
 typeset -ga _zrush_plan_insert=()      # P entries, completed insertion text
 typeset -g  _zrush_plan_cp=            # common-prefix
 typeset -gi _zrush_listing=0
-# Which producer the current plan came from: none (no plan) | compsys | history.
+# Which listing profile the current plan came from: none (no plan) | compsys | history.
 # Single source for the listing kind (behavior.md "History Menu"): confirmation
 # rule and key mapping branch on this and on nothing else.
 typeset -g  _zrush_plan_kind=none
@@ -1677,14 +1677,14 @@ _zrush_worker_handle_message() {  # message [absolute-deadline]
     return 1
   }
   # "store <slot> <generation> <input_generation>" for a store,
-  # "<kind> <generation>" for the two history writes, "plan <producer>" for a plan.
+  # "<kind> <generation>" for the two history writes, and "plan" for the
+  # history-menu query.
   local -a req=( ${=_zrush_worker_pending[$id]} )
-  local reqkind=$req[1] producer= slot=
+  local reqkind=$req[1] slot=
   local -i stored_gen=0 bound_gen=0
   case $reqkind in
     store)                           slot=${req[2]:-} stored_gen=${req[3]:-0} bound_gen=${req[4]:-0} ;;
     history-snapshot|history-append) stored_gen=${req[2]:-0} ;;
-    *)                               producer=${req[2]:-} ;;
   esac
   # A terminal response, whatever it says, retires the frame from the bound on
   # unacknowledged appends (behavior.md "History Menu" 更新経路).
@@ -1716,7 +1716,7 @@ _zrush_worker_handle_message() {  # message [absolute-deadline]
     # optimistic and is now known wrong, so the next menu op starts from a
     # snapshot (behavior.md "Worker Lifecycle").
     if [[ $code == unknown-generation ]] &&
-       [[ $reqkind == history-* || $producer == history ]]; then
+       [[ $reqkind == history-* || $reqkind == plan ]]; then
       _zrush_hist_invalidate unknown-generation
     fi
     if (( id == _zrush_sync_target )); then
@@ -1768,7 +1768,7 @@ _zrush_worker_handle_message() {  # message [absolute-deadline]
   _zrush_worker_failures=0
   _zrush_status_set ""
   if (( id == _zrush_sync_target )); then
-    _zrush_plan_kind=$producer
+    _zrush_plan_kind=history
     _zrush_sync_done=1 _zrush_sync_ok=1
   else
     _zrush_plan_text=$old_text _zrush_plan_nlines=$old_l _zrush_plan_npos=$old_p
@@ -1776,7 +1776,7 @@ _zrush_worker_handle_message() {  # message [absolute-deadline]
     _zrush_plan_hl=( "${(@)old_hl}" ) _zrush_plan_cells=( "${(@)old_cells}" )
     _zrush_plan_nav=( "${(@)old_nav}" ) _zrush_plan_insert=( "${(@)old_insert}" )
   fi
-  _zlog "worker: ok request_id=$id producer=$producer"
+  _zlog "worker: ok request_id=$id plan=history"
   return 0
 }
 
@@ -2087,12 +2087,12 @@ _zrush_request_history() {  # kind payload [event] -> REPLY = candidate generati
 # The explicit query the history menu's synchronous exchange sends
 # (behavior.md "History Menu"). Listings that follow the input are made from
 # `input` notifications instead, so nothing else sends a `plan`.
-_zrush_request_plan() {  # candidate-generation producer query trailing-space [offset]
+_zrush_request_plan() {  # candidate-generation query [offset]
   emulate -L zsh
   setopt localoptions typesetsilent no_monitor no_notify
   local -i gen=$1
-  local producer=$2 query=$3 tspace=$4
-  local -i offset=${5:-0}
+  local query=$2
+  local -i offset=${3:-0}
   (( !_zrush_worker_stopping && !_zrush_worker_runtime_tainted )) || return 1
 
   _zrush_geometry
@@ -2100,16 +2100,15 @@ _zrush_request_plan() {  # candidate-generation producer query trailing-space [o
 
   _zrush_next_request_id || return 1
   local -i id=$REPLY
-  _zrush_worker_pending[$id]="plan $producer"
+  _zrush_worker_pending[$id]=plan
   _zrush_worker_ensure_session || return 1
-  # history_limit and offset are mandatory on every plan whichever store the
-  # generation resolves to; the worker ignores them unless that is a history
-  # listing (cli-protocol.md "Requests and Responses").
-  _zrush_encode_message plan "$id" "$gen" "$PWD" "$producer" "$query" \
-    "$ZRUSH_CFG_MODE" "$ZRUSH_CFG_SMART_CASE" "$rows" "$width" "$tspace" \
+  # `plan` is the history-menu request; its profile, cwd, and trailing-space
+  # policy are fixed by that path and do not appear on the wire.
+  _zrush_encode_message plan "$id" "$gen" "$query" \
+    "$ZRUSH_CFG_MODE" "$ZRUSH_CFG_SMART_CASE" "$rows" "$width" \
     "$ZRUSH_CFG_HISTORY_LIMIT" "$offset"
   _zrush_worker_txq+=( "$REPLY" )
-  _zlog "worker: queued request_id=$id producer=$producer generation=$gen offset=$offset bytes=${#REPLY} queued=$#_zrush_worker_txq"
+  _zlog "worker: queued request_id=$id plan=history generation=$gen offset=$offset bytes=${#REPLY} queued=$#_zrush_worker_txq"
   _zrush_worker_flush || return 1
   typeset -g REPLY=$id
   return 0
@@ -2490,7 +2489,7 @@ _zrush_request_plan_sync() {  # cold snapshot-payload snapshot-head snapshot-cou
   fi
   # cli-protocol.md "history profile": trailing-space is always false, so the
   # inserted text is the history line verbatim.
-  _zrush_request_plan $gen history "$query" false $offset || return 1
+  _zrush_request_plan $gen "$query" $offset || return 1
   local -i target=$REPLY cs
   _zlog "history: query request_id=$target generation=$gen offset=$offset limit=$ZRUSH_CFG_HISTORY_LIMIT"
   _zrush_sync_target=$target _zrush_sync_done=0 _zrush_sync_ok=0

@@ -100,10 +100,10 @@ fn argument_completion(host: &mut Host) {
 /// this adds is a `history-snapshot` (cold) or nothing at all (warm) plus the
 /// `history` plan.
 fn history_menu(host: &mut Host, label: &str) {
-    let opened = host.log_count("producer=history");
+    let opened = host.log_count("plan=history");
     host.press(keys::UP);
     assert!(
-        host.wait_log("producer=history", opened, Duration::from_secs(10)),
+        host.wait_log("plan=history", opened, Duration::from_secs(10)),
         "{label}: the history menu never reached the worker"
     );
     host.press(keys::DISMISS);

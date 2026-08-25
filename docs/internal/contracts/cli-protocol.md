@@ -52,7 +52,7 @@ zrush.zsh(zsh 側)と `zrush` バイナリ(Rust 側)の入出力仕様。
 - 候補 payload 内部のフレーミングには制御バイト(`\0` `\1` `\2`)を使う。
   これらのバイトを含む候補・値の除外は送信側(zsh)が保証し、
   Rust 側はフィールド内にこれらのバイトが出現しないことを前提としてよい。
-  どの機構が除外を担うかは producer profile が定める。詳細は「`zrush worker`」節。
+  どの機構が除外を担うかは source profile が定める。詳細は「`zrush worker`」節。
 
 ### Exit Codes
 
@@ -93,7 +93,7 @@ request 処理を始める前に startup 診断を stderr へ 1 行書いて exi
 `store` 要求では候補レコードストリームを解析してスロットへ格納し、
 `history-snapshot` / `history-append` 要求では同じ形式のストリームを解析して history index を
 置き換え・追記し、
-`plan` 要求ごとにマッチング・ランキング・グループ分割・グリッドレイアウト・ハイライト計算・
+履歴メニューの `plan` 要求ごとにマッチング・ランキング・グループ分割・グリッドレイアウト・ハイライト計算・
 ナビゲーション表構築・挿入テキスト構築を行って stdout へ応答する。
 `input` 通知は静穏期間で置き換えながら最新の 1 個だけを保持し、期間の満了で描画プランまたは
 捕獲要求を worker event として stdout へ送る(「Input Notifications and Worker Events」節)。
@@ -107,7 +107,7 @@ one-shot の `zrush plan` サブコマンドは存在しない。
 `store` / `history-snapshot` / `history-append` 要求で受け取る。
 candidate store のスロットと history index、および静穏判定のための current input はいずれも
 worker セッションに属し、worker の終了とともに失われる(永続化も再構築もしない)。
-ただし純粋な関数ではない: `f = 1` 候補の `/` 合成判定は要求・通知の `cwd` を基準に stat し、
+ただし純粋な関数ではない: `f = 1` 候補の `/` 合成判定は入力通知の `cwd` を基準に stat し、
 静穏期間の計測には単調時計を使う。
 マッチング・ランキング・レイアウト・挿入テキスト構築そのものは、時計にも session state にも依存しない
 純粋な計算として保つ。
@@ -208,8 +208,8 @@ store:            ["store", request_id, slot, candidate_generation, input_genera
                    candidate_payload]
 history-snapshot: ["history-snapshot", request_id, candidate_generation, candidate_payload]
 history-append:   ["history-append", request_id, candidate_generation, candidate_payload]
-plan:             ["plan", request_id, candidate_generation, cwd, producer, query, mode,
-                   smart_case, rows, width, trailing_space, history_limit, offset]
+plan:             ["plan", request_id, candidate_generation, query, mode, smart_case,
+                   rows, width, history_limit, offset]
 ok:               ["ok", request_id, body]
 error:            ["error", request_id, code]
 ```
@@ -217,7 +217,7 @@ error:            ["error", request_id, code]
 要求は 4 種類ある。
 `store` は候補レコードストリームを worker へ渡して解析済みの candidate store のスロットへ格納し、
 `history-snapshot` / `history-append` は同じ形式のストリームを worker の history index へ渡し、
-`plan` はスロットまたは history index を `candidate_generation` で参照して描画プランを得る。
+`plan` は history index を `candidate_generation` で参照して描画プランを得る。
 候補 payload は `plan` に載せない。
 
 - `request_id`: zsh が所有する `1..=9223372036854775807`(`i64::MAX`)の canonical ASCII 10 進識別子。
@@ -236,9 +236,9 @@ error:            ["error", request_id, code]
   `request_id` とは独立の値である。
   シェルセッション内で単調増加し、再利用せず、worker の終了・再起動でもリセットしない。
   `store` では格納先の generation を、`history-snapshot` / `history-append` では
-  index に刻む generation を、`plan` では参照する generation を表す。
-  `plan` の generation 検索は 2 つのスロットと history index を横断して行い、
-  ヒットした側から描画プランを計算する(index は現 stamp との完全一致でヒットとする)。
+  index に刻む generation を、`plan` では history index の現 stamp と照合する generation を表す。
+  `plan` の generation 検索は history index だけを対象とし、現 stamp と完全一致したときに
+  その index の窓から描画プランを計算する。candidate slot は入力通知の `plan-ready` だけが参照する。
   index の revision は index を最後に書いた要求の `candidate_generation` そのものであり、
   別の revision 識別子は存在しない。
 - `input_generation`: zsh が所有する `1..=9223372036854775807`(`i64::MAX`)の canonical ASCII 10 進識別子。
@@ -252,34 +252,25 @@ error:            ["error", request_id, code]
   (`1..=9223372036854775807`)。
   history index を参照する `plan` が index の新しい側から走査する件数の上限であり、
   worker はこれを retention cap へクランプする(走査の意味論は「history profile」節)。
-  スロットを参照する `plan` では無視する
-  (`producer = history` 以外の要求でも値は必須であり、欠落・非 canonical 表記は不正である)。
+  欠落・非 canonical 表記は不正である。
 - `offset`: `plan` だけが持つ、先頭ゼロなしの非負 canonical ASCII 10 進数
   (`0..=18446744073709551615`。`0` は有効)。
-  `producer = history` のとき、ランキング後のマッチ列における窓の先頭(0 始まり)である。
+  history profile のランキング後のマッチ列における窓の先頭(0 始まり)である。
   worker は走査範囲のマッチ件数と `rows` から有効な最大値へクランプする。
-  `producer = compsys` では無視する
-  (`history_limit` と同じく、どの producer でも値は必須であり、欠落・非 canonical 表記は不正である)。
-- `producer`: `compsys` または `history`。
-  結果順に加えてレイアウト方針を選ぶ: `compsys` は最大 8 列・上から下、
-  `history` は 1 列・下から上。レコード解釈・ハイライト・挿入テキスト構築は共通である
-  (「Display Row Contents」「Matching and Ranking Semantics」節)。
+  欠落・非 canonical 表記は不正である。
 - `query`: マッチングに用いるユーザーの as-typed バイト列(NUL 除去済み)。空も有効
   (空クエリは全候補が最高同点マッチになる)。
-  渡す値は producer profile(「compsys Capture Profile」「history profile」)が定める。
+  履歴 `plan` では history profile が値を定め、入力通知では compsys profile が値を定める。
 - `mode` は `prefix` / `substring` / `typo`、`smart_case` は `true` / `false`。
   マッチング設定のスナップショットであり、
   意味論は後述「Matching and Ranking Semantics」節。
 - `rows`: 先頭ゼロなしの正の ASCII 10 進数。表示行の最終予算。zsh が `min(max-lines, $LINES - 1)` を計算し、
   1 以上にクランプして渡す(Rust は端末サイズを知らない)。
 - `width`: 先頭ゼロなしの正の ASCII 10 進数。zsh が `$COLUMNS - 1` を 1 以上にクランプして渡す。
-- `trailing_space`: `true` / `false`。挿入テキストへ末尾スペースを焼き込むかどうかの指定
-  (対応する設定は config-schema.md `[insert].trailing-space`)。
-  渡す値は producer profile(「compsys Capture Profile」「history profile」)が定める。
-- `cwd`: 要求時点の `$PWD` の生バイト列。`f = 1` 候補の stat パスが相対パスなら、このディレクトリを
-  基準に解決する。worker 自身の起動時 cwd は判定に使わない。絶対 stat パスはそのまま使い、
-  シンボリックリンクは追跡する。`~` は展開しない。cwd または対象パスを stat できない場合は
-  「ディレクトリでない」と扱い、`/` を合成しない。
+
+`plan` の profile は常に history であり、`producer`・`cwd`・`trailing_space` を request field として持たない。
+挿入テキストの末尾スペースと `cwd` は、補完 profile の入力通知だけが持つ
+(対応する設定は config-schema.md `[insert].trailing-space`)。
 
 history index は worker が保持する履歴専用の候補列で、スロットとは独立に 1 個だけ存在する。
 
@@ -317,7 +308,7 @@ worker は同じ `request_id` の `error` を返してセッションを継続�
 | `history-append` | `invalid-payload` | 候補レコードストリームの framing error |
 | `history-append` | `unknown-generation` | 未初期化の index への追記、または index の現 stamp 以下の `candidate_generation` |
 | `plan` | `invalid-request` | kind・固定フィールド・scalar の不正 |
-| `plan` | `unknown-generation` | どのスロットにも history index にも存在しない `candidate_generation` の参照 |
+| `plan` | `unknown-generation` | history index が保持していない `candidate_generation` の参照 |
 
 `invalid-request` と `invalid-payload` は要求自体の不正を表す。
 `unknown-generation` は整形としては正しい要求が成立しないことを表し、
@@ -380,10 +371,10 @@ capture-required: ["capture-required", input_generation]
   `0` は「Requests and Responses」節の識別子の範囲外にある予約値であり、通知だけが取り得る。
 - `delay_ms`: `0..=10000` の canonical ASCII 10 進数(先頭ゼロなし、`0` は `0`)。
   この通知に適用する静穏期間をミリ秒で表す(config-schema.md `[display].delay-ms` のスナップショット)。
-- `cwd` / `query` / `mode` / `smart_case` / `rows` / `width` / `trailing_space` は
-  同名の `plan` フィールドと同じ意味・同じ表記であり、通知時点のスナップショットである。
-  通知から作るプランのレイアウトは常に `producer = compsys` のものとし、
-  producer フィールドは持たない。
+- `query` / `mode` / `smart_case` / `rows` / `width` は、通知時点の入力スナップショットであり、
+  履歴 `plan` の同名 field と同じ意味・同じ表記である。
+  `cwd` と `trailing_space` は補完 profile の入力通知だけが持つ profile 固有の値である。
+  通知から作るプランのレイアウトは常に compsys profile のものとし、profile field は持たない。
   history index を参照しないため `history_limit` も持たない。
 - `plan_body`: `plan` の成功応答と同一形式の描画プランストリーム(「`plan` `ok` body (Render Plan Stream)」節)。
   空バイト列も 0 マッチのプランではなく不正である(最小のプランは「Zero Matches」節の 4 フィールド)。
@@ -515,7 +506,7 @@ current input は最後に受理した `input` 通知そのもの(その全フ�
 レコード内は `\2` で連結した `<tag>\1<value>` 形式のフィールドの並び。
 制御バイト(`\0` `\1` `\2`)を含む候補語・付随テキストの除外は送信側が保証する(「Common Conventions」参照)。
 
-レコードモデルは payload の由来(producer)に依らない。
+レコードモデルは payload の source に依らない。
 「Record Interpretation Rules (Normative)」「Batch Header Record」「Candidate Record」「Skip Rules (Normative)」の各小節は
 すべての payload に適用され、Rust 側は payload の由来を知らない。
 由来ごとの追加規約は「compsys Capture Profile」「history profile」が定める。
@@ -575,7 +566,7 @@ Rust は zsh のクォート規則を一切実装しない
 
 レコードストリームの解析そのものは重複候補(同一の match-text/display-text 組)を除去しない
 (送信側の発行順の情報を保つ)。
-重複を送出してよいか、解析結果に profile 固有の重複除去を掛けるかは producer profile が定める
+重複を送出してよいか、解析結果に profile 固有の重複除去を掛けるかは source profile が定める
 (「history profile」は index の query 時に除去し、「compsys Capture Profile」は除去しない)。
 
 #### Skip Rules (Normative)
@@ -648,7 +639,7 @@ index から作られた一覧を履歴一覧、その候補を履歴候補と�
   除外されたイベントについては要求そのものを送らないため、
   候補レコードを 1 件も含まない追記が wire に現れることはない。
 
-**index の query**(`producer = history` の `plan` が index を解決したとき):
+**index の query**(history profile の `plan` が index を解決したとき):
 
 - 走査対象は index の新しい側から `window = min(history_limit, index の件数)` 件である
   (`[history].limit` を途中で上げても、index の件数がそれに満たない間の走査範囲は index 全体である)。
@@ -656,7 +647,7 @@ index から作られた一覧を履歴一覧、その候補を履歴候補と�
   残った候補はその出現の位置と `n` を持つ。
   走査範囲の外から補充はしないため、一覧の対象になる行数は `window` より少なくなり得る
   (重複が走査枠を消費する)。
-- `producer = history` は走査順(新しい順)をそのまま保つため(「Matching and Ranking Semantics」節)、
+- history profile は走査順(新しい順)をそのまま保つため(「Matching and Ranking Semantics」節)、
   この順序がそのまま位置番号順になり、位置 1 は**マッチした候補のうち最も新しい履歴行**になる
   (クエリにマッチしない履歴行は位置を持たないため、位置 1 が index の先頭エントリとは限らない。
   クエリが非空でもマッチ品質で並べ替わらない)。
@@ -667,11 +658,10 @@ index から作られた一覧を履歴一覧、その候補を履歴候補と�
 
 - `history-snapshot` / `history-append`: `candidate_generation` は zsh が新しく採番した値
   (index の現 stamp より厳密に大きい。「Requests and Responses」節)。
-- `plan`: `producer` は `history`、`query` はバッファ全体(as-typed)、
-  `trailing_space` は常に `false`(挿入テキストを履歴行の原文と一致させるため)、
+- `plan`: `query` はバッファ全体(as-typed)、
   `history_limit` は `[history].limit` の設定値(config-schema.md)、
   `offset` は表示窓の先頭(開くときは `0`。端越えの再要求ではずれた位置)。
-- 履歴候補は `f = 1` を持たないため、`cwd` は履歴一覧の計算に影響しない。
+- 履歴候補は `f = 1` を持たないため、`plan` は `cwd` を必要としない。
 
 `history-snapshot` の payload の合成は、全履歴の値の一括展開 1 回(履歴の総件数に線形)と、
 打ち切りまでに読んだ行数と行長に線形な処理からなり、同期経路で行う。
@@ -794,7 +784,7 @@ NUL(`\0`)終端フィールドの平坦列。数値は ASCII 10 進表記。順�
 - 見出しテキストが `width` を超える場合は、セルと同じ規則
   (lossy 表示幅が収まる最大の原バイト列接頭辞)で `width` に切り詰める。
 - 各セルはグループ内で一様な幅(`gmaxw`)にパディングする(表示幅基準)。
-- **制御バイト→スペース正規化(producer 共通)**: 表示テキスト中の C0 制御バイト
+- **制御バイト→スペース正規化(profile 共通)**: 表示テキスト中の C0 制御バイト
   (`0x00`–`0x1F`。改行 `0x0A` を含む)と DEL(`0x7F`)は、それぞれスペース 1 バイト(`0x20`)へ置換する。
   これは表示だけの正規化であり、挿入テキストは原文のまま返る。
   改行が消えることで表示は 1 行化され、端末制御列が表示行へ漏れることもなくなる。
@@ -823,7 +813,7 @@ NUL(`\0`)終端フィールドの平坦列。数値は ASCII 10 進表記。順�
   behavior.md「Selection and Keybindings」「History Menu」節が定める
   (補完一覧の `prev = 0` は選択解除。履歴一覧では端越えの `plan` 再要求、
   または位置 1 かつ窓先頭でのメニュー消去)。
-- ナビゲーション表は producer に依らず同じ意味を持つ。
+- ナビゲーション表は profile に依らず同じ意味を持つ。
   補完一覧は窓を持たないため、最終位置の `next` は自己参照のまま、`left` が 0 になることもない。
 
 #### Insertion Text
@@ -842,12 +832,12 @@ NUL(`\0`)終端フィールドの平坦列。数値は ASCII 10 進表記。順�
   合成する場合の連結は `ip + i + P + p + w + / + s + S + I` になる。
 - `f = 1` かつ `es` が不在(可視サフィックスの明示指定が無い)かつ `s` が空
   かつ `w` の末尾が `/` でない候補は、`rd` と match-text(`m` があれば `m`、なければ `w`)の生バイト列を連結したパスを、
-  そのプランを計算した要求または通知の `cwd` を基準に、シンボリックリンクを追跡して stat する。
+  補完 profile の入力通知が持つ `cwd` を基準に、シンボリックリンクを追跡して stat する。
   stat が失敗する場合・対象がディレクトリでない場合は `/` を合成しない。
   `es = 1` のバッチ、および `s` が非空のバッチの候補は、`f = 1` であっても stat せず `/` を合成しない。
   この判定はプラン計算時点のスナップショットであり、zsh は確定時に再検証しない
   (該当ディレクトリがプラン計算後に削除・変更されていても、返された挿入テキストをそのまま使う)。
-- 末尾スペースは `trailing_space = true` かつ nospace 条件
+- 末尾スペースは補完 profile の入力通知で `trailing_space = true` かつ nospace 条件
   (`S` / `s` / `I` のいずれかが非空、または `/` 合成に該当)に該当しないとき、
   この時点で付与済みとして返す。
 
@@ -895,9 +885,9 @@ zsh は一覧を消す。
 
 > 検証: モードの累積性・ティアの序列と literal / approximate グループ分類・smart-case の真偽両方・誤字許容の範囲(候補の接頭辞に対する 1 編集、1 文字クエリでは不適用)・非 UTF-8 バイト列でもマッチすること —
 > `src/matching.rs` の単体テスト(小さなアルファベット上での DP 参照実装との網羅照合を含む)。
-> literal の存在による approximate の抑止・approximate だけが存在する場合の保持・両 producer の結果順・ティア順のソートと同点時の candidate payload 順保存 — `src/ranking.rs`。
-> `producer = history` がマッチ品質で並べ替えないこと・隠し候補の除外(空クエリと非ドットのクエリで落ちること、`.` 始まりのクエリで残ること、`f = 1` でないバッチには掛からないこと、common-prefix に入らないこと)— `src/plan.rs`。
-> worker セッション越しの producer ごとの結果順と common-prefix — `tests/cli.rs`。`producer = history` のプラン全体 — `tests/vectors/plan/`。
+> literal の存在による approximate の抑止・approximate だけが存在する場合の保持・両 profile の結果順・ティア順のソートと同点時の candidate payload 順保存 — `src/ranking.rs`。
+> history profile がマッチ品質で並べ替えないこと・隠し候補の除外(空クエリと非ドットのクエリで落ちること、`.` 始まりのクエリで残ること、`f = 1` でないバッチには掛からないこと、common-prefix に入らないこと)— `src/plan.rs`。
+> worker セッション越しの completion/history profile ごとの結果順と common-prefix — `tests/cli.rs`。history profile のプラン全体 — `tests/vectors/plan/`。
 > 大文字小文字の畳み込みを ASCII に限る規範は、どのテストも固定していない。
 
 - **隠し候補の除外**: クエリの先頭バイトが `.` でないとき、`f = 1` のバッチに属し match-text が `.` で始まる候補を、ティア判定より前に除外する(空クエリも「`.` で始まらない」に含む)。
@@ -917,25 +907,25 @@ zsh は一覧を消す。
   **approximate** は edit(誤字許容)と fuzzy(文字順保存のあいまい一致)。
   `mode` は候補を拾える最も緩いティアを定める上限であり、このグループ分けや後述の抑止によって
   `mode` が許さないティアを拾うことはない。
-- `mode` が許すティアで全候補を判定した後、producer ごとの結果順を適用する前に、
+- `mode` が許すティアで全候補を判定した後、profile ごとの結果順を適用する前に、
   グループ単位で動的に絞り込む。
   - literal のマッチが 1 件以上あれば、prefix と substring のマッチはすべて残し、
     edit と fuzzy のマッチはすべて除外する。
   - literal のマッチが 0 件なら、`mode` が許す edit と fuzzy のマッチを除外せず残す。
-  この規則は `producer = compsys` と `producer = history` の両方に同一に適用する。
+  この規則は completion profile と history profile の両方に同一に適用する。
   絞り込みを通過した候補のマッチハイライトは各候補のティアから計算し、
   common-prefix は prefix ティアだけから計算する(「common-prefix Semantics」節)。
 - `smart-case = true`: クエリが全て小文字なら大文字小文字を無視、
   大文字を含むなら区別する。`false`: 常に区別しない。
   大文字小文字の畳み込みは **ASCII の範囲のみ**(非 ASCII はバイト安全のため区別される。
   バイト列意味論を保つための意図的制限)。
-- ランキング: 結果順は `producer` で決まる。
-  - `producer = compsys`: マッチ品質スコアの降順。同点は candidate payload での出現順(送信側が発行した順)を保つ。
-  - `producer = history`: 参照先の並び順(history index を走査した順、すなわち新しい順)を
+- ランキング: 結果順は profile で決まる。
+  - completion profile: マッチ品質スコアの降順。同点は candidate payload での出現順(送信側が発行した順)を保つ。
+  - history profile: 参照先の並び順(history index を走査した順、すなわち新しい順)を
     そのまま保つ(マッチ品質で並べ替えない)。
     ティアはこのとき「候補を一覧に含めるかの判定(グループ単位の動的な絞り込みを含む)」と
     「ハイライト範囲の計算」にのみ使う。
-  どちらの producer でも、ティアに 1 つも該当しない候補は一覧に含めない。
+  どちらの profile でも、ティアに 1 つも該当しない候補は一覧に含めない。
 - スコアの序列は「より厳密なマッチのティアほど上位」
   (prefix 一致 > 部分一致 > 誤字許容 > 文字順保存のあいまい一致)。
   誤字許容をあいまい一致より上位に置くのは、前者が高精度・少数
@@ -1153,7 +1143,7 @@ typeset -g _ZRUSH_EXPECTED_BUILD_STAMP='<build-stamp>'
    以降の選択移動・確定は、プラン内のナビゲーション表・セル範囲・挿入テキストの配列引きだけで完結する
    (要求の再送はしない)。
 6. 非選択での select-prev(既定 ↑): worker の history index が同期済みなら、
-   `producer = history` の `plan`(`offset = 0`)だけを同期交換で送って、返ったプランを同じように適用する。
+  history profile の `plan`(`offset = 0`)だけを同期交換で送って、返ったプランを同じように適用する。
    index が未初期化または dirty なら、zsh がメモリ上の履歴から payload を合成し、
    `history-snapshot` と `plan` を同じ同期交換で連送する
    (fork も compsys も介さない。behavior.md「History Menu」節)。

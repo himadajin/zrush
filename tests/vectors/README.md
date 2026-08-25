@@ -2,12 +2,12 @@
 
 This corpus turns the prose rules in `docs/internal/contracts/cli-protocol.md` into executable byte-level fixtures.
 
-Each `plan/<name>/` directory contains `args`, `payload`, an optional `append`, and `expected`: the `plan` request's scalar fields, the write request's `candidate_payload`, a second payload appended to the history index, and the `plan` response's `ok` body.
+Each `plan/<name>/` directory contains `args`, `payload`, an optional `append`, and `expected`: the request's scalar fields, a candidate payload, a second payload appended to the history index, and the render-plan body. A `store` vector exercises the asynchronous completion path and expects a `plan-ready` event; a `history` or `history-append` vector exercises the explicit history `plan` request and expects an `ok` response.
 Each `reject/<name>/` directory contains `args` and `payload`.
 Each `reject-plan/<name>/` directory contains only `plan`.
 Each `encode/<name>/` directory contains `argv`, `hits`, `dscr`, `expected`, and an optional `env`.
 Each `message/<name>/` directory contains a single `frame`.
-The runner drives each vector through one persistent `zrush worker` session as the contract's requests: one write (request_id 1, generation 1) carrying `payload`, then a `plan` referencing the last generation written.
+The runner drives each vector through one persistent `zrush worker` session as the contract's requests: one `store` or `history-snapshot` write (request_id 1, generation 1) carrying `payload`, followed by either the input-bound completion flow or a history `plan` referencing the last history generation.
 A `store` write is bound to the worker's current input, so its session opens with an `input` notification (input_generation 1) whose quiet period outlives the exchange; the `store` settles it, and the resulting `plan-ready` trails the `store`'s terminal `ok`.
 `args` contains flags and their values only.
 
@@ -20,7 +20,7 @@ Two flags select what the session does with `payload` rather than what the `plan
 | `--offset` | the `plan`'s window start over the ranked matches; omitted, it is `0` |
 
 An `append` file adds a `history-append` (request_id 2, generation 2) between the write and the `plan`, so a vector can fix how appended records order and dedup against the snapshot's.
-`history_limit` and `offset` are mandatory `plan` fields whichever store the generation resolves to, so every vector carries them whether or not it reads the index. The runner supplies the defaults above when a vector omits the flags.
+`history_limit` and `offset` are mandatory only on the history `plan`; the runner supplies the defaults above when a vector omits those flags. Completion vectors use `--trailing-space` on their `input` notification instead.
 
 Reject vectors expect that session to answer with a terminal response per request, exactly one of which is an `error`.
 A candidate-stream framing violation fails the write with `invalid-payload`, and a `history-append` against the uninitialized index fails it with `unknown-generation`; either leaves no generation for the `plan` to reference (`unknown-generation`).

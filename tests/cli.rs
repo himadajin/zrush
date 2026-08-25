@@ -41,7 +41,8 @@ fn worker_command() -> (Command, UnixStream, UnixStream) {
 
 // ---- zrush worker ----
 
-/// Run one `store`/`plan` pair through a fresh `zrush worker` session.
+/// Run one completion capture through a fresh worker session. The render plan
+/// is the `plan-ready` event produced by the accepted `store`.
 fn ns(payload: &[u8]) -> Vec<u8> {
     let mut out = payload.len().to_string().into_bytes();
     out.push(b':');
@@ -77,6 +78,12 @@ fn fields(frame: &[u8]) -> Vec<Vec<u8>> {
 }
 
 fn run_plan(extra: &[&str], stdin: &[u8]) -> (i32, Vec<u8>) {
+    if extra
+        .windows(2)
+        .any(|window| window == ["--source", "history"])
+    {
+        return run_history_plan(extra, stdin);
+    }
     let value = |flag: &str| {
         extra
             .windows(2)
@@ -85,42 +92,86 @@ fn run_plan(extra: &[&str], stdin: &[u8]) -> (i32, Vec<u8>) {
             .unwrap_or("")
     };
     // `stdin` is the candidate payload: it reaches the worker as a `store`
-    // (generation 1) that the `plan` then references. Every `store` is bound to
-    // the worker's current input, so the session opens with an `input`
-    // notification whose quiet period outlives the whole exchange: it is still
-    // pending when the `store` arrives, and the `store` settles it
-    // (cli-protocol.md "Input Notifications and Worker Events").
+    // (generation 1), whose accepted response is followed by `plan-ready`.
+    // Every `store` is bound to the worker's current input, so the session
+    // opens with an `input` notification whose quiet period outlives the whole
+    // exchange (cli-protocol.md "Input Notifications and Worker Events").
+    let cwd = std::env::current_dir().unwrap();
     let req = [
         msg(&[
             b"input",
             b"1",
             b"0",
             b"10000",
-            std::env::current_dir().unwrap().as_os_str().as_bytes(),
-            b"",
-            b"typo",
-            b"true",
-            b"10",
-            b"40",
-            b"true",
+            cwd.as_os_str().as_bytes(),
+            value("--query").as_bytes(),
+            value("--mode").as_bytes(),
+            value("--smart-case").as_bytes(),
+            value("--rows").as_bytes(),
+            value("--width").as_bytes(),
+            value("--trailing-space").as_bytes(),
         ]),
         msg(&[b"store", b"1", b"live", b"1", b"1", stdin]),
+    ]
+    .concat();
+    let (mut command, control_read, _control_write) = worker_command();
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn zrush worker");
+    drop(control_read);
+    child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(&[msg(&[b"hello", BUILD_STAMP]), req].concat())
+        .expect("write stdin");
+    let out = child.wait_with_output().expect("wait");
+    let frames = decode_frames(&out.stdout);
+    let response = frames
+        .iter()
+        .rev()
+        .find_map(|frame| {
+            let fs = fields(frame);
+            (fs.first().map(Vec::as_slice) == Some(b"plan-ready"))
+                .then(|| fs.get(2).cloned().unwrap_or_default())
+        })
+        .unwrap_or_default();
+    (out.status.code().expect("exit code"), response)
+}
+
+/// Run one history snapshot and history-only `plan` through a fresh worker.
+fn run_history_plan(extra: &[&str], stdin: &[u8]) -> (i32, Vec<u8>) {
+    let value = |flag: &str| {
+        extra
+            .windows(2)
+            .find(|w| w[0] == flag)
+            .map(|w| w[1])
+            .unwrap_or("")
+    };
+    let history_limit = match value("--history-limit") {
+        "" => "5000",
+        value => value,
+    };
+    let offset = match value("--offset") {
+        "" => "0",
+        value => value,
+    };
+    let req = [
+        msg(&[b"history-snapshot", b"1", b"1", stdin]),
         msg(&[
             b"plan",
             b"2",
             b"1",
-            std::env::current_dir().unwrap().as_os_str().as_bytes(),
-            value("--producer").as_bytes(),
             value("--query").as_bytes(),
             value("--mode").as_bytes(),
-            b"true",
+            value("--smart-case").as_bytes(),
             value("--rows").as_bytes(),
             value("--width").as_bytes(),
-            value("--trailing-space").as_bytes(),
-            // Mandatory on every `plan`; these vectors read a slot, which
-            // ignores them (cli-protocol.md "Requests and Responses").
-            b"5000",
-            b"0",
+            history_limit.as_bytes(),
+            offset.as_bytes(),
         ]),
     ]
     .concat();
@@ -141,14 +192,13 @@ fn run_plan(extra: &[&str], stdin: &[u8]) -> (i32, Vec<u8>) {
     let out = child.wait_with_output().expect("wait");
     let frames = decode_frames(&out.stdout);
     let response = frames
-        .last()
-        .map(|frame| {
+        .iter()
+        .rev()
+        .find_map(|frame| {
             let fs = fields(frame);
-            if fs.first().map(Vec::as_slice) == Some(b"ok") {
-                fs.get(2).cloned().unwrap_or_default()
-            } else {
-                Vec::new()
-            }
+            (fs.first().map(Vec::as_slice) == Some(b"ok")
+                && fs.get(1).map(Vec::as_slice) == Some(b"2"))
+            .then(|| fs.get(2).cloned().unwrap_or_default())
         })
         .unwrap_or_default();
     (out.status.code().expect("exit code"), response)
@@ -157,7 +207,6 @@ fn run_plan(extra: &[&str], stdin: &[u8]) -> (i32, Vec<u8>) {
 /// The full required flag set (cli-protocol.md "Startup and Responsibilities"); tests override
 /// individual values as needed.
 fn plan_args<'a>(
-    producer: &'a str,
     query: &'a str,
     mode: &'a str,
     rows: &'a str,
@@ -165,8 +214,6 @@ fn plan_args<'a>(
     trailing_space: &'a str,
 ) -> Vec<&'a str> {
     vec![
-        "--producer",
-        producer,
         "--query",
         query,
         "--mode",
@@ -221,6 +268,18 @@ fn word(w: &str) -> Vec<u8> {
     field_record(&[("w", w)])
 }
 
+fn history_payload(entries: &[(&[u8], &[u8])]) -> Vec<u8> {
+    let mut out = b"b\x01\0".to_vec();
+    for (line, event) in entries {
+        out.extend_from_slice(b"w\x01");
+        out.extend_from_slice(line);
+        out.extend_from_slice(b"\x02n\x01");
+        out.extend_from_slice(event);
+        out.push(0);
+    }
+    out
+}
+
 fn parse_wire(out: &[u8]) -> wire::Plan {
     wire::parse(out).expect("valid plan")
 }
@@ -239,7 +298,9 @@ fn has_highlight(
 
 #[test]
 fn plan_rejects_negative_width_in_band() {
-    let (code, _) = run_plan(&plan_args("compsys", "a", "typo", "10", "-1", "true"), b"");
+    let mut args = plan_args("a", "typo", "10", "-1", "true");
+    args.extend(["--source", "history"]);
+    let (code, _) = run_plan(&args, b"");
     assert_eq!(code, 0);
 }
 
@@ -261,10 +322,7 @@ fn plan_dir_synthesis_uses_real_filesystem_stat() {
     let rd = format!("{}/", dir.display());
     let mut stdin = header(&[("f", "1"), ("rd", &rd)]);
     stdin.extend(word("child"));
-    let (code, out) = run_plan(
-        &plan_args("compsys", "", "typo", "10", "40", "true"),
-        &stdin,
-    );
+    let (code, out) = run_plan(&plan_args("", "typo", "10", "40", "true"), &stdin);
     assert_eq!(code, 0);
     let p = parse_wire(&out);
     // `/` synthesized (real directory), which also suppresses the
@@ -277,10 +335,7 @@ fn plan_dir_synthesis_uses_real_filesystem_stat() {
 fn plan_trailing_space_true_appends_space() {
     let mut stdin = header(&[]);
     stdin.extend(word("git"));
-    let (code, on) = run_plan(
-        &plan_args("compsys", "", "typo", "10", "40", "true"),
-        &stdin,
-    );
+    let (code, on) = run_plan(&plan_args("", "typo", "10", "40", "true"), &stdin);
     assert_eq!(code, 0);
     assert_eq!(parse_wire(&on).inserts, vec![b"git ".to_vec()]);
 }
@@ -292,10 +347,7 @@ fn plan_literal_matches_suppress_approximate_and_keep_common_prefix() {
         stdin.extend(word(w));
     }
     // width=10 leaves one column, so rows appear in rank order top-to-bottom.
-    let (code, out) = run_plan(
-        &plan_args("compsys", "doc", "typo", "10", "10", "false"),
-        &stdin,
-    );
+    let (code, out) = run_plan(&plan_args("doc", "typo", "10", "10", "false"), &stdin);
     assert_eq!(code, 0);
     let p = parse_wire(&out);
     // The literal survivors keep quality order. dot-config is an Edit
@@ -311,20 +363,19 @@ fn plan_literal_matches_suppress_approximate_and_keep_common_prefix() {
 }
 
 #[test]
-fn plan_history_producer_keeps_stdin_order() {
-    // cli-protocol.md "Matching and Ranking Semantics": --producer history
-    // keeps the payload's (newest-first) order among literal survivors,
-    // while --producer compsys ranks the same survivors by tier.
+fn history_plan_keeps_stdin_order() {
+    // cli-protocol.md "Matching and Ranking Semantics": the history-only plan
+    // keeps the payload's (newest-first) order among literal survivors, while
+    // the completion path ranks the same survivors by tier.
     let mut stdin = header(&[]);
     for w in ["fop", "echo xfoo", "far-out-object", "unrelated", "foo"] {
         stdin.extend(word(w));
     }
     // Even at width=40, history is a single column with position 1 at the
     // bottom. Logical insertion order remains newest-first.
-    let (code, out) = run_plan(
-        &plan_args("history", "foo", "typo", "10", "40", "false"),
-        &stdin,
-    );
+    let mut history_args = plan_args("foo", "typo", "10", "40", "false");
+    history_args.extend(["--source", "history"]);
+    let (code, out) = run_plan(&history_args, &stdin);
     assert_eq!(code, 0);
     // fop is Edit and far-out-object is Fuzzy; literal matches suppress
     // both. unrelated matches no tier.
@@ -337,10 +388,7 @@ fn plan_history_producer_keeps_stdin_order() {
     assert!(!plan.inserts.iter().any(|text| text == b"fop"));
     assert!(!plan.inserts.iter().any(|text| text == b"far-out-object"));
 
-    let (code, out) = run_plan(
-        &plan_args("compsys", "foo", "typo", "10", "9", "false"),
-        &stdin,
-    );
+    let (code, out) = run_plan(&plan_args("foo", "typo", "10", "9", "false"), &stdin);
     assert_eq!(code, 0);
     assert_eq!(
         parse_wire(&out).inserts,
@@ -356,10 +404,7 @@ fn plan_typo_transposition_gti() {
     }
     // width=8: gmaxw=max(3,7)=7 (over the 2 matches) -> cols=floor(10/9)=1,
     // forcing a single column so each match gets its own row.
-    let (code, out) = run_plan(
-        &plan_args("compsys", "gti", "typo", "10", "8", "false"),
-        &stdin,
-    );
+    let (code, out) = run_plan(&plan_args("gti", "typo", "10", "8", "false"), &stdin);
     assert_eq!(code, 0);
     let p = parse_wire(&out);
     // No prefix-tier match under "gti" -> empty common prefix.
@@ -377,10 +422,7 @@ fn plan_match_highlight_offset_is_non_trivial_for_a_mid_string_match() {
     // misreading of end=3 as a length, extending the highlight to "arg").
     let mut stdin = header(&[]);
     stdin.extend(word("cargo"));
-    let (code, out) = run_plan(
-        &plan_args("compsys", "ar", "substring", "10", "40", "false"),
-        &stdin,
-    );
+    let (code, out) = run_plan(&plan_args("ar", "substring", "10", "40", "false"), &stdin);
     assert_eq!(code, 0);
     let p = parse_wire(&out);
     assert_eq!(p.rows, vec![b"cargo".to_vec()]);
@@ -389,27 +431,10 @@ fn plan_match_highlight_offset_is_non_trivial_for_a_mid_string_match() {
 
 #[test]
 fn worker_handshake_and_multiple_requests_share_one_process() {
-    let cwd = std::env::current_dir().unwrap();
-    let payload = {
-        let mut p = header(&[]);
-        p.extend(word("git"));
-        p
-    };
+    let payload = history_payload(&[(b"git", b"1")]);
     let plan = |id: &[u8]| {
         msg(&[
-            b"plan",
-            id,
-            b"1",
-            cwd.as_os_str().as_bytes(),
-            b"compsys",
-            b"",
-            b"typo",
-            b"true",
-            b"10",
-            b"40",
-            b"true",
-            b"5000",
-            b"0",
+            b"plan", id, b"1", b"", b"typo", b"true", b"10", b"40", b"5000", b"0",
         ])
     };
     let (mut command, control_read, _control_write) = worker_command();
@@ -421,20 +446,7 @@ fn worker_handshake_and_multiple_requests_share_one_process() {
     drop(control_read);
     let mut input = Vec::new();
     input.extend(msg(&[b"hello", BUILD_STAMP]));
-    input.extend(msg(&[
-        b"input",
-        b"1",
-        b"0",
-        b"10000",
-        cwd.as_os_str().as_bytes(),
-        b"",
-        b"typo",
-        b"true",
-        b"10",
-        b"40",
-        b"true",
-    ]));
-    input.extend(msg(&[b"store", b"1", b"live", b"1", b"1", &payload]));
+    input.extend(msg(&[b"history-snapshot", b"1", b"1", &payload]));
     input.extend(plan(b"2"));
     input.extend(plan(b"3"));
     let mut stdin = child.stdin.take().unwrap();
@@ -446,8 +458,8 @@ fn worker_handshake_and_multiple_requests_share_one_process() {
     let frames = decode_frames(&out.stdout);
     assert_eq!(
         frames.len(),
-        5,
-        "ready, three terminal responses, and the accepted store's event"
+        4,
+        "ready, the snapshot response, and two plan responses"
     );
     assert_eq!(
         fields(&frames[0]),
@@ -456,19 +468,11 @@ fn worker_handshake_and_multiple_requests_share_one_process() {
     assert_eq!(
         fields(&frames[1]),
         vec![b"ok".to_vec(), b"1".to_vec(), Vec::new()],
-        "the store body is empty"
+        "the snapshot body is empty"
     );
-    // The accepted store settles the pending input, and the contract fixes the
-    // order: the terminal `ok` first, then the event it caused.
-    let event = fields(&frames[2]);
-    assert_eq!(event[0], b"plan-ready");
-    assert_eq!(event[1], b"1", "the event names the settled input");
-    // Both plans read the one stored generation.
-    assert!(fields(&frames[3])[0] == b"ok" && fields(&frames[4])[0] == b"ok");
-    assert_eq!(fields(&frames[3])[2], fields(&frames[4])[2]);
-    // The notification snapshotted the same fields the plans carry, so the
-    // event's body is the same render plan.
-    assert_eq!(event[2], fields(&frames[3])[2]);
+    // Both plans read the one history generation.
+    assert!(fields(&frames[2])[0] == b"ok" && fields(&frames[3])[0] == b"ok");
+    assert_eq!(fields(&frames[2])[2], fields(&frames[3])[2]);
 }
 
 #[test]

@@ -1,5 +1,5 @@
 --query\0
-zzz\0
+a\0
 --mode\0
 typo\0
 --smart-case\0
@@ -8,5 +8,7 @@ true\0
 10\0
 --width\0
 40\0
---trailing-space\0
-true\0
+--history-limit\0
+0\0
+--source\0
+history\0

@@ -729,7 +729,7 @@ unset ZDOTDIR
   # (behavior.md "History Menu").
   reset_transport
   _zrush_worker_ready=1
-  _zrush_worker_pending=( 1 'history-snapshot 1' 2 'plan history' 3 'plan history' )
+  _zrush_worker_pending=( 1 'history-snapshot 1' 2 plan 3 plan )
   _zrush_sync_target=2 _zrush_sync_done=0 _zrush_sync_ok=0
   _zrush_encode_message ok 1 ''; typeset -g SNAPSHOT_OK=$REPLY
   _zrush_encode_message ok 2 $'\0'"0"$'\0'"0"$'\0'"0"$'\0'; typeset -g TARGET=$REPLY
