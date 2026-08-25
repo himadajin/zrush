@@ -32,8 +32,10 @@ source <(~/path/to/zrush/target/release/zrush init zsh)
 
 - **compinit より後**に置く(前に置くと `command not found: compdef` などの原因になる。
   他ツールの補完設定 `eval "$(... completion)"` も compinit より後にすること)。
-- zsh-abbr より後、zsh-syntax-highlighting より前に置く。
+- zsh-abbr より後に置く。
 - zsh-autocomplete とは併用しない(置き換え)。
+- 外部シンタックスハイライトプラグインとは併用しない
+  (サポート対象外であり、併用時の挙動は仕様外)。
 
 `zrush init zsh` は自身の絶対パスを `$ZRUSH_BIN` として埋め込んで出力する。
 テストや特殊な配置で別のバイナリを使わせたい場合は、source する前に `$ZRUSH_BIN` を設定すれば、

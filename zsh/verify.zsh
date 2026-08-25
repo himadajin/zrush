@@ -17,13 +17,12 @@
 #     `setopt share_history` in both:
 #       ZRUSH_VERIFY_DIR=<the sandbox printed below> zsh -f zsh/verify.zsh
 #     A reused sandbox keeps the history the previous shell saved into it.
-#   - To check coexistence with the plugins actually installed on this machine,
-#     point ZRUSH_VERIFY_PRE / ZRUSH_VERIFY_POST at them; they are sourced
-#     before and after zrush, the order docs/user/install.md documents. The
-#     automated suite covers this against doubles, so a released plugin that
-#     changed its technique shows up here and nowhere else:
+#   - To check coexistence with a plugin actually installed on this machine,
+#     point ZRUSH_VERIFY_PRE / ZRUSH_VERIFY_POST at it; they source the plugin
+#     before or after zrush. The automated suite covers common plugin shapes
+#     against doubles, so a released plugin that changed its technique shows up
+#     here and nowhere else. For the supported zsh-abbr load order:
 #       ZRUSH_VERIFY_PRE=/opt/homebrew/share/zsh-abbr/zsh-abbr.zsh \
-#       ZRUSH_VERIFY_POST=/opt/homebrew/share/zsh-syntax-highlighting/zsh-syntax-highlighting.zsh \
 #         zsh -f zsh/verify.zsh
 #   - Exit normally with exit or Ctrl-D.
 emulate -L zsh

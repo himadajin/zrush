@@ -111,7 +111,7 @@ eq "re-source active count" $#_zrush_active_dsp 2
 eq "re-source predecessor-ledger count" $#_zrush_dsp_prev 2
 verdict "re-source releases the previous direct-owned generation"
 
-# Model zsh-syntax-highlighting's in-place wrapper: it moves the original
+# Model a third-party in-place wrapper: it moves the original
 # function behind a backup widget, then replaces our widget name with its own
 # function. This old layer is live predecessor state and must be retained.
 bound_for '^X^A' || note "pre-wrapper ^X^A binding missing"

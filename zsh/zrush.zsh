@@ -1,8 +1,8 @@
 # zrush.zsh — ZLE integration for asynchronous completion
 #
-# Requirements: zsh 5.8+, source after compinit, after zsh-abbr, and before
-# zsh-syntax-highlighting. This file is embedded into the `zrush` binary and
-# loaded via `source <(zrush init zsh)` (cli-protocol.md "`zrush init`"), which
+# Requirements: zsh 5.8+, source after compinit and after zsh-abbr.
+# This file is embedded into the `zrush` binary and loaded via
+# `source <(zrush init zsh)` (cli-protocol.md "`zrush init`"), which
 # injects $ZRUSH_BIN ahead of this file; an already-set $ZRUSH_BIN overrides it.
 #
 # zsh captures compsys candidates in a forked shell and hands the raw
@@ -2787,8 +2787,8 @@ _zrush_select_move() {  # $1=select-prev|select-next
 
 # ---------------------------------------------------------------- State-dependent dispatch
 # The dispatch function embeds its predecessor as an argument and sets it here.
-# Do not inspect $WIDGET: wrappers such as z-sy-h may reinvoke the original widget
-# under another name (for example orig-s2h:*), which must not break fallback.
+# Do not inspect $WIDGET: third-party wrappers may reinvoke the original widget
+# under another name (for example orig-wrapper:*), which must not break fallback.
 typeset -g _zrush_dispatch_prev=
 
 _zrush_call_prev() {  # Fall back through the predecessor chain, never directly to a builtin.
@@ -3113,7 +3113,7 @@ _zrush_init() {
   }
   autoload -Uz add-zsh-hook add-zle-hook-widget is-at-least
 
-  # zsh 5.9+ memo fields let z-sy-h 0.8+ distinguish region_highlight ownership.
+  # zsh 5.9+ memo fields identify zrush-owned entries in shared region_highlight.
   _zrush_hl_memo=
   is-at-least 5.9 $ZSH_VERSION && _zrush_hl_memo=' memo=zrush'
 
@@ -3154,7 +3154,7 @@ _zrush_init() {
   zle -N _zrush-line-init _zrush_line_init
   zle -N _zrush-line-finish _zrush_line_finish
 
-  # Register through add-zle-hook-widget for supported coexistence with zsh-syntax-highlighting.
+  # Register through add-zle-hook-widget without replacing third-party pre-redraw hooks.
   add-zle-hook-widget line-pre-redraw _zrush-line-pre-redraw
   add-zle-hook-widget line-init _zrush-line-init
   add-zle-hook-widget line-finish _zrush-line-finish
