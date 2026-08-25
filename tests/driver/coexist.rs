@@ -1,6 +1,5 @@
 //! Coexistence with third-party zle plugins
-//! (docs/internal/specs/behavior.md "Plugin Coexistence", and the
-//! abbr -> zrush -> z-sy-h load order docs/user/install.md documents).
+//! (docs/internal/specs/behavior.md "Plugin Coexistence").
 //!
 //! The other side of each scenario is a double: an rc fragment reproducing the
 //! *technique* a real plugin uses -- a widget bound ahead of zrush, a
@@ -27,7 +26,7 @@ zle -N _zrt-double-abbr _zrt_double_abbr
 bindkey '^M' _zrt-double-abbr
 "#;
 
-/// zsh-syntax-highlighting 0.8's shape: a `zle-line-pre-redraw` hook registered
+/// A third-party highlighter's shape: a `zle-line-pre-redraw` hook registered
 /// through `add-zle-hook-widget` that rewrites the shared `region_highlight`,
 /// removing only its own previous entries (by `memo=` where zsh supports it,
 /// by ledger subtraction on 5.8) and leaving everyone else's alone.
@@ -35,12 +34,12 @@ bindkey '^M' _zrt-double-abbr
 /// Its entry covers the BUFFER region, as a syntax highlighter's does. That
 /// also keeps it clear of zrush's 5.8 fallback, which drops entries starting at
 /// or beyond `$#BUFFER` (`_zrush_rh_clear` in zsh/zrush.zsh).
-const ZSYH_DOUBLE: &str = r#"
+const PRE_REDRAW_HIGHLIGHT_DOUBLE: &str = r#"
 autoload -Uz add-zle-hook-widget is-at-least
 typeset -g _zrt_double_memo=
 is-at-least 5.9 $ZSH_VERSION && _zrt_double_memo=' memo=zrt-double'
 typeset -ga _zrt_double_rh=()
-_zrt_double_zsyh() {
+_zrt_double_pre_redraw_highlight() {
   if [[ -n $_zrt_double_memo ]]; then
     region_highlight=( "${(@)region_highlight:#*memo=zrt-double}" )
   else
@@ -52,7 +51,7 @@ _zrt_double_zsyh() {
   region_highlight+=( "$e" )
   _zrt_double_rh=( "$e" )
 }
-add-zle-hook-widget zle-line-pre-redraw _zrt_double_zsyh
+add-zle-hook-widget zle-line-pre-redraw _zrt_double_pre_redraw_highlight
 "#;
 
 /// zsh-autosuggestions' shape: a `compadd` wrapper living in the interactive
@@ -121,7 +120,7 @@ fn a_predecessor_bound_ahead_of_zrush_still_receives_enter() {
 
 #[test]
 fn a_pre_redraw_hook_above_zrush_keeps_its_own_highlights() {
-    let mut host = Host::boot_with_doubles("", ZSYH_DOUBLE);
+    let mut host = Host::boot_with_doubles("", PRE_REDRAW_HIGHLIGHT_DOUBLE);
 
     let foreign = foreign_highlights_for_a_typed_buffer(&mut host, "(cox-2a)");
     assert!(
@@ -152,7 +151,7 @@ fn a_pre_redraw_hook_above_zrush_keeps_its_own_highlights() {
 
 #[test]
 fn a_wrapper_above_zrush_survives_re_source_and_keybind_reapply() {
-    let mut host = Host::boot_with_doubles("", ZSYH_DOUBLE);
+    let mut host = Host::boot_with_doubles("", PRE_REDRAW_HIGHLIGHT_DOUBLE);
 
     // Re-sourcing rebuilds zrush's transport and registrations while a third
     // party sits above them; the layers above must stay in the chain.
@@ -174,7 +173,7 @@ fn a_wrapper_above_zrush_survives_re_source_and_keybind_reapply() {
 
 #[test]
 fn zrush_between_a_predecessor_and_a_wrapper_keeps_both() {
-    let mut host = Host::boot_with_doubles(ABBR_DOUBLE, ZSYH_DOUBLE);
+    let mut host = Host::boot_with_doubles(ABBR_DOUBLE, PRE_REDRAW_HIGHLIGHT_DOUBLE);
 
     assert_listing_selection_and_confirm(&mut host, "(cox-4a)");
 
