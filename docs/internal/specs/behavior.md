@@ -6,13 +6,14 @@ zrush の挙動の規範。
 観測可能な挙動を定義する。設定キー名は config-schema.md の表記に従う。
 
 責務境界: Rust(`zrush` バイナリ)がマッチング・ランキング・レコード解析・
-グループ分割・グリッドレイアウト・ハイライト計算・ナビゲーション表構築・
-挿入テキスト構築・config 解釈を担う。
+バッファの字句分類・コマンド解決・グループ分割・グリッドレイアウト・
+ハイライト計算・ナビゲーション表構築・挿入テキスト構築・config 解釈を担う。
 zsh は zle 統合・compsys 呼び出しによる捕獲・プランの適用
 (POSTDISPLAY/region_highlight への描画、BUFFER 編集、bindkey)を担う。
 「zsh の意味論は zsh が計算し、データとして渡す」
 (`${(Q)}` 復元・`${(q)}` クォート・`~` 展開・terminfo 解決は zsh 側)。
 詳細な入出力仕様は `../contracts/cli-protocol.md`。
+バッファ字句分類の意味論は `syntax.md`。
 
 対象環境: zsh 5.8 以上(macOS / Linux)。
 `KEYS_QUEUED_COUNT` は 5.9 追加のため、5.8 では入力圧の見送り(後述)が縮退する。
