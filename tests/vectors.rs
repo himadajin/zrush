@@ -1,6 +1,6 @@
 use std::ffi::OsString;
 use std::io::Write;
-use std::os::unix::ffi::OsStrExt;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
@@ -174,15 +174,10 @@ fn run_vector_raw(path: &Path) -> std::process::Output {
     let append_path = path.join("append");
     let append = append_path.exists().then(|| read_vector_file(&append_path));
     let cwd = std::env::current_dir().expect("cwd");
-    // One session carries the vector as the contract's requests: the payload
-    // goes in with the write `--source` names (request_id 1, generation 1), an
-    // `append` file follows it as a `history-append` (request_id 2, generation
-    // 2), and the trailing `plan` reads back the last generation written.
-    // A `store` is bound to the worker's current input, so a `store` vector
-    // opens with an `input` notification (input_generation 1) whose quiet period
-    // outlives the session: it is still pending when the `store` arrives, and
-    // the `store` settles it into one `plan-ready`
-    // (cli-protocol.md "Input Notifications and Worker Events").
+    // One session carries the vector as the contract's requests. Completion
+    // vectors use `input` + `store` and assert the resulting `plan-ready`
+    // event; history vectors use the history write followed by the
+    // history-only `plan` request.
     let source = vector_source(path);
     let mut requests = match source.as_bytes() {
         b"store" => [
@@ -192,12 +187,12 @@ fn run_vector_raw(path: &Path) -> std::process::Output {
                 b"0",
                 b"10000",
                 cwd.as_os_str().as_bytes(),
-                b"",
-                b"typo",
-                b"true",
-                b"1",
-                b"1",
-                b"false",
+                value("--query").as_bytes(),
+                value("--mode").as_bytes(),
+                value("--smart-case").as_bytes(),
+                value("--rows").as_bytes(),
+                value("--width").as_bytes(),
+                value("--trailing-space").as_bytes(),
             ]),
             msg(&[b"store", b"1", b"live", b"1", BINDING, &payload]),
         ]
@@ -213,8 +208,8 @@ fn run_vector_raw(path: &Path) -> std::process::Output {
         }
         None => (b"1", b"2"),
     };
-    // `history_limit` is mandatory on every `plan`, so a vector that does not
-    // exercise the scan window inherits the `[history].limit` default.
+    // `history_limit` is mandatory on the history-only `plan`, so a vector
+    // that does not exercise the scan window inherits the default.
     let history_limit = match value("--history-limit") {
         limit if limit.is_empty() => OsString::from("5000"),
         limit => limit,
@@ -223,21 +218,56 @@ fn run_vector_raw(path: &Path) -> std::process::Output {
         value if value.is_empty() => OsString::from("0"),
         value => value,
     };
-    requests.extend(msg(&[
-        b"plan",
-        plan_id,
-        generation,
-        cwd.as_os_str().as_bytes(),
-        value("--producer").as_bytes(),
-        value("--query").as_bytes(),
-        value("--mode").as_bytes(),
-        value("--smart-case").as_bytes(),
-        value("--rows").as_bytes(),
-        value("--width").as_bytes(),
-        value("--trailing-space").as_bytes(),
-        history_limit.as_bytes(),
-        offset.as_bytes(),
-    ]));
+    if source.as_bytes() != b"store" {
+        let mut plan_fields = vec![
+            b"plan".to_vec(),
+            plan_id.to_vec(),
+            generation.to_vec(),
+            value("--query").into_vec(),
+            value("--mode").into_vec(),
+            value("--smart-case").into_vec(),
+            value("--rows").into_vec(),
+            value("--width").into_vec(),
+            history_limit.into_vec(),
+            offset.into_vec(),
+        ];
+        match value("--plan-shape").as_bytes() {
+            b"missing-offset" => {
+                plan_fields.pop();
+            }
+            b"missing-query" => {
+                plan_fields.remove(3);
+            }
+            b"extra-field" => {
+                plan_fields.push(b"extra".to_vec());
+            }
+            b"obsolete-producer" => {
+                plan_fields = vec![
+                    b"plan".to_vec(),
+                    plan_id.to_vec(),
+                    generation.to_vec(),
+                    cwd.as_os_str().as_bytes().to_vec(),
+                    b"compsys".to_vec(),
+                    value("--query").into_vec(),
+                    value("--mode").into_vec(),
+                    value("--smart-case").into_vec(),
+                    value("--rows").into_vec(),
+                    value("--width").into_vec(),
+                    b"false".to_vec(),
+                    b"5000".to_vec(),
+                    b"0".to_vec(),
+                ];
+            }
+            b"" => {}
+            shape => panic!(
+                "{}: unknown --plan-shape {:?}",
+                path.display(),
+                String::from_utf8_lossy(shape)
+            ),
+        }
+        let plan_fields: Vec<&[u8]> = plan_fields.iter().map(Vec::as_slice).collect();
+        requests.extend(msg(&plan_fields));
+    }
     let (control_read, _control_write) = UnixStream::pair().expect("create control channel");
     let control_fd = control_read.as_raw_fd();
     let mut command = Command::new(env!("CARGO_BIN_EXE_zrush"));
@@ -280,13 +310,20 @@ fn run_vector_raw(path: &Path) -> std::process::Output {
 
 fn run_vector(path: &Path) -> std::process::Output {
     let mut output = run_vector_raw(path);
-    // Strip the handshake response and unwrap the terminal ok payload.
+    // Strip the handshake response and unwrap the render-plan body, whether it
+    // arrived as a completion `plan-ready` event or a history `plan` response.
     let frames = decode_strict(&output.stdout);
-    if let Some(frame) = frames.last() {
+    let source = vector_source(path);
+    let body = frames.iter().rev().find_map(|frame| {
         let fs = decode_fields_strict(frame);
-        if fs.first().map(Vec::as_slice) == Some(b"ok") {
-            output.stdout = fs.get(2).cloned().unwrap_or_default();
+        match fs.first().map(Vec::as_slice) {
+            Some(b"plan-ready") if source.as_bytes() == b"store" => fs.get(2).cloned(),
+            Some(b"ok") if source.as_bytes() != b"store" => fs.get(2).cloned(),
+            _ => None,
         }
+    });
+    if let Some(body) = body {
+        output.stdout = body;
     }
     output
 }
@@ -455,12 +492,12 @@ fn reject_vectors_match_expected_in_band_errors() {
         let name = vector_name(&path);
         let output = run_vector_raw(&path);
         let frames = decode_strict(&output.stdout);
-        // A vector is rejected by exactly one of the session's two requests.
-        // A bad payload fails the write (request_id 1) with `invalid-payload`,
-        // and an append against the uninitialized index fails it with
-        // `unknown-generation`; either way nothing is left for the `plan`
-        // (request_id 2) to reference. Bad scalars write fine and fail the
-        // `plan` itself.
+        // A vector is rejected by exactly one of the history write or the
+        // history-only plan. A bad payload fails the write (request_id 1) with
+        // `invalid-payload`, and an append against the uninitialized index
+        // fails it with `unknown-generation`; either way the plan (request_id
+        // 2) has no generation to reference. Bad plan scalars or shapes write
+        // the snapshot successfully and fail the plan itself.
         let write_reply: &[u8] = if name.ends_with("nonterminated-stdin") {
             b"invalid-payload"
         } else if vector_source(&path) == *"history-append" {
@@ -473,29 +510,20 @@ fn reject_vectors_match_expected_in_band_errors() {
         } else {
             b"unknown-generation"
         };
-        let store_frame = if write_reply.is_empty() {
+        let write_frame = if write_reply.is_empty() {
             vec![b"ok".to_vec(), b"1".to_vec(), Vec::new()]
         } else {
             vec![b"error".to_vec(), b"1".to_vec(), write_reply.to_vec()]
         };
-        // Only an accepted `store` settles the notification its session opened
-        // with, so only then does a `plan-ready` sit between the two terminal
-        // responses (cli-protocol.md "Input Notifications and Worker Events").
-        let settles = write_reply.is_empty() && vector_source(&path) == *"store";
-        let event_is_plan_ready = |frame: &[u8]| {
-            let event = decode_fields_strict(frame);
-            event.len() == 3 && event[0] == b"plan-ready" && event[1] == BINDING
-        };
         let valid = output.status.code() == Some(0)
-            && frames.len() == 3 + usize::from(settles)
+            && frames.len() == 3
             && decode_fields_strict(&frames[0]) == vec![b"ready".to_vec(), BUILD_STAMP.to_vec()]
-            && decode_fields_strict(&frames[1]) == store_frame
-            && (!settles || event_is_plan_ready(&frames[2]))
+            && decode_fields_strict(&frames[1]) == write_frame
             && decode_fields_strict(frames.last().expect("a nonempty response stream"))
                 == vec![b"error".to_vec(), b"2".to_vec(), plan_reply.to_vec()];
         if !valid {
             failures.push(format!(
-                "{name}: expected ready + a terminal store reply + a terminal in-band plan error; got exit {:?}, stdout: {}, stderr: {}",
+                "{name}: expected ready + a terminal history-write reply + a terminal in-band plan error; got exit {:?}, stdout: {}, stderr: {}",
                 output.status.code(),
                 dump(&output.stdout),
                 dump(&output.stderr)

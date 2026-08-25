@@ -290,7 +290,6 @@ enum Request {
     },
     Plan {
         generation: i64,
-        cwd: Vec<u8>,
         history_limit: usize,
         params: plan::Params,
     },
@@ -635,20 +634,15 @@ fn process_request<W: Write>(
         },
         Request::Plan {
             generation,
-            cwd,
             history_limit,
             params,
         } => {
-            let is_dir = |path: &[u8]| is_dir_from(&cwd, path);
-            // cli-protocol.md "Requests and Responses": one generation namespace spanning
-            // both slots and the index. The index answers only for its
-            // current stamp, and builds the query window per request because
-            // the scan bound is the request's.
-            let body = if let Some(stored) = session.store.find(generation) {
-                Some(plan::compute(&params, stored, &is_dir))
-            } else if session.history.holds(generation) {
+            // cli-protocol.md "Requests and Responses": an explicit plan
+            // addresses the history index only. History candidates never carry
+            // directory-synthesis metadata, so no filesystem stat is needed.
+            let body = if session.history.holds(generation) {
                 let window = session.history.window(history_limit);
-                Some(plan::compute(&params, &window, &is_dir))
+                Some(plan::compute(&params, &window, &|_| false))
             } else {
                 None
             };
@@ -694,7 +688,7 @@ fn parse_store(fields: Vec<Vec<u8>>) -> Request {
 }
 
 /// cli-protocol.md "Input Notifications and Worker Events": an `input` notification, whose
-/// plan fields are always laid out as `producer = compsys`.
+/// layout parameters use the compsys profile.
 fn parse_input(fields: Vec<Vec<u8>>, now: Instant) -> Option<CurrentInput> {
     let [
         _kind,
@@ -757,26 +751,20 @@ fn parse_plan(fields: Vec<Vec<u8>>) -> Request {
             _kind,
             _id,
             generation,
-            cwd,
-            producer,
             query,
             mode,
             smart_case,
             rows,
             width,
-            trailing_space,
             history_limit,
             offset,
         ],
-    ) = <[Vec<u8>; 13]>::try_from(fields)
+    ) = <[Vec<u8>; 10]>::try_from(fields)
     else {
         return Request::Invalid;
     };
 
     let Some(generation) = parse_identifier(&generation) else {
-        return Request::Invalid;
-    };
-    let Some(producer) = parse_producer(&producer) else {
         return Request::Invalid;
     };
     let Some(mode) = Mode::parse(std::str::from_utf8(&mode).unwrap_or("")) else {
@@ -791,11 +779,8 @@ fn parse_plan(fields: Vec<Vec<u8>>) -> Request {
     let Some(width) = parse_positive_usize(&width) else {
         return Request::Invalid;
     };
-    let Some(trailing_space) = parse_bool(&trailing_space) else {
-        return Request::Invalid;
-    };
-    // Same grammar as an identifier, and mandatory whichever store the
-    // generation resolves to (cli-protocol.md "Requests and Responses").
+    // Both fields are meaningful for the history-only plan and mandatory in
+    // its request shape (cli-protocol.md "Requests and Responses").
     let Some(history_limit) = parse_identifier(&history_limit) else {
         return Request::Invalid;
     };
@@ -805,16 +790,15 @@ fn parse_plan(fields: Vec<Vec<u8>>) -> Request {
 
     Request::Plan {
         generation,
-        cwd,
         history_limit: usize::try_from(history_limit).unwrap_or(usize::MAX),
         params: plan::Params {
-            producer,
+            producer: Producer::History,
             query,
             mode,
             smart_case,
             rows,
             width,
-            trailing_space,
+            trailing_space: false,
             offset,
         },
     }
@@ -824,14 +808,6 @@ fn parse_slot(value: &[u8]) -> Option<Slot> {
     match value {
         b"live" => Some(Slot::Live),
         b"cache" => Some(Slot::Cache),
-        _ => None,
-    }
-}
-
-fn parse_producer(value: &[u8]) -> Option<Producer> {
-    match value {
-        b"compsys" => Some(Producer::Compsys),
-        b"history" => Some(Producer::History),
         _ => None,
     }
 }
@@ -1162,14 +1138,10 @@ mod tests {
     }
 
     fn plan_request<'a>(id: &'a [u8], generation: &'a [u8]) -> Vec<&'a [u8]> {
-        vec![
-            b"plan", id, generation, b"/", b"compsys", b"", b"typo", b"true", b"10", b"40",
-            b"true", b"5000", b"0",
-        ]
+        history_plan_request_at(id, generation, b"5000", b"0")
     }
 
-    /// A `plan` reading the history index: the `history` producer and an
-    /// explicit scan bound.
+    /// A `plan` reading the history index with an explicit scan bound.
     fn history_plan_request<'a>(
         id: &'a [u8],
         generation: &'a [u8],
@@ -1188,14 +1160,11 @@ mod tests {
             b"plan",
             id,
             generation,
-            b"/",
-            b"history",
             b"",
             b"typo",
             b"true",
             b"10",
             b"40",
-            b"false",
             history_limit,
             offset,
         ]
@@ -1226,9 +1195,14 @@ mod tests {
 
     #[test]
     fn handshake_and_multiple_requests_share_one_session() {
+        let installed = history_payload(&[(b"git", b"1")]);
         let decoded = session(&[
-            pending_input(b"1"),
-            message(&store_request(b"1", b"live", b"5", b"1", b"")),
+            message(&history_request(
+                b"history-snapshot",
+                b"1",
+                b"5",
+                &installed,
+            )),
             message(&plan_request(b"2", b"5")),
             message(&plan_request(b"3", b"5")),
         ]);
@@ -1236,15 +1210,14 @@ mod tests {
         assert_eq!(reply(&decoded, b"1"), ok(b"1"));
         assert_eq!(&reply(&decoded, b"2")[..2], [b"ok".as_slice(), b"2"]);
         assert_eq!(&reply(&decoded, b"3")[..2], [b"ok".as_slice(), b"3"]);
-        assert_eq!(body(&reply(&decoded, b"2")), b"\0\x30\0\x30\0\x30\0");
+        assert_eq!(body(&reply(&decoded, b"2")), body(&reply(&decoded, b"3")));
     }
 
     #[test]
-    fn one_store_serves_every_later_plan() {
-        let stored = payload(b"git");
+    fn one_history_snapshot_serves_every_later_plan() {
+        let stored = history_payload(&[(b"git", b"1")]);
         let decoded = session(&[
-            pending_input(b"1"),
-            message(&store_request(b"1", b"live", b"5", b"1", &stored)),
+            message(&history_request(b"history-snapshot", b"1", b"5", &stored)),
             message(&plan_request(b"2", b"5")),
             message(&plan_request(b"3", b"5")),
         ]);
@@ -1271,22 +1244,16 @@ mod tests {
             message(&store_request(b"2", b"live", b"6", b"2", &live)),
             pending_input(b"3"),
             message(&store_request(b"3", b"cache", b"7", b"3", &recached)),
-            message(&plan_request(b"4", b"7")),
-            message(&plan_request(b"5", b"6")),
-            message(&plan_request(b"6", b"5")),
+            message(&input_notification(b"4", b"5", b"0")),
+            message(&input_notification(b"5", b"6", b"0")),
         ]);
 
-        assert!(
-            body(&reply(&decoded, b"4"))
-                .windows(4)
-                .any(|bytes| bytes == b"gzip")
-        );
-        assert!(
-            body(&reply(&decoded, b"5"))
-                .windows(4)
-                .any(|bytes| bytes == b"grep")
-        );
-        assert_eq!(reply(&decoded, b"6"), error(b"6", b"unknown-generation"));
+        let events = events(&decoded);
+        assert!(events[0][2].windows(3).any(|bytes| bytes == b"git"));
+        assert!(events[1][2].windows(4).any(|bytes| bytes == b"grep"));
+        assert!(events[2][2].windows(4).any(|bytes| bytes == b"gzip"));
+        assert_eq!(events[3], capture_required(b"4"));
+        assert!(events[4][2].windows(4).any(|bytes| bytes == b"grep"));
     }
 
     #[test]
@@ -1307,26 +1274,19 @@ mod tests {
             message(&store_request(b"2", b"cache", b"6", b"2", &cached)),
             pending_input(b"3"),
             message(&store_request(b"3", b"live", b"7", b"3", b"unterminated")),
-            message(&plan_request(b"4", b"5")),
-            message(&plan_request(b"5", b"6")),
-            message(&plan_request(b"6", b"7")),
+            message(&input_notification(b"4", b"5", b"0")),
+            message(&input_notification(b"5", b"6", b"0")),
+            message(&input_notification(b"6", b"7", b"0")),
         ]);
 
         assert_eq!(reply(&decoded, b"3"), error(b"3", b"invalid-payload"));
-        // Neither the slot the failed store addressed nor the other one moved.
-        assert!(
-            body(&reply(&decoded, b"4"))
-                .windows(3)
-                .any(|bytes| bytes == b"git")
-        );
-        assert!(
-            body(&reply(&decoded, b"5"))
-                .windows(4)
-                .any(|bytes| bytes == b"grep")
-        );
-        assert_eq!(reply(&decoded, b"6"), error(b"6", b"unknown-generation"));
-        // A `store` that never reached a slot settles nothing either.
-        assert_eq!(events(&decoded).len(), 2);
+        // Neither the slot the failed store addressed nor the other one moved;
+        // the next notifications still resolve the two accepted generations,
+        // while the failed generation asks for a fresh capture.
+        let events = events(&decoded);
+        assert!(events[2][2].windows(3).any(|bytes| bytes == b"git"));
+        assert!(events[3][2].windows(4).any(|bytes| bytes == b"grep"));
+        assert_eq!(events[4], capture_required(b"6"));
     }
 
     #[test]
@@ -1765,11 +1725,9 @@ mod tests {
                 .any(|bytes| bytes == b"ls")
         );
         assert_eq!(reply(&decoded, b"6"), error(b"6", b"unknown-generation"));
-        assert!(
-            body(&reply(&decoded, b"7"))
-                .windows(3)
-                .any(|bytes| bytes == b"git")
-        );
+        // A generation held only by a candidate slot is not a valid history
+        // plan reference.
+        assert_eq!(reply(&decoded, b"7"), error(b"7", b"unknown-generation"));
     }
 
     #[test]
@@ -1791,8 +1749,8 @@ mod tests {
         assert_eq!(reply(&decoded, b"3"), error(b"3", b"unknown-generation"));
     }
 
-    /// cli-protocol.md "Requests and Responses": `store` never reaches the index and the
-    /// history writes never reach a slot.
+    /// cli-protocol.md "Requests and Responses": `store` never reaches the
+    /// index and an explicit `plan` never reaches a candidate slot.
     #[test]
     fn history_writes_and_slots_are_independent() {
         let live = payload(b"git");
@@ -1817,23 +1775,15 @@ mod tests {
             message(&plan_request(b"8", b"5")),
         ]);
 
-        assert!(
-            body(&reply(&decoded, b"5"))
-                .windows(4)
-                .any(|bytes| bytes == b"grep")
-        );
+        assert_eq!(reply(&decoded, b"5"), error(b"5", b"unknown-generation"));
         assert!(
             body(&reply(&decoded, b"6"))
                 .windows(2)
                 .any(|bytes| bytes == b"ls")
         );
         // Generation 8 belongs to the `live` slot, and generation 5 was
-        // replaced there: neither resolves to the index.
-        assert!(
-            !body(&reply(&decoded, b"7"))
-                .windows(2)
-                .any(|bytes| bytes == b"ls")
-        );
+        // replaced there: neither resolves to the history index.
+        assert_eq!(reply(&decoded, b"7"), error(b"7", b"unknown-generation"));
         assert_eq!(reply(&decoded, b"8"), error(b"8", b"unknown-generation"));
     }
 
@@ -1903,11 +1853,10 @@ mod tests {
     }
 
     /// cli-protocol.md 「history profile」: the request's scan bound is
-    /// clamped to the retention cap, and a slot-resolved `plan` ignores it.
+    /// clamped to the retention cap for the history-only `plan`.
     #[test]
-    fn the_history_limit_bounds_the_scan_and_is_ignored_by_slots() {
+    fn the_history_limit_bounds_the_history_scan() {
         let installed = history_payload(&[(b"newest", b"3"), (b"older", b"2"), (b"oldest", b"1")]);
-        let stored = payload(b"git");
         let decoded = session(&[
             message(&history_request(
                 b"history-snapshot",
@@ -1915,8 +1864,6 @@ mod tests {
                 b"5",
                 &installed,
             )),
-            pending_input(b"1"),
-            message(&store_request(b"2", b"live", b"6", b"1", &stored)),
             message(&history_plan_request(b"3", b"5", b"1")),
             message(&history_plan_request(b"4", b"5", b"9223372036854775807")),
             message(&history_plan_request(b"5", b"6", b"1")),
@@ -1928,9 +1875,8 @@ mod tests {
         // A limit past the retention cap simply scans the whole index.
         let scanned_all = reply(&decoded, b"4");
         assert!(body(&scanned_all).windows(6).any(|b| b == b"oldest"));
-        // The slot's payload is listed whole: `history_limit` addresses the
-        // index alone.
-        assert!(body(&reply(&decoded, b"5")).windows(3).any(|b| b == b"git"));
+        // A candidate-slot generation is not a history index generation.
+        assert_eq!(reply(&decoded, b"5"), error(b"5", b"unknown-generation"));
     }
 
     #[test]

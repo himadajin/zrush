@@ -395,7 +395,7 @@ reserialize_plan() {  # -> REPLY=bytes, or return 1 with REPLY=reason
   _zrush_netstring_take "$ready_frame"
   _zrush_worker_handle_message "$REPLY"
   local -i ready_kept_failures=$(( _zrush_worker_ready == 1 && _zrush_worker_failures == 1 ))
-  typeset -gA _zrush_worker_pending=( 41 'plan history' )
+  typeset -gA _zrush_worker_pending=( 41 plan )
   _zrush_netstring_take "$error_frame"
   _zrush_worker_handle_message "$REPLY"
   if (( ready_kept_failures && _zrush_worker_failures == 0 \
@@ -412,7 +412,7 @@ reserialize_plan() {  # -> REPLY=bytes, or return 1 with REPLY=reason
     || { out "FATAL: $REPLY"; exit 1 }
   local stale_plan=$REPLY
   _zrush_worker_ready=1 _zrush_worker_failures=1 _zrush_disabled=0 _zrush_disable_reason= _zrush_enabled=1
-  typeset -gA _zrush_worker_pending=( 41 'plan history' )
+  typeset -gA _zrush_worker_pending=( 41 plan )
   _zrush_sync_target=0
   _zrush_plan_text=sentinel _zrush_plan_cp=sentinel-cp _zrush_plan_kind=history
   _zrush_plan_nlines=7 _zrush_plan_npos=0
@@ -458,7 +458,7 @@ reserialize_plan() {  # -> REPLY=bytes, or return 1 with REPLY=reason
   functions[_zrush_start_collection]='(( ++_zrt_collections )); return 0'
   _zrush_worker_ready=1 _zrush_worker_failures=0 _zrush_worker_stopping=0
   _zrush_disabled=0 _zrush_disable_reason= _zrush_enabled=1
-  typeset -gA _zrush_worker_pending=( 53 'plan history' )
+  typeset -gA _zrush_worker_pending=( 53 plan )
   _zrush_sync_target=53 _zrush_sync_done=0 _zrush_sync_ok=0
   _zrush_cc_fp=fingerprint _zrush_cc_time=$EPOCHSECONDS _zrush_cc_cand_gen=9
   _zrush_encode_message error 53 unknown-generation
@@ -766,7 +766,7 @@ reserialize_plan() {  # -> REPLY=bytes, or return 1 with REPLY=reason
 
   # ---- History index requests, observed on the same outbound queue ----
   # The index is generation-addressed like a slot, but it is written by its own
-  # two kinds and read by a plan with producer=history
+  # two kinds and read by the history-only plan
   # (cli-protocol.md "Requests and Responses" / "history profile").
   local -i hist_wire=1
   local -i snap_gen=0 ev=0
@@ -778,17 +778,17 @@ reserialize_plan() {  # -> REPLY=bytes, or return 1 with REPLY=reason
   (( $#sf == 4 )) || hist_wire=0
   [[ $sf[1] == history-snapshot && $sf[3] == $snap_gen && $sf[4] == $'b\1\0w\1ls\2n\17\0' ]] || hist_wire=0
   [[ ${_zrush_worker_pending[$sf[2]]} == "history-snapshot $snap_gen" ]] || hist_wire=0
-  # The query behind it: producer=history, the whole buffer as the query,
-  # trailing-space false, the configured history_limit, and offset 0.
-  _zrush_request_plan $snap_gen history 'ls -l' false || hist_wire=0
+  # The query behind it: the whole buffer as the query, the configured
+  # history_limit, and offset 0. The history profile fixes the other fields.
+  _zrush_request_plan $snap_gen 'ls -l' 0 || hist_wire=0
   wire_fields "$_zrush_worker_txq[2]" && pf=( "${(@)reply}" ) || hist_wire=0
-  (( $#pf == 13 )) || hist_wire=0
-  [[ $pf[1] == plan && $pf[3] == $snap_gen && $pf[5] == history && $pf[6] == 'ls -l' \
-     && $pf[11] == false && $pf[12] == 1234 && $pf[13] == 0 ]] || hist_wire=0
-  [[ ${_zrush_worker_pending[$pf[2]]} == 'plan history' ]] || hist_wire=0
-  _zrush_request_plan $snap_gen history 'ls -l' false 3 || hist_wire=0
+  (( $#pf == 10 )) || hist_wire=0
+  [[ $pf[1] == plan && $pf[3] == $snap_gen && $pf[4] == 'ls -l' \
+     && $pf[9] == 1234 && $pf[10] == 0 ]] || hist_wire=0
+  [[ ${_zrush_worker_pending[$pf[2]]} == plan ]] || hist_wire=0
+  _zrush_request_plan $snap_gen 'ls -l' 3 || hist_wire=0
   wire_fields "$_zrush_worker_txq[3]" && pf=( "${(@)reply}" ) || hist_wire=0
-  (( $#pf == 13 && pf[13] == 3 )) || hist_wire=0
+  (( $#pf == 10 && pf[10] == 3 )) || hist_wire=0
   if (( hist_wire )); then
     ok "history wiring: a snapshot frame and the history plan that reads it back"
   else
@@ -866,7 +866,7 @@ reserialize_plan() {  # -> REPLY=bytes, or return 1 with REPLY=reason
   fi
 
   # unknown-generation on either write kind or on the history plan drops the
-  # index latch; other producers leave it alone
+  # index latch
   # (behavior.md "Worker Lifecycle").
   local -i unknown_wire=1
   local kind
@@ -875,7 +875,7 @@ reserialize_plan() {  # -> REPLY=bytes, or return 1 with REPLY=reason
     _zrush_worker_ready=1
     _zrush_hist_latch 50 5 5
     if [[ $kind == plan ]]; then
-      _zrush_worker_pending=( 900 'plan history' )
+      _zrush_worker_pending=( 900 plan )
     else
       _zrush_worker_pending=( 900 "$kind 50" )
     fi

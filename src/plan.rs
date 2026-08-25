@@ -879,8 +879,9 @@ mod tests {
 
     #[test]
     fn history_order_keeps_stdin_order_regardless_of_match_quality() {
-        // cli-protocol.md "producer = history": the payload is newest
-        // first. Approximate candidates are suppressed when literals exist,
+        // cli-protocol.md "Matching and Ranking Semantics": the history
+        // profile keeps the payload newest-first. Approximate candidates are
+        // suppressed when literals exist,
         // while the surviving literal candidates keep that payload order.
         let mut stdin = header(&[]);
         for w in ["fop", "echo xfoo", "far-out-object", "unrelated", "foo"] {
