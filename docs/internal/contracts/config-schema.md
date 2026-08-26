@@ -16,6 +16,7 @@
 
 - `min-input` と空バッファの抑止規則が効くのは入力に追従する自動表示のみで、
   明示操作である履歴メニュー(behavior.md)には適用しない。
+  バッファ装飾にも `min-input` は効かない(1 文字目から着色する。`[syntax]`)。
 - `delay-ms` の待ちは worker 側で起こる。
   zsh は抑止規則を通ったバッファ変化を直ちに入力通知として送り、その通知が運ぶ `delay-ms` の分だけ
   worker が新しい通知を待って、最新のものだけを採用する
@@ -24,6 +25,8 @@
   静穏期間中に届いた新しい通知は期間を張り直すため、打鍵が続く間は通知が採用されない。
   `delay-ms = 0` は通知を受理と同時に採用することを意味し、打鍵ごとに settle する
   (空語収集キャッシュがヒットしている間は収集を伴わず `plan-ready` が返る)。
+- `delay-ms` はバッファ装飾には効かない。
+  worker は通知の受理時に字句解析して直ちに結果を返す(`[syntax]`、behavior.md「Buffer Syntax Highlighting」)。
 
 ## [display.highlight]
 
@@ -74,6 +77,63 @@
   有界化する(behavior.md「History Menu」)。
   合成は `limit` で絞らないため、`limit` をいくつにしても同期経路が扱うバイト量はその固定上限を超えない。
 - 履歴候補の表示行数は `[display].max-lines` を共用する(履歴専用のキーは設けない)。
+
+## [syntax]
+
+コマンドラインバッファ自身のシンタックスハイライト。
+
+| キー | 型 | 既定値 | 制約 | 意味 |
+|---|---|---|---|---|
+| `enabled` | 真偽値 | `true` | — | バッファのシンタックスハイライトを行うか |
+
+- `enabled = false` は**解析ごと止める**。zsh は入力通知の `buffer` field を空で送る。
+  worker はこの設定を知らないが、空の入力には token が 1 個も無いため、
+  字句解析も filesystem 参照も起こらない。zsh はバッファ装飾のエントリを持たない
+  (cli-protocol.md「Input Notifications and Worker Events」)。
+- これは「`[syntax.highlight]` の全キーが空文字列」とは別概念である。
+  後者では解析は通常どおり走り、装飾だけが付かない。
+- `enabled = true` の間、`[display].min-input` による抑止は入力通知を止めない。
+  1 文字目から着色するためであり、一覧側の帰結は zsh が捨てる(behavior.md「Candidate Collection」)。
+  空バッファの抑止は `enabled` によらず通知を止める(装飾ゼロという結果を zsh だけで決められるため)。
+
+## [syntax.highlight]
+
+バッファの装飾。値は `[display.highlight]` と同じく zsh の highlight 指定文字列
+(`region_highlight` の spec)をそのまま zsh へ渡す。
+キーは字句解析器の分類(`../specs/syntax.md`「Token kinds」)の kebab-case であり、
+`syntax-highlight` event の `role` と 1 対 1 に対応する(cli-protocol.md)。
+
+| キー | 型 | 既定値 | 意味 |
+|---|---|---|---|
+| `command` | 文字列 | `"fg=green"` | `$PATH` 上またはパス指定で実在する外部コマンド |
+| `reserved` | 文字列 | `"fg=yellow"` | 予約語(`if`, `for`, `[[` など) |
+| `alias` | 文字列 | `"fg=green"` | エイリアス名 |
+| `function` | 文字列 | `"fg=green"` | 関数名 |
+| `builtin` | 文字列 | `"fg=green"` | ビルトイン名 |
+| `precommand` | 文字列 | `"fg=green,underline"` | `command` / `exec` / `nohup` / `sudo` |
+| `unknown` | 文字列 | `"fg=red,bold"` | 解決できなかったコマンド語 |
+| `assignment` | 文字列 | `""` | 前置代入(`NAME=value`) |
+| `option` | 文字列 | `""` | オプション語(`-a`, `--all`) |
+| `redirect` | 文字列 | `""` | リダイレクト演算子 |
+| `operator` | 文字列 | `""` | 制御演算子・区切り |
+| `comment` | 文字列 | `"fg=black,bold"` | `interactive_comments` 有効時のコメント |
+| `single-quote` | 文字列 | `"fg=yellow"` | `'...'` の範囲 |
+| `double-quote` | 文字列 | `"fg=yellow"` | `"..."` の範囲 |
+| `dollar-quote` | 文字列 | `"fg=cyan"` | `$'...'` の範囲 |
+| `escape` | 文字列 | `"fg=cyan"` | `\` とその直後の 1 バイト |
+| `substitution` | 文字列 | `""` | `$(...)` / `${...}` の範囲 |
+| `path` | 文字列 | `"underline"` | 実在する literal path の語 |
+
+- 検証は `[display.highlight]` と同じく「文字列であること」まで。spec の解釈は zle に委ねる。
+- **空文字列は「装飾なし」**(region_highlight エントリを追加しない)。
+- 字句解析器が `Word` に分類する語(通常の引数)はキーを持たず、常に無装飾である。
+  キーの粒度は字句解析器の分類が区別するものに限り、
+  それを超える細分化(文字列を single / double で分ける以上の分割など)はしない。
+- 意味分類のキー(`command`〜`option`)と装飾範囲のキー(`single-quote`〜`path`)は
+  同じ範囲に重なり得る。重なりは event の並び順で解決し、**後のエントリが勝つ**
+  (cli-protocol.md「`syntax-highlight` body (Buffer Highlight Stream)」)。
+  実際の並びは「意味分類 → 装飾範囲 → `path`」であるため、
+  たとえば実在するクォート済みパスは `path` の装飾になる。
 
 ## [keybind]
 

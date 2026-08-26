@@ -32,6 +32,29 @@ trailing-space = true # 確定時に末尾スペースを付与
 [history]
 limit = 5000          # 履歴メニューが遡る履歴の最大件数(1〜20000)
 
+[syntax]
+enabled = true        # 入力行のシンタックスハイライト
+
+[syntax.highlight]    # zsh の highlight 指定文字列。"" で装飾なし
+command      = "fg=green"           # 実在する外部コマンド
+reserved     = "fg=yellow"          # 予約語(if / for / [[ など)
+alias        = "fg=green"           # エイリアス
+function     = "fg=green"           # 関数
+builtin      = "fg=green"           # ビルトイン
+precommand   = "fg=green,underline" # command / exec / nohup / sudo
+unknown      = "fg=red,bold"        # 見つからないコマンド
+assignment   = ""                   # VAR=value
+option       = ""                   # -a / --all
+redirect     = ""                   # > / >> / < など
+operator     = ""                   # ; / && / || / | など
+comment      = "fg=black,bold"      # # から行末(interactive_comments 有効時)
+single-quote = "fg=yellow"          # '...'
+double-quote = "fg=yellow"          # "..."
+dollar-quote = "fg=cyan"            # $'...'
+escape       = "fg=cyan"            # \ とその次の 1 文字
+substitution = ""                   # $(...) / ${...}
+path         = "underline"          # 実在するパス
+
 [keybind]
 select-next  = ["down", "ctrl-n"]
 select-prev  = ["up", "ctrl-p"]
@@ -56,6 +79,31 @@ dismiss      = ["ctrl-g"]
 上限に達した場合は新しい方から入るところまでが対象になり、それより古い履歴は `limit` を上げても出てこない。
 1 行が極端に長い履歴や、同じコマンドの繰り返しが多い履歴ほど、この上限に早く届く。
 通常の履歴なら既定の 5000 件ぶんは上限に届かず、そのまま全件が対象になる。
+
+## 入力行のシンタックスハイライト(`[syntax]`)
+
+入力中のコマンドラインを、コマンド・予約語・クォート・パスなどの種別で色分けする。
+既定で有効で、1 文字目から色が付く。実在しないコマンドは `unknown`(既定で赤太字)になるため、
+Enter を押す前に打ち間違いに気づける。
+
+色は `[syntax.highlight]` に zsh の highlight 指定文字列(`fg=green`、`underline`、
+`fg=red,bold` など)をそのまま書く。`""` にした種別は装飾なしになる。
+通常の引数は色分けの対象外で、常に装飾なし。
+
+```toml
+[syntax.highlight]
+unknown = "fg=magenta"  # 見つからないコマンドの色を変える
+path    = ""            # パスの下線をやめる
+```
+
+種別が重なった範囲(たとえば実在するパスをクォートで囲んだ語)は、後から決まる方が勝つ。
+順番は「コマンドなどの意味 → クォートやエスケープ → パス」なので、上の例では `path` の装飾になる。
+
+機能ごと止めたい場合は `[syntax] enabled = false`。
+このとき zrush は解析そのものを行わない(全種別を `""` にした場合は解析は走り、色が付かないだけ)。
+
+外部のシンタックスハイライトプラグインとの併用はサポートしない。
+同じ場所を二重に装飾することになるため、どちらか一方だけを使うこと。
 
 ## Tab の挙動(`[insert].tab`)
 

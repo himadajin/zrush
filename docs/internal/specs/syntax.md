@@ -26,6 +26,16 @@ lexer が返す種別は次のとおり。
 意味分類 token (`Command` から `Unknown`、`Word`、`Assignment`、`Option`) と構文範囲 token
 (`SingleQuote` から `Path`) は同じ span に重なってよい。
 
+## Token order
+
+返す token 列の順序は規範である。
+
+- token 群は word と構造要素(制御演算子・redirect・`Comment`)の出現順に並ぶ。
+- 1 つの word が生む token はその word の位置でまとまり、内部は
+  意味分類 → 装飾範囲(word 内の出現順)→ `Path` の順に並ぶ。
+- この順序がそのまま装飾の重なりの解決順になる(後の token が勝つ)。
+  解決の規範は `../contracts/cli-protocol.md`。
+
 ## Lexical boundaries
 
 - 空白、改行、制御演算子、redirect は word を終了する。
@@ -87,3 +97,14 @@ lexer は `LexContext` を引数に取る。context は `NamespaceSnapshot`、`c
 まとめて置き換える。path resolver は snapshot に含まれず、その cache lifetime も namespace 更新から独立する。
 字句境界と意味分類は resolver の filesystem 状態から独立して unit-test できる。
 resolver だけが filesystem を参照し、cache の lifetime も resolver 内に閉じる。
+
+## Delivery
+
+- 解析の契機は worker が `input` 通知を受理した時点であり、静穏期間の満了を待たない。
+- per-call context は同じ通知の field が供給する: 解析対象の buffer、`cwd`、`interactive_comments`。
+  `NamespaceSnapshot` だけが session state であり、`namespace-snapshot` 要求で置き換わる。
+  snapshot を 1 度も受理していない worker は解析結果を配送しない。
+- 結果は文字オフセットと role の列として `syntax-highlight` worker event で zsh へ渡す。
+  role は各 token 種別の kebab-case であり、`Word` は既定で無装飾のため role を持たず配送されない。
+- ワイヤ形式・role 名・適用規則は `../contracts/cli-protocol.md`、
+  role ごとの装飾スペックは `../contracts/config-schema.md` が定める。
