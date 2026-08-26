@@ -147,6 +147,9 @@ typeset -gi _zrush_worker_callback_seq=${_zrush_worker_callback_seq:-0}
 typeset -gA _zrush_worker_callback_generation=( data 0 ack 0 drain 0 )
 typeset -gA _zrush_worker_callback_handler=()
 typeset -gA _zrush_worker_pending=()
+typeset -g  _zrush_namespace_payload= _zrush_namespace_queued= _zrush_namespace_acked=
+typeset -gA _zrush_namespace_pending=()
+typeset -gi _zrush_namespace_latest_id=0
 typeset -gi _zrush_sync_target=0 _zrush_sync_done=0 _zrush_sync_ok=0
 # Lifecycle stops may block briefly, but each operation uses one 100ms
 # absolute budget, matching the existing synchronous history exchange.
@@ -475,6 +478,7 @@ _zrush_precmd() {
   # Ahead of the config block, whose reload branches return early: the index
   # must not skip a prompt (behavior.md "History Menu" 更新経路).
   _zrush_hist_reconcile
+  _zrush_namespace_refresh
   _zrush_config_mtime
   if [[ $REPLY != $_zrush_cfg_mtime ]]; then
     _zlog "precmd: config mtime changed ($_zrush_cfg_mtime -> $REPLY); reloading"
@@ -1094,6 +1098,88 @@ _zrush_encode_message() {
   _zrush_netstring "$payload"
 }
 
+_zrush_namespace_name_stream() {  # names... -> REPLY
+  emulate -L zsh
+  local LC_ALL=C name stream=
+  for name in "$@"; do
+    _zrush_netstring "$name"
+    stream+=$REPLY
+  done
+  typeset -g REPLY=$stream
+}
+
+_zrush_namespace_collect() {  # -> REPLY
+  emulate -L zsh
+  setopt localoptions typesetsilent
+  local LC_ALL=C name payload= stream
+  local -a alias_names=( ${(ok)aliases} )
+  local -a function_names=() builtin_names=( ${(ok)builtins} )
+  local -a reserved_names=( ${(ok)reswords} )
+  for name in ${(ok)functions}; do
+    [[ $name == _zrush* ]] || function_names+=( "$name" )
+  done
+  _zrush_namespace_name_stream "${(@)alias_names}"; stream=$REPLY
+  _zrush_netstring "$stream"; payload+=$REPLY
+  _zrush_namespace_name_stream "${(@)function_names}"; stream=$REPLY
+  _zrush_netstring "$stream"; payload+=$REPLY
+  _zrush_namespace_name_stream "${(@)builtin_names}"; stream=$REPLY
+  _zrush_netstring "$stream"; payload+=$REPLY
+  _zrush_namespace_name_stream "${(@)reserved_names}"; stream=$REPLY
+  _zrush_netstring "$stream"; payload+=$REPLY
+  _zrush_netstring "${PATH-}"; payload+=$REPLY
+  typeset -g REPLY=$payload
+}
+
+_zrush_namespace_latch_drop() {
+  _zrush_namespace_queued= _zrush_namespace_acked=
+  _zrush_namespace_pending=()
+  _zrush_namespace_latest_id=0
+}
+
+_zrush_request_namespace() {  # canonical-payload
+  emulate -L zsh
+  setopt localoptions typesetsilent no_monitor no_notify
+  local payload=$1
+  (( _zrush_worker_rfd >= 0 && !_zrush_worker_stopping &&
+     !_zrush_worker_runtime_tainted )) || return 1
+  [[ $payload != "$_zrush_namespace_queued" ]] || return 0
+  _zrush_next_request_id || return 1
+  local -i id=$REPLY
+  _zrush_worker_pending[$id]=namespace-snapshot
+  _zrush_namespace_pending[$id]=$payload
+  _zrush_namespace_queued=$payload
+  _zrush_namespace_latest_id=$id
+  _zrush_encode_message namespace-snapshot "$id" "$payload"
+  _zrush_worker_txq+=( "$REPLY" )
+  _zlog "worker: queued namespace-snapshot request_id=$id bytes=${#REPLY} queued=$#_zrush_worker_txq"
+  _zrush_worker_flush || return 1
+  return 0
+}
+
+_zrush_namespace_refresh() {
+  emulate -L zsh
+  _zrush_namespace_collect
+  _zrush_namespace_payload=$REPLY
+  (( _zrush_worker_rfd >= 0 && !_zrush_worker_stopping &&
+     !_zrush_worker_runtime_tainted )) || return 0
+  _zrush_request_namespace "$_zrush_namespace_payload"
+}
+
+_zrush_namespace_settle() {  # request-id ok|error
+  emulate -L zsh
+  local id=$1 result=$2 identity=${_zrush_namespace_pending[$1]-}
+  unset "_zrush_namespace_pending[$id]"
+  (( id == _zrush_namespace_latest_id )) || return 0
+  [[ $identity == "$_zrush_namespace_queued" ]] || return 0
+  if [[ $result == ok ]]; then
+    _zrush_namespace_acked=$identity
+  else
+    _zrush_namespace_queued= _zrush_namespace_acked=
+    _zrush_namespace_latest_id=0
+  fi
+  return 0
+}
+
 _zrush_worker_warn_once() {
   (( _zrush_worker_warned )) && return 0
   _zrush_worker_warned=1
@@ -1294,6 +1380,7 @@ _zrush_worker_begin_stop() {
   # (behavior.md "Worker Lifecycle": one invalidation set for both latches).
   _zrush_cc_latch_drop
   _zrush_hist_invalidate session-stop
+  _zrush_namespace_latch_drop
   # The worker's current input dies with the session too, so the generation it
   # would have answered is invalidated here and never replayed.
   _zrush_input_invalidate
@@ -1316,6 +1403,7 @@ _zrush_worker_finalize() {
   _zrush_worker_txq=()
   _zrush_worker_pending=()
   _zrush_cc_staged=()
+  _zrush_namespace_latch_drop
   _zrush_sync_target=0 _zrush_sync_done=0 _zrush_sync_ok=0
   _zrush_worker_stopping=0
   _zlog "worker: transport stopped"
@@ -1468,6 +1556,7 @@ _zrush_worker_start() {
   # A new session starts with empty slots and an uninitialized index.
   _zrush_cc_latch_drop
   _zrush_hist_invalidate session-start
+  _zrush_namespace_latch_drop
   _zrush_worker_runtime_valid || {
     _zrush_worker_session_fail "worker runtime unavailable"
     return 1
@@ -1546,6 +1635,9 @@ _zrush_worker_start() {
   _zrush_worker_rx=
   _zrush_encode_message hello "$_ZRUSH_EXPECTED_BUILD_STAMP"
   _zrush_worker_txq=( "$REPLY" )
+  _zrush_namespace_collect
+  _zrush_namespace_payload=$REPLY
+  _zrush_request_namespace "$_zrush_namespace_payload" || return 1
   _zrush_kick
   _zlog "worker: started rfd=$_zrush_worker_rfd wfd=$_zrush_worker_wfd controlfd=$_zrush_worker_control_wfd"
   _zrush_worker_flush
@@ -1677,8 +1769,8 @@ _zrush_worker_handle_message() {  # message [absolute-deadline]
     return 1
   }
   # "store <slot> <generation> <input_generation>" for a store,
-  # "<kind> <generation>" for the two history writes, and "plan" for the
-  # history-menu query.
+  # "<kind> <generation>" for the two history writes, and the kind alone for
+  # namespace synchronization or the history-menu query.
   local -a req=( ${=_zrush_worker_pending[$id]} )
   local reqkind=$req[1] slot=
   local -i stored_gen=0 bound_gen=0
@@ -1699,6 +1791,11 @@ _zrush_worker_handle_message() {  # message [absolute-deadline]
       _zrush_worker_session_fail "invalid error code"
       return 1
     }
+    if [[ $reqkind == namespace-snapshot &&
+          $code != invalid-request && $code != invalid-payload ]]; then
+      _zrush_worker_session_fail "invalid namespace-snapshot error code"
+      return 1
+    fi
     if (( id == _zrush_sync_target )) && _zrush_worker_deadline_expired "$deadline"; then
       _zrush_worker_session_fail "history deadline exceeded request_id=$id"
       return 1
@@ -1708,8 +1805,12 @@ _zrush_worker_handle_message() {  # message [absolute-deadline]
     # becomes a latch -- `superseded` included (cli-protocol.md
     # "Response Validation and zsh-Side Application (Normative)": only an `ok` moves the latch).
     unset "_zrush_cc_staged[$id]"
-    _zrush_worker_failures=0
-    _zrush_status_set ""
+    if [[ $reqkind == namespace-snapshot ]]; then
+      _zrush_namespace_settle $id error
+    else
+      _zrush_worker_failures=0
+      _zrush_status_set ""
+    fi
     # cli-protocol.md "Response Validation and zsh-Side Application (Normative)": unknown-generation is an
     # ordinary terminal error, and nothing is replayed. The index refused a
     # write, or answered for a generation it does not hold: the latch was
@@ -1734,7 +1835,7 @@ _zrush_worker_handle_message() {  # message [absolute-deadline]
     return 0
   fi
 
-  if [[ $reqkind == store || $reqkind == history-* ]]; then
+  if [[ $reqkind == namespace-snapshot || $reqkind == store || $reqkind == history-* ]]; then
     # cli-protocol.md "Requests and Responses": a successful store or history write answers
     # with an empty body.
     [[ -z $f[3] ]] || {
@@ -1742,8 +1843,12 @@ _zrush_worker_handle_message() {  # message [absolute-deadline]
       return 1
     }
     unset "_zrush_worker_pending[$id]"
-    _zrush_worker_failures=0
-    _zrush_status_set ""
+    if [[ $reqkind == namespace-snapshot ]]; then
+      _zrush_namespace_settle $id ok
+    else
+      _zrush_worker_failures=0
+      _zrush_status_set ""
+    fi
     # The worker now holds this generation, so the entry staged for it becomes
     # the latch (behavior.md "Empty-Word Collection Cache"). The history index latch is
     # not staged: it already moved optimistically when the frame was enqueued.
@@ -2020,7 +2125,8 @@ _zrush_worker_ensure_session() {
   (( _zrush_worker_rfd >= 0 )) && return 0
   local -i failures_before=$_zrush_worker_failures
   if ! _zrush_worker_start; then
-    (( _zrush_worker_failures != failures_before )) || _zrush_worker_session_fail "startup failed"
+    (( _zrush_disabled || _zrush_worker_failures != failures_before )) ||
+      _zrush_worker_session_fail "startup failed"
     return 1
   fi
   return 0
@@ -2036,13 +2142,13 @@ _zrush_request_store() {  # slot payload input-generation -> REPLY = candidate g
   local slot=$1 payload=$2
   local -i input_gen=$3
   (( !_zrush_worker_stopping && !_zrush_worker_runtime_tainted )) || return 1
+  _zrush_worker_ensure_session || return 1
   _zrush_next_request_id || return 1
   local -i id=$REPLY
   _zrush_next_cand_gen || return 1
   local -i gen=$REPLY
   _zrush_worker_pending[$id]="store $slot $gen $input_gen"
   [[ $slot == cache ]] && _zrush_cc_stage $id
-  _zrush_worker_ensure_session || return 1
   _zrush_encode_message store "$id" "$slot" "$gen" "$input_gen" "$payload"
   _zrush_worker_txq+=( "$REPLY" )
   _zlog "worker: queued store request_id=$id slot=$slot generation=$gen input_generation=$input_gen bytes=${#REPLY} queued=$#_zrush_worker_txq"
@@ -2094,6 +2200,7 @@ _zrush_request_plan() {  # candidate-generation query [offset]
   local query=$2
   local -i offset=${3:-0}
   (( !_zrush_worker_stopping && !_zrush_worker_runtime_tainted )) || return 1
+  _zrush_worker_ensure_session || return 1
 
   _zrush_geometry
   local -i rows=$REPLY_ROWS width=$REPLY_WIDTH
@@ -2101,7 +2208,6 @@ _zrush_request_plan() {  # candidate-generation query [offset]
   _zrush_next_request_id || return 1
   local -i id=$REPLY
   _zrush_worker_pending[$id]=plan
-  _zrush_worker_ensure_session || return 1
   # `plan` is the history-menu request; its profile, cwd, and trailing-space
   # policy are fixed by that path and do not appear on the wire.
   _zrush_encode_message plan "$id" "$gen" "$query" \
@@ -3137,6 +3243,9 @@ _zrush_init() {
     _zrush_notice="zrush: worker disabled (runtime setup failed); start a new shell"
     return 1
   }
+
+  _zrush_namespace_collect
+  _zrush_namespace_payload=$REPLY
 
   # Detect compinit via _main_complete, including setups delegated to zsh-autocomplete.
   if (( ! $+functions[_main_complete] )); then

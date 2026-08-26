@@ -2,7 +2,8 @@
 
 コマンドラインバッファの字句分類の規範。
 この文書は lexer の純粋な分類と、環境を参照する名前・path の解決を分ける。
-wire、zsh、描画への接続は別の契約で定める。
+snapshot の供給と session lifetime は `../contracts/cli-protocol.md` と `behavior.md`、
+buffer 入力と描画への接続はそれぞれの契約で定める。
 
 ## Input and offsets
 
@@ -56,6 +57,9 @@ command position での優先順位は次のとおり。
 reserved word の初期集合は `if`, `then`, `else`, `elif`, `fi`, `for`, `while`, `until`, `do`,
 `done`, `case`, `esac`, `select`, `coproc`, `function`, `repeat`, `time`, `in`, `!`, `[[`, `]]` とする。
 snapshot は alias／function／builtin／reserved の名前集合と `$PATH` の raw 値を供給する。
+名前集合の要素と `$PATH` は byte 列のまま保持し、UTF-8 へ変換しない。
+`$commands` や PATH directory の列挙結果・mtime は snapshot に含めず、filesystem 由来の情報は resolver が取得する。
+`PWD`、`cwd`、`interactive_comments` も snapshot の一部ではなく、必要な呼び出しごとの context として分離する。
 
 `NAME=` または `NAME=value` の unquoted name prefix を持ち、command position にある word は
 `Assignment` とする。assignment の後ろでは command position を維持する。
@@ -79,5 +83,7 @@ command position 以外で unquoted `-` から始まる二文字以上の word �
 
 lexer は `LexContext` を引数に取る。context は `NamespaceSnapshot`、`cwd`、
 `interactive_comments`、path resolver を含む。
+`NamespaceSnapshot` は worker session state として完全な値を 1 個保持し、更新時は名前集合と raw `$PATH` を
+まとめて置き換える。path resolver は snapshot に含まれず、その cache lifetime も namespace 更新から独立する。
 字句境界と意味分類は resolver の filesystem 状態から独立して unit-test できる。
 resolver だけが filesystem を参照し、cache の lifetime も resolver 内に閉じる。

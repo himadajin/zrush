@@ -190,12 +190,18 @@ fn worker(fake: &Fake, control_fd: i32) {
         // whichever key correlates this kind -- request_id for a request, and
         // input_generation for a notification.
         let notification = matches!(head, Some(b"input" | b"flush"));
-        // The request kinds fold onto "a request carrying a payload" and "a
-        // request asking for a plan" so a state line always splits into four
-        // fields (`tests/driver/fake.rs`). The history writes join the `store`
-        // class: like it they answer with an empty body, and the modes below
-        // decide only what the `plan` behind them gets back.
+        // Namespace synchronization is its own request kind. It is an
+        // internal bootstrap/update operation, so the failure modes below
+        // must never consume it: a death/hold is meant to target the first
+        // user operation after the snapshot has been accepted.
+        //
+        // The remaining request kinds fold onto "a request carrying a
+        // payload" and "a request asking for a plan" so a state line always
+        // splits into four fields (`tests/driver/fake.rs`). The history writes
+        // join the `store` class: like it they answer with an empty body, and
+        // the modes below decide only what the `plan` behind them gets back.
         let kind = match head {
+            Some(b"namespace-snapshot") => "namespace-snapshot",
             Some(b"store" | b"history-snapshot" | b"history-append") => "store",
             Some(b"plan") => "plan",
             Some(b"input") => "input",
@@ -207,6 +213,18 @@ fn worker(fake: &Fake, control_fd: i32) {
             "{} {session} {kind} {key}",
             if notification { "notify" } else { "request" }
         ));
+
+        if kind == "namespace-snapshot" {
+            // The fake does not need to inspect the nested payload: the real
+            // worker owns its validation tests. For driver lifecycle tests,
+            // this request is only the session bootstrap and always succeeds
+            // with the contract's empty body. In particular, do this before
+            // reading the selected mode so `hold`, `die`, and request-error
+            // injections remain aimed at the user's operation.
+            write_message(&[b"ok", key.as_bytes(), b""]);
+            fake.note(&format!("namespace {session} {key}"));
+            continue;
+        }
 
         let mut action = fake.mode();
         if action == "hold" {

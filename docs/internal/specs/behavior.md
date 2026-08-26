@@ -6,9 +6,9 @@ zrush の挙動の規範。
 観測可能な挙動を定義する。設定キー名は config-schema.md の表記に従う。
 
 責務境界: Rust(`zrush` バイナリ)がマッチング・ランキング・レコード解析・
-バッファの字句分類・コマンド解決・グループ分割・グリッドレイアウト・
+バッファの字句分類・コマンド解決・名前空間 snapshot の保持・グループ分割・グリッドレイアウト・
 ハイライト計算・ナビゲーション表構築・挿入テキスト構築・config 解釈を担う。
-zsh は zle 統合・compsys 呼び出しによる捕獲・プランの適用
+zsh は zle 統合・compsys 呼び出しによる捕獲・zsh 名前空間 snapshot の採取と供給・プランの適用
 (POSTDISPLAY/region_highlight への描画、BUFFER 編集、bindkey)を担う。
 「zsh の意味論は zsh が計算し、データとして渡す」
 (`${(Q)}` 復元・`${(q)}` クォート・`~` 展開・terminfo 解決は zsh 側)。
@@ -61,7 +61,8 @@ zsh は zle 統合・compsys 呼び出しによる捕獲・プランの適用
   まで保持し、response EOF まで上記の rollback quarantine を続ける。readiness cleanup を保証できない場合は
   fail-closed のまま direct な明示 cleanup または shell exit に委ねてよい。EOF finalization 後も taint は残り、
   同じ source generation で worker を交換しない。
-- worker は最初の実メッセージ(要求または入力通知)で遅延起動し、対話シェルごとに高々 1 個とする。
+- worker は namespace 同期以外の最初の実メッセージ(要求または入力通知)が必要になったときに遅延起動し、
+  対話シェルごとに高々 1 個とする。namespace の初回供給や `precmd` 更新だけを理由に起動しない。
   stdin/stdout は request/response FIFO に接続し、abort-control FIFO の read fd を
   `zrush worker --control-fd N` で渡す(詳細は `../contracts/cli-protocol.md`)。
   worker と短命な writer child は対話シェルの job table に登録せず、zsh は両者の numeric PID を
@@ -76,7 +77,7 @@ zsh は zle 統合・compsys 呼び出しによる捕獲・プランの適用
 - request/response・入力通知・worker event の nested-netstring と `hello` / `ready` は
   `../contracts/cli-protocol.md` が定める。通常の補完経路は cold start・握手・event を同期的に待たず、
   response fd の `zle -F` callback で進める。同期的に起動と応答を待てるのは履歴メニューだけで、
-  その 1 本の絶対 100ms deadline に起動・握手・先行 request・
+  その 1 本の絶対 100ms deadline に起動・握手・bootstrap の namespace request とその応答・先行 request・
   `history-snapshot` と `plan` の連送(index が同期済みなら `plan` だけ)・
   `plan` の終端応答をすべて含める。
 - worker stdin への送信単位は完成済み frame 1 個で、outbound queue に send offset を持たない。
@@ -96,7 +97,9 @@ zsh は zle 統合・compsys 呼び出しによる捕獲・プランの適用
   再利用しない。cleanup 後も同じ source generation では worker を再開せず、新しい source generation の同期 runtime
   setup が成功した後だけ transport を再び有効化する。notification watcher 登録に失敗した場合は direct な明示
   cleanup まで fail-closed でよい。
-- 要求の frame は coalesce・置換・除去せず request_id 順に直列送信する。送信時に stale でも worker の
+- 要求の frame は coalesce・置換・除去せず request_id 順に直列送信する。cold path は worker session の
+  bootstrap を先に行い、その中で namespace request の `request_id` を採番してから、起動契機となった要求の
+  `request_id` を採番する。したがって wire 上の要求順と `request_id` 順は一致する。送信時に stale でも worker の
   終端応答まで読み、UI 適用だけを捨てる。backpressure を受けるのは writer の `syswrite` だけで、
   ZLE callback は ack を同期的に待たず busy loop もしない。
 - queue 内で置換・除去してよいのは、まだ writer child へ委譲していない `input` / `flush` frame だけである。
@@ -185,8 +188,10 @@ zsh は zle 統合・compsys 呼び出しによる捕獲・プランの適用
   **worker session failure** であり、異常 abort を開始する。その session の未完了 request は
   queue/送信中/送信済みを区別せず破棄して replay しない。
   現在の `input_generation` も無効化し、入力通知を replay しない。
-- 連続 worker session failure 回数は、正常に形成された終端 `ok` / `error` または
+- 連続 worker session failure 回数は、namespace request を除く正常に形成された終端 `ok` / `error` または
   正常に形成された worker event を受けたときだけ 0 に戻す。
+  自動的な namespace bootstrap/update の終端応答は user operation の成功ではないため、`ok` / `error` の
+  どちらでも failure counter と warning latch を戻さない。
   握手成功だけでは戻さない。1 回目の失敗を finalization した後は worker 不在のままとし、次の実メッセージで
   代替 worker を 1 個だけ遅延起動する。終端応答も event も無いままの 2 回目でその shell の zrush を無効化し、
   無限 respawn や one-shot fallback は行わない。ただし taint された runtime generation はこの通常の 1 回交換の
@@ -228,6 +233,41 @@ zsh は zle 統合・compsys 呼び出しによる捕獲・プランの適用
 - worker の起動・正常 shutdown・異常 abort・交換・quarantine・re-source・disable・exit の全経路で、
   internal fd 操作は対話シェル自身の fd 0 / 1 / 2 の open/closed 状態と接続先を変えない。
   internal close error の抑止を shell stderr へ恒久適用しない。
+
+## Namespace Snapshot Synchronization
+
+worker が buffer syntax を分類するときに使う zsh 名前空間は、完全な snapshot として zsh から供給する。
+wire の byte-exact な形と receiver の置換規則は
+`../contracts/cli-protocol.md`「Requests and Responses」節が定める。
+
+- snapshot は regular alias、`_zrush` 接頭辞を持たない function、enabled builtin、reserved word の名前集合と、
+  raw `$PATH` だけからなる。`$commands`、PATH directory の mtime、`PWD`、`cwd`、
+  `interactive_comments` は含めない。PATH directory の解決と cache は Rust の path resolver が担い、
+  namespace session state には混ぜない。
+- zsh は source 時の初期化と各 `precmd` で最新の snapshot payload を採取する。
+  名前集合は `LC_ALL=C` の byte 順で整列し重複を除く。
+  canonical payload 全体の byte 列をそのまま content identity とし、同一 payload は同一内容、
+  1 byte でも異なる payload は異なる内容として扱う。したがって alias や function の個数が同じまま
+  名前だけが置き換わった場合も、次の `precmd` で変化として検知する。
+- worker が不在なら `precmd` は更新要求を作らず、起動せず、後のための frame も queue しない。
+  active session では、採取した identity がその session へ最後に queue した identity と異なる場合だけ
+  `namespace-snapshot` 要求を queue する。最新要求の終端応答を待つ間も同じ identity を重複送信しない。
+- namespace の初回供給は shell 起動時ではなく worker session ごとに行う。
+  新 session を起動するときは、その時点の最新 payload から要求を作り、
+  `hello` → `namespace-snapshot` → 起動契機となった入力通知または要求、の順で queue する。
+  namespace の終端応答は待たずに後続を pipeline してよい。worker が要求を受信順に処理するため、
+  後続は snapshot の置換後に処理される。
+- zsh は session ごとに、最後に queue した namespace identity と、その要求の終端状態を latch として持つ。
+  最新 identity の `ok` だけがその供給を確認済みにする。最新 identity の `error` は latch を無効化し、
+  次の `precmd` で同じ内容でも再試行できるようにする。より新しい更新を既に queue した後で届いた古い応答は、
+  未完了要求の終端としてだけ処理し、最新 identity の latch を変更しない。
+- namespace snapshot と latch は worker session に属する。worker の起動・正常 shutdown・異常 abort・
+  session failure・交換・re-source では latch を無効化し、次 session へ同じ内容でも必ず再供給する。
+  前 session の request や snapshot を replay または継承しない。
+- namespace の `ok` / `error` は通常の終端応答として未完了要求表から取り除くが、
+  worker session failure の連続回数と warning latch を戻さない。
+  この例外により、bootstrap だけ成功して最初の user operation で毎回失敗する worker も、
+  「Worker Lifecycle」の circuit breaker の対象になる。
 
 ## Candidate Collection
 
@@ -504,13 +544,14 @@ zsh は zle 統合・compsys 呼び出しによる捕獲・プランの適用
   最も新しい候補レコード 1 件だけで上限を超える場合は index が 0 件になり、後述の「Zero Matches」に従う。
 - 同期区間の開始(cold なら snapshot の合成が完了した直後)から、`plan` 要求の完全な終端応答を
   受け取るまでを **1 本の絶対 100ms deadline**で制限する。worker が未起動なら、その起動・
-  `hello` / `ready` 握手・要求の送信・先行要求の終端応答の消費・完全な `plan` 応答の受信を
+  `hello` / `ready` 握手・bootstrap の `namespace-snapshot` の送信と終端応答の消費・
+  要求の送信・その他の先行要求の終端応答の消費・完全な `plan` 応答の受信を
   すべて同じ 100ms に含める。cold でも deadline を 2 本に分けたり延長したりしない。
   deadline は固定方針であり設定項目にしない。
   環境変数 `ZRUSH_HISTORY_DEADLINE_MS`(ミリ秒、未設定時は 100)で deadline を上書きできるが、これは `zsh/zrush.zsh` の `ZRUSH_BIN` と `ZRUSH_NO_INIT` に倣ったテストドライバ専用の seam である。
   payload 合成と同期判定に費やす時間はこの deadline に含めない。
 - `plan` 要求の完全な終端応答を受信した時点で同期待ちは終了する
-  (先行する `history-snapshot` の終端応答はその途中で消費する)。
+  (先行する `namespace-snapshot` と `history-snapshot` の終端応答はその途中で消費する)。
   受信済みで未処理の後続応答は同期待ちの中では処理せず、非同期経路が引き取る。
 - 同期待ちの間に先行する非同期要求の応答を受けた場合も通常どおり終端まで読み、stale なら破棄して
   `plan` 要求の request_id を待ち続ける。

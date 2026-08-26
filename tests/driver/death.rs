@@ -91,8 +91,9 @@ fn active_session_deaths_open_the_breaker_and_a_re_source_recovers() {
             ),
         "(err-1a) active-death state missing: state={after_death} starts={restarts}"
     );
-    // The first message of a collection is the `input` notification the
-    // keystroke makes, so that is what this session died on
+    // The namespace bootstrap is acknowledged before the first user
+    // operation. The fake therefore dies on the collection's `input`
+    // notification, not on the bootstrap request
     // (cli-protocol.md "Input Notifications and Worker Events").
     let dead_generation = host
         .fake()
@@ -118,10 +119,10 @@ fn active_session_deaths_open_the_breaker_and_a_re_source_recovers() {
         .is_ok();
 
     // ---- the lazy replacement, held after ready and assignment ----
-    // The fake parks on the first message it reads, which is the `input`
-    // notification the keystroke makes: it answers with no event, so nothing is
-    // ever collected and no request goes out behind it
-    // (cli-protocol.md "Input Notifications and Worker Events").
+    // The namespace bootstrap is acknowledged before the user operation. The
+    // fake then parks on the collection's `input` notification: it answers
+    // with no event, so nothing is ever collected and no request goes out
+    // behind it (cli-protocol.md "Input Notifications and Worker Events").
     host.fake().set_mode(Mode::Hold);
     let held0 = host.fake().count(&format!("hold {second} "));
     host.send_keys("ls fx/basic/");

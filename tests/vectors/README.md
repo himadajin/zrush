@@ -89,8 +89,8 @@ A generated `expected` is a proposal, not an answer -- read it against cli-proto
 
 ## `message/`
 
-`message/` fixes whole outer messages of the session that carry no candidate stream and no render plan of their own: the input notifications zsh sends, the events the worker sends back, and the terminal response that tells zsh a capture arrived too late.
-Each `frame` is one complete outer message, byte for byte as cli-protocol.md "Input Notifications and Worker Events" spells it, so the six examples in that section and this corpus are one set of bytes.
+`message/` fixes whole outer messages of the session that carry no candidate stream and no render plan of their own: namespace requests, input notifications zsh sends, events the worker sends back, and the terminal response that tells zsh a capture arrived too late.
+Each `frame` is one complete outer message, byte for byte as cli-protocol.md spells it, so the protocol examples and this corpus are one set of bytes.
 
 | vector | message it fixes |
 |---|---|
@@ -100,6 +100,7 @@ Each `frame` is one complete outer message, byte for byte as cli-protocol.md "In
 | `error-superseded` | the `superseded` that store receives when the input is already gone |
 | `plan-ready-zero-match` | a `plan-ready` carrying the four-field zero-match plan |
 | `flush` | the `flush` that settles an input immediately |
+| `namespace-snapshot` | a request carrying the four canonical name-set streams and raw `$PATH` |
 
 `zsh -f tests/zsh/vectors.zsh` drives these in both directions: it makes the sender produce the notification, flush and store frames byte for byte, and feeds the event and error frames to the receiver to fix what each one does -- including that an event whose `input_generation` is not the current one is dropped before its body is looked at.
 The Rust runner reads no vector here; it only holds every `frame` to the canonical spelling above.
