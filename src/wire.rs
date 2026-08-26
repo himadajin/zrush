@@ -1,9 +1,12 @@
-//! Render-plan wire serialization and reference parsing.
+//! Render-plan and buffer-highlight wire serialization, and reference parsing
+//! of the render plan.
 
 use std::fmt;
 use std::io::Write as _;
 
 use crate::layout;
+use crate::span::CharSpan;
+use crate::syntax::{Token, TokenKind};
 
 /// Per-build identity shared by init output, config output, and the worker
 /// handshake (cli-protocol.md "Build Stamp").
@@ -180,6 +183,51 @@ pub(crate) fn serialize(
 fn push_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
     out.extend_from_slice(bytes);
     out.push(0);
+}
+
+/// Flatten one buffer analysis into the highlight stream of cli-protocol.md
+/// "`syntax-highlight` body (Buffer Highlight Stream)". The analysis order is
+/// preserved because it is what decides overlap on the zsh side.
+pub(crate) fn serialize_highlights(tokens: &[Token]) -> Vec<u8> {
+    let entries: Vec<(&'static str, CharSpan)> = tokens
+        .iter()
+        .filter_map(|token| Some((highlight_role(token.kind)?, token.span)))
+        .collect();
+
+    let mut out = Vec::new();
+    let _ = write!(out, "{}", entries.len());
+    out.push(0);
+    for (role, span) in entries {
+        let _ = write!(out, "{role} {} {}", span.start, span.len());
+        out.push(0);
+    }
+    out
+}
+
+/// The role a token kind is delivered under, or `None` for the kind that
+/// carries no decoration (specs/syntax.md "Delivery").
+fn highlight_role(kind: TokenKind) -> Option<&'static str> {
+    Some(match kind {
+        TokenKind::Command => "command",
+        TokenKind::Reserved => "reserved",
+        TokenKind::Alias => "alias",
+        TokenKind::Function => "function",
+        TokenKind::Builtin => "builtin",
+        TokenKind::Precommand => "precommand",
+        TokenKind::Unknown => "unknown",
+        TokenKind::Assignment => "assignment",
+        TokenKind::Option => "option",
+        TokenKind::Redirect => "redirect",
+        TokenKind::Operator => "operator",
+        TokenKind::Comment => "comment",
+        TokenKind::SingleQuote => "single-quote",
+        TokenKind::DoubleQuote => "double-quote",
+        TokenKind::DollarQuote => "dollar-quote",
+        TokenKind::Escape => "escape",
+        TokenKind::Substitution => "substitution",
+        TokenKind::Path => "path",
+        TokenKind::Word => return None,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
