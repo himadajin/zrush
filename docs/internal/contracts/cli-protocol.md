@@ -40,7 +40,8 @@ zrush.zsh(zsh 側)と `zrush` バイナリ(Rust 側)の入出力仕様。
 > `tests/vectors/encode/`(`zsh -f tests/zsh/vectors.zsh`)。他の profile の分を固定するテストは無い。
 
 - 対話シェルごとに `zrush worker` を最大 1 プロセス常駐させ、複数のメッセージを同じ
-  stdin/stdout セッションで処理する。ワーカーは最初の実メッセージ(要求または入力通知)まで起動しない。
+  stdin/stdout セッションで処理する。ワーカーは namespace 同期以外の最初の実メッセージ
+  (要求または入力通知)が必要になるまで起動しない。起動時には `namespace-snapshot` をそのメッセージより先に送る。
   `zrush config` は設定の読み込みごとに、`zrush init` はシェル起動(source)時に、
   それぞれ one-shot で起動する。
 - 文字列はバイト列として扱い、エンコーディング変換をしない(ファイル名は任意バイト列であり得る)。
@@ -90,6 +91,7 @@ option の欠落、数字でない/2 以下の値、未知または余分な引�
 fd が closed / write-only である場合、または watchdog setup に失敗した場合は、`hello` / `ready` や
 request 処理を始める前に startup 診断を stderr へ 1 行書いて exit 1 する。
 起動後は stdin から要求と入力通知を読み、
+`namespace-snapshot` 要求では zsh の名前空間と raw `$PATH` の完全な snapshot を session state として置き換え、
 `store` 要求では候補レコードストリームを解析してスロットへ格納し、
 `history-snapshot` / `history-append` 要求では同じ形式のストリームを解析して history index を
 置き換え・追記し、
@@ -105,8 +107,9 @@ one-shot の `zrush plan` サブコマンドは存在しない。
 ワーカーは **config.toml を読まない**。設定スナップショットは要求・通知のフィールドで受け取る
 (設定の取得・mtime 監視は zsh 側の責務)。`HISTFILE` も読まず、候補もそのイベント番号も
 `store` / `history-snapshot` / `history-append` 要求で受け取る。
-candidate store のスロットと history index、および静穏判定のための current input はいずれも
+namespace snapshot、candidate store のスロット、history index、および静穏判定のための current input はいずれも
 worker セッションに属し、worker の終了とともに失われる(永続化も再構築もしない)。
+namespace snapshot は名前集合と raw `$PATH` だけを保持し、filesystem cache を持つ path resolver は含まない。
 ただし純粋な関数ではない: `f = 1` 候補の `/` 合成判定は入力通知の `cwd` を基準に stat し、
 静穏期間の計測には単調時計を使う。
 マッチング・ランキング・レイアウト・挿入テキスト構築そのものは、時計にも session state にも依存しない
@@ -155,6 +158,9 @@ message   = netstring(netstring(field-1) ... netstring(field-N))
   完全一致しなければならない。前後空白、符号、別の大小文字表記を許さない。
 
 起動直後、zsh は最初の要求・通知より前に `hello` を送り、worker はその build stamp を照合して応答する。
+各 worker session の最初の実メッセージは `namespace-snapshot` 要求とし、
+その session を起動させた入力通知または他の要求はさらに後ろへ並べる。
+したがって cold start の queue 順は `hello` → `namespace-snapshot` → 起動契機のメッセージである。
 zsh は kind・フィールド数・build stamp が完全一致する `ready` だけを握手の成立として受け入れる。
 要求と入力通知は握手応答の到着を待たずに `hello` の後ろへ pipeline してよい。
 pipeline されたメッセージの帰結は握手の結果が定める:
@@ -185,7 +191,7 @@ worker が受ける `hello` の kind・フィールド数・stamp 表記自体�
 
 | 種別 | 向き | 相関の鍵 | 応答 |
 |---|---|---|---|
-| 要求(`store` / `history-snapshot` / `history-append` / `plan`) | zsh → worker | `request_id` | `ok` / `error` をちょうど 1 個 |
+| 要求(`namespace-snapshot` / `store` / `history-snapshot` / `history-append` / `plan`) | zsh → worker | `request_id` | `ok` / `error` をちょうど 1 個 |
 | 入力通知(`input` / `flush`) | zsh → worker | `input_generation` | 無し(帰結は worker event) |
 | worker event(`plan-ready` / `capture-required`) | worker → zsh | `input_generation` | 無し |
 
@@ -204,6 +210,7 @@ worker が受ける `hello` の kind・フィールド数・stamp 表記自体�
 角括弧内は外側 message payload に固定順で並ぶ netstring field を表す。
 
 ```
+namespace-snapshot: ["namespace-snapshot", request_id, namespace_payload]
 store:            ["store", request_id, slot, candidate_generation, input_generation,
                    candidate_payload]
 history-snapshot: ["history-snapshot", request_id, candidate_generation, candidate_payload]
@@ -214,7 +221,8 @@ ok:               ["ok", request_id, body]
 error:            ["error", request_id, code]
 ```
 
-要求は 4 種類ある。
+要求は 5 種類ある。
+`namespace-snapshot` は zsh の名前空間と raw `$PATH` の完全な snapshot を worker session へ渡し、
 `store` は候補レコードストリームを worker へ渡して解析済みの candidate store のスロットへ格納し、
 `history-snapshot` / `history-append` は同じ形式のストリームを worker の history index へ渡し、
 `plan` は history index を `candidate_generation` で参照して描画プランを得る。
@@ -224,6 +232,22 @@ error:            ["error", request_id, code]
   先頭ゼロを付けない。
   シェルセッション内で単調増加し、worker の終了・再起動でもリセットまたは再利用しない。
   候補集合や履歴の revision を表す値ではない。
+- `namespace_payload`: alias list、function list、builtin list、reserved list、raw `$PATH` の順に
+  ちょうど 5 field を並べた canonical netstring stream。各 list field の payload も、名前を 1 field ずつ
+  並べた canonical netstring streamであり、空 stream は空集合を表す。すなわち形は次のとおりである。
+
+  ```
+  namespace_payload = netstring(alias_list) netstring(function_list)
+                      netstring(builtin_list) netstring(reserved_list) netstring(raw_PATH)
+  *_list            = netstring(name-1) ... netstring(name-N)
+  ```
+
+  zsh は各 list を `LC_ALL=C` の byte 順に整列し、重複のない canonical な集合として発行する。
+  worker は受信した各 list を byte 列の集合として解釈するため、空名、重複、非整列も受理し、
+  順序を意味として保持しない。名前と raw `$PATH` は UTF-8 へ変換も再エンコードもしない。
+  5 番目の field は `$PATH` parameter の raw 値であり、directory ごとの分解や走査結果ではない。
+  `$commands`、PATH directory の mtime、`PWD`、`cwd`、`interactive_comments` はこの payload に含めない。
+  `namespace_payload` に固有の byte-size 上限は設けない。
 - `slot`: `live` または `cache`。`store` だけが持つフィールドである。
   zsh が所有する列挙であり、worker はスロットの意味を解釈しない。
   worker はスロットごとに最大 1 generation の解析済み candidate store を保持し、
@@ -298,6 +322,8 @@ worker は同じ `request_id` の `error` を返してセッションを継続�
 
 | kind | code | 意味 |
 |---|---|---|
+| `namespace-snapshot` | `invalid-request` | kind・外側の固定フィールド数の不正 |
+| `namespace-snapshot` | `invalid-payload` | `namespace_payload` の tuple/list netstring framing、または tuple のフィールド数の不正 |
 | `store` | `invalid-request` | kind・固定フィールド・scalar・`slot` 列挙の不正 |
 | `store` | `superseded` | current input の `input_generation` と一致しない束縛 |
 | `store` | `invalid-payload` | 候補レコードストリームの framing error |
@@ -318,6 +344,12 @@ worker は同じ `request_id` の `error` を返してセッションを継続�
 `superseded` は、整形としては正しい `store` が答えようとした入力が既に置き換えられていることを表す。
 `store` の coalescing はこの終端応答で表現し、無応答で捨てることはしない。
 `plan` は候補 payload を運ばないため、`invalid-payload` は `plan` の code 集合に現れない。
+`namespace-snapshot` の検証順は、外側 message からの `request_id` の回収 → kind・外側のフィールド数 →
+`namespace_payload` の 5-field tuple framing → 4 個の list の framing、である。
+全 5 field と全 list を解析し終えてから snapshot 全体を 1 回で置き換える。
+payload の framing error や field 数違いで `invalid-payload` となった要求は、以前の snapshot を部分的にも変更しない。
+session state の snapshot は最初の成功までは absent であり、成功するたびに完全な `NamespaceSnapshot` 1 個を
+格納する。2 回目以降も名前集合や `$PATH` を merge せず、以前の値全体を破棄して新しい値へ置き換える。
 `store` と history 2 種の検証順は、`request_id` の回収 → kind・フィールド数・scalar
 (`store` の `slot` 列挙を含む)→(`store` のみ)`input_generation` の束縛 →
 `candidate_payload` の framing →
@@ -327,16 +359,22 @@ worker は同じ `request_id` の `error` を返してセッションを継続�
 複数の不正がある要求では、先に検出されるものを返す。
 `error` で終わる `store` は既存のスロットをいっさい変更せず、event も生じない
 (全スロット無変更のまま終端 error を返す)。
+`error` で終わる `namespace-snapshot` は以前の snapshot をいっさい変更しない。
 `error` で終わる `history-snapshot` / `history-append` も index の内容と stamp をいっさい変更しない。
-外側または nested netstring framing の破損、あるいは request_id の欠落・非 canonical 表記・範囲外によって
+外側 message またはその field の netstring framing の破損、あるいは request_id の欠落・非 canonical 表記・範囲外によって
 安全に対応付けられない場合は応答せずセッションを終了する。
+相関可能な `namespace-snapshot` の第 3 field の中だけで起きた tuple/list framing error は
+message framing error ではなく、上記の `invalid-payload` で終端する。
 
 `ready` を返したセッションでは、相関可能な各 request は `ok` または `error` の**終端応答をちょうど 1 個**受ける。
-`store` と `history-snapshot` / `history-append` もこの規範に従う 1 個の request である。
+`namespace-snapshot`、`store`、`history-snapshot` / `history-append` もこの規範に従う 1 個の request である。
 `incompatible` を返したセッションでその後に届くバイトは request ではなく、この規範の対象外である。
 worker は要求を受信順に処理し、応答を黙って省略しない。`error` も正常に形成された終端応答であり、
 worker セッション失敗には数えない。
 `superseded` も同じく正常な終端応答であり、失敗にも stale な応答にも数えない。
+zsh は `namespace-snapshot` の終端応答を待たずに、その session の起動契機となった入力通知または要求を
+後ろへ pipeline してよい。worker の受信順処理により、後続メッセージは置換後の snapshot を観測する。
+snapshot の更新順を表す generation は持たず、session byte stream の受信順だけが置換順を定める。
 zsh は `history-snapshot` / `history-append` の終端応答を待たずに、
 同じ generation を参照する `plan` をその後ろへ pipeline してよい
 (pipeline の許容範囲は握手の規範と同じ)。
@@ -346,7 +384,7 @@ zsh は `history-snapshot` / `history-append` の終端応答を待たずに、
 `history-snapshot` / `history-append` の効果を**ちょうどすべて**反映した index を参照する
 (後から届く history 要求の効果は含まない)。
 zsh は index への書き込みを query より後ろへ並べ替えず、まとめて後回しにもしない。
-`ok` の `body` は kind で決まる: `store` と history 2 種の成功では空バイト列、
+`ok` の `body` は kind で決まる: `namespace-snapshot`、`store`、history 2 種の成功では空バイト列、
 `plan` の成功では後述の描画プランストリームそのものである。
 
 ### Input Notifications and Worker Events
@@ -947,13 +985,18 @@ zsh は一覧を消す。
 - `error` の `code` は `invalid-request` / `invalid-payload` / `unknown-generation` / `superseded` の
   いずれかでなければならない。
   それ以外の値は不正な応答であり、worker セッションを壊れたものとして終了する。
-- `error` は相関する要求の正常な終端応答である。その要求の結果を破棄し、それが現在の最新要求なら
-  既存一覧も消す。stale 要求なら UI 状態を変えない。どちらの場合も worker は継続利用する。
+- `error` は相関する要求の正常な終端応答である。その要求の結果を破棄する。
+  UI 結果を持つ要求が現在の最新要求なら既存一覧も消し、stale 要求なら UI 状態を変えない。
+  どちらの場合も worker は継続利用する。
   「現在の最新要求」の判定は経路ごとに決まる。
-  非同期経路の要求は `store` だけであり、その束縛の `input_generation` が
+  UI 結果を持つ非同期経路の要求は `store` だけであり、その束縛の `input_generation` が
   zsh のいま有効な `input_generation` と一致することが判定になる
   (`superseded` はこの一致が成り立たないことを表すため、UI 状態を変えない)。
   `plan` は履歴メニューの同期交換専用であり、同期待ちの対象要求と一致することが判定になる。
+- `namespace-snapshot` の `error` は UI 結果を持たず、一覧を変更しない。
+  最新 identity の要求なら namespace latch を無効化し、次の `precmd` で再試行可能にする。
+  より新しい namespace 更新を既に queue 済みなら、その古い `error` は最新 latch を変更しない
+  (詳細は behavior.md「Namespace Snapshot Synchronization」節)。
 - `unknown-generation` は、`plan` が参照した generation を worker が保持していないこと、または
   `history-snapshot` / `history-append` が名乗った generation が index の現 stamp と両立しないことを表す。
   他の `error` と同じく正常な終端応答であり、worker セッション失敗にも連続失敗回数にも数えない。
@@ -969,7 +1012,7 @@ zsh は一覧を消す。
   candidate store latch はこの `store` について進めない(latch を進めるのは `ok` だけである)。
   対象の `input_generation` は既に無効なので UI 状態も変えない。
   worker セッション失敗にも連続失敗回数にも数えない。
-- `store` と `history-snapshot` / `history-append` の `ok` は body が空バイト列であることを検証する。
+- `namespace-snapshot`、`store`、`history-snapshot` / `history-append` の `ok` は body が空バイト列であることを検証する。
   空でなければ仕様を満たさない応答として扱い、プランを破棄する場合と同じく worker セッションを終了する。
 - `plan` の `ok` body、および現在の generation に一致する `plan-ready` の `plan_body` が
   仕様を満たさない場合
@@ -981,11 +1024,15 @@ zsh は一覧を消す。
   プラン全体を破棄して一覧を消し、worker セッションを終了する。
   同じ session の他の未完了要求も behavior.md「Worker Lifecycle」に従ってすべて破棄する。
   壊れた success を受理してセッションを継続してはならない。
-- 正常に形成された `ok` / `error` と正常に形成された worker event は、
+- 正常に形成された `namespace-snapshot` の `ok` / `error` を除き、
+  正常に形成された `ok` / `error` と正常に形成された worker event は、
   worker セッションの連続失敗回数を 0 に戻す。
   `ok` であっても、対応する要求より後の実要求を zsh が既に開始していれば stale なので適用せず捨てる。
   stale 応答も正常に形成されていれば終端応答として扱い、失敗回数を戻す。
   generation が一致せず捨てる event も、kind とフィールド数が正しければ同じく失敗回数を戻す。
+  `namespace-snapshot` は session bootstrap とプロンプト境界の自動同期に使う内部要求なので、
+  その正常な終端応答は user operation の成功とは数えず、連続失敗回数も warning latch も戻さない。
+  ただし通常の終端応答として未完了要求表からは取り除き、仕様を満たさない応答は他 kind と同じ session failure とする。
 - worker の stderr は端末に流さない(zle 表示を壊さないため)。`ZRUSH_LOG` が設定されていれば
   診断をそこへ追記し、未設定なら `/dev/null` へ送る。
   main request 処理がセッション失敗で終了するときは、その理由を 1 行の診断として stderr に書いてから終了する。
@@ -1123,10 +1170,12 @@ typeset -g _ZRUSH_EXPECTED_BUILD_STAMP='<build-stamp>'
    埋め込みスクリプト自身の source 時処理として `zrush config` を実行し、build stamp を照合し、private runtime directory と
    request/response/abort-control FIFO を同期的・transactional に作成してからキーバインドを適用する。
 2. プロンプト表示ごと: config.toml の mtime を確認し、変化していれば
-   `zrush config` を再実行して source、キーバインドを再適用、警告があれば表示。
-3. 最初の実メッセージ時: source 時に作成済みの FIFO endpoint だけを開き、abort-control FIFO の read fd を渡して
-   `zrush worker --control-fd N` を起動し、watchdog setup 後に `hello` を送る。
-   最初のメッセージは `ready` を待たずに `hello` の後ろへ pipeline する(「Session Framing and Handshake」節)。
+   `zrush config` を再実行して source、キーバインドを再適用、警告があれば表示する。
+   同じ `precmd` で namespace payload も採取し、live worker session で内容が変わったときだけ更新要求を queue する。
+3. namespace 同期以外の最初の実メッセージ時: source 時に作成済みの FIFO endpoint だけを開き、
+   abort-control FIFO の read fd を渡して `zrush worker --control-fd N` を起動し、watchdog setup 後に `hello` を送る。
+   `ready` を待たず、`namespace-snapshot` と起動契機のメッセージをこの順で `hello` の後ろへ pipeline する
+   (「Session Framing and Handshake」節)。
    遅延起動時に runtime directory/FIFO を作成してはならない。spawn 後の parent endpoint/watcher failure と
    writer notification/watcher failure の fail-closed quarantine・runtime taint は behavior.md が定める。
 4. 入力変化: zsh は新しい `input_generation` を採番して `input` 通知を直ちに送る。

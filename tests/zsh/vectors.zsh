@@ -635,6 +635,9 @@ reserialize_plan() {  # -> REPLY=bytes, or return 1 with REPLY=reason
     _zrush_worker_ready=1 _zrush_worker_stopping=0 _zrush_worker_runtime_tainted=0
     _zrush_worker_failures=0 _zrush_disabled=0 _zrush_disable_reason= _zrush_enabled=1
     _zrush_worker_txq=() _zrush_worker_pending=() _zrush_cc_staged=()
+    _zrush_namespace_payload= _zrush_namespace_queued= _zrush_namespace_acked=
+    _zrush_namespace_pending=()
+    _zrush_namespace_latest_id=0
     _zrush_sync_target=0 _zrush_sync_done=0 _zrush_sync_ok=0
     _zrush_input_gen=0 _zrush_input_pending=0 _zrush_input_latched=0
     _zrush_collect_gen=0
@@ -898,6 +901,162 @@ reserialize_plan() {  # -> REPLY=bytes, or return 1 with REPLY=reason
     ng "history wiring: index latch after unknown-generation gen=$_zrush_hist_gen"
   fi
   _zrush_hist_reset
+
+  # ---- Namespace snapshot request and content identity ----
+  local -i namespace_wire=1
+  local saved_path=$PATH
+  alias zrt_ns_b='ignored-b'
+  alias zrt_ns_a='ignored-a'
+  functions[zrt_ns_f_b]=':'
+  functions[zrt_ns_f_a]=':'
+  functions[_zrush_hidden_fixture]=':'
+  PATH=/zrt/bin:/zrt/sbin
+  _zrush_namespace_collect
+  local namespace_first=$REPLY
+  _zrush_decode_fields "$namespace_first" || namespace_wire=0
+  local -a namespace_tuple=( "${(@)reply}" ) namespace_names=() namespace_sorted=()
+  (( $#namespace_tuple == 5 )) || namespace_wire=0
+  _zrush_decode_fields "$namespace_tuple[1]" || namespace_wire=0
+  namespace_names=( "${(@)reply}" )
+  () { local LC_ALL=C; namespace_sorted=( ${(o)namespace_names} ) }
+  [[ "${(pj:\0:)namespace_names}" == "${(pj:\0:)namespace_sorted}" \
+     && ${namespace_names[(Ie)zrt_ns_a]} -gt 0 && ${namespace_names[(Ie)zrt_ns_b]} -gt 0 ]] || namespace_wire=0
+  _zrush_decode_fields "$namespace_tuple[2]" || namespace_wire=0
+  namespace_names=( "${(@)reply}" )
+  () { local LC_ALL=C; namespace_sorted=( ${(o)namespace_names} ) }
+  [[ "${(pj:\0:)namespace_names}" == "${(pj:\0:)namespace_sorted}" \
+     && ${namespace_names[(Ie)zrt_ns_f_a]} -gt 0 && ${namespace_names[(Ie)zrt_ns_f_b]} -gt 0 \
+     && ${namespace_names[(Ie)_zrush_hidden_fixture]} -eq 0 ]] || namespace_wire=0
+  _zrush_decode_fields "$namespace_tuple[3]" || namespace_wire=0
+  namespace_names=( "${(@)reply}" )
+  (( ${namespace_names[(Ie)echo]} > 0 )) || namespace_wire=0
+  _zrush_decode_fields "$namespace_tuple[4]" || namespace_wire=0
+  namespace_names=( "${(@)reply}" )
+  (( ${namespace_names[(Ie)if]} > 0 )) || namespace_wire=0
+  [[ $namespace_tuple[5] == /zrt/bin:/zrt/sbin ]] || namespace_wire=0
+  _zrush_namespace_collect
+  [[ $REPLY == "$namespace_first" ]] || namespace_wire=0
+  unalias zrt_ns_b
+  alias zrt_ns_c='ignored-c'
+  _zrush_namespace_collect
+  local namespace_changed=$REPLY
+  [[ $namespace_changed != "$namespace_first" ]] || namespace_wire=0
+  unalias zrt_ns_a zrt_ns_c
+  unfunction zrt_ns_f_a zrt_ns_f_b _zrush_hidden_fixture
+  PATH=$saved_path
+
+  _zrush_namespace_name_stream a zed; local ns_alias=$REPLY
+  _zrush_namespace_name_stream Fn foo; local ns_function=$REPLY
+  _zrush_namespace_name_stream echo printf; local ns_builtin=$REPLY
+  _zrush_namespace_name_stream if then; local ns_reserved=$REPLY
+  local ns_payload= ns_field
+  for ns_field in "$ns_alias" "$ns_function" "$ns_builtin" "$ns_reserved" /bin:/usr/bin; do
+    _zrush_netstring "$ns_field"; ns_payload+=$REPLY
+  done
+  _zrush_encode_message namespace-snapshot 7 "$ns_payload"
+  local ns_frame=$REPLY
+  read_vector $VECTORS/message/namespace-snapshot/frame || { out "FATAL: $REPLY"; exit 1 }
+  [[ $REPLY == "$ns_frame" ]] || namespace_wire=0
+
+  wire_reset
+  PATH='/same/*'
+  _zrush_namespace_collect
+  local namespace_glob_path=$REPLY
+  _zrush_request_namespace "$namespace_glob_path" || namespace_wire=0
+  PATH=/same/x
+  _zrush_namespace_collect
+  local namespace_literal_path=$REPLY
+  (( ${#namespace_glob_path} == ${#namespace_literal_path} )) || namespace_wire=0
+  _zrush_request_namespace "$namespace_literal_path" || namespace_wire=0
+  (( $#_zrush_namespace_pending == 2 && $#_zrush_worker_txq == 2 )) || namespace_wire=0
+  PATH=$saved_path
+
+  wire_reset
+  _zrush_worker_failures=1 _zrush_worker_warned=1 _zrush_notice=keep
+  _zrush_request_namespace "$namespace_first" || namespace_wire=0
+  _zrush_request_namespace "$namespace_first" || namespace_wire=0
+  (( $#_zrush_namespace_pending == 1 && $#_zrush_worker_txq == 1 )) || namespace_wire=0
+  _zrush_request_namespace "$namespace_changed" || namespace_wire=0
+  _zrush_request_namespace "$namespace_first" || namespace_wire=0
+  local -a ns_ids=( ${(onk)_zrush_namespace_pending} )
+  (( $#ns_ids == 3 )) || namespace_wire=0
+  _zrush_encode_message error $ns_ids[1] invalid-payload
+  _zrush_netstring_take "$REPLY"; _zrush_worker_handle_message "$REPLY" || namespace_wire=0
+  [[ $_zrush_namespace_queued == "$namespace_first" ]] || namespace_wire=0
+  _zrush_encode_message error $ns_ids[2] invalid-payload
+  _zrush_netstring_take "$REPLY"; _zrush_worker_handle_message "$REPLY" || namespace_wire=0
+  [[ $_zrush_namespace_queued == "$namespace_first" ]] || namespace_wire=0
+  _zrush_encode_message error $ns_ids[3] invalid-payload
+  _zrush_netstring_take "$REPLY"; _zrush_worker_handle_message "$REPLY" || namespace_wire=0
+  [[ -z $_zrush_namespace_queued ]] || namespace_wire=0
+  _zrush_request_namespace "$namespace_changed" || namespace_wire=0
+  ns_ids=( ${(onk)_zrush_namespace_pending} )
+  _zrush_encode_message ok $ns_ids[-1] ''
+  _zrush_netstring_take "$REPLY"; _zrush_worker_handle_message "$REPLY" || namespace_wire=0
+  [[ $_zrush_namespace_acked == "$namespace_changed" && $_zrush_worker_failures == 1 \
+     && $_zrush_worker_warned == 1 && $_zrush_notice == keep ]] || namespace_wire=0
+
+  local saved_worker_start=$functions[_zrush_worker_start]
+  typeset -gi _zrt_namespace_starts=0
+  functions[_zrush_worker_start]='(( ++_zrt_namespace_starts )); return 1'
+  wire_reset
+  _zrush_worker_rfd=-1
+  _zrush_namespace_refresh
+  (( _zrt_namespace_starts == 0 && $#_zrush_worker_txq == 0 \
+     && $#_zrush_namespace_pending == 0 )) || namespace_wire=0
+  functions[_zrush_worker_start]=$saved_worker_start
+  unset _zrt_namespace_starts
+
+  local saved_ensure_session=$functions[_zrush_worker_ensure_session]
+  functions[_zrush_worker_ensure_session]='
+    _zrush_worker_rfd=$wire_fd _zrush_worker_ack_fd=$wire_fd
+    _zrush_encode_message hello "$_ZRUSH_EXPECTED_BUILD_STAMP"
+    _zrush_worker_txq=( "$REPLY" )
+    _zrush_namespace_latch_drop
+    _zrush_request_namespace "$ns_payload"
+  '
+  wire_reset
+  _zrush_worker_rfd=-1
+  _zrush_request_store live $'b\1\0' 7 || namespace_wire=0
+  local -a bootstrap_kinds=() bootstrap_ids=()
+  local bootstrap_frame
+  for bootstrap_frame in "${(@)_zrush_worker_txq}"; do
+    wire_fields "$bootstrap_frame" || namespace_wire=0
+    bootstrap_kinds+=( "$reply[1]" )
+    [[ $reply[1] == namespace-snapshot || $reply[1] == store ]] && bootstrap_ids+=( "$reply[2]" )
+  done
+  [[ "${(j: :)bootstrap_kinds}" == 'hello namespace-snapshot store' \
+     && $bootstrap_ids[1] -lt $bootstrap_ids[2] ]] || namespace_wire=0
+  functions[_zrush_worker_ensure_session]=$saved_ensure_session
+
+  local saved_start_for_exhaustion=$functions[_zrush_worker_start]
+  local saved_fail_for_exhaustion=$functions[_zrush_worker_session_fail]
+  local -i saved_request_seq=$_zrush_request_seq
+  typeset -gi _zrt_startup_session_failures=0
+  functions[_zrush_worker_start]='_zrush_next_request_id'
+  functions[_zrush_worker_session_fail]='(( ++_zrt_startup_session_failures )); return 1'
+  wire_reset
+  _zrush_worker_rfd=-1 _zrush_request_seq=9223372036854775807
+  _zrush_worker_ensure_session
+  local -i exhaustion_st=$?
+  local -i exhaustion_wire=1
+  (( exhaustion_st == 1 && _zrush_disabled && _zrush_worker_failures == 0 \
+     && _zrt_startup_session_failures == 0 )) || exhaustion_wire=0
+  [[ $_zrush_disable_reason == policy ]] || exhaustion_wire=0
+  functions[_zrush_worker_start]=$saved_start_for_exhaustion
+  functions[_zrush_worker_session_fail]=$saved_fail_for_exhaustion
+  _zrush_request_seq=$saved_request_seq
+  unset _zrt_startup_session_failures
+  if (( exhaustion_wire )); then
+    ok "worker startup: bootstrap request-id exhaustion remains a policy disable"
+  else
+    ng "worker startup: bootstrap request-id exhaustion was reclassified as a session failure"
+  fi
+  if (( namespace_wire )); then
+    ok "namespace snapshot: canonical content, exact identity, golden frame and latest-response latch"
+  else
+    ng "namespace snapshot: content/frame/latch contract mismatch"
+  fi
 
   # ---- Notification and event frames (tests/vectors/message/) ----
   # cli-protocol.md "Input Notifications and Worker Events" spells six complete messages and

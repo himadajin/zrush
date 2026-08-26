@@ -26,15 +26,16 @@ fn fork_capture_round_trip_reuses_one_worker() {
     let first = host.worker_state();
     let first_rfd: i32 = dump_field(&first, "rfd").parse().expect("numeric rfd");
     let first_runtime = dump_field(&first, "runtime").to_string();
-    // One collection spends one request id and one candidate generation: the
-    // `store` that hands the records over. Its listing arrives as the
+    // The cold session spends its first request id on the namespace bootstrap;
+    // the collection then spends the next one and one candidate generation on
+    // the `store` that hands the records over. Its listing arrives as the
     // `plan-ready` that store settles, which is no request at all
     // (cli-protocol.md "Input Notifications and Worker Events").
     assert!(
         first_rfd > 2
             && state_has(
                 &first,
-                &["ready=1", "seq=1", "candgen=1", "stopping=0", "tainted=0"]
+                &["ready=1", "seq=2", "candgen=1", "stopping=0", "tainted=0"]
             )
             && first_runtime != "<none>",
         "(worker-1b) unexpected first-request state: {first}"
@@ -94,7 +95,9 @@ fn build_stamp_mismatch_re_sources_and_restarts_the_worker() {
     host.drain(Duration::from_millis(300));
 
     let live = host.worker_state();
-    let seq_before_auto = dump_field(&live, "seq").to_string();
+    let seq_before_auto: u64 = dump_field(&live, "seq")
+        .parse()
+        .expect("numeric request sequence before automatic re-source");
     let runtime_before = dump_field(&live, "runtime").to_string();
 
     let auto_config0 = host.log_count("build: automatic re-source completed");
@@ -134,7 +137,7 @@ fn build_stamp_mismatch_re_sources_and_restarts_the_worker() {
     let config_runtime = dump_field(&after_config, "runtime").to_string();
     assert!(
         config_rfd > 2
-            && state_has(&after_config, &[&format!("seq={seq_before_auto}")])
+            && state_has(&after_config, &[&format!("seq={}", seq_before_auto + 1)])
             && config_runtime != "<none>"
             && config_runtime != runtime_before
             && !Path::new(&runtime_before).exists(),

@@ -51,11 +51,27 @@ fn ns(payload: &[u8]) -> Vec<u8> {
     out
 }
 fn msg(fields: &[&[u8]]) -> Vec<u8> {
+    ns(&field_stream(fields))
+}
+fn field_stream(fields: &[&[u8]]) -> Vec<u8> {
     let mut payload = Vec::new();
     for f in fields {
         payload.extend(ns(f));
     }
-    ns(&payload)
+    payload
+}
+fn namespace_payload(
+    aliases: &[&[u8]],
+    functions: &[&[u8]],
+    builtins: &[&[u8]],
+    reserved: &[&[u8]],
+    path: &[u8],
+) -> Vec<u8> {
+    let aliases = field_stream(aliases);
+    let functions = field_stream(functions);
+    let builtins = field_stream(builtins);
+    let reserved = field_stream(reserved);
+    field_stream(&[&aliases, &functions, &builtins, &reserved, path])
 }
 fn decode_frames(mut bytes: &[u8]) -> Vec<Vec<u8>> {
     let mut frames = Vec::new();
@@ -427,6 +443,49 @@ fn plan_match_highlight_offset_is_non_trivial_for_a_mid_string_match() {
     let p = parse_wire(&out);
     assert_eq!(p.rows, vec![b"cargo".to_vec()]);
     assert!(has_highlight(&p, wire::Role::Match, 1, 1, 2));
+}
+
+#[test]
+fn worker_accepts_repeated_namespace_snapshots_in_one_process() {
+    let first = namespace_payload(&[b"alias"], &[b"fn"], &[b"echo"], &[b"if"], b"/bin");
+    let second = namespace_payload(&[], &[], &[], &[], b"");
+    let (mut command, control_read, _control_write) = worker_command();
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    drop(control_read);
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(
+            &[
+                msg(&[b"hello", BUILD_STAMP]),
+                msg(&[b"namespace-snapshot", b"1", &first]),
+                msg(&[b"namespace-snapshot", b"2", &second]),
+            ]
+            .concat(),
+        )
+        .unwrap();
+
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success());
+    let frames = decode_frames(&out.stdout);
+    assert_eq!(frames.len(), 3, "ready and one response per request");
+    assert_eq!(
+        fields(&frames[0]),
+        vec![b"ready".to_vec(), BUILD_STAMP.to_vec()]
+    );
+    assert_eq!(
+        fields(&frames[1]),
+        vec![b"ok".to_vec(), b"1".to_vec(), Vec::new()]
+    );
+    assert_eq!(
+        fields(&frames[2]),
+        vec![b"ok".to_vec(), b"2".to_vec(), Vec::new()]
+    );
 }
 
 #[test]

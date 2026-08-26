@@ -98,6 +98,9 @@ unset ZDOTDIR
     _zrush_worker_stopping=0 _zrush_worker_rx=
     _zrush_worker_runtime_tainted=0
     _zrush_worker_txq=() _zrush_worker_pending=() _zrush_cc_staged=()
+    _zrush_namespace_payload= _zrush_namespace_queued= _zrush_namespace_acked=
+    _zrush_namespace_pending=()
+    _zrush_namespace_latest_id=0
     _zrush_cc_fp= _zrush_cc_time=0 _zrush_cc_cand_gen=0
     _zrush_hist_reset
     _zrush_sync_target=0 _zrush_sync_done=0 _zrush_sync_ok=0
@@ -388,7 +391,7 @@ unset ZDOTDIR
   _zrush_encode_message input 6 0 30 / ab prefix false 1 1 false
   typeset -g NOTIFY_B=$REPLY
   _zrush_encode_message flush 6; typeset -g NOTIFY_FLUSH=$REPLY
-  _zrush_encode_message store 1 live 1 6 $'b\1\0'; typeset -g REQUEST_FRAME=$REPLY
+  _zrush_encode_message namespace-snapshot 1 '0:,0:,0:,0:,0:,'; typeset -g REQUEST_FRAME=$REPLY
   print -rn -- "$NOTIFY_A" >| $WORK/notify.expected
   _zrush_worker_txq=( "$NOTIFY_A" )
   _zrush_worker_flush
@@ -729,26 +732,35 @@ unset ZDOTDIR
   # (behavior.md "History Menu").
   reset_transport
   _zrush_worker_ready=1
-  _zrush_worker_pending=( 1 'history-snapshot 1' 2 plan 3 plan )
-  _zrush_sync_target=2 _zrush_sync_done=0 _zrush_sync_ok=0
-  _zrush_encode_message ok 1 ''; typeset -g SNAPSHOT_OK=$REPLY
-  _zrush_encode_message ok 2 $'\0'"0"$'\0'"0"$'\0'"0"$'\0'; typeset -g TARGET=$REPLY
-  _zrush_encode_message error 3 invalid-request; typeset -g TRAILING=$REPLY
-  _zrush_worker_rx=$SNAPSHOT_OK$TARGET$TRAILING
+  _zrush_worker_pending=( 1 namespace-snapshot 2 'history-snapshot 1' 3 plan 4 plan )
+  _zrush_namespace_queued=fixture _zrush_namespace_pending=( 1 fixture )
+  _zrush_sync_target=3 _zrush_sync_done=0 _zrush_sync_ok=0
+  _zrush_encode_message ok 1 ''; typeset -g NAMESPACE_OK=$REPLY
+  _zrush_encode_message ok 2 ''; typeset -g SNAPSHOT_OK=$REPLY
+  _zrush_encode_message ok 3 $'\0'"0"$'\0'"0"$'\0'"0"$'\0'; typeset -g TARGET=$REPLY
+  _zrush_encode_message error 4 invalid-request; typeset -g TRAILING=$REPLY
+  _zrush_worker_rx=$NAMESPACE_OK$SNAPSHOT_OK$TARGET$TRAILING
   _zrush_worker_read sync $(( EPOCHREALTIME + 1.0 )); typeset -gi sync_st=$?
   eq "sync target status" $sync_st 0
-  eq "snapshot response consumed en route" ${+_zrush_worker_pending[1]} 0
+  eq "namespace response consumed en route" ${+_zrush_worker_pending[1]} 0
+  eq "snapshot response consumed en route" ${+_zrush_worker_pending[2]} 0
   eq "sync target committed" "$_zrush_sync_done:$_zrush_sync_ok" 1:1
   eq "trailing response retained" "$_zrush_worker_rx" "$TRAILING"
   verdict "sync read: the snapshot is consumed and the plan commits while trailing responses remain asynchronous"
 
-  # An ok that carries a body does not satisfy the contract for any of the three
+  # An ok that carries a body does not satisfy the contract for any of the four
   # payload-carrying kinds; the plan a store or snapshot backs must never be
   # applied on such a session.
   typeset -g WRITE_FAILURE=
   local kind descriptor
-  for kind in store history-snapshot history-append; do
-    [[ $kind == store ]] && descriptor='store live 4 7' || descriptor="$kind 4"
+  for kind in namespace-snapshot store history-snapshot history-append; do
+    if [[ $kind == store ]]; then
+      descriptor='store live 4 7'
+    elif [[ $kind == namespace-snapshot ]]; then
+      descriptor=namespace-snapshot
+    else
+      descriptor="$kind 4"
+    fi
     reset_transport
     _zrush_worker_ready=1
     _zrush_worker_pending=( 4 "$descriptor" )
@@ -765,7 +777,7 @@ unset ZDOTDIR
       note "unexpected $kind body failure reason: ${WRITE_FAILURE:-<none>}"
     eq "$kind body leaves the request pending" ${+_zrush_worker_pending[4]} 1
   done
-  verdict "sync read: a store or history write whose ok carries a body ends the session"
+  verdict "sync read: a namespace, store or history write whose ok carries a body ends the session"
 
   reset_transport
   out "SUMMARY: PASS=$PASS FAIL=$FAIL"

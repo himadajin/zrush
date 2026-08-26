@@ -1,7 +1,9 @@
-//! Persistent worker session: `store`, `history-snapshot`, `history-append`
-//! and `plan` requests, the `input` / `flush` notifications, and the
-//! `plan-ready` / `capture-required` events their quiet periods produce.
+//! Persistent worker session: `namespace-snapshot`, `store`,
+//! `history-snapshot`, `history-append` and `plan` requests, the `input` /
+//! `flush` notifications, and the `plan-ready` / `capture-required` events
+//! their quiet periods produce.
 
+use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::fmt;
 use std::fs::File;
@@ -16,6 +18,7 @@ use crate::history::HistoryIndex;
 use crate::matching::Mode;
 use crate::plan::{self, Producer};
 use crate::record;
+use crate::syntax::NamespaceSnapshot;
 use crate::wire::{BUILD_STAMP, parse_canonical_u64};
 
 const READ_BUFFER_SIZE: usize = 8192;
@@ -277,6 +280,9 @@ enum MessageResult {
 }
 
 enum Request {
+    Namespace {
+        payload: Vec<u8>,
+    },
     Store {
         slot: Slot,
         generation: i64,
@@ -349,12 +355,14 @@ struct CurrentInput {
     expiry: Option<Instant>,
 }
 
-/// Everything one session retains: the candidate store's slots, the history
-/// index -- which is not a slot, `store` never reaches it and the history
-/// writes never reach a slot (cli-protocol.md "Requests and Responses") -- and the one
-/// current input the quiet period is measured for.
+/// Everything one session retains: the namespace snapshot, the candidate
+/// store's slots, the history index -- which is not a slot, `store` never
+/// reaches it and the history writes never reach a slot (cli-protocol.md
+/// "Requests and Responses") -- and the one current input the quiet period is
+/// measured for.
 #[derive(Default)]
 struct Session {
+    namespace: Option<NamespaceSnapshot>,
     store: CandidateStore,
     history: HistoryIndex,
     input: Option<CurrentInput>,
@@ -586,6 +594,15 @@ fn process_request<W: Write>(
 
     match parse_request(fields) {
         Request::Invalid => write_message(output, &[b"error", &request_id, b"invalid-request"]),
+        Request::Namespace { payload } => match parse_namespace_payload(&payload) {
+            Ok(snapshot) => {
+                session.namespace = Some(snapshot);
+                write_message(output, &[b"ok", &request_id, b""])
+            }
+            Err(InvalidNamespacePayload) => {
+                write_message(output, &[b"error", &request_id, b"invalid-payload"])
+            }
+        },
         Request::Store {
             slot,
             generation,
@@ -656,12 +673,47 @@ fn process_request<W: Write>(
 
 fn parse_request(fields: Vec<Vec<u8>>) -> Request {
     match fields.first().map(Vec::as_slice) {
+        Some(b"namespace-snapshot") => parse_namespace(fields),
         Some(b"store") => parse_store(fields),
         Some(b"history-snapshot") => parse_history(fields, HistoryWrite::Snapshot),
         Some(b"history-append") => parse_history(fields, HistoryWrite::Append),
         Some(b"plan") => parse_plan(fields),
         _ => Request::Invalid,
     }
+}
+
+fn parse_namespace(fields: Vec<Vec<u8>>) -> Request {
+    let Ok([_kind, _id, payload]) = <[Vec<u8>; 3]>::try_from(fields) else {
+        return Request::Invalid;
+    };
+    Request::Namespace { payload }
+}
+
+#[derive(Debug)]
+struct InvalidNamespacePayload;
+
+/// Decode a complete namespace snapshot before exposing any of it to the
+/// session (cli-protocol.md "Requests and Responses").
+fn parse_namespace_payload(payload: &[u8]) -> Result<NamespaceSnapshot, InvalidNamespacePayload> {
+    let fields = decode_netstring_stream(payload).map_err(|_| InvalidNamespacePayload)?;
+    let Ok([aliases, functions, builtins, reserved, path]) = <[Vec<u8>; 5]>::try_from(fields)
+    else {
+        return Err(InvalidNamespacePayload);
+    };
+
+    Ok(NamespaceSnapshot {
+        aliases: parse_name_set(&aliases)?,
+        functions: parse_name_set(&functions)?,
+        builtins: parse_name_set(&builtins)?,
+        reserved: parse_name_set(&reserved)?,
+        path,
+    })
+}
+
+fn parse_name_set(payload: &[u8]) -> Result<BTreeSet<Vec<u8>>, InvalidNamespacePayload> {
+    decode_netstring_stream(payload)
+        .map(|names| names.into_iter().collect())
+        .map_err(|_| InvalidNamespacePayload)
 }
 
 fn parse_store(fields: Vec<Vec<u8>>) -> Request {
@@ -857,11 +909,15 @@ fn is_build_stamp(value: &[u8]) -> bool {
 }
 
 fn decode_fields(message: &[u8]) -> Result<Vec<Vec<u8>>, Error> {
+    decode_netstring_stream(message).map_err(Error::Framing)
+}
+
+fn decode_netstring_stream(message: &[u8]) -> Result<Vec<Vec<u8>>, framing::Error> {
     let mut decoder = Decoder::new();
     let fields = decoder
         .feed(message)
-        .map_err(|feed_error| Error::Framing(feed_error.error))?;
-    decoder.finish().map_err(Error::Framing)?;
+        .map_err(|feed_error| feed_error.error)?;
+    decoder.finish()?;
     Ok(fields)
 }
 
@@ -894,11 +950,36 @@ mod tests {
     use std::collections::VecDeque;
 
     fn message(fields: &[&[u8]]) -> Vec<u8> {
-        let inner: Vec<u8> = fields
+        framing::encode(&field_stream(fields))
+    }
+
+    fn field_stream(fields: &[&[u8]]) -> Vec<u8> {
+        fields
             .iter()
             .flat_map(|field| framing::encode(field))
-            .collect();
-        framing::encode(&inner)
+            .collect()
+    }
+
+    fn name_list(names: &[&[u8]]) -> Vec<u8> {
+        field_stream(names)
+    }
+
+    fn namespace_payload(
+        aliases: &[&[u8]],
+        functions: &[&[u8]],
+        builtins: &[&[u8]],
+        reserved: &[&[u8]],
+        path: &[u8],
+    ) -> Vec<u8> {
+        let aliases = name_list(aliases);
+        let functions = name_list(functions);
+        let builtins = name_list(builtins);
+        let reserved = name_list(reserved);
+        field_stream(&[&aliases, &functions, &builtins, &reserved, path])
+    }
+
+    fn namespace_request<'a>(id: &'a [u8], payload: &'a [u8]) -> Vec<&'a [u8]> {
+        vec![b"namespace-snapshot", id, payload]
     }
 
     fn messages(bytes: &[u8]) -> Vec<Vec<Vec<u8>>> {
@@ -1191,6 +1272,186 @@ mod tests {
         payload: &'a [u8],
     ) -> Vec<&'a [u8]> {
         vec![kind, id, generation, payload]
+    }
+
+    fn process_request_fields(session: &mut Session, fields: &[&[u8]]) -> Vec<Vec<Vec<u8>>> {
+        let mut output = Vec::new();
+        process_request(
+            fields.iter().map(|field| field.to_vec()).collect(),
+            session,
+            &mut output,
+        )
+        .unwrap();
+        messages(&output)
+    }
+
+    #[test]
+    fn namespace_snapshot_preserves_all_raw_fields_with_set_semantics() {
+        let raw_name = b"\xffname";
+        let raw_path = b"/bin:\xff/tools:";
+        let payload = namespace_payload(
+            &[b"z", b"a", b"z", b"", raw_name],
+            &[b"fn"],
+            &[b"echo", b"printf"],
+            &[b"if", b"then"],
+            raw_path,
+        );
+        let mut session = Session::default();
+
+        let decoded = process_request_fields(&mut session, &namespace_request(b"1", &payload));
+
+        assert_eq!(decoded, [ok(b"1")]);
+        let snapshot = session.namespace.as_ref().unwrap();
+        assert_eq!(
+            snapshot.aliases,
+            [
+                b"".to_vec(),
+                b"a".to_vec(),
+                b"z".to_vec(),
+                raw_name.to_vec()
+            ]
+            .into_iter()
+            .collect()
+        );
+        assert_eq!(snapshot.functions, [b"fn".to_vec()].into_iter().collect());
+        assert_eq!(
+            snapshot.builtins,
+            [b"echo".to_vec(), b"printf".to_vec()].into_iter().collect()
+        );
+        assert_eq!(
+            snapshot.reserved,
+            [b"if".to_vec(), b"then".to_vec()].into_iter().collect()
+        );
+        assert_eq!(snapshot.path, raw_path);
+    }
+
+    #[test]
+    fn empty_namespace_fields_are_valid_and_replace_the_whole_snapshot() {
+        let first = namespace_payload(&[b"alias"], &[b"fn"], &[b"echo"], &[b"if"], b"/bin");
+        let empty = namespace_payload(&[], &[], &[], &[], b"");
+        let mut session = Session::default();
+
+        assert_eq!(
+            process_request_fields(&mut session, &namespace_request(b"1", &first)),
+            [ok(b"1")]
+        );
+        assert_eq!(
+            process_request_fields(&mut session, &namespace_request(b"2", &empty)),
+            [ok(b"2")]
+        );
+
+        let snapshot = session.namespace.as_ref().unwrap();
+        assert!(snapshot.aliases.is_empty());
+        assert!(snapshot.functions.is_empty());
+        assert!(snapshot.builtins.is_empty());
+        assert!(snapshot.reserved.is_empty());
+        assert!(snapshot.path.is_empty());
+    }
+
+    #[test]
+    fn namespace_shape_and_payload_errors_are_distinct_terminal_responses() {
+        let valid = namespace_payload(&[], &[], &[], &[], b"");
+        let malformed_tuple = b"1:x!";
+        let short_tuple = field_stream(&[b"", b"", b"", b""]);
+        let mut session = Session::default();
+
+        let invalid_request = process_request_fields(&mut session, &[b"namespace-snapshot", b"1"]);
+        let invalid_payload =
+            process_request_fields(&mut session, &namespace_request(b"2", malformed_tuple));
+        let valid_response = process_request_fields(&mut session, &namespace_request(b"3", &valid));
+        let invalid_tuple_shape =
+            process_request_fields(&mut session, &namespace_request(b"4", &short_tuple));
+
+        assert_eq!(invalid_request, [error(b"1", b"invalid-request")]);
+        assert_eq!(invalid_payload, [error(b"2", b"invalid-payload")]);
+        assert_eq!(valid_response, [ok(b"3")]);
+        assert_eq!(invalid_tuple_shape, [error(b"4", b"invalid-payload")]);
+    }
+
+    #[test]
+    fn namespace_request_needs_a_canonical_request_id_before_it_can_reply() {
+        let payload = namespace_payload(&[], &[], &[], &[], b"");
+        for id in [b"01".as_slice(), b"0", b"9223372036854775808"] {
+            let (result, output) = drive(vec![
+                Step::Send(hello()),
+                Step::Send(message(&namespace_request(id, &payload))),
+            ]);
+            assert!(matches!(result, Err(Error::Protocol)), "{id:?}");
+            assert_eq!(messages(&output).len(), 1, "{id:?}");
+        }
+    }
+
+    #[test]
+    fn malformed_namespace_tuple_or_list_rolls_back_without_other_side_effects() {
+        let original = namespace_payload(&[b"old"], &[b"fn"], &[b"echo"], &[b"if"], b"/bin");
+        let valid_empty_list = name_list(&[]);
+        let malformed_list = b"1:x!";
+        let malformed_nested = field_stream(&[
+            malformed_list,
+            &valid_empty_list,
+            &valid_empty_list,
+            &valid_empty_list,
+            b"/other",
+        ]);
+        let candidate = payload(b"candidate");
+        let history = history_payload(&[(b"history", b"1")]);
+        let mut session = Session::default();
+        assert_eq!(
+            process_request_fields(&mut session, &namespace_request(b"1", &original)),
+            [ok(b"1")]
+        );
+        session
+            .store
+            .insert(Slot::Live, 41, record::parse(candidate).unwrap());
+        session
+            .history
+            .install(42, &record::parse(history).unwrap())
+            .unwrap();
+        let mut input_output = Vec::new();
+        session
+            .accept_input(
+                input_notification(b"7", b"0", b"1000")
+                    .into_iter()
+                    .map(<[u8]>::to_vec)
+                    .collect(),
+                Instant::now(),
+                &mut input_output,
+            )
+            .unwrap();
+        assert!(input_output.is_empty());
+
+        for (id, malformed) in [
+            (b"2".as_slice(), b"1:x!".as_slice()),
+            (b"3", &*malformed_nested),
+        ] {
+            let decoded = process_request_fields(&mut session, &namespace_request(id, malformed));
+            assert_eq!(decoded, [error(id, b"invalid-payload")]);
+            let snapshot = session.namespace.as_ref().unwrap();
+            assert_eq!(snapshot.aliases, [b"old".to_vec()].into_iter().collect());
+            assert_eq!(snapshot.functions, [b"fn".to_vec()].into_iter().collect());
+            assert_eq!(snapshot.builtins, [b"echo".to_vec()].into_iter().collect());
+            assert_eq!(snapshot.reserved, [b"if".to_vec()].into_iter().collect());
+            assert_eq!(snapshot.path, b"/bin");
+            assert!(session.store.find(41).is_some());
+            assert!(session.history.holds(42));
+            assert_eq!(
+                session.input.as_ref().map(|input| input.generation),
+                Some(7)
+            );
+        }
+    }
+
+    #[test]
+    fn a_new_session_starts_without_a_namespace_snapshot() {
+        let payload = namespace_payload(&[b"alias"], &[], &[], &[], b"/bin");
+        let mut first = Session::default();
+        assert_eq!(
+            process_request_fields(&mut first, &namespace_request(b"1", &payload)),
+            [ok(b"1")]
+        );
+        assert!(first.namespace.is_some());
+
+        assert!(Session::default().namespace.is_none());
     }
 
     #[test]
