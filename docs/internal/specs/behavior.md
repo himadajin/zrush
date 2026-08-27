@@ -8,8 +8,8 @@ zrush の挙動の規範。
 責務境界: Rust(`zrush` バイナリ)がマッチング・ランキング・レコード解析・
 バッファの字句分類・コマンド解決・名前空間 snapshot の保持・グループ分割・グリッドレイアウト・
 ハイライト計算・ナビゲーション表構築・挿入テキスト構築・config 解釈を担う。
-zsh は zle 統合・compsys 呼び出しによる捕獲・zsh 名前空間 snapshot の採取と供給・プランの適用
-(POSTDISPLAY/region_highlight への描画、BUFFER 編集、bindkey)を担う。
+zsh は zle 統合・compsys 呼び出しによる捕獲・zsh 名前空間 snapshot の採取と供給・プランと
+バッファ装飾の適用(POSTDISPLAY/region_highlight への描画、BUFFER 編集、bindkey)を担う。
 「zsh の意味論は zsh が計算し、データとして渡す」
 (`${(Q)}` 復元・`${(q)}` クォート・`~` 展開・terminfo 解決は zsh 側)。
 詳細な入出力仕様は `../contracts/cli-protocol.md`。
@@ -25,15 +25,18 @@ zsh は zle 統合・compsys 呼び出しによる捕獲・zsh 名前空間 snap
   補完候補の確定はカーソル以降のテキスト(RBUFFER)に触らない。
   履歴候補の確定は行全体の置き換えを求める明示操作であり、RBUFFER も含めて置き換える
   (規範は `../contracts/cli-protocol.md`「Plan Application (zsh-Side Normative)」節)。
-- **入力は決してブロックしない**: 候補収集は非同期で行う。
+- **入力は決してブロックしない**: 候補収集もバッファ装飾も非同期で行う。
   収集が遅い場合も「一覧が遅れて出る」だけで、打鍵は常に即応する。
-  この原則に対する同期的な例外は、ユーザーが明示した履歴メニュー(後述)と、
-  process の重複・frame 途中の EOF・fd の取り違えを防ぐための worker lifecycle 停止だけである。
+  この原則に対する同期的な例外は次の 3 つだけである:
+  ユーザーが明示した履歴メニュー(後述)、
+  process の重複・frame 途中の EOF・fd の取り違えを防ぐための worker lifecycle 停止、
+  そして行の確定時にバッファ装飾を 1 回だけ確定させる line-finish settle(「Buffer Syntax Highlighting」節)。
   履歴メニューで worker が走査する履歴エントリ数は `[history].limit` 件までに、
   index を作り直すときに zsh が合成する payload は固定のバイト上限までに限り、worker 交換には
   固定の絶対 100ms deadline を置く。lifecycle 停止も後述の 1 本の絶対 100ms deadline 内だけ
   同期待機を許し、正常 shutdown から異常 abort へ移っても更新しない。超過後は入力へ戻して
   readiness-driven cleanup を続けるため、入力を無期限に止めない。
+  line-finish settle も同じ 100ms の絶対 deadline を 1 本だけ持ち、超過時はベストエフォートで先へ進む。
 - **確定は挿入のみ**: コマンドは実行しない(実行はもう一度 Enter)。
 - zrush は compinit を実行しない。compsys 未初期化を検知したら警告のみ表示する。
 
@@ -76,8 +79,10 @@ zsh は zle 統合・compsys 呼び出しによる捕獲・zsh 名前空間 snap
   control channel や request FIFO の EOF、job/exit status から完了を推測しない。
 - request/response・入力通知・worker event の nested-netstring と `hello` / `ready` は
   `../contracts/cli-protocol.md` が定める。通常の補完経路は cold start・握手・event を同期的に待たず、
-  response fd の `zle -F` callback で進める。同期的に起動と応答を待てるのは履歴メニューだけで、
-  その 1 本の絶対 100ms deadline に起動・握手・bootstrap の namespace request とその応答・先行 request・
+  response fd の `zle -F` callback で進める。同期的に応答を待てるのは履歴メニューと
+  line-finish settle(「Buffer Syntax Highlighting」節)だけで、worker の起動まで同期的に待つのは
+  履歴メニューだけである。
+  履歴メニューの 1 本の絶対 100ms deadline に起動・握手・bootstrap の namespace request とその応答・先行 request・
   `history-snapshot` と `plan` の連送(index が同期済みなら `plan` だけ)・
   `plan` の終端応答をすべて含める。
 - worker stdin への送信単位は完成済み frame 1 個で、outbound queue に send offset を持たない。
@@ -127,8 +132,11 @@ zsh は zle 統合・compsys 呼び出しによる捕獲・zsh 名前空間 snap
   worker の event はこれと一致するときだけ適用し、一致しないものは捨てる。
   無効化点は次のとおりで、いずれも取り消しメッセージを worker へ送らない
   (worker は静穏期間の満了で event を送るが、zsh がそれを捨てるだけで足りる):
-  バッファ変化、空バッファ / `min-input` による抑止、入力圧による見送り、
-  履歴メニューを開く操作、dismiss、確定(挿入)、行の確定と初期化、
+  バッファ変化、空バッファ / `min-input` による抑止
+  (`[syntax].enabled = true` の `min-input` 抑止だけは、新しい generation を採番して
+  **装飾専用の通知**を送る。「Candidate Collection」節)、入力圧による見送り、
+  履歴メニューを開く操作、dismiss、確定(挿入)、行の確定と初期化
+  (行の確定では line-finish settle の完了後に無効化する。「Buffer Syntax Highlighting」節)、
   worker の正常 shutdown・異常 abort・session failure・worker の交換・re-source。
 - worker の current input と静穏期間は worker session に属し、session とともに失われる。
   zsh は失われた入力通知を replay せず、`capture-required` に答えるはずだった捕獲も作り直さない。
@@ -144,6 +152,8 @@ zsh は zle 統合・compsys 呼び出しによる捕獲・zsh 名前空間 snap
   session failure・worker の交換・re-source のたび、および latch の generation を名乗った入力通知が
   `capture-required` を受けたときに無効化する
   (worker がその generation を保持していないことの通知であり、error ではない)。
+  装飾専用の通知は latch の generation を名乗らないため、その `capture-required` は無効化点ではない
+  (「Candidate Collection」「Empty-Word Collection Cache」節)。
   latch を無効化した generation を payload の再送で復元することはせず、
   `error` / `superseded` で終端した `store` も replay しない。
   新しい generation を作るのは新しい収集だけである。
@@ -184,8 +194,10 @@ zsh は zle 統合・compsys 呼び出しによる捕獲・zsh 名前空間 snap
 - 外側/nested framing の破損、通常処理中の response EOF/read error、ack なしの writer 通知 EOF、
   予期しない終了、要求と対応しない応答、仕様を満たさない `ok`、仕様を満たさない worker event
   (未知の kind、フィールド数違い、非 canonical な `input_generation`、現在の generation に一致する
-  `plan-ready` の壊れたプラン)、履歴交換の deadline 超過は
-  **worker session failure** であり、異常 abort を開始する。その session の未完了 request は
+  `plan-ready` の壊れたプラン、現在の generation に一致する `syntax-highlight` の壊れた body)、
+  履歴交換の deadline 超過は
+  **worker session failure** であり、異常 abort を開始する。
+  line-finish settle の deadline 超過はこれに含まない(「Buffer Syntax Highlighting」節)。その session の未完了 request は
   queue/送信中/送信済みを区別せず破棄して replay しない。
   現在の `input_generation` も無効化し、入力通知を replay しない。
 - 連続 worker session failure 回数は、namespace request を除く正常に形成された終端 `ok` / `error` または
@@ -278,6 +290,26 @@ wire の byte-exact な形と receiver の置換規則は
   新しい `input_generation` を採番して入力通知を直ちに queue する。
   未処理のキー入力がある間は通知を作らず、そのキーが起こす次の変化で作り直す
   (入力圧は zsh にしか見えないためここで判定する)。
+- `[syntax].enabled = true` の間、`min-input` による抑止は通知そのものを止めず、
+  その通知を**装飾専用の通知**にする(1 文字目から着色するため)。
+  装飾専用の通知とはバッファ装飾のためだけに送る入力通知であり、一覧に一切関与しない。
+  `min-input` 抑止のほか、line-finish settle が送る通知もこれである
+  (「Buffer Syntax Highlighting」節)。次の 1 つの規則にまとめて従う。
+  - `candidate_generation` は**常に `0`** とする。空語収集キャッシュのヒット判定は行わない。
+    `min-input >= 1` で現在語が空になる入力(`ls ` のカーソル直後など)は
+    空語収集キャッシュの対象と `min-input` 抑止が同時に成り立つが、この規則が唯一の答えである
+    (「Empty-Word Collection Cache」節)。
+  - 返る `plan-ready` / `capture-required` は捨てる。捕獲を開始せず、一覧を作らない
+    (表示中の一覧があってもこの通知は触らない。消去が要るかどうかはその通知を作った操作が決める)。
+  - latch の generation を名乗らないため、捨てた event は空語収集キャッシュの latch を変えない。
+  - Tab の判定では「event 待ちの `input_generation`」に数えない。
+    pending Tab の押下を受け取らず、`flush` の送出対象にもならない(「Tab」節)。
+  `[syntax].enabled = false` のときは、`min-input` の抑止規則が通知そのものを止める。
+- 空バッファの抑止は `[syntax].enabled` によらず通知そのものを止める。
+  空バッファに置ける装飾範囲は存在せず、装飾ゼロという結果を zsh だけで決められるため、
+  worker を起こしてまで往復する理由が無い(遅延起動の原則を保つ)。
+  zsh はこの変化で自分のバッファ装飾エントリを取り除く(「Buffer Syntax Highlighting」節)。
+- 入力圧による見送りは装飾にも同じく効き、次の変化まで装飾も更新されない。
 - 静穏判定(`delay-ms`、既定 30ms)は worker が持つ。zsh はタイマーを持たず、
   設定値は通知のフィールドとして運ぶ
   (`../contracts/cli-protocol.md`「Input Notifications and Worker Events」節)。
@@ -285,6 +317,8 @@ wire の byte-exact な形と receiver の置換規則は
   `plan-ready` か `capture-required` を返す。
 - 入力通知は、その時点の広げ規則が定めるクエリ・行数/桁数予算・マッチング設定・`cwd`・`delay-ms` と、
   空語収集キャッシュが提供する candidate generation(提供が無ければ `0`)を運ぶ。
+  加えてバッファ装飾のための per-call context として `BUFFER` 全体と `interactive_comments` を運ぶ
+  (`[syntax].enabled = false` のときバッファは空で送る。「Buffer Syntax Highlighting」節)。
 - 現在の `input_generation` に一致する `capture-required` を受けたときにだけ、compsys 捕獲を 1 回開始する。
   一致する `plan-ready` を受けたときは捕獲せず、そのプランをそのまま適用する。
   一致しない event は捨てる(捕獲も表示も起こさない)。
@@ -372,6 +406,12 @@ wire の byte-exact な形と receiver の置換規則は
   worker がそれを保持していれば、収集も `store` も起こらないまま `plan-ready` が返る
   (payload の転送も再解析も起こらない)。
   worker が保持していなければ `capture-required` が返るため、zsh は latch を無効化して通常の収集へ落ちる。
+- 装飾専用の通知(「Candidate Collection」節)では検証そのものを行わず、
+  `candidate_generation` を `0` として送る。
+  latch の generation を名乗らないため、その generation の `capture-required` / `plan-ready` を捨てても
+  latch は変わらず、ヒットにもミスにも数えない
+  (latch を無効化するのは latch の generation を名乗った通知が `capture-required` を受けたときだけである。
+  「Worker Lifecycle」節)。
 - ミス時は通知の `candidate_generation` を `0` として送り、返る `capture-required` で通常どおり収集する。
   収集の `store` が `ok` で終端した時点で、フィンガープリント・保存時刻・latch を更新する
   (`superseded` や他の `error` で終端した `store` では更新しない)。
@@ -409,7 +449,9 @@ wire の byte-exact な形と receiver の置換規則は
 - 補完一覧の入力通知は変化の検知と同時に、`store` 要求は収集完了後の非同期結果経路から worker へ送る。
   応答と worker event は worker stdout の `zle -F` コールバックで受け、キー入力を同期的に待たせない
   (「入力は決してブロックしない」原則)。
-  例外は履歴メニューで、こちらは select-prev の押下時に同期実行する(「History Menu」節)。
+  例外は履歴メニュー(select-prev の押下時に同期実行する。「History Menu」節)と
+  line-finish settle(「Buffer Syntax Highlighting」節)の 2 つで、
+  バッファ装飾の通常の配送も `zle -F` の非同期経路である。
   ディレクトリ合成 `/` 判定のための stat(cli-protocol.md「Insertion Text」節)は
   表示位置として採用された候補数に有界であるため、この非同期実行を妨げない。
 - ワイド文字の整列: プラン内のオフセット(ハイライト範囲・セル実テキスト範囲)は文字数、
@@ -424,10 +466,74 @@ wire の byte-exact な形と receiver の置換規則は
   match と history-number の装飾は選択中セルには適用しない
   (実現方法は cli-protocol.md「Highlights」節: 選択変更のたびに
   プランからエントリを再構築し、選択エントリへ差し替える)。空文字列は装飾なし。
+- バッファ(入力行)自身の装飾は `[syntax.highlight]` が担い、一覧の装飾とは独立している
+  (「Buffer Syntax Highlighting」節)。
 - region_highlight の自エントリは帳簿で管理し、zsh 5.9+ では `memo=zrush` を付与して
   他の `region_highlight` 利用者のエントリと区別する。
+  自エントリは 3 群に分かれ、memo のサフィックスで識別する:
+  一覧本体が `memo=zrush`、選択セルが `memo=zrush-sel`、バッファ装飾が `memo=zrush-syn`。
+  差し替えと消去は群ごとに独立して行い、一覧の更新・消去がバッファ装飾を落とすことも、
+  その逆もない。
   5.8 では memo が使えないため、バッファ編集後の選択ハイライト解除が
   次の描画まで遅れる劣化を許容する。
+  同じ理由で、5.8 のバッファ装飾エントリも帳簿の値一致による差分削除で取り除く。
+  ZLE はバッファ編集のたびに `region_highlight` エントリのオフセットを書き換えるため、
+  ずれたエントリは値一致で取り除けないことがある。
+  その場合に古い装飾が次の event(または line-finish settle)まで残る劣化を、
+  選択ハイライトと同じく許容する。
+
+## Buffer Syntax Highlighting
+
+入力行そのものを字句分類に基づいて装飾する。既定で有効(`[syntax].enabled`)。
+分類の意味論は `syntax.md`、ワイヤ形式と適用規則は
+`../contracts/cli-protocol.md`「Input Notifications and Worker Events」
+「`syntax-highlight` body (Buffer Highlight Stream)」が定める。
+
+- **配送は非同期**: worker は入力通知を受理した時点で、静穏期間を待たずにバッファを字句解析し、
+  `syntax-highlight` event を返す。一覧の静穏判定とは独立であり、打鍵ごとに 1 個返る。
+- zsh はいま有効な `input_generation` に一致する event だけを適用し、一致しないものは捨てる。
+  適用はバッファ領域(オフセット 0 から)への `region_highlight` エントリ群の差し替えで、
+  一覧側のエントリには触れない(「Display」節)。
+- **空バッファでは装飾を持たない**: 空バッファ(空白のみを含む)になる変化で、zsh は入力通知を送らずに
+  自分のバッファ装飾エントリを取り除く(装飾すべき語が無いため、往復を待つ必要がない)。
+- **消してから描かない**: 新しい event が届くまで直前の装飾を保持する。
+  打鍵直後の 1 フレームだけ新しい入力が未着色に見えることは許容する
+  (字句解析はバッファ長に比例する小さな純計算である)。
+- role から装飾スペックへの写像は zsh が `[syntax.highlight]` を引いて行う。
+  空スペックのエントリは追加しない。重なった範囲は event の並び順で後のエントリが勝つ。
+- **`enabled = false`** のとき、zsh は入力通知のバッファを空で送る。
+  worker はこの設定を知らないが、空の入力には token が無いため字句解析は起こらない。
+  zsh はバッファ装飾のエントリを持たず、設定が有効から無効へ変わったときは
+  次の描画で自分のバッファ装飾エントリを取り除く。
+- worker が不在・停止中・quarantine 中の間は装飾を更新しない。
+  worker session failure・交換・re-source の後は、次のバッファ変化の event が装飾を作り直す。
+  失われた通知の replay はしない。
+- コマンド語の分類は zsh のコマンドハッシュとの厳密一致を保証しない
+  (`hash` の手動登録や rehash 直後のズレなど)。ズレの帰結は装飾が一時的に違うことだけであり、
+  ベストエフォートとして仕様外にする。
+
+### Line-Finish Settle
+
+Enter で確定した行はスクロールバックへそのまま焼き付くため、
+古い装飾を残さないよう `zle-line-finish` で 1 回だけ同期的に確定させる。
+
+- 現在のバッファに対応する `syntax-highlight` を適用済みなら、待たずに終わる。
+- 未適用なら、必要に応じて新しい `input_generation` の入力通知を 1 個送り
+  (入力圧で通知を見送っていた場合)、その generation の `syntax-highlight` を同期的に待って適用する。
+  この通知も**装飾専用の通知**であり(「Candidate Collection」節)、`candidate_generation = 0` で送って
+  一覧側の帰結(`plan-ready` / `capture-required`)を捨てる。
+  したがって空語収集キャッシュの latch も変えない。
+- 同期待ちは開始時に定める **1 本の絶対 100ms deadline** に限る。
+  値は固定方針であり設定項目にしない。
+  待っている間に届いた他の応答・event は通常の規則で処理する(stale なら捨てる)。
+- **超過時はベストエフォートで先へ進む**: 装飾を更新しないまま行を確定させ、通知の replay はしない。
+  超過そのものは worker session failure ではない(履歴メニューと違い、
+  応答が無くても行の確定は成立し、失われるのは装飾の鮮度だけである)。
+  読み取り途中のバイトはそのまま残し、通常の非同期経路が次に引き取る。
+- `enabled = false` のとき、空バッファのとき、および worker が不在・停止中・quarantine 中のときは、
+  通知も送らず待たない(行の確定のために worker を起動することはない)。
+- settle の後、行の確定として一覧を消し現在の `input_generation` を無効化するが、
+  バッファ装飾のエントリは残す(これがスクロールバックへ焼き付く装飾である)。
 
 ## Selection and Keybindings
 
@@ -629,6 +735,10 @@ wire の byte-exact な形と receiver の置換規則は
 - 一覧がなく、event 待ちの `input_generation` も進行中の収集も無い静止状態の Tab は、
   前任者チェーン(素の補完など)へフォールバックする
   (候補 0 件の結果を受け取った後もこの静止状態である)。
+- **装飾専用の通知の generation は、この判定において「event 待ちの `input_generation`」に数えない**
+  (その event は捨てられ、一覧にならないため。「Candidate Collection」節)。
+  したがって `min-input` で一覧が抑止されている間の Tab は静止状態として前任者チェーンへ落ち、
+  押下の記録も `flush` の送出も行わない。
 
 ## Confirmation (Insertion)
 

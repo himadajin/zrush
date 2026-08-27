@@ -99,6 +99,8 @@ request 処理を始める前に startup 診断を stderr へ 1 行書いて exi
 ナビゲーション表構築・挿入テキスト構築を行って stdout へ応答する。
 `input` 通知は静穏期間で置き換えながら最新の 1 個だけを保持し、期間の満了で描画プランまたは
 捕獲要求を worker event として stdout へ送る(「Input Notifications and Worker Events」節)。
+`input` 通知の受理時には、静穏期間を待たずにバッファを字句解析して
+バッファ装飾の worker event を 1 個送る(同節)。
 したがって worker は「1 要求を読む → 1 応答を書く」だけの loop ではなく、
 stdin の待機に静穏期間の満了時刻を deadline として与え、新しいメッセージが来なくても
 期間の満了だけで event を送れる session event loop として動く。
@@ -153,6 +155,7 @@ message   = netstring(netstring(field-1) ... netstring(field-N))
   完成していたメッセージは先に処理し、OS の read 境界によって配送結果を変えない。
 - 候補レコードストリームは `store` / `history-snapshot` / `history-append` 要求の、
   描画プランストリームは `plan` の成功応答と `plan-ready` event の、
+  バッファ装飾ストリームは `syntax-highlight` event の、
   それぞれ 1 個の opaque field として入れ子にする。その内側の NUL フレーミングは後述の規範を保つ。
 - kind・build stamp・request_id・列挙値・真偽値・数値・error code は、以下に示す ASCII バイト列と
   完全一致しなければならない。前後空白、符号、別の大小文字表記を許さない。
@@ -193,7 +196,7 @@ worker が受ける `hello` の kind・フィールド数・stamp 表記自体�
 |---|---|---|---|
 | 要求(`namespace-snapshot` / `store` / `history-snapshot` / `history-append` / `plan`) | zsh → worker | `request_id` | `ok` / `error` をちょうど 1 個 |
 | 入力通知(`input` / `flush`) | zsh → worker | `input_generation` | 無し(帰結は worker event) |
-| worker event(`plan-ready` / `capture-required`) | worker → zsh | `input_generation` | 無し |
+| worker event(`plan-ready` / `capture-required` / `syntax-highlight`) | worker → zsh | `input_generation` | 無し |
 
 - 要求だけが `request_id` を持ち、zsh の未完了要求表に登録される。
   入力通知は `request_id` を持たず、未完了要求表にも登録しない。
@@ -389,15 +392,17 @@ zsh は index への書き込みを query より後ろへ並べ替えず、ま�
 
 ### Input Notifications and Worker Events
 
-バッファ変化の通知と、その帰結の配送はこの 4 kind で行う。
+バッファ変化の通知と、その帰結の配送はこの 5 kind で行う。
 角括弧内は外側 message payload に固定順で並ぶ netstring field を表す。
 
 ```
 input:            ["input", input_generation, candidate_generation, delay_ms, cwd, query,
-                   mode, smart_case, rows, width, trailing_space]
+                   mode, smart_case, rows, width, trailing_space, buffer,
+                   interactive_comments]
 flush:            ["flush", input_generation]
 plan-ready:       ["plan-ready", input_generation, plan_body]
 capture-required: ["capture-required", input_generation]
+syntax-highlight: ["syntax-highlight", input_generation, highlight_body]
 ```
 
 - `input_generation`: 「Requests and Responses」節と同じ zsh 所有の canonical 10 進識別子。
@@ -412,10 +417,27 @@ capture-required: ["capture-required", input_generation]
 - `query` / `mode` / `smart_case` / `rows` / `width` は、通知時点の入力スナップショットであり、
   履歴 `plan` の同名 field と同じ意味・同じ表記である。
   `cwd` と `trailing_space` は補完 profile の入力通知だけが持つ profile 固有の値である。
+  `cwd` はファイル候補の合成 `/` 判定と、`buffer` の字句解析における path・command 解決の両方の基準になる。
+  `buffer` と `interactive_comments` はバッファ装飾のための per-call context であり、
+  一覧の計算には使わない。
   通知から作るプランのレイアウトは常に compsys profile のものとし、profile field は持たない。
   history index を参照しないため `history_limit` も持たない。
+- `buffer`: 字句解析の対象とするバッファのバイト列(NUL 除去済み)。空も有効である。
+  `query` が現在語から広げ規則で切り出した部分列であるのに対し、これは `BUFFER` 全体を運ぶ。
+  NUL の除去は `query` と同じ送信側の規律である。
+  NUL を実際に含むバッファでは、除去によって以降の文字オフセットが原バッファに対してずれるが、
+  これはベストエフォートとして仕様外にする(端末リサイズ直後のレイアウトのズレと同じ扱い)。
+  バッファ装飾が無効(config-schema.md `[syntax].enabled = false`)のとき、zsh はこの field を空で送る。
+  空の `buffer` は token を 1 個も含まないため、worker は字句解析を行わず token 0 個の event を返す。
+  空バッファの変化では zsh が入力通知そのものを送らないため(behavior.md「Candidate Collection」)、
+  空の `buffer` を運ぶ通知は装飾が無効なときにだけ現れる。
+- `interactive_comments`: `true` / `false`。通知時点で `interactive_comments` オプションが有効かを表す
+  (`syntax.md`「Lexical boundaries」の `#` の扱いを決める)。
+  名前空間 snapshot ではなく呼び出しごとの context として運ぶ値である(`syntax.md`「Context and purity」)。
 - `plan_body`: `plan` の成功応答と同一形式の描画プランストリーム(「`plan` `ok` body (Render Plan Stream)」節)。
   空バイト列も 0 マッチのプランではなく不正である(最小のプランは「Zero Matches」節の 4 フィールド)。
+- `highlight_body`: バッファ装飾のトークン列(「`syntax-highlight` body (Buffer Highlight Stream)」節)。
+  token 0 個でも空バイト列ではなく、ちょうど 1 フィールドである。
 
 #### Worker-Side Norms
 
@@ -427,6 +449,15 @@ current input は最後に受理した `input` 通知そのもの(その全フ�
   受理した通知は current input を丸ごと置き換え、その通知自身の `delay_ms` で静穏期間を張り直す。
   置き換えられた pending の入力は event を生まずに消える。
   `delay_ms = 0` の通知は受理と同時に settle する。
+- **バッファ装飾**: `input` を受理した worker は、静穏期間の満了を待たずその場で
+  `buffer` を字句解析し、その `input_generation` の `syntax-highlight` を 1 個送る。
+  置き換えられて settle しなかった通知もこの event を生む
+  (装飾の配送は静穏判定の対象外であり、打鍵ごとに 1 個返る)。
+  解析の context は同じ通知の `cwd` と `interactive_comments`、および session state の
+  namespace snapshot である(`../specs/syntax.md`「Context and purity」)。
+  namespace snapshot をまだ 1 度も受理していない worker は `syntax-highlight` を送らない
+  (zsh は session の最初の実メッセージより前に `namespace-snapshot` を並べるため、この窓は極小である)。
+  解析結果は session state にせず、path resolver の cache だけが session を跨いで残る。
 - **settle**: 通知の `candidate_generation` が `0` でなく、かつその generation を candidate store が
   保持していれば、その候補と通知のフィールドから描画プランを計算して `plan-ready` を 1 個送る。
   そうでなければ `capture-required` を 1 個送る。
@@ -442,8 +473,11 @@ current input は最後に受理した `input` 通知そのもの(その全フ�
   格納した `candidate_generation` の候補と current input のフィールドから計算した
   `plan-ready` を 1 個送る。
   順序は固定で、終端 `ok` を先に書いてから `plan-ready` を書く。
-- 1 つの `input_generation` が生む event は、高々 `capture-required` 1 個と `plan-ready` 1 個であり、
-  両方が生じる場合は必ずこの順に並ぶ。
+- 1 つの `input_generation` が生む `syntax-highlight` は高々 1 個であり、
+  同じ generation の他の event よりも必ず前に並ぶ(受理時に送り、settle を待たないため)。
+- 1 つの `input_generation` が生む **settle 由来の** event は、
+  高々 `capture-required` 1 個と `plan-ready` 1 個であり、両方が生じる場合は必ずこの順に並ぶ
+  (受理時に送る `syntax-highlight` はこの数え上げの外にあり、常にこれらより前に並ぶ)。
   これは上の受理規則と、zsh が `capture-required` 1 個につき `store` を 1 個だけ送ること
   (「zsh-Side Norms」)からの帰結であり、worker は event 数を別途カウントして強制しない
   (同じ generation に束縛された 2 個目の `store` は 2 個目の `plan-ready` を生む)。
@@ -469,8 +503,16 @@ current input は最後に受理した `input` 通知そのもの(その全フ�
   一致しない body は解析しない。
 - 一致する `plan-ready` の `plan_body` は `plan` の `ok` body と同じ受理条件で検証し、
   同じ規則で適用する(「Response Validation and zsh-Side Application (Normative)」節)。
+  ただし装飾専用の通知の generation は除く。その `plan-ready` は body を解析せず捨てる
+  (behavior.md「Candidate Collection」節)。
+- 一致する `syntax-highlight` の `highlight_body` は「`syntax-highlight` body (Buffer Highlight Stream)」節の
+  受理条件で検証し、同節の規則でバッファ領域へ適用する。
+  `plan-ready` と同じく、**generation の照合を body の検証より先に行い**、一致しない body は解析しない。
 - 一致する `capture-required` を受けた `input_generation` について、zsh は compsys 捕獲を
   ちょうど 1 回開始し、その結果を同じ `input_generation` を束縛した `store` で送る。
+  ただし装飾専用の通知の generation は除く。その `capture-required` は捕獲を開始させずに捨てる
+  (装飾専用の通知は `candidate_generation = 0` を名乗るため必ず `capture-required` を受けるが、
+  一覧を作らないための通知である。behavior.md「Candidate Collection」節)。
   無効化された `input_generation` のために完走した捕獲の結果は、`store` にせず破棄する
   (`store` は必ず束縛を持つため、他に適合する形が無い)。
 - 未知の kind、フィールド数違い、非 canonical な `input_generation` を持つ event は
@@ -490,10 +532,24 @@ current input は最後に受理した `input` 通知そのもの(その全フ�
 
 - `input_generation = 7`、再利用できる候補は無く(`candidate_generation = 0`)、
   静穏期間 30ms、`cwd = /tmp`、`query = gi`、`mode = typo`、`smart_case = true`、
-  `rows = 10`、`width = 79`、`trailing_space = true` の入力通知:
+  `rows = 10`、`width = 79`、`trailing_space = true`、`buffer = gi`、
+  `interactive_comments = false` の入力通知:
 
   ```
-  64:5:input,1:7,1:0,2:30,4:/tmp,2:gi,4:typo,4:true,2:10,2:79,4:true,,
+  77:5:input,1:7,1:0,2:30,4:/tmp,2:gi,4:typo,4:true,2:10,2:79,4:true,2:gi,5:false,,
+  ```
+
+- 上の通知を受理した直後に返る `syntax-highlight`
+  (`gi` は実行可能ファイルとして解決しないため token 1 個の `unknown 0 2`):
+
+  ```
+  42:16:syntax-highlight,1:7,14:1\0unknown 0 2\0,,
+  ```
+
+- 装飾すべき token が無い場合の `syntax-highlight`(`buffer` が空、すなわち装飾が無効なとき):
+
+  ```
+  29:16:syntax-highlight,1:7,2:0\0,,
   ```
 
 - 同じ generation に対する `capture-required`:
@@ -527,6 +583,61 @@ current input は最後に受理した `input` 通知そのもの(その全フ�
   ```
   12:5:flush,1:7,,
   ```
+
+### `syntax-highlight` body (Buffer Highlight Stream)
+
+`syntax-highlight` event の `highlight_body` は、バッファ領域に適用する装飾の平坦列である。
+描画プランと同じく NUL(`\0`)終端フィールドの平坦列で、数値は ASCII 10 進表記。順序は固定:
+
+```
+フィールド 1: T(トークンエントリ数)
+続く T 個: "role start len"(空白区切り)
+```
+
+総フィールド数は `1 + T`。`T = 0` の body はフィールド 1 個(`0\0`)であり、空バイト列ではない。
+
+- `role` は字句解析器の分類(`../specs/syntax.md`「Token kinds」)の kebab-case で、次の 18 個に閉じている。
+
+  `command`, `reserved`, `alias`, `function`, `builtin`, `precommand`, `unknown`,
+  `assignment`, `option`, `redirect`, `operator`, `comment`,
+  `single-quote`, `double-quote`, `dollar-quote`, `escape`, `substitution`, `path`。
+
+  `Word` は既定で無装飾であり role を持たないため、worker はこの分類の token を event に載せない。
+  role は config-schema.md `[syntax.highlight]` のキーと 1 対 1 に対応し、
+  zsh が該当スペックへ写像する(空スペック = 装飾なし)。
+- `start` / `len` は `buffer` を lossy UTF-8 解釈したときの Unicode スカラー値の並びに対する
+  0 始まりの**文字数**である(「Offset Rules」節の文字オフセットと同じ数え方)。
+  基準は listing text ではなくバッファそのものなので、`start = 0` はバッファ先頭を指す。
+- エントリはバッファの内側に収まる: `start + len <= buffer の文字数`。
+- 同じ span に意味分類の token と装飾範囲の token が重なる(`../specs/syntax.md`「Token kinds」)。
+  エントリの並び順は worker の解析が返す順序であり、規範である
+  (`../specs/syntax.md`「Token order」)。zsh はこの順で `region_highlight` へ追加し、
+  重なった領域は**後のエントリが勝つ**(zsh の `region_highlight` の解決順そのもの。
+  スペックの合成はしない)。
+
+#### Buffer Highlight Application (zsh-Side Normative)
+
+- 適用先は現在の `BUFFER` であり、オフセットにはプランのような `$#BUFFER + 1` の加算をしない
+  (加算は POSTDISPLAY 上の listing text にだけ必要な補正である)。
+- 装飾が有効かどうか(config-schema.md `[syntax].enabled`)は zsh 側の判断であり、
+  無効なら zsh は自身のバッファ装飾エントリを持たない。
+- 受理した event のエントリで、zrush が持つ**バッファ装飾のエントリ群だけ**を丸ごと差し替える。
+  一覧(POSTDISPLAY)側のエントリはこの差し替えで変化せず、逆に一覧の差し替えや消去も
+  バッファ装飾のエントリを落とさない。両者は独立した 2 群として扱う
+  (帳簿と memo による識別は behavior.md「Display」節)。
+- 新しい event が届くまで、直前に適用したバッファ装飾を保持する
+  (一覧テキストの「消してから描かない」と同じ方針)。
+  バッファがその間に縮んで範囲がバッファ外へ出たエントリの見え方は仕様外であり、
+  次の event で置き換わる。
+- 受理条件を満たさない `highlight_body`
+  (最終フィールドの NUL 終端欠落、`T` が非負の数字列でない、
+  総フィールド数が `1 + T` と一致しない、エントリのタプルの要素数が 3 でない、
+  `role` が上記 18 個以外、`start` / `len` が非負の canonical 10 進数でない、
+  `start + len` がバッファの文字数を超える)は、event 全体を破棄して worker セッションを終了する
+  (壊れた `plan_body` と同じ扱い。「Response Validation and zsh-Side Application (Normative)」節。
+  停止に伴う破棄・無効化は behavior.md「Worker Lifecycle」が定める)。
+  受信側が自身の文字数の数え方を使うことは許すが、正当な event を弾かないよう、
+  用いる上界は Rust 側の文字数以上でなければならない(「Offset Rules」節と同じベストエフォート)。
 
 ### `candidate_payload` (Candidate Record Stream)
 
@@ -639,6 +750,11 @@ zpty 内で compsys を駆動して得る payload(behavior.md「Candidate Collec
   `trailing_space` は `[insert].trailing-space`、`delay_ms` は `[display].delay-ms` の設定値、
   `candidate_generation` は空語収集キャッシュの latch が有効ならその generation、
   それ以外は `0`(behavior.md「Empty-Word Collection Cache」節)。
+  ただし装飾専用の通知(behavior.md「Candidate Collection」節)は
+  latch を名乗らず、キャッシュのヒット判定も行わずに常に `0` を送る。
+  `buffer` は `BUFFER` 全体(`[syntax].enabled = false` なら空)、
+  `interactive_comments` は通知時点の同名オプションの状態。
+  この 2 つは一覧の計算に使わず、バッファ装飾の per-call context としてだけ運ぶ。
 - この profile の候補は `input` 通知の帰結として一覧になる。
   `plan` 要求は履歴メニューの同期交換が使う明示操作であり、
   入力に追従する一覧のために送ることはない。
@@ -1024,6 +1140,8 @@ zsh は一覧を消す。
   プラン全体を破棄して一覧を消し、worker セッションを終了する。
   同じ session の他の未完了要求も behavior.md「Worker Lifecycle」に従ってすべて破棄する。
   壊れた success を受理してセッションを継続してはならない。
+- 現在の generation に一致する `syntax-highlight` の `highlight_body` が仕様を満たさない場合も
+  同じく worker セッションを終了する(受理条件は「`syntax-highlight` body (Buffer Highlight Stream)」節)。
 - 正常に形成された `namespace-snapshot` の `ok` / `error` を除き、
   正常に形成された `ok` / `error` と正常に形成された worker event は、
   worker セッションの連続失敗回数を 0 に戻す。
@@ -1077,6 +1195,25 @@ typeset -g  ZRUSH_CFG_HL_MATCH='underline'
 typeset -g  ZRUSH_CFG_HL_HEADING='bold'
 typeset -g  ZRUSH_CFG_HL_HISTORY_NUMBER='faint'
 typeset -g  ZRUSH_CFG_HISTORY_LIMIT='5000'
+typeset -g  ZRUSH_CFG_SYNTAX_ENABLED='true'
+typeset -g  ZRUSH_CFG_SYNTAX_HL_COMMAND='fg=green'
+typeset -g  ZRUSH_CFG_SYNTAX_HL_RESERVED='fg=yellow'
+typeset -g  ZRUSH_CFG_SYNTAX_HL_ALIAS='fg=green'
+typeset -g  ZRUSH_CFG_SYNTAX_HL_FUNCTION='fg=green'
+typeset -g  ZRUSH_CFG_SYNTAX_HL_BUILTIN='fg=green'
+typeset -g  ZRUSH_CFG_SYNTAX_HL_PRECOMMAND='fg=green,underline'
+typeset -g  ZRUSH_CFG_SYNTAX_HL_UNKNOWN='fg=red,bold'
+typeset -g  ZRUSH_CFG_SYNTAX_HL_ASSIGNMENT=''
+typeset -g  ZRUSH_CFG_SYNTAX_HL_OPTION=''
+typeset -g  ZRUSH_CFG_SYNTAX_HL_REDIRECT=''
+typeset -g  ZRUSH_CFG_SYNTAX_HL_OPERATOR=''
+typeset -g  ZRUSH_CFG_SYNTAX_HL_COMMENT='fg=black,bold'
+typeset -g  ZRUSH_CFG_SYNTAX_HL_SINGLE_QUOTE='fg=yellow'
+typeset -g  ZRUSH_CFG_SYNTAX_HL_DOUBLE_QUOTE='fg=yellow'
+typeset -g  ZRUSH_CFG_SYNTAX_HL_DOLLAR_QUOTE='fg=cyan'
+typeset -g  ZRUSH_CFG_SYNTAX_HL_ESCAPE='fg=cyan'
+typeset -g  ZRUSH_CFG_SYNTAX_HL_SUBSTITUTION=''
+typeset -g  ZRUSH_CFG_SYNTAX_HL_PATH='underline'
 typeset -ga ZRUSH_CFG_KEYBINDS=(
   'select-next'  'key:down'
   'select-next'  'seq:^N'
@@ -1093,6 +1230,10 @@ typeset -ga ZRUSH_CFG_WARNINGS=()
 ```
 
 - 出力は `typeset` への静的代入のみ(コマンド実行を含む出力はしない)。
+- `ZRUSH_CFG_SYNTAX_HL_*` の変数名は `[syntax.highlight]` のキーを大文字化し、
+  `-` を `_` に置き換えたものである(`single-quote` → `ZRUSH_CFG_SYNTAX_HL_SINGLE_QUOTE`)。
+  出力順は config-schema.md「[syntax.highlight]」の表の順(字句解析器の分類の宣言順)とする。
+  zsh は `syntax-highlight` event の `role` を同じ機械的な写像で変数名へ変換する。
 - **クォート規律(規範)**: すべての値を単一引用符 `'...'` で囲み、
   値内の `'` は `'\''` にエスケープする(警告メッセージはユーザー入力由来の任意文字列を含むため必須)。
 - zsh 側は `emulate -L zsh` の統制された文脈で source する(継承 setopt による解釈事故の防止)。
@@ -1179,7 +1320,9 @@ typeset -g _ZRUSH_EXPECTED_BUILD_STAMP='<build-stamp>'
    遅延起動時に runtime directory/FIFO を作成してはならない。spawn 後の parent endpoint/watcher failure と
    writer notification/watcher failure の fail-closed quarantine・runtime taint は behavior.md が定める。
 4. 入力変化: zsh は新しい `input_generation` を採番して `input` 通知を直ちに送る。
-   worker は `delay-ms` の静穏期間を張り、打鍵が続く間は新しい通知で置き換え続ける。
+   worker は受理と同時にバッファを字句解析して `syntax-highlight` を返し、
+   zsh はそれを `BUFFER` 領域の `region_highlight` へ適用する。
+   続けて worker は `delay-ms` の静穏期間を張り、打鍵が続く間は新しい通知で置き換え続ける。
    期間が満了すると、通知が名乗った `candidate_generation` を保持していれば
    `plan-ready` を返し(空語収集キャッシュのヒットはこの経路になる)、
    保持していなければ `capture-required` を返す。

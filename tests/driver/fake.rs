@@ -1,5 +1,6 @@
 //! The controllable `zrush` launcher (`tests/driver/bin/fake_worker.rs`) as the
-//! tests see it: a control file that selects the next request's failure mode,
+//! tests see it: a control file that selects the next request's failure mode, a
+//! highlight file that decides what every accepted `input` is decorated with,
 //! and the append-only state file the fake writes instead of anything the tests
 //! could read off its stdout.
 
@@ -57,6 +58,7 @@ pub struct Fake {
     control: PathBuf,
     state: PathBuf,
     count: PathBuf,
+    highlight: PathBuf,
 }
 
 impl Fake {
@@ -66,6 +68,7 @@ impl Fake {
         let control = work.join("fake-control");
         let state = work.join("fake-state");
         let count = work.join("fake-state.count");
+        let highlight = work.join("fake-state.highlight");
         atomic_write(&control, Mode::Proxy.as_str());
         command
             .env("ZRUSH_BIN", env!("CARGO_BIN_EXE_zrush-fake-worker"))
@@ -75,11 +78,24 @@ impl Fake {
             control,
             state,
             count,
+            highlight,
         }
     }
 
     pub fn set_mode(&self, mode: Mode) {
         atomic_write(&self.control, mode.as_str());
+    }
+
+    /// The `role start len` entries the fake answers every accepted `input`
+    /// with, for the whole session and not one generation of it. An empty
+    /// slice asks for the zero-token event; a host that never calls this gets
+    /// no `syntax-highlight` at all.
+    pub fn set_highlight(&self, entries: &[&str]) {
+        let mut text = entries.join("\n");
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        atomic_write(&self.highlight, &text);
     }
 
     /// State lines containing `needle` (`grep -cF` semantics). Needles for a
@@ -160,9 +176,9 @@ impl Fake {
     }
 }
 
-/// Every reader of `path` (the fake's `hold`-loop poller, and its one-shot
-/// mode checks) must see a complete mode, so write a sibling temp file and
-/// `rename` it in.
+/// Every reader of `path` (the fake's `hold`-loop poller, its one-shot mode
+/// checks, and its per-`input` read of the highlight file) must see a complete
+/// value, so write a sibling temp file and `rename` it in.
 fn atomic_write(path: &Path, contents: &str) {
     let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
     fs::write(&tmp, contents).expect("write fake control temp file");

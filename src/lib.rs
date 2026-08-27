@@ -23,7 +23,6 @@ mod plan;
 mod ranking;
 mod record;
 mod span;
-#[allow(dead_code)]
 mod syntax;
 mod worker;
 

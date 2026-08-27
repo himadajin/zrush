@@ -16,6 +16,34 @@ use crate::wire::BUILD_STAMP;
 /// `history_limit` to it (cli-protocol.md 「history profile」).
 pub(crate) const HISTORY_LIMIT_MAX: u32 = 20000;
 
+/// Number of `[syntax.highlight]` keys.
+pub const SYNTAX_HL_N: usize = 18;
+
+/// `[syntax.highlight]` keys with their default specs, in the order
+/// config-schema.md declares them (which is also the output order required by
+/// cli-protocol.md). The zsh variable name is derived mechanically:
+/// `ZRUSH_CFG_SYNTAX_HL_` + the key uppercased with `-` turned into `_`.
+const SYNTAX_HIGHLIGHT: [(&str, &str); SYNTAX_HL_N] = [
+    ("command", "fg=green"),
+    ("reserved", "fg=yellow"),
+    ("alias", "fg=green"),
+    ("function", "fg=green"),
+    ("builtin", "fg=green"),
+    ("precommand", "fg=green,underline"),
+    ("unknown", "fg=red,bold"),
+    ("assignment", ""),
+    ("option", ""),
+    ("redirect", ""),
+    ("operator", ""),
+    ("comment", "fg=black,bold"),
+    ("single-quote", "fg=yellow"),
+    ("double-quote", "fg=yellow"),
+    ("dollar-quote", "fg=cyan"),
+    ("escape", "fg=cyan"),
+    ("substitution", ""),
+    ("path", "underline"),
+];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TabBehavior {
     CommonPrefix,
@@ -63,6 +91,11 @@ pub struct Config {
     pub trailing_space: bool,
     // [history]
     pub history_limit: u32,
+    // [syntax]
+    pub syntax_enabled: bool,
+    // [syntax.highlight] — same pass-through discipline as
+    // [display.highlight], index-aligned with SYNTAX_HIGHLIGHT.
+    pub syntax_highlight: [String; SYNTAX_HL_N],
     // [keybind] — normalized seq:/key: spec lists (one action may bind
     // several keys), index-aligned with keybind::ACTIONS.
     pub keybinds: [Vec<String>; keybind::N],
@@ -83,6 +116,8 @@ impl Default for Config {
             tab: TabBehavior::Menu,
             trailing_space: true,
             history_limit: 5000,
+            syntax_enabled: true,
+            syntax_highlight: SYNTAX_HIGHLIGHT.map(|(_, spec)| spec.to_string()),
             keybinds: keybind::default_specs(),
         }
     }
@@ -146,7 +181,7 @@ pub fn parse(source: &str) -> LoadResult {
 
     for (tname, tval) in &table {
         match tname.as_str() {
-            "display" | "matching" | "insert" | "history" | "keybind" => {
+            "display" | "matching" | "insert" | "history" | "syntax" | "keybind" => {
                 let Some(sub) = tval.as_table() else {
                     warnings.push(format!(
                         "config: {tname}: expected a table, got {}; using defaults",
@@ -185,37 +220,17 @@ fn apply_key(
     warnings: &mut Vec<String>,
 ) {
     match (table, key) {
-        ("display", "highlight") => {
-            let Some(sub) = val.as_table() else {
-                warnings.push(format!(
-                    "config: [display.highlight]: expected a table, got {}; using defaults",
-                    fmt_got(val)
-                ));
-                return;
-            };
-            for (k, v) in sub {
-                let target = match k.as_str() {
-                    "selected" => &mut cfg.hl_selected,
-                    "match" => &mut cfg.hl_match,
-                    "heading" => &mut cfg.hl_heading,
-                    "history-number" => &mut cfg.hl_history_number,
-                    _ => {
-                        warnings.push(format!(
-                            "config: [display.highlight] unknown key \"{k}\"; ignoring"
-                        ));
-                        continue;
-                    }
-                };
-                if let Some(s) = v.as_str() {
-                    *target = s.to_string();
-                } else {
-                    warnings.push(format!(
-                        "config: [display.highlight] {k}: expected string, got {}; using default \"{target}\"",
-                        fmt_got(v)
-                    ));
-                }
-            }
-        }
+        ("display", "highlight") => highlight_table(
+            "display.highlight",
+            val,
+            &mut [
+                ("selected", &mut cfg.hl_selected),
+                ("match", &mut cfg.hl_match),
+                ("heading", &mut cfg.hl_heading),
+                ("history-number", &mut cfg.hl_history_number),
+            ],
+            warnings,
+        ),
         ("display", "max-lines") => cfg.max_lines = int_val(val, table, key, 1, 1000, 10, warnings),
         ("display", "delay-ms") => cfg.delay_ms = int_val(val, table, key, 0, 10000, 30, warnings),
         ("display", "min-input") => cfg.min_input = int_val(val, table, key, 0, 100, 0, warnings),
@@ -248,6 +263,17 @@ fn apply_key(
         ("history", "limit") => {
             cfg.history_limit =
                 int_val(val, table, key, 1, HISTORY_LIMIT_MAX.into(), 5000, warnings);
+        }
+        ("syntax", "enabled") => {
+            cfg.syntax_enabled = bool_val(val, table, key, true, warnings);
+        }
+        ("syntax", "highlight") => {
+            let mut fields: Vec<(&str, &mut String)> = SYNTAX_HIGHLIGHT
+                .iter()
+                .map(|(k, _)| *k)
+                .zip(cfg.syntax_highlight.iter_mut())
+                .collect();
+            highlight_table("syntax.highlight", val, &mut fields, warnings);
         }
         ("keybind", _) => {
             if let Some(i) = keybind::ACTIONS.iter().position(|a| *a == key) {
@@ -290,6 +316,39 @@ fn apply_key(
         }
         _ => {
             warnings.push(format!("config: [{table}] unknown key \"{key}\"; ignoring"));
+        }
+    }
+}
+
+/// Apply one highlight table (`[display.highlight]`, `[syntax.highlight]`).
+/// Values are zsh region_highlight specs passed through verbatim; validation
+/// stops at "is a string" and an empty string is a valid value
+/// (config-schema.md).
+fn highlight_table(
+    label: &str,
+    val: &toml::Value,
+    fields: &mut [(&str, &mut String)],
+    warnings: &mut Vec<String>,
+) {
+    let Some(sub) = val.as_table() else {
+        warnings.push(format!(
+            "config: [{label}]: expected a table, got {}; using defaults",
+            fmt_got(val)
+        ));
+        return;
+    };
+    for (k, v) in sub {
+        let Some((_, target)) = fields.iter_mut().find(|(name, _)| name == k) else {
+            warnings.push(format!("config: [{label}] unknown key \"{k}\"; ignoring"));
+            continue;
+        };
+        if let Some(s) = v.as_str() {
+            **target = s.to_string();
+        } else {
+            warnings.push(format!(
+                "config: [{label}] {k}: expected string, got {}; using default \"{target}\"",
+                fmt_got(v)
+            ));
         }
     }
 }
@@ -356,7 +415,7 @@ pub fn to_zsh(result: &LoadResult) -> String {
     use std::fmt::Write as _;
     let c = &result.config;
     let mut o = String::new();
-    let scalars: [(&str, String); 13] = [
+    let scalars: [(&str, String); 14] = [
         ("ZRUSH_BUILD_STAMP", BUILD_STAMP.to_string()),
         ("ZRUSH_CFG_MAX_LINES", c.max_lines.to_string()),
         ("ZRUSH_CFG_DELAY_MS", c.delay_ms.to_string()),
@@ -370,9 +429,14 @@ pub fn to_zsh(result: &LoadResult) -> String {
         ("ZRUSH_CFG_HL_HEADING", c.hl_heading.clone()),
         ("ZRUSH_CFG_HL_HISTORY_NUMBER", c.hl_history_number.clone()),
         ("ZRUSH_CFG_HISTORY_LIMIT", c.history_limit.to_string()),
+        ("ZRUSH_CFG_SYNTAX_ENABLED", c.syntax_enabled.to_string()),
     ];
     for (name, value) in &scalars {
         let _ = writeln!(o, "typeset -g  {name}={}", sq(value));
+    }
+    for ((key, _), value) in SYNTAX_HIGHLIGHT.iter().zip(&c.syntax_highlight) {
+        let suffix = key.to_uppercase().replace('-', "_");
+        let _ = writeln!(o, "typeset -g  ZRUSH_CFG_SYNTAX_HL_{suffix}={}", sq(value));
     }
     o.push_str("typeset -ga ZRUSH_CFG_KEYBINDS=(\n");
     for (action, specs) in keybind::ACTIONS.iter().zip(&c.keybinds) {
@@ -412,7 +476,40 @@ mod tests {
         assert_eq!(c.tab, TabBehavior::Menu);
         assert!(c.trailing_space);
         assert_eq!(c.history_limit, 5000);
+        assert!(c.syntax_enabled);
+        assert_eq!(
+            c.syntax_highlight,
+            [
+                "fg=green",
+                "fg=yellow",
+                "fg=green",
+                "fg=green",
+                "fg=green",
+                "fg=green,underline",
+                "fg=red,bold",
+                "",
+                "",
+                "",
+                "",
+                "fg=black,bold",
+                "fg=yellow",
+                "fg=yellow",
+                "fg=cyan",
+                "fg=cyan",
+                "",
+                "underline",
+            ]
+            .map(String::from)
+        );
         assert_eq!(c.keybinds, keybind::default_specs());
+    }
+
+    /// Index of a `[syntax.highlight]` key, for tests that pin one value.
+    fn syntax_hl(key: &str) -> usize {
+        SYNTAX_HIGHLIGHT
+            .iter()
+            .position(|(k, _)| *k == key)
+            .unwrap_or_else(|| panic!("no [syntax.highlight] key {key:?}"))
     }
 
     #[test]
@@ -448,6 +545,15 @@ mod tests {
             [history]
             limit = 200
 
+            [syntax]
+            enabled = false
+
+            [syntax.highlight]
+            command = "fg=blue"
+            unknown = ""
+            single-quote = "fg=magenta"
+            path = "bold,underline"
+
             [keybind]
             select-next = ["ctrl-j", "j"]
             select-prev = "ctrl-k"
@@ -470,6 +576,20 @@ mod tests {
         assert_eq!(c.hl_match, "", "empty string means no decoration");
         assert_eq!(c.hl_heading, "fg=green");
         assert_eq!(c.hl_history_number, "fg=yellow,faint");
+        assert!(!c.syntax_enabled);
+        assert_eq!(c.syntax_highlight[syntax_hl("command")], "fg=blue");
+        assert_eq!(
+            c.syntax_highlight[syntax_hl("unknown")],
+            "",
+            "empty string means no decoration"
+        );
+        assert_eq!(c.syntax_highlight[syntax_hl("single-quote")], "fg=magenta");
+        assert_eq!(c.syntax_highlight[syntax_hl("path")], "bold,underline");
+        assert_eq!(
+            c.syntax_highlight[syntax_hl("reserved")],
+            "fg=yellow",
+            "untouched keys keep their default"
+        );
         // array, bare string (= one-element list), explicit empty list,
         // and an untouched action keeping its multi-key default
         assert_eq!(c.keybinds[0], vec!["seq:^J", "seq:j"]);
@@ -541,6 +661,78 @@ mod tests {
             "{}",
             r.warnings[0]
         );
+    }
+
+    #[test]
+    fn syntax_enabled_type_mismatch_falls_back() {
+        let r = parse("[syntax]\nenabled = \"yes\"\n");
+        assert!(r.config.syntax_enabled);
+        assert_eq!(r.warnings.len(), 1);
+        assert!(
+            r.warnings[0]
+                .contains("[syntax] enabled: expected boolean, got \"yes\"; using default true"),
+            "{}",
+            r.warnings[0]
+        );
+    }
+
+    #[test]
+    fn syntax_highlight_invalid_and_unknown_keys_fall_back() {
+        let r = parse("[syntax.highlight]\ncommand = 5\nword = \"bold\"\n");
+        assert_eq!(r.config.syntax_highlight[syntax_hl("command")], "fg=green");
+        assert_eq!(r.warnings.len(), 2);
+        assert!(
+            r.warnings.iter().any(|w| w.contains(
+                "[syntax.highlight] command: expected string, got 5; using default \"fg=green\""
+            )),
+            "{:?}",
+            r.warnings
+        );
+        // Word is a lexer classification without a key (config-schema.md).
+        assert!(
+            r.warnings
+                .iter()
+                .any(|w| w.contains("[syntax.highlight] unknown key \"word\"; ignoring")),
+            "{:?}",
+            r.warnings
+        );
+    }
+
+    #[test]
+    fn syntax_highlight_non_table_falls_back() {
+        let r = parse("[syntax]\nhighlight = \"fg=green\"\n");
+        assert_eq!(r.config.syntax_highlight[syntax_hl("command")], "fg=green");
+        assert!(
+            r.warnings[0]
+                .contains("[syntax.highlight]: expected a table, got \"fg=green\"; using defaults"),
+            "{}",
+            r.warnings[0]
+        );
+    }
+
+    #[test]
+    fn syntax_unknown_key_warns() {
+        let r = parse("[syntax]\nenable = true\n");
+        assert_eq!(r.config, Config::default());
+        assert_eq!(
+            r.warnings,
+            vec!["config: [syntax] unknown key \"enable\"; ignoring"]
+        );
+    }
+
+    #[test]
+    fn syntax_highlight_variable_names_follow_the_contract_mapping() {
+        let out = to_zsh(&LoadResult::default());
+        for (key, spec) in SYNTAX_HIGHLIGHT {
+            let name = format!(
+                "ZRUSH_CFG_SYNTAX_HL_{}",
+                key.to_uppercase().replace('-', "_")
+            );
+            assert!(
+                out.contains(&format!("typeset -g  {name}='{spec}'\n")),
+                "{name} missing from:\n{out}"
+            );
+        }
     }
 
     #[test]

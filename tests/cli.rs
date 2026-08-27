@@ -112,6 +112,8 @@ fn run_plan(extra: &[&str], stdin: &[u8]) -> (i32, Vec<u8>) {
     // Every `store` is bound to the worker's current input, so the session
     // opens with an `input` notification whose quiet period outlives the whole
     // exchange (cli-protocol.md "Input Notifications and Worker Events").
+    // These vectors are about the render plan alone, so the notification
+    // carries no buffer to decorate.
     let cwd = std::env::current_dir().unwrap();
     let req = [
         msg(&[
@@ -126,6 +128,8 @@ fn run_plan(extra: &[&str], stdin: &[u8]) -> (i32, Vec<u8>) {
             value("--rows").as_bytes(),
             value("--width").as_bytes(),
             value("--trailing-space").as_bytes(),
+            b"",
+            b"false",
         ]),
         msg(&[b"store", b"1", b"live", b"1", b"1", stdin]),
     ]
@@ -648,6 +652,25 @@ typeset -g  ZRUSH_CFG_HL_MATCH='underline'
 typeset -g  ZRUSH_CFG_HL_HEADING='bold'
 typeset -g  ZRUSH_CFG_HL_HISTORY_NUMBER='faint'
 typeset -g  ZRUSH_CFG_HISTORY_LIMIT='5000'
+typeset -g  ZRUSH_CFG_SYNTAX_ENABLED='true'
+typeset -g  ZRUSH_CFG_SYNTAX_HL_COMMAND='fg=green'
+typeset -g  ZRUSH_CFG_SYNTAX_HL_RESERVED='fg=yellow'
+typeset -g  ZRUSH_CFG_SYNTAX_HL_ALIAS='fg=green'
+typeset -g  ZRUSH_CFG_SYNTAX_HL_FUNCTION='fg=green'
+typeset -g  ZRUSH_CFG_SYNTAX_HL_BUILTIN='fg=green'
+typeset -g  ZRUSH_CFG_SYNTAX_HL_PRECOMMAND='fg=green,underline'
+typeset -g  ZRUSH_CFG_SYNTAX_HL_UNKNOWN='fg=red,bold'
+typeset -g  ZRUSH_CFG_SYNTAX_HL_ASSIGNMENT=''
+typeset -g  ZRUSH_CFG_SYNTAX_HL_OPTION=''
+typeset -g  ZRUSH_CFG_SYNTAX_HL_REDIRECT=''
+typeset -g  ZRUSH_CFG_SYNTAX_HL_OPERATOR=''
+typeset -g  ZRUSH_CFG_SYNTAX_HL_COMMENT='fg=black,bold'
+typeset -g  ZRUSH_CFG_SYNTAX_HL_SINGLE_QUOTE='fg=yellow'
+typeset -g  ZRUSH_CFG_SYNTAX_HL_DOUBLE_QUOTE='fg=yellow'
+typeset -g  ZRUSH_CFG_SYNTAX_HL_DOLLAR_QUOTE='fg=cyan'
+typeset -g  ZRUSH_CFG_SYNTAX_HL_ESCAPE='fg=cyan'
+typeset -g  ZRUSH_CFG_SYNTAX_HL_SUBSTITUTION=''
+typeset -g  ZRUSH_CFG_SYNTAX_HL_PATH='underline'
 typeset -ga ZRUSH_CFG_KEYBINDS=(
   'select-next'  'key:down'
   'select-next'  'seq:^N'

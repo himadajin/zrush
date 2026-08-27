@@ -177,7 +177,8 @@ fn run_vector_raw(path: &Path) -> std::process::Output {
     // One session carries the vector as the contract's requests. Completion
     // vectors use `input` + `store` and assert the resulting `plan-ready`
     // event; history vectors use the history write followed by the
-    // history-only `plan` request.
+    // history-only `plan` request. The corpus fixes render plans, so the
+    // notification carries no buffer to decorate.
     let source = vector_source(path);
     let mut requests = match source.as_bytes() {
         b"store" => [
@@ -193,6 +194,8 @@ fn run_vector_raw(path: &Path) -> std::process::Output {
                 value("--rows").as_bytes(),
                 value("--width").as_bytes(),
                 value("--trailing-space").as_bytes(),
+                b"",
+                b"false",
             ]),
             msg(&[b"store", b"1", b"live", b"1", BINDING, &payload]),
         ]
