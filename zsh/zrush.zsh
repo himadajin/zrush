@@ -56,6 +56,7 @@ if (( ${_zrush_installed:-0} || ${_zrush_worker_stopping:-0} ||
     }
     (( $+functions[_zrush_input_invalidate] )) && _zrush_input_invalidate
     (( $+functions[_zrush_rh_clear] )) && _zrush_rh_clear
+    (( $+functions[_zrush_rh_clear_syn] )) && _zrush_rh_clear_syn
     return 0
   }
   (( $? == 0 )) || return 1
@@ -106,14 +107,35 @@ typeset -gi _zrush_stale_disabled=0
 typeset -gi _zrush_worker_stopping=${_zrush_worker_stopping:-0}
 typeset -gi _zrush_installed=0
 typeset -gi _zrush_status_rendering=0
+# The closed role vocabulary of a buffer-highlight body, in the order
+# cli-protocol.md "`syntax-highlight` body (Buffer Highlight Stream)" fixes.
+typeset -ga _ZRUSH_SYNTAX_ROLES=(
+  command reserved alias function builtin precommand unknown
+  assignment option redirect operator comment
+  single-quote double-quote dollar-quote escape substitution path
+)
+# role -> the `zrush config` variable holding its spec. The name is derived
+# mechanically (cli-protocol.md "`zrush config` stdout (zsh Source Format)"), so
+# one lookup answers both "is this role in the vocabulary" and "which spec".
+typeset -gA _ZRUSH_SYNTAX_ROLE_VAR=()
+
 # Variables this script consumes from `zrush config` output (validation and rollback)
 typeset -ga _ZRUSH_CFG_VARS=(
   ZRUSH_CFG_MAX_LINES ZRUSH_CFG_DELAY_MS ZRUSH_CFG_MIN_INPUT
   ZRUSH_CFG_MODE ZRUSH_CFG_SMART_CASE ZRUSH_CFG_TAB ZRUSH_CFG_TRAILING_SPACE
   ZRUSH_CFG_HL_SELECTED ZRUSH_CFG_HL_MATCH ZRUSH_CFG_HL_HEADING
   ZRUSH_CFG_HL_HISTORY_NUMBER
-  ZRUSH_CFG_HISTORY_LIMIT ZRUSH_CFG_KEYBINDS ZRUSH_CFG_WARNINGS
+  ZRUSH_CFG_HISTORY_LIMIT ZRUSH_CFG_SYNTAX_ENABLED
+  ZRUSH_CFG_KEYBINDS ZRUSH_CFG_WARNINGS
 )
+() {
+  emulate -L zsh
+  local role
+  for role in "${(@)_ZRUSH_SYNTAX_ROLES}"; do
+    _ZRUSH_SYNTAX_ROLE_VAR[$role]=ZRUSH_CFG_SYNTAX_HL_${${(U)role}//-/_}
+    _ZRUSH_CFG_VARS+=( $_ZRUSH_SYNTAX_ROLE_VAR[$role] )
+  done
+}
 
 # Collection request state
 typeset -g  _zrush_query= _zrush_fuzzy= _zrush_buf= _zrush_pty= _zrush_capture_pid=
@@ -127,6 +149,13 @@ typeset -gi _zrush_last_cursor=-1
 typeset -gi _zrush_input_gen=0
 typeset -gi _zrush_input_pending=0   # no worker event has answered it yet
 typeset -gi _zrush_input_latched=0   # its notification named the cache latch's generation
+# Its notification was decoration-only (behavior.md "Candidate Collection"):
+# the listing-side events it draws are discarded, so it is never pending.
+typeset -gi _zrush_input_decor=0
+# The input_generation whose syntax-highlight was last applied to the buffer.
+# input_generation never repeats, so a value left over from an earlier one can
+# never be mistaken for the current generation and needs no invalidation point.
+typeset -gi _zrush_syn_gen=0
 # The input_generation the collection in flight was started for, 0 when none is
 # running. What the finished capture answers is this one, not whatever is
 # current when it finishes.
@@ -154,6 +183,9 @@ typeset -gi _zrush_sync_target=0 _zrush_sync_done=0 _zrush_sync_ok=0
 # Lifecycle stops may block briefly, but each operation uses one 100ms
 # absolute budget, matching the existing synchronous history exchange.
 typeset -gi _ZRUSH_WORKER_SHUTDOWN_MS=100
+# The one absolute budget the line-finish settle may block input for
+# (behavior.md "Line-Finish Settle"). Fixed by policy, never a config key.
+typeset -gi _ZRUSH_SYN_SETTLE_MS=100
 # Byte ceiling on one synthesized history payload (behavior.md "History Menu").
 typeset -gi _ZRUSH_HISTORY_PAYLOAD_MAX_BYTES=262144
 
@@ -177,9 +209,16 @@ typeset -g  _zrush_plan_kind=none
 typeset -gi _zrush_plan_offset=0
 
 # Rendering (POSTDISPLAY + region_highlight)
-typeset -ga _zrush_rh=()      # ledger of entries added to region_highlight
+# Own entries form three groups told apart by the memo suffix (behavior.md
+# "Display"), and each group is replaced and cleared on its own. The ledgers are
+# separate for the same reason: on 5.8, where memo does not exist, a group is
+# subtracted from region_highlight by its own recorded values.
+typeset -ga _zrush_rh=()      # listing body and selection (memo=zrush, memo=zrush-sel)
+typeset -ga _zrush_rh_syn=()  # buffer decoration (memo=zrush-syn)
 typeset -g  _zrush_rh_sel=    # selected highlight entry, removed separately on input
 typeset -g  _zrush_hl_memo=   # ' memo=zrush' on zsh 5.9+
+# Entries of the last accepted syntax-highlight body, each "role start len".
+typeset -ga _zrush_syn_hl=()
 
 # Selection and Tab state
 typeset -gi _zrush_selected=0      # 0=unselected; >0=one-based, column-major display position
@@ -729,13 +768,14 @@ _zrush_cancel_collection() {
 # is cancelled with it (behavior.md "Candidate Collection").
 _zrush_input_invalidate() {
   emulate -L zsh
-  _zrush_input_gen=0 _zrush_input_pending=0 _zrush_input_latched=0
+  _zrush_input_gen=0 _zrush_input_pending=0 _zrush_input_latched=0 _zrush_input_decor=0
   _zrush_txq_drop_notifications
   _zrush_cancel_collection
   return 0
 }
 
-# Remove only this plugin's region_highlight entries.
+# Remove only this plugin's listing region_highlight entries, leaving the buffer
+# decoration group untouched (behavior.md "Display").
 # ZLE rewrites offsets after buffer edits, so exact original values cannot identify them.
 # zsh 5.9+ uses memo=zrush; 5.8 removes entries in the POSTDISPLAY region
 # (start >= $#BUFFER), accepting possible collateral removal there.
@@ -778,12 +818,31 @@ _zrush_rh_clear_sel() {
   return 0
 }
 
-_zrush_rh_add() {  # $1=start $2=end $3=spec [$4=memo suffix (-sel)]
+# Remove only the buffer decoration group, leaving the listing groups alone
+# (cli-protocol.md "Buffer Highlight Application (zsh-Side Normative)").
+# On 5.8 this is the ledger's exact values: an entry ZLE has since shifted
+# stays until the next event replaces it (behavior.md "Display").
+_zrush_rh_clear_syn() {
+  (( $#_zrush_rh_syn )) || return 0
+  if [[ -n $_zrush_hl_memo ]]; then
+    region_highlight=( "${(@)region_highlight:#*memo=zrush-syn}" )
+  else
+    region_highlight=( "${(@)region_highlight:|_zrush_rh_syn}" )
+  fi
+  _zrush_rh_syn=()
+  return 0
+}
+
+_zrush_rh_add() {  # $1=start $2=end $3=spec [$4=memo suffix (-sel|-syn)]
                    # Offsets are character counts from the start of BUFFER.
   local e="$1 $2 $3${_zrush_hl_memo:+ memo=zrush${4:-}}"
   region_highlight+=( "$e" )
-  _zrush_rh+=( "$e" )
-  [[ ${4:-} == -sel ]] && _zrush_rh_sel=$e
+  if [[ ${4:-} == -syn ]]; then
+    _zrush_rh_syn+=( "$e" )
+  else
+    _zrush_rh+=( "$e" )
+    [[ ${4:-} == -sel ]] && _zrush_rh_sel=$e
+  fi
   return 0
 }
 
@@ -1750,7 +1809,7 @@ _zrush_worker_handle_message() {  # message [absolute-deadline]
   # applied entirely on their own terms (cli-protocol.md "Message Types").
   local kind=$f[1]
   case $kind in
-    plan-ready|capture-required)
+    plan-ready|capture-required|syntax-highlight)
       _zrush_worker_handle_event "${(@)f}"
       return $?
       ;;
@@ -1890,14 +1949,14 @@ _zrush_worker_handle_message() {  # message [absolute-deadline]
 # correlation is the input_generation, and only the one this shell still treats
 # as valid is applied. A malformed shape is a session failure, because an event
 # has no in-band way to report one.
-_zrush_worker_handle_event() {  # kind input_generation [plan_body]
+_zrush_worker_handle_event() {  # kind input_generation [plan_body|highlight_body]
   emulate -L zsh
   setopt localoptions extendedglob
   local kind=$1 gen=$2
-  if [[ $kind == plan-ready ]]; then
-    (( $# == 3 )) || { _zrush_worker_session_fail "invalid plan-ready field count"; return 1 }
-  else
+  if [[ $kind == capture-required ]]; then
     (( $# == 2 )) || { _zrush_worker_session_fail "invalid capture-required field count"; return 1 }
+  else
+    (( $# == 3 )) || { _zrush_worker_session_fail "invalid $kind field count"; return 1 }
   fi
   [[ $gen == [1-9][0-9]# ]] && _zrush_dec_le_all 9223372036854775807 "$gen" || {
     _zrush_worker_session_fail "noncanonical event input_generation"
@@ -1910,6 +1969,29 @@ _zrush_worker_handle_event() {  # kind input_generation [plan_body]
   _zrush_status_set ""
   if (( gen != _zrush_input_gen )); then
     _zlog "worker: dropped $kind for input_generation=$gen (current=$_zrush_input_gen)"
+    return 0
+  fi
+  # The decoration arrives on acceptance rather than on settle, so it neither
+  # answers the input nor takes part in the listing groups (behavior.md
+  # "Buffer Syntax Highlighting"). The generation is matched above, before the
+  # body is parsed (cli-protocol.md "zsh-Side Norms"), and zle -F -w callers
+  # require an explicit redraw.
+  if [[ $kind == syntax-highlight ]]; then
+    _zrush_parse_highlight "$3" || {
+      _zrush_worker_session_fail "malformed buffer highlight input_generation=$gen"
+      return 1
+    }
+    _zrush_apply_syntax
+    _zrush_syn_gen=$gen
+    zle -R 2>/dev/null
+    _zlog "worker: syntax-highlight applied input_generation=$gen entries=$#_zrush_syn_hl"
+    return 0
+  fi
+  # A decoration-only notification names candidate_generation 0, so it always
+  # draws a capture-required; both listing-side events are discarded without
+  # starting a capture or touching the listing (behavior.md "Candidate Collection").
+  if (( _zrush_input_decor )); then
+    _zlog "worker: dropped $kind for decoration-only input_generation=$gen"
     return 0
   fi
   _zrush_input_pending=0
@@ -2229,9 +2311,14 @@ _zrush_request_plan() {  # candidate-generation query [offset]
 # The quiet period itself is `delay-ms`, measured by the worker; this side has
 # no timer. The candidate generation is the empty-word cache's latch when it
 # hits and the reserved 0 otherwise (behavior.md "Empty-Word Collection Cache").
-_zrush_send_input() {
+#
+# A decoration-only notification follows one rule set instead (behavior.md
+# "Candidate Collection"): candidate_generation is always 0 with no cache check,
+# it is never pending, and the listing-side events it draws are discarded.
+_zrush_send_input() {  # [1 = decoration-only]
   emulate -L zsh
   setopt localoptions typesetsilent no_monitor no_notify
+  local -i decor=${1:-0}
   (( !_zrush_worker_stopping && !_zrush_worker_runtime_tainted )) || return 1
   # A notification is a real message, so it is what starts the worker when none
   # is running. It happens before the cache is consulted because a fresh session
@@ -2243,22 +2330,32 @@ _zrush_send_input() {
   _zrush_fuzzy=${REPLY_QUERY//$'\0'/}   # the sender must strip NUL from the query
 
   local -i cand_gen=0 latched=0
-  if _zrush_cc_subject && _zrush_cc_check; then
+  if (( !decor )) && _zrush_cc_subject && _zrush_cc_check; then
     cand_gen=$_zrush_cc_cand_gen latched=1
   fi
+
+  # Per-call context for the buffer lexer. `enabled = false` is expressed by an
+  # empty buffer field, which carries no token at all (config-schema.md
+  # "[syntax]"); NUL is stripped by the same sender discipline as the query.
+  local buffer=
+  [[ $ZRUSH_CFG_SYNTAX_ENABLED == true ]] && buffer=${BUFFER//$'\0'/}
+  local comments=false
+  [[ -o interactive_comments ]] && comments=true
 
   _zrush_next_input_gen || return 1
   local -i gen=$REPLY
   _zrush_geometry
   local -i rows=$REPLY_ROWS width=$REPLY_WIDTH delay=$ZRUSH_CFG_DELAY_MS
   _zrush_encode_message input "$gen" "$cand_gen" "$delay" "$PWD" "$_zrush_fuzzy" \
-    "$ZRUSH_CFG_MODE" "$ZRUSH_CFG_SMART_CASE" "$rows" "$width" "$ZRUSH_CFG_TRAILING_SPACE"
+    "$ZRUSH_CFG_MODE" "$ZRUSH_CFG_SMART_CASE" "$rows" "$width" "$ZRUSH_CFG_TRAILING_SPACE" \
+    "$buffer" "$comments"
   # This notification replaces the previous one, so any frame the previous one
 # left unhanded is removed rather than sent (behavior.md "Worker Lifecycle").
   _zrush_txq_drop_notifications
   _zrush_worker_txq+=( "$REPLY" )
-  _zrush_input_gen=$gen _zrush_input_pending=1 _zrush_input_latched=$latched
-  _zlog "worker: queued input input_generation=$gen candidate_generation=$cand_gen delay=$delay query=${(qqqq)_zrush_fuzzy} queued=$#_zrush_worker_txq"
+  _zrush_input_gen=$gen _zrush_input_latched=$latched _zrush_input_decor=$decor
+  _zrush_input_pending=$(( !decor ))
+  _zlog "worker: queued input input_generation=$gen candidate_generation=$cand_gen delay=$delay decoration_only=$decor query=${(qqqq)_zrush_fuzzy} queued=$#_zrush_worker_txq"
   _zrush_worker_flush || return 1
   return 0
 }
@@ -2389,6 +2486,45 @@ _zrush_parse_plan() {  # $1=raw render-plan bytes
   return 0
 }
 
+# Validate one buffer-highlight body into _zrush_syn_hl.
+# Field layout is fixed (cli-protocol.md "`syntax-highlight` body (Buffer Highlight Stream)"):
+#   T, then T "role start len" -- total 1 + T fields.
+# Offsets are into BUFFER itself, so no listing correction applies to them, and
+# $#BUFFER is this receiver's own character reading of the same bytes (its
+# NUL-stripped form is what the worker counted, so it is never the smaller one).
+_zrush_parse_highlight() {  # $1=raw buffer-highlight bytes
+  emulate -L zsh
+  setopt localoptions extendedglob
+  local out=$1
+  [[ $out == *$'\0' ]] || return 1   # final NUL required (cli-protocol.md)
+  local -a f=( "${(@0)${out%$'\0'}}" )
+  local -i n=$#f
+  [[ $f[1] == <-> ]] || return 1
+  _zrush_dec_le_all $n $f[1] || return 1
+  (( 1 + $f[1] == n )) || return 1   # exact field count: 1 + T
+
+  local -i N=$#BUFFER
+  local e
+  local -a tok offs=()
+  for e in "${(@)f[2,-1]}"; do
+    tok=( ${=e} )
+    (( $#tok == 3 )) || return 1
+    [[ -n ${_ZRUSH_SYNTAX_ROLE_VAR[$tok[1]]:-} ]] || return 1
+    [[ $tok[2] == (0|[1-9][0-9]#) && $tok[3] == (0|[1-9][0-9]#) ]] || return 1
+    offs+=( $tok[2] $tok[3] )
+  done
+  # Bound each value on its own first -- string compare, no arithmetic -- so the
+  # sum below cannot truncate a wide digit string or overflow.
+  _zrush_dec_le_all $N "${(@)offs}" || return 1
+  local -i i
+  for (( i = 1; i <= $#offs; i += 2 )); do
+    (( offs[i] + offs[i+1] <= N )) || return 1
+  done
+
+  _zrush_syn_hl=( "${(@)f[2,-1]}" )
+  return 0
+}
+
 # ---------------------------------------------------------------- Apply the plan
 # Call only from a ZLE widget context. Applies the last successfully parsed
 # plan (_zrush_plan_*) to POSTDISPLAY and region_highlight without any
@@ -2445,6 +2581,25 @@ _zrush_apply_highlights() {
     f=( ${=_zrush_plan_cells[sel]} )   # start len
     _zrush_rh_add $(( off + f[1] )) $(( off + f[1] + f[2] )) "$hl_sel" -sel
   fi
+  return 0
+}
+
+# Call only from a ZLE widget context. Replaces the buffer decoration group with
+# the last accepted syntax-highlight body (cli-protocol.md "Buffer Highlight
+# Application (zsh-Side Normative)"): offsets address BUFFER directly, the role
+# picks its `[syntax.highlight]` spec, an empty spec adds no entry, and the
+# body's own order is kept so a later entry wins where ranges overlap.
+_zrush_apply_syntax() {
+  emulate -L zsh
+  _zrush_rh_clear_syn
+  local e spec
+  local -a tok
+  for e in "${(@)_zrush_syn_hl}"; do
+    tok=( ${=e} )   # role start len
+    spec=${(P)_ZRUSH_SYNTAX_ROLE_VAR[$tok[1]]}
+    [[ -n $spec ]] || continue
+    _zrush_rh_add $tok[2] $(( tok[2] + tok[3] )) "$spec" -syn
+  done
   return 0
 }
 
@@ -2719,16 +2874,24 @@ _zrush_line_pre_redraw() {
   _zrush_rh_clear_sel
 
   # See docs/internal/specs/behavior.md "Candidate Collection": blank buffers neither collect nor display.
+  # A blank buffer holds no decoration either, and zsh settles that on its own
+  # rather than waiting for a round trip (behavior.md "Buffer Syntax Highlighting").
   if [[ -z ${BUFFER//[[:space:]]/} ]]; then
     _zrush_teardown
+    _zrush_rh_clear_syn
     return 0
   fi
 
   # Apply min-input to the current word; blank buffers were handled above.
+  # While decoration is on, this suppression does not stop the notification but
+  # makes it decoration-only, so colouring starts at the first character
+  # (behavior.md "Candidate Collection").
+  local -i decor=0
   _zrush_widen "$LBUFFER"
   if (( ${#REPLY_WORD} < ZRUSH_CFG_MIN_INPUT )); then
     _zrush_teardown
-    return 0
+    [[ $ZRUSH_CFG_SYNTAX_ENABLED == true ]] || return 0
+    decor=1
   fi
 
   # Input pressure is visible to zsh alone, so it is judged here: while keys are
@@ -2736,7 +2899,7 @@ _zrush_line_pre_redraw() {
   # the next one (behavior.md "Candidate Collection"). The listing is left as it is.
   (( KEYS_QUEUED_COUNT || PENDING )) && return 0
 
-  _zrush_send_input
+  _zrush_send_input $decor
   return 0
 }
 
@@ -2750,13 +2913,72 @@ _zrush_line_init() {
   # candidate list or a pending-Tab insertion) into this one.
   _zrush_input_invalidate
   _zrush_teardown
+  # The decoration the previous line finished with belongs to that line's
+  # scrollback, not to this one; a new line starts with none. This is also where
+  # a switch to `[syntax].enabled = false` takes its entries away, config being
+  # reloaded at the prompt boundary just before (behavior.md "Buffer Syntax Highlighting").
+  _zrush_rh_clear_syn
   _zrush_status_refresh
+  return 0
+}
+
+# The one synchronous wait the buffer decoration takes (behavior.md
+# "Line-Finish Settle"): a finished line burns into scrollback as it stands, so
+# its decoration is confirmed once here instead of being left to the next
+# keystroke that will never come. Nothing about it is a session concern --
+# exceeding the deadline loses freshness, not correctness -- and no worker is
+# started for it.
+_zrush_syn_settle() {
+  emulate -L zsh
+  [[ $ZRUSH_CFG_SYNTAX_ENABLED == true ]] || return 0
+  [[ -n ${BUFFER//[[:space:]]/} ]] || return 0
+  (( !_zrush_worker_stopping && !_zrush_worker_runtime_tainted )) || return 0
+  (( _zrush_worker_rfd >= 0 )) || return 0
+
+  local -i gen=$_zrush_input_gen
+  if (( gen > 0 && gen == _zrush_syn_gen )); then
+    return 0
+  fi
+  if (( gen <= 0 )); then
+    # Input pressure held the notification back; make the one this line needs.
+    _zrush_send_input 1 || return 0
+    gen=$_zrush_input_gen
+    (( gen > 0 )) || return 0
+  fi
+
+  local -F deadline=$(( EPOCHREALTIME + _ZRUSH_SYN_SETTLE_MS / 1000.0 )) remaining
+  local -i cs
+  while (( _zrush_syn_gen != gen )); do
+    (( !_zrush_worker_stopping && _zrush_worker_rfd >= 0 )) || return 0
+    remaining=$(( deadline - EPOCHREALTIME ))
+    if (( remaining <= 0 )); then
+      # Best effort: the line is finished undecorated-as-of-now and the
+      # notification is not replayed. Bytes read so far stay in the receive
+      # buffer for the ordinary asynchronous path.
+      _zlog "syntax: settle deadline exceeded input_generation=$gen"
+      return 0
+    fi
+    cs=$(( remaining * 100 ))
+    (( cs < 1 )) && cs=1
+    if (( _zrush_worker_ack_fd >= 0 )); then
+      zselect -t $cs -r $_zrush_worker_rfd -r $_zrush_worker_ack_fd >/dev/null 2>&1
+    else
+      zselect -t $cs -r $_zrush_worker_rfd >/dev/null 2>&1
+    fi
+    _zrush_worker_consume_ack || return 0
+    _zrush_worker_read async || return 0
+  done
+  _zlog "syntax: settled input_generation=$gen"
   return 0
 }
 
 _zrush_line_finish() {
   emulate -L zsh
   (( _zrush_enabled )) || return 0
+  # Before the listing goes and the generation is invalidated: the settle needs
+  # both to still be the ones this line was notified under. The decoration
+  # entries themselves stay -- they are what burns into scrollback.
+  _zrush_syn_settle
   _zrush_input_invalidate
   _zrush_teardown
   _zlog "line-finish: cleared"
