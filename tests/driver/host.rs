@@ -192,6 +192,17 @@ impl Host {
         })
     }
 
+    /// [`Host::boot`] with `config` already at
+    /// `$XDG_CONFIG_HOME/zrush/config.toml` when the shell sources zrush, so
+    /// the variant is in force from the first keystroke instead of racing the
+    /// per-prompt config reload.
+    pub fn boot_with_config(config: &str) -> Self {
+        Self::boot_with(BootOptions {
+            config: Some(config),
+            ..BootOptions::default()
+        })
+    }
+
     /// Like [`Host::boot`], but under `tests/zsh/rc/history.zshrc`.
     pub fn boot_history() -> Self {
         Self::boot_with(BootOptions {

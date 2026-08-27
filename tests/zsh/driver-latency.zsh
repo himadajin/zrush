@@ -36,6 +36,13 @@
 #                timer-subprocess bucket, because neither exists:
 #                notify -> quiet-period -> capture-start -> compsys
 #                    -> capture-transport -> worker-roundtrip+apply
+#   colour     : keystroke to buffer decoration, taken from ZRUSH_LOG rather
+#                than from the pty: the applied checkpoint is subtracted from
+#                the moment the key was written, so the number is the whole
+#                path (key -> notification -> analysis -> region_highlight)
+#                without the pty polling resolution. Reported with its
+#                key-to-notification part, and measured on one keystroke at the
+#                end of a settled buffer
 #   history    : each history host reports three things. `index-cold` opens
 #                (first open of the host, then one forced discontinuity per
 #                later trial) and `index-warm` opens (the index already built)
@@ -248,6 +255,80 @@ paint_break_hit_case() {  # needs one preceding command-position collection (see
   out "CASE  | ${(r:12:)1} | ${(r:32:)2} | first-paint=$(fmt $REPLY)ms"
   breakdown_hit_last $HOSTLOG $skip
   drain 0.6
+  return 0
+}
+
+# ------------------------------------------------- keystroke -> colour
+# behavior.md "Buffer Syntax Highlighting": the decoration event is answered
+# when the worker accepts the notification, without waiting for the quiet
+# period, so it is measured apart from first-paint rather than as a phase of it.
+#
+# The number is ZRUSH_LOG-timed: _zlog stamps every line with the same
+# EPOCHREALTIME clock this driver reads, so the applied checkpoint is
+# subtracted from the moment the keystroke was written and none of the pty
+# polling resolution enters it. What it therefore covers is the key reaching
+# the line editor, the notification, the worker's analysis, the entries landing
+# in region_highlight, and the redraw that shows them -- the applied checkpoint
+# is logged after the `zle -R` the event handler issues.
+#
+# Each trial types a prefix, lets it settle, and measures the single keystroke
+# that follows: a key landing while the prefix is still queued is input
+# pressure, and the notification pressure defers belongs to the next buffer
+# change (behavior.md "Candidate Collection"), not to the key being measured.
+# The event is matched by the generation the measured keystroke notified under,
+# so a decoration the prefix was still owed cannot be timed in its place.
+syn_once() {  # $1=prefix keys $2=final keystroke -> REPLY=ms, REPLY_NOTIFY=ms
+  typeset -g REPLY=NA REPLY_NOTIFY=NA
+  send_keys $1
+  drain 0.8
+  local -i skip=0
+  [[ -r $HOSTLOG ]] && skip=$(wc -l < $HOSTLOG)
+  local -F t0=$EPOCHREALTIME t_apply=0 t_notify=0
+  send_keys $2
+  local -F dl=$(( SECONDS + 10 ))
+  local -a L=()
+  local line gen=
+  while (( SECONDS < dl )); do
+    drain 0.05
+    L=( ${(f)"$(<$HOSTLOG)"} )
+    L=( "${(@)L[$(( skip + 1 )),-1]}" )
+    t_apply=0; t_notify=0; gen=
+    for line in "${(@)L}"; do
+      case $line in
+        *" MEAS-notify")
+          (( t_notify == 0 )) && { ts_of $line; t_notify=$REPLY } ;;
+        *" worker: queued input input_generation="*)
+          [[ -z $gen ]] && gen=${${line#*input_generation=}%% *} ;;
+      esac
+      [[ -n $gen && $line == *" worker: syntax-highlight applied input_generation=$gen "* ]] &&
+        (( t_apply == 0 )) && { ts_of $line; t_apply=$REPLY }
+    done
+    (( t_apply )) && break
+  done
+  clear_line
+  (( t_apply )) || return 1
+  typeset -g REPLY=$(( (t_apply - t0) * 1000 ))
+  (( t_notify )) && typeset -g REPLY_NOTIFY=$(( (t_notify - t0) * 1000 ))
+  return 0
+}
+
+syn_case() {  # $1=host-label $2=case-label $3=prefix keys $4=final keystroke [$5=trials]
+  local -i trials=${5:-${ZRUSH_LATENCY_TRIALS:-4}}
+  local -a ms=() notify=()
+  local -i i
+  for (( i = 1; i <= trials; ++i )); do
+    if syn_once $3 $4; then
+      ms+=( $REPLY )
+      [[ $REPLY_NOTIFY == NA ]] || notify+=( $REPLY_NOTIFY )
+    else
+      out "WARN: [$1/$2] attempt $i produced no decoration"
+    fi
+    drain 0.4
+  done
+  median $ms; local m_total=$REPLY
+  median $notify; local m_notify=$REPLY
+  (( $#ms == trials )) || bad "WARN: [$1/$2] $(( trials - $#ms )) of $trials attempts produced no decoration"
+  out "COLOUR| ${(r:12:)1} | ${(r:32:)2} | med=$(fmt $m_total)ms | key→notify med=$(fmt $m_notify)ms | trials=[${(j:, :)${(@)ms/(#m)*/$(fmt $MATCH)}}]"
   return 0
 }
 
@@ -531,6 +612,11 @@ history_tax_suite() {  # $1=host-label
     paint_break_case min-zrush "git (git chec)"   'git chec'     'checkout'
     paint_case min-zrush "file (docs/inte)" 'ls docs/inte' 'internal'
     paint_case min-zrush "git (git chec)"   'git chec'     'checkout'
+    # Buffer decoration, measured on the last keystroke of each buffer: one
+    # command word resolved against $PATH, and one argument resolved as a
+    # literal path (specs/syntax.md "Literal paths and resolution").
+    syn_case min-zrush "colour cmd (whic+h)"       'whic'            'h'
+    syn_case min-zrush "colour path (interna+l)"   'ls docs/interna' 'l'
   else
     bad "FATAL: min-zrush failed to start"
   fi
@@ -544,6 +630,9 @@ history_tax_suite() {  # $1=host-label
     paint_case min-d0 "cmd (whic)"       'whic'         'which'
     paint_case min-d0 "file (docs/inte)" 'ls docs/inte' 'internal'
     paint_case min-d0 "git (git chec)"   'git chec'     'checkout'
+    # The same colour case without a quiet period in the way: the decoration
+    # does not wait for one, so this pair is what shows it.
+    syn_case min-d0 "colour cmd (whic+h)"          'whic'            'h'
   else
     bad "FATAL: min-d0 failed to start"
   fi

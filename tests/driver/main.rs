@@ -28,5 +28,6 @@ mod pty;
 mod select;
 mod sendbreak;
 mod session;
+mod syntax;
 mod tab;
 mod teardown;

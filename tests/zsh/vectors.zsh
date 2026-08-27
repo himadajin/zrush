@@ -1118,6 +1118,43 @@ reserialize_plan() {  # -> REPLY=bytes, or return 1 with REPLY=reason
       store: $got_store"
   fi
 
+  # The same notification with the buffer decoration switched off: only the
+  # `buffer` field changes, and it goes out empty (config-schema.md "[syntax]").
+  # The query keeps carrying the current word, so the listing side is untouched.
+  local -i syn_off_wire=1
+  wire_reset
+  _zrush_cc_fp= _zrush_cc_time=0 _zrush_cc_cand_gen=0 _zrush_cc_staged=()
+  _zrush_input_gen_seq=6
+  ZRUSH_CFG_SYNTAX_ENABLED=false
+  BUFFER=gi LBUFFER=gi RBUFFER= CURSOR=2
+  builtin cd -q /tmp 2>/dev/null
+  [[ $PWD == /tmp ]] || syn_off_wire=0
+  _zrush_send_input 2>/dev/null
+  builtin cd -q $saved_pwd
+  ZRUSH_CFG_SYNTAX_ENABLED=
+  local -a golden_input=()
+  wire_fields "$frame_input" && golden_input=( "${(@)reply}" ) || syn_off_wire=0
+  if wire_fields "${_zrush_worker_txq[1]:-}"; then
+    hf=( "${(@)reply}" )
+    (( $#hf == $#golden_input )) || syn_off_wire=0
+    local -i fi
+    for (( fi = 1; fi <= $#golden_input; ++fi )); do
+      if (( fi == 12 )); then
+        [[ -z $hf[12] && -n $golden_input[12] ]] || syn_off_wire=0
+      else
+        [[ $hf[fi] == "$golden_input[fi]" ]] || syn_off_wire=0
+      fi
+    done
+  else
+    syn_off_wire=0
+  fi
+  if (( syn_off_wire )); then
+    ok "notification buffer field: disabled decoration sends it empty and changes nothing else"
+  else
+    dump_bytes "${_zrush_worker_txq[1]:-}"
+    ng "notification buffer field: unexpected frame with decoration disabled: $REPLY"
+  fi
+
   # The receiver. A session failure is stubbed out so a wrong outcome is
   # reported rather than acted on, and so the reason itself can be checked.
   local saved_session_fail_ev=${functions[_zrush_worker_session_fail]}
@@ -1201,6 +1238,47 @@ reserialize_plan() {  # -> REPLY=bytes, or return 1 with REPLY=reason
   else
     ng "worker events: collections=$_zrt_event_collections tabs=$_zrt_event_tabs pending=$_zrush_input_pending kind=$_zrush_plan_kind failure=${_zrt_event_failure:-<none>}"
   fi
+
+  # The decoration event on the same receiver: it is applied to the buffer
+  # group without answering the input it names, its generation is matched
+  # before the body is looked at, and a body that fails the acceptance clauses
+  # of the current generation ends the session (cli-protocol.md "Buffer
+  # Highlight Application (zsh-Side Normative)").
+  local -i syn_event_wire=1
+  wire_reset
+  BUFFER=ls region_highlight=() _zrush_rh=() _zrush_rh_sel= _zrush_rh_syn=()
+  _zrush_syn_hl=() _zrush_syn_gen=0 _zrush_hl_memo=
+  ZRUSH_CFG_SYNTAX_HL_COMMAND=fg=green
+  _zrush_input_gen=7 _zrush_input_pending=1
+  _zrush_encode_message syntax-highlight 7 $'1\0command 0 2\0'
+  event_deliver "$REPLY"; (( $? == 0 )) || syn_event_wire=0
+  [[ "${(j:|:)_zrush_rh_syn}" == '0 2 fg=green' && -z $_zrt_event_failure ]] || syn_event_wire=0
+  (( _zrush_syn_gen == 7 && _zrush_input_pending == 1 )) || syn_event_wire=0
+  # Another generation's event is dropped before its body is parsed: bytes that
+  # are fatal for the current generation change nothing here.
+  _zrush_input_gen=8
+  _zrush_encode_message syntax-highlight 7 'not a highlight body'
+  event_deliver "$REPLY"; (( $? == 0 )) || syn_event_wire=0
+  [[ -z $_zrt_event_failure && "${(j:|:)_zrush_rh_syn}" == '0 2 fg=green' ]] || syn_event_wire=0
+  (( _zrush_syn_gen == 7 )) || syn_event_wire=0
+  # The same bytes for the current generation are a session failure.
+  _zrush_input_gen=7
+  _zrush_encode_message syntax-highlight 7 'not a highlight body'
+  event_deliver "$REPLY"
+  [[ $_zrt_event_failure == 'malformed buffer highlight input_generation=7' ]] || syn_event_wire=0
+  _zrt_event_failure=
+  # And so is a shape violation, which has no in-band error either.
+  _zrush_encode_message syntax-highlight 7
+  event_deliver "$REPLY"
+  [[ $_zrt_event_failure == 'invalid syntax-highlight field count' ]] || syn_event_wire=0
+  _zrt_event_failure=
+  if (( syn_event_wire )); then
+    ok "buffer highlight events: applied without answering the input, stale dropped unparsed, malformed fatal"
+  else
+    ng "buffer highlight events: syn=${(qqqq)${(j:|:)_zrush_rh_syn}} gen=$_zrush_syn_gen pending=$_zrush_input_pending failure=${_zrt_event_failure:-<none>}"
+  fi
+  BUFFER= region_highlight=() _zrush_rh_syn=() _zrush_syn_hl=() _zrush_syn_gen=0
+  ZRUSH_CFG_SYNTAX_HL_COMMAND=
 
   # superseded is the normal terminal answer to a capture whose input is
   # already gone: no session failure, no latch, and the listing showing now
@@ -1323,6 +1401,41 @@ reserialize_plan() {  # -> REPLY=bytes, or return 1 with REPLY=reason
     ng "suppression: ${#_zrush_worker_txq} frame(s) queued gen=$_zrush_input_gen pending=$_zrush_input_pending L=$_zrush_plan_nlines kind=$_zrush_plan_kind"
   fi
   ZRUSH_CFG_MIN_INPUT=0
+
+  # min-input with the decoration on is the one suppression that still
+  # notifies: the listing goes as before, but a decoration-only notification is
+  # made so colouring starts at the first character (behavior.md "Candidate
+  # Collection"). It carries the whole buffer, names candidate_generation 0
+  # without consulting the cache latch, and is never pending.
+  local -i decor_wire=1
+  wire_reset
+  _zrush_enabled=1 _zrush_disabled=0 _zrush_disable_reason=
+  _zrush_cc_fp=fingerprint _zrush_cc_time=$EPOCHSECONDS _zrush_cc_cand_gen=41
+  ZRUSH_CFG_MIN_INPUT=3 ZRUSH_CFG_SYNTAX_ENABLED=true
+  _zrush_plan_kind=compsys _zrush_plan_nlines=2 _zrush_plan_npos=1 _zrush_listing=1
+  _zrush_last_buffer=old _zrush_last_cursor=0
+  BUFFER=ab LBUFFER=ab CURSOR=2
+  _zrush_line_pre_redraw
+  ZRUSH_CFG_MIN_INPUT=0 ZRUSH_CFG_SYNTAX_ENABLED=
+  (( $#_zrush_worker_txq == 1 && _zrush_input_gen > 0 )) || decor_wire=0
+  (( _zrush_input_decor == 1 && _zrush_input_pending == 0 && _zrush_input_latched == 0 )) ||
+    decor_wire=0
+  (( _zrush_plan_nlines == 0 && _zrush_plan_npos == 0 && !_zrush_listing )) || decor_wire=0
+  [[ $_zrush_plan_kind == none ]] || decor_wire=0
+  if wire_fields "${_zrush_worker_txq[1]:-}"; then
+    hf=( "${(@)reply}" )
+    [[ $hf[1] == input && $hf[2] == $_zrush_input_gen && $hf[3] == 0 && $hf[12] == ab ]] ||
+      decor_wire=0
+  else
+    decor_wire=0
+  fi
+  (( _zrush_cc_cand_gen == 41 )) || decor_wire=0
+  if (( decor_wire )); then
+    ok "min-input with decoration on: a decoration-only notification carrying the buffer"
+  else
+    ng "min-input with decoration on: ${#_zrush_worker_txq} frame(s) queued gen=$_zrush_input_gen decor=$_zrush_input_decor pending=$_zrush_input_pending latch=$_zrush_cc_cand_gen kind=$_zrush_plan_kind"
+  fi
+  _zrush_cc_fp= _zrush_cc_time=0 _zrush_cc_cand_gen=0
 
   functions[_zrush_worker_session_fail]=$saved_session_fail_ev
   functions[_zrush_start_collection]=$saved_start_collection_ev
@@ -1469,6 +1582,83 @@ reserialize_plan() {  # -> REPLY=bytes, or return 1 with REPLY=reason
     ng "history-number highlight: empty spec left ledger=${(qqqq)_zrush_rh}"
   fi
   unset REPLY
+
+  # ---------------- Buffer highlight body ----------------
+  # cli-protocol.md "`syntax-highlight` body (Buffer Highlight Stream)": one
+  # well-formed body is decoded in the order it arrives, and every acceptance
+  # clause has a body that must be refused. `word` is not among the 18 roles --
+  # the kind the lexer leaves undecorated is never delivered.
+  local -i syn_wire=1
+  BUFFER='ls -l fx'   # 8 characters, the bound every offset is checked against
+  region_highlight=() _zrush_rh=() _zrush_rh_sel= _zrush_rh_syn=() _zrush_syn_hl=()
+  _zrush_hl_memo=
+  local good_body=$'4\0command 0 2\0option 3 2\0single-quote 6 2\0path 6 2\0'
+  _zrush_parse_highlight "$good_body" || syn_wire=0
+  [[ "${(j:|:)_zrush_syn_hl}" == 'command 0 2|option 3 2|single-quote 6 2|path 6 2' ]] ||
+    syn_wire=0
+  # No token at all is one field, not an empty byte string.
+  _zrush_parse_highlight $'0\0' || syn_wire=0
+  (( $#_zrush_syn_hl == 0 )) || syn_wire=0
+  local -a reject_names=(
+    'no final NUL'          'T is not a digit string'  'T does not count the fields'
+    'tuple is not a triple' 'role outside the 18'      'noncanonical start'
+    'negative length'       'entry reaches past the buffer'
+  )
+  local -a reject_bodies=(
+    $'1\0command 0 2'   $'x\0command 0 2\0'  $'2\0command 0 2\0'
+    $'1\0command 0\0'   $'1\0word 0 2\0'     $'1\0command 00 2\0'
+    $'1\0command 0 -1\0' $'1\0command 6 3\0'
+  )
+  local -a accepted=()
+  local -i ri
+  for (( ri = 1; ri <= $#reject_bodies; ++ri )); do
+    _zrush_parse_highlight "$reject_bodies[ri]" && accepted+=( "$reject_names[ri]" )
+  done
+  (( $#accepted )) && syn_wire=0
+
+  # The applier: role -> `[syntax.highlight]` spec, an empty spec adding no
+  # entry, and the body's own order kept so the later entry of an overlap wins
+  # (config-schema.md "[syntax.highlight]"). Run once per memo regime, since
+  # 5.8 tells the group apart by its ledger rather than by the tag.
+  ZRUSH_CFG_SYNTAX_HL_COMMAND=fg=green
+  ZRUSH_CFG_SYNTAX_HL_OPTION=
+  ZRUSH_CFG_SYNTAX_HL_SINGLE_QUOTE=fg=yellow
+  ZRUSH_CFG_SYNTAX_HL_PATH=underline
+  ZRUSH_CFG_SYNTAX_HL_RESERVED=fg=magenta
+  local memo want_syn want_listing
+  for memo in '' ' memo=zrush'; do
+    _zrush_hl_memo=$memo
+    region_highlight=() _zrush_rh=() _zrush_rh_sel= _zrush_rh_syn=()
+    _zrush_parse_highlight "$good_body" || syn_wire=0
+    _zrush_apply_syntax
+    want_syn="0 2 fg=green${memo:+ memo=zrush-syn}|6 8 fg=yellow${memo:+ memo=zrush-syn}|6 8 underline${memo:+ memo=zrush-syn}"
+    [[ "${(j:|:)_zrush_rh_syn}" == "$want_syn" ]] || syn_wire=0
+    [[ "${(j:|:)region_highlight}" == "$want_syn" ]] || syn_wire=0
+    (( $#_zrush_rh == 0 )) || syn_wire=0
+    # The next body replaces this group whole and leaves the listing group
+    # alone, in both directions.
+    _zrush_rh_add 9 12 bold
+    want_listing="9 12 bold${memo:+ memo=zrush}"
+    _zrush_parse_highlight $'1\0reserved 0 2\0' || syn_wire=0
+    _zrush_apply_syntax
+    want_syn="0 2 fg=magenta${memo:+ memo=zrush-syn}"
+    [[ "${(j:|:)_zrush_rh_syn}" == "$want_syn" ]] || syn_wire=0
+    [[ "${(j:|:)_zrush_rh}" == "$want_listing" ]] || syn_wire=0
+    [[ "${(j:|:)region_highlight}" == "$want_listing|$want_syn" ]] || syn_wire=0
+    _zrush_rh_clear
+    [[ "${(j:|:)region_highlight}" == "$want_syn" ]] || syn_wire=0
+    _zrush_rh_clear_syn
+    (( $#region_highlight == 0 && $#_zrush_rh_syn == 0 )) || syn_wire=0
+  done
+  if (( syn_wire )); then
+    ok "buffer highlight: the body's acceptance clauses, the role specs and the group's own replacement"
+  else
+    ng "buffer highlight: accepted=${(j:, :)accepted:-<none>} syn=${(qqqq)${(j:|:)_zrush_rh_syn}} listing=${(qqqq)${(j:|:)_zrush_rh}} rh=${(qqqq)${(j:|:)region_highlight}}"
+  fi
+  BUFFER= region_highlight=() _zrush_rh=() _zrush_rh_syn=() _zrush_syn_hl=()
+  _zrush_hl_memo=
+  ZRUSH_CFG_SYNTAX_HL_COMMAND= ZRUSH_CFG_SYNTAX_HL_SINGLE_QUOTE=
+  ZRUSH_CFG_SYNTAX_HL_PATH= ZRUSH_CFG_SYNTAX_HL_RESERVED=
 
   # ---------------- Corpus is canonical text ----------------
   # Without this a dec_bytes bug could quietly map a vector onto some *other*
