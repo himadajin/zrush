@@ -665,7 +665,7 @@ reserialize_plan() {  # -> REPLY=bytes, or return 1 with REPLY=reason
   (( $#_zrush_worker_txq == 1 )) || hit_wire=0
   if wire_fields "$_zrush_worker_txq[1]"; then
     hf=( "${(@)reply}" )
-    (( $#hf == 11 )) || hit_wire=0
+    (( $#hf == 13 )) || hit_wire=0
     [[ $hf[1] == input && $hf[3] == 7 && $hf[4] == 30 ]] || hit_wire=0
     (( $hf[2] == _zrush_input_gen )) || hit_wire=0
   else
@@ -1084,12 +1084,14 @@ reserialize_plan() {  # -> REPLY=bytes, or return 1 with REPLY=reason
   _zrush_input_gen_seq=6
   ZRUSH_CFG_DELAY_MS=30 ZRUSH_CFG_MODE=typo ZRUSH_CFG_SMART_CASE=true
   ZRUSH_CFG_MAX_LINES=10 ZRUSH_CFG_TRAILING_SPACE=true
+  ZRUSH_CFG_SYNTAX_ENABLED=true
   LINES=11 COLUMNS=80
   BUFFER=gi LBUFFER=gi RBUFFER= CURSOR=2
   builtin cd -q /tmp 2>/dev/null
   [[ $PWD == /tmp ]] || notify_wire=0
   _zrush_send_input 2>/dev/null
   _zrush_send_flush 2>/dev/null
+  ZRUSH_CFG_SYNTAX_ENABLED=
   builtin cd -q $saved_pwd
   local notify_frame=${_zrush_worker_txq[1]:-} flush_frame=${_zrush_worker_txq[2]:-}
   (( $#_zrush_worker_txq == 2 )) || notify_wire=0
