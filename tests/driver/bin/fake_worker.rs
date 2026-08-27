@@ -9,6 +9,8 @@
 //! The tests never read this process's stdout. They observe the append-only
 //! state file (`$ZRUSH_FAKE_STATE`) and the session counter beside it, so every
 //! line written here is part of the harness contract (`tests/driver/fake.rs`).
+//! The `.highlight` file beside the state file is the other direction: what a
+//! test writes there is what every accepted `input` is decorated with.
 
 use std::env;
 use std::ffi::{OsStr, OsString};
@@ -65,11 +67,13 @@ fn exec_real(real: &OsStr, args: &[OsString]) -> ! {
 }
 
 /// The control/state/counter file trio, re-read per request so a test can
-/// change the mode while a session is live.
+/// change the mode while a session is live, plus the highlight file that
+/// decides what an accepted `input` is decorated with.
 struct Fake {
     control: PathBuf,
     state: PathBuf,
     count: PathBuf,
+    highlight: PathBuf,
 }
 
 impl Fake {
@@ -82,11 +86,30 @@ impl Fake {
         );
         let mut count = state.clone();
         count.set_extension("count");
+        let mut highlight = state.clone();
+        highlight.set_extension("highlight");
         Self {
             control,
             state,
             count,
+            highlight,
         }
+    }
+
+    /// The `role start len` entries, one per line, that every accepted
+    /// `input` is answered with; an existing but empty file asks for the
+    /// zero-token event. Without the file this fake sends no
+    /// `syntax-highlight` at all, which is what the lifecycle tests that
+    /// predate buffer decoration observe.
+    fn highlight_entries(&self) -> Option<Vec<String>> {
+        let text = fs::read_to_string(&self.highlight).ok()?;
+        Some(
+            text.lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(str::to_string)
+                .collect(),
+        )
     }
 
     fn mode(&self) -> String {
@@ -173,6 +196,10 @@ fn worker(fake: &Fake, control_fd: i32) {
     write_message(&[b"ready", &hello[1]]);
     fake.note(&format!("ready {session}"));
 
+    // specs/syntax.md "Delivery": nothing is decorated until the session has
+    // a namespace snapshot to classify against.
+    let mut snapshot_seen = false;
+
     loop {
         let Some(payload) = read_netstring(&mut input, fake) else {
             fake.note(&format!("eof {session}"));
@@ -222,8 +249,28 @@ fn worker(fake: &Fake, control_fd: i32) {
             // reading the selected mode so `hold`, `die`, and request-error
             // injections remain aimed at the user's operation.
             write_message(&[b"ok", key.as_bytes(), b""]);
+            snapshot_seen = true;
             fake.note(&format!("namespace {session} {key}"));
             continue;
+        }
+
+        // cli-protocol.md "Worker-Side Norms": the decoration event is
+        // written when the notification is accepted, ahead of anything its
+        // quiet period produces. It is deliberately outside the failure
+        // injections below, which aim at the user's operation.
+        if kind == "input"
+            && snapshot_seen
+            && let Some(entries) = fake.highlight_entries()
+        {
+            write_message(&[
+                b"syntax-highlight",
+                key.as_bytes(),
+                &highlight_body(&entries),
+            ]);
+            fake.note(&format!(
+                "syntax-highlight {session} {key} {}",
+                entries.len()
+            ));
         }
 
         let mut action = fake.mode();
@@ -276,6 +323,18 @@ fn worker(fake: &Fake, control_fd: i32) {
         }
         fake.note(&format!("{action} {session} {key}"));
     }
+}
+
+/// The flat highlight stream of cli-protocol.md "`syntax-highlight` body
+/// (Buffer Highlight Stream)": the entry count, then the entries themselves.
+fn highlight_body(entries: &[String]) -> Vec<u8> {
+    let mut body = entries.len().to_string().into_bytes();
+    body.push(0);
+    for entry in entries {
+        body.extend_from_slice(entry.as_bytes());
+        body.push(0);
+    }
+    body
 }
 
 /// One scalar field of a message, as the state lines and the wire spell it.

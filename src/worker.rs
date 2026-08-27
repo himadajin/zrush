@@ -1,7 +1,8 @@
 //! Persistent worker session: `namespace-snapshot`, `store`,
 //! `history-snapshot`, `history-append` and `plan` requests, the `input` /
-//! `flush` notifications, and the `plan-ready` / `capture-required` events
-//! their quiet periods produce.
+//! `flush` notifications, the `syntax-highlight` event an accepted `input`
+//! produces at once, and the `plan-ready` / `capture-required` events their
+//! quiet periods produce.
 
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
@@ -18,8 +19,8 @@ use crate::history::HistoryIndex;
 use crate::matching::Mode;
 use crate::plan::{self, Producer};
 use crate::record;
-use crate::syntax::NamespaceSnapshot;
-use crate::wire::{BUILD_STAMP, parse_canonical_u64};
+use crate::syntax::{self, LexContext, NamespaceSnapshot, PathResolver};
+use crate::wire::{self, BUILD_STAMP, parse_canonical_u64};
 
 const READ_BUFFER_SIZE: usize = 8192;
 const FIRST_APPLICATION_FD: RawFd = 3;
@@ -351,6 +352,10 @@ struct CurrentInput {
     /// The generation this input claims can serve it, or `0` for "none".
     candidate_generation: i64,
     cwd: Vec<u8>,
+    /// The buffer this notification asks to have tokenized, and the option
+    /// its tokenization needs (specs/syntax.md "Context and purity").
+    buffer: Vec<u8>,
+    interactive_comments: bool,
     params: plan::Params,
     expiry: Option<Instant>,
 }
@@ -360,9 +365,14 @@ struct CurrentInput {
 /// reaches it and the history writes never reach a slot (cli-protocol.md
 /// "Requests and Responses") -- and the one current input the quiet period is
 /// measured for.
+///
+/// The path resolver is not part of the snapshot: it lives for the whole
+/// session and its cache outlives every snapshot replacement
+/// (specs/syntax.md "Context and purity").
 #[derive(Default)]
 struct Session {
     namespace: Option<NamespaceSnapshot>,
+    resolver: PathResolver,
     store: CandidateStore,
     history: HistoryIndex,
     input: Option<CurrentInput>,
@@ -442,10 +452,37 @@ impl Session {
         let settles_now = input.expiry.is_none();
         let generation = input.candidate_generation;
         self.input = Some(input);
+        self.emit_highlight(output)?;
         if settles_now {
             self.settle_against(generation, output)?;
         }
         Ok(())
+    }
+
+    /// cli-protocol.md "Input Notifications and Worker Events": the buffer of
+    /// the notification just accepted is tokenized on the spot, ahead of
+    /// anything its quiet period will produce. Without a namespace snapshot
+    /// there is nothing to classify against and no event is sent.
+    fn emit_highlight<W: Write>(&mut self, output: &mut W) -> Result<(), Error> {
+        let (Some(snapshot), Some(input)) = (&self.namespace, &self.input) else {
+            return Ok(());
+        };
+        // An empty buffer holds no token, so it is not handed to the lexer.
+        let tokens = if input.buffer.is_empty() {
+            Vec::new()
+        } else {
+            let mut context = LexContext::new(
+                snapshot,
+                &input.cwd,
+                input.interactive_comments,
+                &mut self.resolver,
+            );
+            syntax::analyze(&input.buffer, &mut context)
+        };
+
+        let target = input.generation.to_string();
+        let body = wire::serialize_highlights(&tokens);
+        write_message(output, &[b"syntax-highlight", target.as_bytes(), &body])
     }
 
     /// cli-protocol.md "Input Notifications and Worker Events": a `flush` cuts the quiet
@@ -754,7 +791,9 @@ fn parse_input(fields: Vec<Vec<u8>>, now: Instant) -> Option<CurrentInput> {
         rows,
         width,
         trailing_space,
-    ] = <[Vec<u8>; 11]>::try_from(fields).ok()?;
+        buffer,
+        interactive_comments,
+    ] = <[Vec<u8>; 13]>::try_from(fields).ok()?;
 
     let generation = parse_identifier(&generation)?;
     let candidate_generation = parse_reference(&candidate_generation)?;
@@ -764,11 +803,14 @@ fn parse_input(fields: Vec<Vec<u8>>, now: Instant) -> Option<CurrentInput> {
     let rows = parse_positive_usize(&rows)?;
     let width = parse_positive_usize(&width)?;
     let trailing_space = parse_bool(&trailing_space)?;
+    let interactive_comments = parse_bool(&interactive_comments)?;
 
     Some(CurrentInput {
         generation,
         candidate_generation,
         cwd,
+        buffer,
+        interactive_comments,
         params: plan::Params {
             producer: Producer::Compsys,
             query,
@@ -1161,7 +1203,7 @@ mod tests {
             .filter(|message| {
                 matches!(
                     message.first().map(Vec::as_slice),
-                    Some(b"plan-ready" | b"capture-required")
+                    Some(b"plan-ready" | b"capture-required" | b"syntax-highlight")
                 )
             })
             .cloned()
@@ -1170,6 +1212,27 @@ mod tests {
 
     fn capture_required(generation: &[u8]) -> Vec<Vec<u8>> {
         vec![b"capture-required".to_vec(), generation.to_vec()]
+    }
+
+    fn highlight(generation: &[u8], entries: &[&str]) -> Vec<Vec<u8>> {
+        let mut body = entries.len().to_string().into_bytes();
+        body.push(0);
+        for entry in entries {
+            body.extend_from_slice(entry.as_bytes());
+            body.push(0);
+        }
+        vec![b"syntax-highlight".to_vec(), generation.to_vec(), body]
+    }
+
+    fn zero_token_highlight(generation: &[u8]) -> Vec<Vec<u8>> {
+        highlight(generation, &[])
+    }
+
+    /// A snapshot whose `$PATH` has no element that could resolve a command
+    /// word, so classification stays independent of the test machine.
+    fn empty_namespace(id: &[u8]) -> Vec<u8> {
+        let payload = namespace_payload(&[], &[], &[], &[], b"/nonexistent-zrush-path");
+        message(&namespace_request(id, &payload))
     }
 
     /// Field 3 of a terminal response: an `ok` body or an error `code`.
@@ -1192,23 +1255,38 @@ mod tests {
         vec![b"store", id, slot, generation, input_generation, payload]
     }
 
+    /// A notification carrying no buffer: the shape zsh sends when buffer
+    /// decoration is off, and the one every test that is not about
+    /// decoration uses.
     fn input_notification<'a>(
         generation: &'a [u8],
         candidate_generation: &'a [u8],
         delay_ms: &'a [u8],
+    ) -> Vec<&'a [u8]> {
+        buffer_notification(generation, candidate_generation, delay_ms, b"", b"/")
+    }
+
+    fn buffer_notification<'a>(
+        generation: &'a [u8],
+        candidate_generation: &'a [u8],
+        delay_ms: &'a [u8],
+        buffer: &'a [u8],
+        cwd: &'a [u8],
     ) -> Vec<&'a [u8]> {
         vec![
             b"input",
             generation,
             candidate_generation,
             delay_ms,
-            b"/",
+            cwd,
             b"",
             b"typo",
             b"true",
             b"10",
             b"40",
             b"true",
+            buffer,
+            b"false",
         ]
     }
 
@@ -1418,7 +1496,9 @@ mod tests {
                 &mut input_output,
             )
             .unwrap();
-        assert!(input_output.is_empty());
+        // The notification carries no buffer, so its decoration event is the
+        // zero-token one and nothing else has settled yet.
+        assert_eq!(messages(&input_output), [zero_token_highlight(b"7")]);
 
         for (id, malformed) in [
             (b"2".as_slice(), b"1:x!".as_slice()),
@@ -1854,11 +1934,23 @@ mod tests {
                     .collect(),
             );
         }
-        // Shape and enumeration violations of the same notification.
+        // Shape and enumeration violations of the same notification. Dropping
+        // the last field is exactly the twelve-field shape of the previous
+        // wire, and one field past the notification is no notification either.
         let mut short = input_notification(b"1", b"0", b"30");
         short.pop();
         malformed.push(short.iter().map(|field| field.to_vec()).collect());
-        for (index, value) in [(6, b"fuzzy".as_slice()), (7, b"TRUE"), (8, b"0"), (9, b"0")] {
+        let mut long = input_notification(b"1", b"0", b"30");
+        long.push(b"extra");
+        malformed.push(long.iter().map(|field| field.to_vec()).collect());
+        for (index, value) in [
+            (6, b"fuzzy".as_slice()),
+            (7, b"TRUE"),
+            (8, b"0"),
+            (9, b"0"),
+            (12, b"TRUE"),
+            (12, b""),
+        ] {
             let mut fields = input_notification(b"1", b"0", b"30");
             fields[index] = value;
             malformed.push(fields.iter().map(|field| field.to_vec()).collect());
@@ -2255,37 +2347,136 @@ mod tests {
     /// by this session verbatim.
     #[test]
     fn the_contract_examples_are_this_wire() {
-        let input = b"64:5:input,1:7,1:0,2:30,4:/tmp,2:gi,4:typo,4:true,2:10,2:79,4:true,,";
+        let input =
+            b"77:5:input,1:7,1:0,2:30,4:/tmp,2:gi,4:typo,4:true,2:10,2:79,4:true,2:gi,5:false,,";
+        let unknown_command = b"42:16:syntax-highlight,1:7,14:1\0unknown 0 2\0,,";
+        let no_tokens = b"29:16:syntax-highlight,1:7,2:0\0,,";
         let capture_required = b"24:16:capture-required,1:7,,";
         let store = b"40:5:store,2:12,4:live,2:41,1:7,8:b\x01\0w\x01ls\0,,";
         let superseded = b"27:5:error,2:12,10:superseded,,";
         let plan_ready = b"28:10:plan-ready,1:7,7:\x000\x000\x000\x00,,";
         let flush = b"12:5:flush,1:7,,";
-
-        let (result, output) = drive(vec![
-            Step::Send(hello()),
-            Step::Send(input.to_vec()),
-            wait(30),
-            Step::Send(store.to_vec()),
-            // The input is settled by now, so this flush is dropped.
-            Step::Send(flush.to_vec()),
-            // A later input supersedes generation 7 and the same capture with
-            // it.
-            Step::Send(message(&input_notification(b"8", b"0", b"1000"))),
-            Step::Send(store.to_vec()),
+        // The same notification with an empty `buffer`, which is how zsh
+        // spells decoration being off.
+        let bufferless = message(&[
+            b"input", b"7", b"0", b"30", b"/tmp", b"gi", b"typo", b"true", b"10", b"79", b"true",
+            b"", b"false",
         ]);
 
-        assert_eq!(result.unwrap(), End::Eof);
+        let run_examples = |first: Vec<u8>| {
+            let (result, output) = drive(vec![
+                Step::Send(hello()),
+                Step::Send(empty_namespace(b"1")),
+                Step::Send(first),
+                wait(30),
+                Step::Send(store.to_vec()),
+                // The input is settled by now, so this flush is dropped.
+                Step::Send(flush.to_vec()),
+                // A later input supersedes generation 7 and the same capture
+                // with it.
+                Step::Send(message(&input_notification(b"8", b"0", b"1000"))),
+                Step::Send(store.to_vec()),
+            ]);
+            assert_eq!(result.unwrap(), End::Eof);
+            output
+        };
+
+        let head = [
+            message(&[b"ready", BUILD_STAMP.as_bytes()]),
+            message(&[b"ok", b"1", b""]),
+        ]
+        .concat();
+        let tail = [
+            capture_required.to_vec(),
+            message(&[b"ok", b"12", b""]),
+            plan_ready.to_vec(),
+            // The bufferless notification that supersedes generation 7.
+            message(&[b"syntax-highlight", b"8", b"0\0"]),
+            superseded.to_vec(),
+        ]
+        .concat();
+
         assert_eq!(
-            output,
+            run_examples(input.to_vec()),
+            [head.clone(), unknown_command.to_vec(), tail.clone()].concat()
+        );
+        assert_eq!(
+            run_examples(bufferless),
+            [head, no_tokens.to_vec(), tail].concat()
+        );
+    }
+
+    /// cli-protocol.md "Worker-Side Norms": the decoration event is written
+    /// when the notification is accepted, before anything its quiet period
+    /// produces, and a notification that is replaced before it settles still
+    /// produced one.
+    #[test]
+    fn every_accepted_input_is_decorated_once_before_its_settle_events() {
+        let decoded = timed(vec![
+            Step::Send(empty_namespace(b"1")),
+            Step::Send(message(&buffer_notification(
+                b"1", b"0", b"1000", b"gi", b"/",
+            ))),
+            // Replaced while still pending: no settle event of its own.
+            Step::Send(message(&buffer_notification(
+                b"2", b"0", b"0", b"gi foo", b"/",
+            ))),
+        ]);
+
+        assert_eq!(
+            events(&decoded),
             [
-                message(&[b"ready", BUILD_STAMP.as_bytes()]),
-                capture_required.to_vec(),
-                message(&[b"ok", b"12", b""]),
-                plan_ready.to_vec(),
-                superseded.to_vec(),
+                highlight(b"1", &["unknown 0 2"]),
+                highlight(b"2", &["unknown 0 2"]),
+                capture_required(b"2"),
             ]
-            .concat()
+        );
+    }
+
+    /// specs/syntax.md "Delivery": nothing is delivered until a snapshot has
+    /// been accepted; the notification is otherwise handled as usual.
+    #[test]
+    fn no_buffer_is_decorated_before_the_first_namespace_snapshot() {
+        let decoded = timed(vec![
+            Step::Send(message(&buffer_notification(b"1", b"0", b"0", b"gi", b"/"))),
+            Step::Send(empty_namespace(b"2")),
+            Step::Send(message(&buffer_notification(b"3", b"0", b"0", b"gi", b"/"))),
+        ]);
+
+        assert_eq!(
+            events(&decoded),
+            [
+                capture_required(b"1"),
+                highlight(b"3", &["unknown 0 2"]),
+                capture_required(b"3"),
+            ]
+        );
+    }
+
+    /// The `Word` kind is delivered under no role, and offsets count
+    /// characters of the buffer itself rather than its bytes.
+    #[test]
+    fn roles_and_offsets_follow_the_analysis_of_the_whole_buffer() {
+        let payload = namespace_payload(&[], &[], &[b"echo"], &[], b"/nonexistent-zrush-path");
+        let decoded = timed(vec![
+            Step::Send(message(&namespace_request(b"1", &payload))),
+            Step::Send(message(&buffer_notification(
+                b"2",
+                b"0",
+                b"0",
+                "echo é 'q' >x".as_bytes(),
+                b"/",
+            ))),
+        ]);
+
+        assert_eq!(
+            events(&decoded),
+            [
+                // The two-byte `é` counts as one character, and neither it nor
+                // the word behind the redirect carries a role.
+                highlight(b"2", &["builtin 0 4", "single-quote 7 3", "redirect 11 1"]),
+                capture_required(b"2"),
+            ]
         );
     }
 }

@@ -112,6 +112,8 @@ fn run_plan(extra: &[&str], stdin: &[u8]) -> (i32, Vec<u8>) {
     // Every `store` is bound to the worker's current input, so the session
     // opens with an `input` notification whose quiet period outlives the whole
     // exchange (cli-protocol.md "Input Notifications and Worker Events").
+    // These vectors are about the render plan alone, so the notification
+    // carries no buffer to decorate.
     let cwd = std::env::current_dir().unwrap();
     let req = [
         msg(&[
@@ -126,6 +128,8 @@ fn run_plan(extra: &[&str], stdin: &[u8]) -> (i32, Vec<u8>) {
             value("--rows").as_bytes(),
             value("--width").as_bytes(),
             value("--trailing-space").as_bytes(),
+            b"",
+            b"false",
         ]),
         msg(&[b"store", b"1", b"live", b"1", b"1", stdin]),
     ]
