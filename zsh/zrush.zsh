@@ -1711,8 +1711,12 @@ _zrush_worker_start() {
   _zrush_worker_rx=
   _zrush_encode_message hello "$_ZRUSH_EXPECTED_BUILD_STAMP"
   _zrush_worker_txq=( "$REPLY" )
-  _zrush_namespace_collect
-  _zrush_namespace_payload=$REPLY
+  # Source-time init and every precmd refresh leave the canonical payload
+  # cached, so collect only when there is none to reuse.
+  if [[ -z $_zrush_namespace_payload ]]; then
+    _zrush_namespace_collect
+    _zrush_namespace_payload=$REPLY
+  fi
   _zrush_request_namespace "$_zrush_namespace_payload" || return 1
   _zrush_kick
   _zlog "worker: started rfd=$_zrush_worker_rfd wfd=$_zrush_worker_wfd controlfd=$_zrush_worker_control_wfd"
