@@ -186,8 +186,8 @@ fn an_expired_ttl_recollects_although_the_fingerprint_still_matches() {
     );
 }
 
-/// A new alias is a new command-position candidate, and the alias count the
-/// fingerprint covers is what notices it. TTL and latch stay valid, so the
+/// A new alias is a new command-position candidate, and the alias names the
+/// fingerprint covers are what notice it. TTL and latch stay valid, so the
 /// fingerprint alone forces the recollection -- and the recollection is what
 /// puts the new command in the listing.
 #[test]
@@ -228,7 +228,7 @@ fn a_changed_environment_expires_the_fingerprint() {
 }
 
 /// A new executable in a `$PATH` directory is a new command-position candidate
-/// that no counted quantity notices -- only that directory's mtime does. The
+/// that no shell name set notices -- only that directory's mtime does. The
 /// change lands between two prompts, which is where the fingerprint the
 /// notification compares against is computed (behavior.md "Empty-Word Collection Cache").
 #[test]
@@ -278,6 +278,57 @@ fn a_new_executable_on_path_expires_the_fingerprint() {
     assert!(
         post.contains("whic-zrt-newcmd"),
         "(cc-8d) the recollected listing is missing the new command: {post:?}"
+    );
+}
+
+/// A rename is a candidate-set change no count can see: one alias goes and
+/// another arrives between the same two prompts, so functions, aliases and
+/// builtins are all as numerous as they were. The fingerprint carries the name
+/// lists themselves, so the replacement is what expires it -- and the
+/// recollection is what puts the new name in the listing
+/// (behavior.md "Empty-Word Collection Cache").
+#[test]
+fn a_same_count_replacement_expires_the_fingerprint() {
+    let mut host = Host::boot();
+    // Warmed with the old alias already in place: the entry under test is the
+    // one whose environment the swap below leaves the same size.
+    host.send_line("alias whic-zrt-gone=:");
+    host.sync_prompt(Duration::from_secs(5));
+    host.drain(Duration::from_millis(300));
+    warm_to_a_hit(&mut host, "(cc-9 setup)");
+
+    host.send_line("unalias whic-zrt-gone; alias whic-zrt-kept=:");
+    assert!(
+        host.sync_prompt(Duration::from_secs(10)),
+        "(cc-9a) the replacement's prompt never came back"
+    );
+    host.drain(Duration::from_millis(500));
+    let changed = host.cache_state();
+    assert!(
+        state_has(&changed, &["fpmatch=0"]),
+        "(cc-9a) a same-count alias replacement did not change the fingerprint: {changed}"
+    );
+
+    let stale = host.log_count("cache: miss (fingerprint)");
+    let collecting = host.log_count(COLLECTING);
+    let applied = host.log_count("plan: applied");
+    assert!(
+        !query(&mut host, "(cc-9b)"),
+        "(cc-9b) a fingerprint from before the replacement was still served from the latch"
+    );
+    assert!(
+        host.log_count("cache: miss (fingerprint)") == stale + 1
+            && host.log_count(COLLECTING) > collecting,
+        "(cc-9c) the stale entry did not recollect"
+    );
+    assert!(
+        host.wait_log("plan: applied", applied, Duration::from_secs(10)),
+        "(cc-9d) the recollection never rendered"
+    );
+    let post = host.postdisplay("(cc-9d)");
+    assert!(
+        post.contains("whic-zrt-kept"),
+        "(cc-9d) the recollected listing is missing the new command: {post:?}"
     );
 }
 
@@ -403,7 +454,7 @@ fn the_latch_dies_with_the_worker_session_and_with_a_re_source() {
 
 /// zrush generates one handler function per armed `zle -F` watcher, so its own
 /// function table moves whenever a worker session starts or stops. None of that
-/// is a candidate-set change, and the fingerprint counts only the names outside
+/// is a candidate-set change, and the fingerprint covers only the names outside
 /// zrush's namespace so that it says so (behavior.md "Empty-Word Collection Cache").
 /// A restart still costs one recollection -- through the latch, which is the
 /// worker's own state -- but the fingerprint must survive it untouched.
