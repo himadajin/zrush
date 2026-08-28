@@ -25,6 +25,8 @@ typeset -gi PASS=0 FAIL=0 WAIT_CS=500 IDLE_CS=10
 out() { print -r -u2 -- "$@" }
 ok() { out "PASS: $1"; (( ++PASS )) }
 ng() { out "FAIL: $1"; (( ++FAIL )) }
+# A case whose fixture this zsh cannot build is reported, not counted.
+skip() { out "SKIP: $1" }
 typeset -ga WHY=()
 eq() { [[ $2 == "$3" ]] || WHY+=( "$1: got ${(qqq)2}, want ${(qqq)3}" ) }
 note() { WHY+=( "$1" ) }
@@ -88,11 +90,12 @@ unset ZDOTDIR
     done
     for fd in ${_zrush_worker_ack_fd:--1} ${_zrush_worker_drain_fd:--1} \
               ${_zrush_worker_rfd:--1} ${_zrush_worker_wfd:--1} \
-              ${_zrush_worker_control_wfd:--1}; do
+              ${_zrush_worker_nbwfd:--1} ${_zrush_worker_control_wfd:--1}; do
       (( fd > 2 )) && _zrush_close_internal_fd $fd
     done
     _zrush_worker_runtime_destroy
-    _zrush_worker_rfd=-1 _zrush_worker_wfd=-1 _zrush_worker_control_wfd=-1
+    _zrush_worker_rfd=-1 _zrush_worker_wfd=-1 _zrush_worker_nbwfd=-1
+    _zrush_worker_control_wfd=-1
     _zrush_worker_ack_fd=-1 _zrush_worker_drain_fd=-1
     _zrush_worker_ready=0
     _zrush_worker_stopping=0 _zrush_worker_rx=
@@ -142,6 +145,24 @@ unset ZDOTDIR
     (( _zrush_worker_ready ))
   }
 
+  # The same capability the transport itself probes: whether this zsh's sysopen
+  # can open a nonblocking write fd at all.
+  typeset -gi NONBLOCK_OK=0
+  () {
+    emulate -L zsh
+    local fifo=$WORK/nonblock-probe.fifo
+    local -i anchor=-1 probe=-1
+    command mkfifo $fifo || return
+    if sysopen -rw -o cloexec -u anchor $fifo &&
+       sysopen -w -o cloexec,nonblock -u probe $fifo 2>/dev/null; then
+      NONBLOCK_OK=1
+    fi
+    (( probe > 2 )) && exec {probe}>&-
+    (( anchor > 2 )) && exec {anchor}>&-
+    command rm -f $fifo
+    return 0
+  }
+
   stop_until_done() {
     emulate -L zsh
     local -F deadline=$(( EPOCHREALTIME + ${1:-5.0} ))
@@ -167,6 +188,8 @@ unset ZDOTDIR
   for endpoint in $req $resp $ctl; do
     mode_of $endpoint && eq "FIFO mode $endpoint" $REPLY 600
   done
+  (( _zrush_worker_pipe_buf >= 512 )) ||
+    note "request FIFO atomicity ceiling below the POSIX floor: $_zrush_worker_pipe_buf"
   [[ /dev/fd/0 -ef /dev/fd/$saved0 && /dev/fd/1 -ef /dev/fd/$saved1 \
      && /dev/fd/2 -ef /dev/fd/$saved2 ]] || note "runtime setup changed shell stdio"
   _zrush_worker_runtime_destroy
@@ -185,6 +208,7 @@ unset ZDOTDIR
     note "lazy start created a runtime"
   eq "lazy start response fd" $_zrush_worker_rfd -1
   eq "lazy start request fd" $_zrush_worker_wfd -1
+  eq "lazy start nonblocking request fd" $_zrush_worker_nbwfd -1
   eq "lazy start control fd" $_zrush_worker_control_wfd -1
   verdict "startup: lazy start never creates the source-generation runtime"
 
@@ -205,6 +229,7 @@ unset ZDOTDIR
   (( transaction_st != 0 )) || note "injected endpoint failure reported success"
   eq "unpublished response fd" $_zrush_worker_rfd -1
   eq "unpublished request fd" $_zrush_worker_wfd -1
+  eq "unpublished nonblocking request fd" $_zrush_worker_nbwfd -1
   eq "unpublished control fd" $_zrush_worker_control_wfd -1
   eq "unpublished ack fd" $_zrush_worker_ack_fd -1
   eq "stopping gate finalized" $_zrush_worker_stopping 0
@@ -374,6 +399,158 @@ unset ZDOTDIR
   command rm -f $REQ_FIFO $HOLD_FIFO
   verdict "writer: ack releases the slot and preserves serial ordering without process EOF"
 
+  # ---------------------------------------------- writer path selection by size
+  # Without a nonblocking request write fd -- a zsh whose sysopen cannot open
+  # one -- the session has no direct-write path at all, and a frame well within
+  # PIPE_BUF is delegated like any other (behavior.md "Worker Lifecycle").
+  reset_transport
+  REQ_FIFO=$WORK/no-direct-request.fifo
+  command mkfifo $REQ_FIFO
+  sysopen -rw -o cloexec -u REQ_ANCHOR $REQ_FIFO
+  sysopen -r -o cloexec -u REQ_R $REQ_FIFO
+  sysopen -w -o cloexec -u _zrush_worker_wfd $REQ_FIFO
+  _zrush_worker_nbwfd=-1
+  _zrush_worker_pipe_buf=512
+  _zrush_worker_ready=1
+  _zrush_encode_message input 14 0 30 / z prefix false 1 1 false
+  typeset -g NO_DIRECT=$REPLY
+  (( ${#NO_DIRECT} <= _zrush_worker_pipe_buf )) || note "no-direct fixture exceeds the ceiling"
+  print -rn -- "$NO_DIRECT" >| $WORK/no-direct.expected
+  _zrush_worker_txq=( "$NO_DIRECT" )
+  _zrush_worker_flush; typeset -gi no_direct_st=$?
+  eq "no-direct flush status" $no_direct_st 0
+  (( _zrush_worker_ack_fd > 2 )) || note "a small frame was not delegated without the nonblocking fd"
+  eq "no-direct frame left the queue" $#_zrush_worker_txq 0
+  drain_exact $REQ_R $WORK/no-direct.actual ${#NO_DIRECT} || note "the delegated small frame did not arrive"
+  command cmp -s $WORK/no-direct.expected $WORK/no-direct.actual || note "delegated small frame bytes differ"
+  readable $_zrush_worker_ack_fd || note "delegated small frame ack did not arrive"
+  _zrush_worker_consume_ack
+  eq "no-direct writer slot released" $_zrush_worker_ack_fd -1
+  exec {REQ_R}>&- {REQ_ANCHOR}>&-
+  _zrush_worker_close_request
+  command rm -f $REQ_FIFO
+  verdict "writer: without a nonblocking request fd every frame is delegated to the writer child"
+
+  # The remaining direct-write cases need a nonblocking request write fd to
+  # build their seam at all. Where sysopen cannot open one, no session has a
+  # direct-write path and the case above is the whole story.
+  if (( NONBLOCK_OK )); then
+    # ------------------------------------- direct nonblocking write of small frames
+    # A frame within the request FIFO's PIPE_BUF is delivered whole or not at all,
+    # so a successful nonblocking write settles it without a writer child, an ack
+    # watcher, or a callback round-trip (behavior.md "Worker Lifecycle").
+    reset_transport
+    REQ_FIFO=$WORK/direct-request.fifo
+    command mkfifo $REQ_FIFO
+    typeset -gi DIRECT_NB
+    sysopen -rw -o cloexec -u REQ_ANCHOR $REQ_FIFO
+    sysopen -r -o cloexec -u REQ_R $REQ_FIFO
+    sysopen -w -o cloexec -u _zrush_worker_wfd $REQ_FIFO
+    sysopen -w -o cloexec,nonblock -u _zrush_worker_nbwfd $REQ_FIFO
+    DIRECT_NB=$_zrush_worker_nbwfd
+    _zrush_worker_pipe_buf=512
+    _zrush_worker_ready=1
+    _zrush_encode_message input 11 0 30 / q prefix false 1 1 false
+    typeset -g DIRECT_A=$REPLY
+    _zrush_encode_message flush 11; typeset -g DIRECT_B=$REPLY
+    (( ${#DIRECT_A} <= 512 && ${#DIRECT_B} <= 512 )) ||
+      note "fixture frames exceed the atomicity ceiling: ${#DIRECT_A}/${#DIRECT_B}"
+    print -rn -- "$DIRECT_A$DIRECT_B" >| $WORK/direct.expected
+    _zrush_worker_txq=( "$DIRECT_A" "$DIRECT_B" )
+    _zrush_worker_flush; typeset -gi direct_st=$?
+    eq "direct flush status" $direct_st 0
+    eq "direct write drains the queue" $#_zrush_worker_txq 0
+    eq "direct write acquires no ack slot" $_zrush_worker_ack_fd -1
+    eq "direct write registers no ack callback" ${_zrush_worker_callback_generation[ack]} 0
+    eq "direct write keeps the nonblocking fd" $_zrush_worker_nbwfd $DIRECT_NB
+    drain_exact $REQ_R $WORK/direct.actual $(( ${#DIRECT_A} + ${#DIRECT_B} )) ||
+      note "directly written frames did not arrive"
+    command cmp -s $WORK/direct.expected $WORK/direct.actual || note "directly written bytes differ"
+    exec {REQ_R}>&- {REQ_ANCHOR}>&-
+    _zrush_worker_close_request
+    eq "close_request closes the nonblocking fd" $_zrush_worker_nbwfd -1
+    [[ ! -e /dev/fd/$DIRECT_NB ]] || note "nonblocking request fd outlived the session"
+    command rm -f $REQ_FIFO
+    verdict "writer: a frame within PIPE_BUF is written directly and settles synchronously"
+
+    # A full FIFO makes the nonblocking write fail without delivering anything;
+    # the frame then takes the writer-child path unchanged.
+    reset_transport
+    REQ_FIFO=$WORK/eagain-request.fifo
+    command mkfifo $REQ_FIFO
+    sysopen -rw -o cloexec -u REQ_ANCHOR $REQ_FIFO
+    sysopen -r -o cloexec -u REQ_R $REQ_FIFO
+    sysopen -w -o cloexec -u _zrush_worker_wfd $REQ_FIFO
+    sysopen -w -o cloexec,nonblock -u _zrush_worker_nbwfd $REQ_FIFO
+    _zrush_worker_pipe_buf=512
+    _zrush_worker_ready=1
+    _zrush_encode_message input 12 0 30 / qq prefix false 1 1 false
+    typeset -g EAGAIN_FRAME=$REPLY
+    typeset -gi PAD_BYTES=0
+    syswrite -c PAD_BYTES -o $_zrush_worker_nbwfd -- ${(l:1048576::x:)} 2>/dev/null
+    (( PAD_BYTES > 0 )) || note "could not fill the request FIFO"
+    # The padding and the frame leave the FIFO as one stream, so they are compared
+    # as one: the writer child may refill the space a read has just freed.
+    print -rn -- "${(l:$PAD_BYTES::x:)}$EAGAIN_FRAME" >| $WORK/eagain.expected
+    _zrush_worker_txq=( "$EAGAIN_FRAME" )
+    _zrush_worker_flush; typeset -gi eagain_st=$?
+    eq "EAGAIN flush status" $eagain_st 0
+    (( _zrush_worker_ack_fd > 2 )) || note "EAGAIN did not fall back to a writer child"
+    eq "EAGAIN frame left the queue" $#_zrush_worker_txq 0
+    drain_exact $REQ_R $WORK/eagain.actual $(( PAD_BYTES + ${#EAGAIN_FRAME} )) ||
+      note "the delegated frame did not follow the padding"
+    command cmp -s $WORK/eagain.expected $WORK/eagain.actual || note "delegated frame bytes differ"
+    readable $_zrush_worker_ack_fd || note "delegated frame ack did not arrive"
+    _zrush_worker_consume_ack
+    eq "EAGAIN writer slot released" $_zrush_worker_ack_fd -1
+    exec {REQ_R}>&- {REQ_ANCHOR}>&-
+    _zrush_worker_close_request
+    command rm -f $REQ_FIFO
+    verdict "writer: a nonblocking write refused with EAGAIN falls back to the writer child"
+
+    # Size decides, not kind: a payload-carrying frame past PIPE_BUF is delegated,
+    # and the small frame behind it waits for the ack rather than overtaking it.
+    reset_transport
+    REQ_FIFO=$WORK/oversize-request.fifo
+    command mkfifo $REQ_FIFO
+    sysopen -rw -o cloexec -u REQ_ANCHOR $REQ_FIFO
+    sysopen -r -o cloexec -u REQ_R $REQ_FIFO
+    sysopen -w -o cloexec -u _zrush_worker_wfd $REQ_FIFO
+    sysopen -w -o cloexec,nonblock -u _zrush_worker_nbwfd $REQ_FIFO
+    _zrush_worker_pipe_buf=512
+    _zrush_worker_ready=1
+    typeset -g BIG_PAYLOAD=${(l:4096::c:)}
+    _zrush_encode_message store 13 live 1 7 $'\1'"$BIG_PAYLOAD"$'\0'
+    typeset -g OVERSIZE=$REPLY
+    _zrush_encode_message flush 13; typeset -g OVERSIZE_TAIL=$REPLY
+    (( ${#OVERSIZE} > _zrush_worker_pipe_buf )) || note "oversize fixture is not oversize"
+    print -rn -- "$OVERSIZE" >| $WORK/oversize.expected
+    print -rn -- "$OVERSIZE_TAIL" >| $WORK/oversize-tail.expected
+    _zrush_worker_txq=( "$OVERSIZE" "$OVERSIZE_TAIL" )
+    _zrush_worker_flush; typeset -gi oversize_st=$?
+    eq "oversize flush status" $oversize_st 0
+    (( _zrush_worker_ack_fd > 2 )) || note "oversize frame was not delegated"
+    eq "small frame stays behind the delegated one" $#_zrush_worker_txq 1
+    drain_exact $REQ_R $WORK/oversize.actual ${#OVERSIZE} || note "oversize frame did not arrive"
+    command cmp -s $WORK/oversize.expected $WORK/oversize.actual || note "oversize frame bytes differ"
+    readable $_zrush_worker_ack_fd || note "oversize frame ack did not arrive"
+    _zrush_worker_consume_ack
+    eq "ack releases the slot and writes the tail directly" $_zrush_worker_ack_fd -1
+    eq "tail frame left the queue" $#_zrush_worker_txq 0
+    drain_exact $REQ_R $WORK/oversize-tail.actual ${#OVERSIZE_TAIL} ||
+      note "the tail frame did not follow the oversize one"
+    command cmp -s $WORK/oversize-tail.expected $WORK/oversize-tail.actual ||
+      note "tail frame bytes differ"
+    exec {REQ_R}>&- {REQ_ANCHOR}>&-
+    _zrush_worker_close_request
+    command rm -f $REQ_FIFO
+    verdict "writer: a frame past PIPE_BUF is delegated and never overtaken by a smaller one"
+  else
+    skip "writer: a frame within PIPE_BUF is written directly and settles synchronously"
+    skip "writer: a nonblocking write refused with EAGAIN falls back to the writer child"
+    skip "writer: a frame past PIPE_BUF is delegated and never overtaken by a smaller one"
+  fi
+
   # ------------------------------------------- notification frames in the queue
   # Only frames still waiting in the queue may be dropped or replaced. The one
   # already handed to a writer child is on its way to the FIFO and is settled by
@@ -427,7 +604,9 @@ unset ZDOTDIR
   typeset -g writer_failed_ctl=$_zrush_worker_control_path
   typeset -gi writer0 writer1 writer2
   exec {writer0}<&0 {writer1}>&1 {writer2}>&2
-  _zrush_encode_message plan 77 5 / history q prefix false 1 1 5000
+  # Past PIPE_BUF, so the frame is delegated rather than written directly.
+  _zrush_encode_message store 77 live 1 5 $'\1'"${(l:8192::c:)}"$'\0'
+  (( ${#REPLY} > _zrush_worker_pipe_buf )) || note "post-spawn writer fixture is not delegated"
   _zrush_worker_txq=( "$REPLY" never-replayed )
   functions[_zrt_poll_writer]=$functions[_zrush_worker_poll_writer]
   functions[_zrt_poll_eof]=$functions[_zrush_worker_poll_eof]

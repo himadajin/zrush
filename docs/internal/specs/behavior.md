@@ -86,10 +86,20 @@ zsh は zle 統合・compsys 呼び出しによる捕獲・zsh 名前空間 snap
   `history-snapshot` と `plan` の連送(index が同期済みなら `plan` だけ)・
   `plan` の終端応答をすべて含める。
 - worker stdin への送信単位は完成済み frame 1 個で、outbound queue に send offset を持たない。
-  対話シェル自身は request FIFO へ blocking write せず、cloexec 付き request write fd を fork した
-  短命な writer child に渡す。fork した child は request と通知以外の transport fd copy を直ちに閉じ、
-  control/response EOF を保持しない。writer は 1 回の `syswrite` で frame 全体を書き、直後に自身の request fd を
-  閉じてから通知 pipe へ ack byte 1 個を書く。ack は full-frame delivery を証明し、その時点で writer の
+  対話シェル自身は request FIFO へ blocking write しない。session 開始時に、他の transport fd と同じ
+  lifecycle で cloexec + nonblock 付きの request write fd をもう 1 本開く。writer child へ委譲中でないとき、
+  queue 先頭の frame だけは、その nonblock fd への 1 回の `syswrite` で直接書いてよい。
+  pipe/FIFO への PIPE_BUF 以下の write は all-or-nothing なので、成功した非 blocking write はそれ自体が
+  full-frame delivery であり、ack を介さずその場で決着する(ack watcher も callback 往復も要らない)。
+  したがって直接書けるのは frame の byte 長が request FIFO の PIPE_BUF 以下のときだけで、frame の kind では
+  決めない。EAGAIN、および PIPE_BUF を超える frame は writer child へ委譲する。
+  nonblock の open ができない zsh では、その session は直接 write の経路を持たず、
+  すべての frame を writer child へ委譲する。
+  委譲は cloexec 付きの blocking request write fd を fork した短命な writer child に渡す。fork した child は
+  委譲された request write fd と通知以外の transport fd copy を直ちに閉じ、control/response EOF も
+  nonblock request write fd も保持しない。writer は 1 回の `syswrite` で frame 全体を書き、
+  直後に自身の request fd を閉じてから通知 pipe へ ack byte 1 個を書く。
+  ack は full-frame delivery を証明し、その時点で writer の
   通知 watcher/fd、transport ownership、sole writer slot を解放するため、通常送信では writer process の
   通知 EOF を待たず次 frame を渡してよい。ack 前の通知 EOF は write failure であり、通常 session を失敗にする。
   停止中の unacked writer は ack または通知 EOF のどちらかを観測するまで replacement gate として残るが、
