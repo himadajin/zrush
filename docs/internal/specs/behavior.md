@@ -315,6 +315,9 @@ wire の byte-exact な形と receiver の置換規則は
   (`../contracts/cli-protocol.md`「Input Notifications and Worker Events」節)。
   worker は静穏期間中に届いた通知で前の通知を置き換え、満了時に残っていた最新の 1 個だけを採用して
   `plan-ready` か `capture-required` を返す。
+  静穏期間が掛かるのは捕獲を要し得る通知だけである。
+  通知の `candidate_generation` を worker が保持している(空語収集キャッシュのヒットが実際に解決した)ときは、
+  受理と同時に `plan-ready` が返る。この場合の一覧更新は打鍵ごとに 1 回で、`delay-ms` は待たない。
 - 入力通知は、その時点の広げ規則が定めるクエリ・行数/桁数予算・マッチング設定・`cwd`・`delay-ms` と、
   空語収集キャッシュが提供する candidate generation(提供が無ければ `0`)を運ぶ。
   加えてバッファ装飾のための per-call context として `BUFFER` 全体と `interactive_comments` を運ぶ
@@ -405,6 +408,9 @@ wire の byte-exact な形と receiver の置換規則は
 - ヒット時は latch が指す generation を通知の `candidate_generation` に載せる。
   worker がそれを保持していれば、収集も `store` も起こらないまま `plan-ready` が返る
   (payload の転送も再解析も起こらない)。
+  この `plan-ready` は静穏期間を待たず通知の受理と同時に返るため、
+  一覧は打鍵ごとに `plan-ready` 1 個・再描画 1 回で即座に更新される
+  (「Candidate Collection」節)。
   worker が保持していなければ `capture-required` が返るため、zsh は latch を無効化して通常の収集へ落ちる。
 - 装飾専用の通知(「Candidate Collection」節)では検証そのものを行わず、
   `candidate_generation` を `0` として送る。

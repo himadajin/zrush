@@ -2,7 +2,7 @@
 //! `history-snapshot`, `history-append` and `plan` requests, the `input` /
 //! `flush` notifications, the `syntax-highlight` event an accepted `input`
 //! produces at once, and the `plan-ready` / `capture-required` events their
-//! quiet periods produce.
+//! settling produces.
 
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
@@ -429,7 +429,8 @@ impl Session {
 
     /// cli-protocol.md "Input Notifications and Worker Events": an accepted `input`
     /// replaces the current one whole and restarts the quiet period with its
-    /// own `delay_ms`; `0` settles at acceptance.
+    /// own `delay_ms`; `0` settles at acceptance, and so does an input the
+    /// store can already answer.
     fn accept_input<W: Write>(
         &mut self,
         fields: Vec<Vec<u8>>,
@@ -449,8 +450,9 @@ impl Session {
             return Err(Error::Protocol);
         }
 
-        let settles_now = input.expiry.is_none();
         let generation = input.candidate_generation;
+        let settles_now =
+            input.expiry.is_none() || (generation != 0 && self.store.find(generation).is_some());
         self.input = Some(input);
         self.emit_highlight(output)?;
         if settles_now {
@@ -1817,6 +1819,29 @@ mod tests {
         assert_eq!(events[1][..2], [b"plan-ready".to_vec(), b"2".to_vec()]);
         assert!(events[1][2].windows(3).any(|bytes| bytes == b"git"));
         assert_eq!(events[2], capture_required(b"3"));
+    }
+
+    /// cli-protocol.md "Input Notifications and Worker Events": a held
+    /// `candidate_generation` settles its notification at acceptance whatever
+    /// its `delay_ms` says; an unheld one still waits out the quiet period.
+    #[test]
+    fn a_held_candidate_generation_settles_without_a_quiet_period() {
+        let stored = payload(b"git");
+        let decoded = timed(vec![
+            Step::Send(pending_input(b"1")),
+            Step::Send(message(&store_request(
+                b"1", b"cache", b"41", b"1", &stored,
+            ))),
+            Step::Send(message(&input_notification(b"2", b"41", b"1000"))),
+            // A stale latch: nothing holds this generation, so it waits.
+            Step::Send(message(&input_notification(b"3", b"999", b"1000"))),
+            wait(500),
+        ]);
+
+        let events = events(&decoded);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[1][..2], [b"plan-ready".to_vec(), b"2".to_vec()]);
+        assert!(events[1][2].windows(3).any(|bytes| bytes == b"git"));
     }
 
     /// cli-protocol.md "Input Notifications and Worker Events": a notification's
