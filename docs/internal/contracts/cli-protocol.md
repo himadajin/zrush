@@ -414,6 +414,9 @@ syntax-highlight: ["syntax-highlight", input_generation, highlight_body]
   `0` は「Requests and Responses」節の識別子の範囲外にある予約値であり、通知だけが取り得る。
 - `delay_ms`: `0..=10000` の canonical ASCII 10 進数(先頭ゼロなし、`0` は `0`)。
   この通知に適用する静穏期間をミリ秒で表す(config-schema.md `[display].delay-ms` のスナップショット)。
+  静穏期間は捕獲を要し得る通知だけに掛かる。
+  candidate store だけで解決する通知は受理と同時に settle するため、この値は効かない
+  (「Worker-Side Norms」節)。
 - `query` / `mode` / `smart_case` / `rows` / `width` は、通知時点の入力スナップショットであり、
   履歴 `plan` の同名 field と同じ意味・同じ表記である。
   `cwd` と `trailing_space` は補完 profile の入力通知だけが持つ profile 固有の値である。
@@ -446,9 +449,15 @@ current input は最後に受理した `input` 通知そのもの(その全フ�
 静穏期間が満了するまでを **pending**、満了した後を **settled** と呼ぶ。
 
 - **`input` の受理**: `input_generation` はセッション内で厳密に単調増加していなければならない。
-  受理した通知は current input を丸ごと置き換え、その通知自身の `delay_ms` で静穏期間を張り直す。
+  受理した通知は current input を丸ごと置き換える。
   置き換えられた pending の入力は event を生まずに消える。
-  `delay_ms = 0` の通知は受理と同時に settle する。
+  受理した通知の `candidate_generation` が `0` でなく、かつその generation を candidate store が
+  保持していれば、静穏期間を張らずに受理と同時に settle する
+  (捕獲が要らないと受理時点で確定しているため、待つ理由が無い)。
+  そうでなければ(`candidate_generation` が `0`、または store が保持していない)
+  その通知自身の `delay_ms` で静穏期間を張り直し、満了時に settle する。
+  `delay_ms = 0` の通知は、この規則とは独立に受理と同時に settle する。
+  すなわち静穏期間は捕獲を要し得る通知だけに掛かる。
 - **バッファ装飾**: `input` を受理した worker は、静穏期間の満了を待たずその場で
   `buffer` を字句解析し、その `input_generation` の `syntax-highlight` を 1 個送る。
   置き換えられて settle しなかった通知もこの event を生む

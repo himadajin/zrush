@@ -523,3 +523,39 @@ fn capture_required_drops_only_the_latch_its_notification_named() {
         "(cc-6g) capture-required was counted against the worker session: {after}"
     );
 }
+
+/// The quiet period is there to suppress captures, so a notification the
+/// candidate store already answers settles at acceptance however long
+/// `delay-ms` is, while one that may still need a capture waits it out
+/// (cli-protocol.md "Worker-Side Norms", behavior.md "Empty-Word Collection Cache").
+/// A `delay-ms` far longer than any of this test's waits is what separates the
+/// two: an immediate listing cannot be the quiet period expiring early.
+#[test]
+fn a_latched_input_renders_without_waiting_out_the_quiet_period() {
+    let mut host = Host::boot_with_config("[display]\ndelay-ms = 2000\n");
+    warm_to_a_hit(&mut host, "(cc-7 setup)");
+
+    let ready = host.log_count(READY);
+    host.send_keys(QUERY);
+    assert!(
+        host.wait_log(READY, ready, Duration::from_millis(1000)),
+        "(cc-7a) the latched input waited out its quiet period"
+    );
+    host.clear_line();
+    host.drain(Duration::from_millis(300));
+
+    // An argument-position word is not the cache's subject, so its notification
+    // carries `candidate_generation = 0` and nothing can settle it early.
+    let collecting = host.log_count(COLLECTING);
+    host.send_keys("ls fx/basic/al");
+    host.drain(Duration::from_millis(1000));
+    assert_eq!(
+        host.log_count(COLLECTING),
+        collecting,
+        "(cc-7b) an unresolvable input settled before its quiet period"
+    );
+    assert!(
+        host.wait_log(COLLECTING, collecting, Duration::from_secs(10)),
+        "(cc-7c) the unresolvable input never settled"
+    );
+}
