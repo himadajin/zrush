@@ -1659,7 +1659,6 @@ _zrush_worker_start() {
   if ! sysopen -rw -o cloexec -u req_anchor "$_zrush_worker_request_path" ||
        ! sysopen -r -o cloexec -u child_in "$_zrush_worker_request_path" ||
        ! sysopen -w -o cloexec -u parent_w "$_zrush_worker_request_path" ||
-       ! sysopen -w -o cloexec,nonblock -u parent_nb "$_zrush_worker_request_path" ||
        ! sysopen -rw -o cloexec -u resp_anchor "$_zrush_worker_response_path" ||
        ! sysopen -r -o cloexec -u parent_r "$_zrush_worker_response_path" ||
        ! sysopen -w -o cloexec -u child_out "$_zrush_worker_response_path" ||
@@ -1668,13 +1667,13 @@ _zrush_worker_start() {
        ! sysopen -w -o cloexec -u parent_ctl "$_zrush_worker_control_path"; then
     endpoint_failed=1
   fi
-  for fd in $req_anchor $child_in $parent_w $parent_nb $resp_anchor $parent_r \
+  for fd in $req_anchor $child_in $parent_w $resp_anchor $parent_r \
             $child_out $ctl_anchor $child_ctl $parent_ctl; do
     (( fd > 2 )) || endpoint_failed=1
   done
 
   if (( endpoint_failed )); then
-    for fd in $req_anchor $child_in $parent_w $parent_nb $resp_anchor $parent_r \
+    for fd in $req_anchor $child_in $parent_w $resp_anchor $parent_r \
               $child_out $ctl_anchor $child_ctl $parent_ctl; do
       [[ -n $fd ]] && (( fd > 2 )) && _zrush_close_internal_fd $fd
     done
@@ -1682,11 +1681,21 @@ _zrush_worker_start() {
     return 1
   fi
 
+  # The direct-write fd is an optimization, not an endpoint: it is opened while
+  # the anchor still holds a reader, and a zsh that cannot open it leaves the
+  # session without a direct-write path (behavior.md "Worker Lifecycle").
+  if ! sysopen -w -o cloexec,nonblock -u parent_nb "$_zrush_worker_request_path" 2>/dev/null ||
+       [[ $parent_nb != <3-> ]]; then
+    parent_nb=
+    _zlog "worker: no nonblocking request write fd; every frame is delegated"
+  fi
+
   exec {spawn_fd}< <(
     exec 0<&$child_in || exit 1
     exec 1>&$child_out || exit 1
     exec {child_in}>&- {child_out}>&-
-    exec {req_anchor}>&- {parent_w}>&- {parent_nb}>&-
+    exec {req_anchor}>&- {parent_w}>&-
+    [[ -n $parent_nb ]] && exec {parent_nb}>&-
     exec {resp_anchor}>&- {parent_r}>&-
     exec {ctl_anchor}>&- {parent_ctl}>&-
     exec "$ZRUSH_BIN" worker --control-fd "$child_ctl" 2>>| "${ZRUSH_LOG:-/dev/null}"
@@ -1704,7 +1713,7 @@ _zrush_worker_start() {
     _zrush_worker_begin_stop
     _zrush_worker_rfd=$parent_r
     _zrush_worker_wfd=$parent_w
-    _zrush_worker_nbwfd=$parent_nb
+    _zrush_worker_nbwfd=${parent_nb:--1}
     _zrush_worker_control_wfd=$parent_ctl
     _zrush_worker_ready=0
     _zrush_worker_rx=
@@ -1722,7 +1731,7 @@ _zrush_worker_start() {
 
   _zrush_worker_rfd=$parent_r
   _zrush_worker_wfd=$parent_w
-  _zrush_worker_nbwfd=$parent_nb
+  _zrush_worker_nbwfd=${parent_nb:--1}
   _zrush_worker_control_wfd=$parent_ctl
   _zrush_worker_ready=0
   _zrush_worker_rx=

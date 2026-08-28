@@ -93,6 +93,8 @@ zsh は zle 統合・compsys 呼び出しによる捕獲・zsh 名前空間 snap
   full-frame delivery であり、ack を介さずその場で決着する(ack watcher も callback 往復も要らない)。
   したがって直接書けるのは frame の byte 長が request FIFO の PIPE_BUF 以下のときだけで、frame の kind では
   決めない。EAGAIN、および PIPE_BUF を超える frame は writer child へ委譲する。
+  nonblock の open ができない zsh では、その session は直接 write の経路を持たず、
+  すべての frame を writer child へ委譲する。
   委譲は cloexec 付きの blocking request write fd を fork した短命な writer child に渡す。fork した child は
   委譲された request write fd と通知以外の transport fd copy を直ちに閉じ、control/response EOF も
   nonblock request write fd も保持しない。writer は 1 回の `syswrite` で frame 全体を書き、
