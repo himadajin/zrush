@@ -409,6 +409,9 @@ wire の byte-exact な形と receiver の置換規則は
   zsh が保持するのは**フィンガープリント・保存時刻・`cache` スロットの candidate store latch**
   (現 worker session が保持している generation)の 3 つだけで、生の捕獲 payload は保持しない。
 - 検証は入力通知を作る時点で行う。
+  ただし比較相手となる現在のフィンガープリントは**プロンプトごとに 1 回だけ**算出し、
+  その行の編集中はすべての通知が同じ値を参照する
+  (行編集中に起きた環境変化は、次のプロンプトの算出でフィンガープリント不一致として捕まる)。
   ヒットの条件は次の 3 つがすべて成り立つこと:
   **フィンガープリント**(`$PATH` 文字列 + PATH 各ディレクトリの
   mtime + 関数・エイリアス・ビルトインの個数。`autocd` 有効または PATH に相対要素が
@@ -431,6 +434,7 @@ wire の byte-exact な形と receiver の置換規則は
 - ミス時は通知の `candidate_generation` を `0` として送り、返る `capture-required` で通常どおり収集する。
   収集の `store` が `ok` で終端した時点で、フィンガープリント・保存時刻・latch を更新する
   (`superseded` や他の `error` で終端した `store` では更新しない)。
+  保存するフィンガープリントは、その `store` を送出した時点で有効なプロンプトごとの値である。
   worker session を失った後は latch が無効なため、フィンガープリントと TTL が有効でもミスとして再収集する
   (latch の無効化点は「Worker Lifecycle」節)。
 

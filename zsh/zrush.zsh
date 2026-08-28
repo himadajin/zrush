@@ -237,6 +237,10 @@ typeset -gi _zrush_tab_pending=0   # Tab was pressed before candidates arrived
 # fingerprint means no cache entry.
 typeset -g  _zrush_cc_fp=          # fingerprint at save time
 typeset -gi _zrush_cc_time=0       # save time (EPOCHSECONDS)
+# This prompt's fingerprint, computed once per prompt and used by every
+# comparison and snapshot on the line. Empty until the first precmd of a
+# source computes it.
+typeset -g  _zrush_cc_prompt_fp=
 # Candidate store latch: the generation this worker session holds in its
 # `cache` slot, 0 when there is none. Belongs to the worker session, so a
 # source starts without one (behavior.md "Worker Lifecycle").
@@ -524,6 +528,9 @@ _zrush_precmd() {
   # must not skip a prompt (behavior.md "History Menu" 更新経路).
   _zrush_hist_reconcile
   _zrush_namespace_refresh
+  # Also ahead of the config block's early returns: the fingerprint is the
+  # prompt's, and no prompt may leave the previous one's in place.
+  _zrush_cc_prompt_refresh
   _zrush_config_mtime
   if [[ $REPLY != $_zrush_cfg_mtime ]]; then
     _zlog "precmd: config mtime changed ($_zrush_cfg_mtime -> $REPLY); reloading"
@@ -905,6 +912,24 @@ _zrush_cc_fingerprint() {
   return 0
 }
 
+# Recompute this prompt's fingerprint. Called from _zrush_precmd.
+_zrush_cc_prompt_refresh() {
+  _zrush_cc_fingerprint
+  typeset -g _zrush_cc_prompt_fp=$REPLY
+  return 0
+}
+
+# REPLY = this prompt's fingerprint, computing it on the spot when no precmd
+# has produced one yet (behavior.md "Empty-Word Collection Cache").
+_zrush_cc_fp_current() {
+  if [[ -z $_zrush_cc_prompt_fp ]]; then
+    _zrush_cc_prompt_refresh
+  else
+    typeset -g REPLY=$_zrush_cc_prompt_fp
+  fi
+  return 0
+}
+
 # The worker no longer holds the cache slot's generation. Called from every
 # invalidation point named in behavior.md "Worker Lifecycle".
 _zrush_cc_latch_drop() {
@@ -944,7 +969,7 @@ _zrush_cc_check() {  # 0=usable hit; on a miss, log the reason and return nonzer
     _zrush_cc_invalidate
     return 1
   fi
-  _zrush_cc_fingerprint
+  _zrush_cc_fp_current
   if [[ $REPLY != "$_zrush_cc_fp" ]]; then
     _zlog "cache: miss (fingerprint)"
     _zrush_cc_invalidate
@@ -956,12 +981,12 @@ _zrush_cc_check() {  # 0=usable hit; on a miss, log the reason and return nonzer
 
 # The latch may only name a generation the worker actually holds
 # (behavior.md "Empty-Word Collection Cache"), so an entry is staged when the `cache`
-# store goes out and committed when that store's `ok` comes back. The
-# fingerprint and the save time are snapshotted here, at collection time:
-# computing them on arrival would describe an environment the capture never saw.
+# store goes out and committed when that store's `ok` comes back. The save time
+# and this prompt's fingerprint are snapshotted here, at collection time: values
+# taken on arrival would describe an environment the capture never saw.
 _zrush_cc_stage() {  # $1=store request_id
   emulate -L zsh
-  _zrush_cc_fingerprint
+  _zrush_cc_fp_current
   _zrush_cc_staged[$1]="$EPOCHSECONDS $REPLY"
   return 0
 }

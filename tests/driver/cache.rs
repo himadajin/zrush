@@ -227,6 +227,60 @@ fn a_changed_environment_expires_the_fingerprint() {
     );
 }
 
+/// A new executable in a `$PATH` directory is a new command-position candidate
+/// that no counted quantity notices -- only that directory's mtime does. The
+/// change lands between two prompts, which is where the fingerprint the
+/// notification compares against is computed (behavior.md "Empty-Word Collection Cache").
+#[test]
+fn a_new_executable_on_path_expires_the_fingerprint() {
+    let mut host = Host::boot();
+    // A PATH directory this host owns, so nothing but this test can move its
+    // mtime under the warmed entry.
+    host.send_line("mkdir -p $HOME/zrt-bin && path=($HOME/zrt-bin $path)");
+    host.sync_prompt(Duration::from_secs(5));
+    host.drain(Duration::from_millis(300));
+    warm_to_a_hit(&mut host, "(cc-8 setup)");
+
+    // The sleep keeps the write out of the second the warmed fingerprint was
+    // taken in: the mtime it records has one-second resolution.
+    host.send_line(
+        "sleep 1.1; print -r '#!/bin/sh' > $HOME/zrt-bin/whic-zrt-newcmd \
+         && chmod +x $HOME/zrt-bin/whic-zrt-newcmd && rehash",
+    );
+    assert!(
+        host.sync_prompt(Duration::from_secs(10)),
+        "(cc-8a) the new executable's prompt never came back"
+    );
+    host.drain(Duration::from_millis(500));
+    let changed = host.cache_state();
+    assert!(
+        state_has(&changed, &["fpmatch=0"]),
+        "(cc-8a) a new executable on $PATH did not change the fingerprint: {changed}"
+    );
+
+    let stale = host.log_count("cache: miss (fingerprint)");
+    let collecting = host.log_count(COLLECTING);
+    let applied = host.log_count("plan: applied");
+    assert!(
+        !query(&mut host, "(cc-8b)"),
+        "(cc-8b) a fingerprint from before the new executable was still served from the latch"
+    );
+    assert!(
+        host.log_count("cache: miss (fingerprint)") == stale + 1
+            && host.log_count(COLLECTING) > collecting,
+        "(cc-8c) the stale entry did not recollect"
+    );
+    assert!(
+        host.wait_log("plan: applied", applied, Duration::from_secs(10)),
+        "(cc-8d) the recollection never rendered"
+    );
+    let post = host.postdisplay("(cc-8d)");
+    assert!(
+        post.contains("whic-zrt-newcmd"),
+        "(cc-8d) the recollected listing is missing the new command: {post:?}"
+    );
+}
+
 /// The latch belongs to the worker session. A session failure drops it and so
 /// does a re-source, both while the fingerprint matches and the entry is well
 /// inside its TTL, and recollection is the only way back. The candidate
