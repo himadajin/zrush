@@ -49,5 +49,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+        with:
+          install: true
+      - uses: crazy-max/ghaction-github-runtime@v3
       - name: Test suite in container (zsh ${{ matrix.zsh-version }})
         run: tests/docker/run.sh ${{ matrix.zsh-version }}
+        env:
+          ZRUSH_DOCKER_BUILD_ARGS: --cache-from type=gha,scope=zsh-${{ matrix.zsh-version }} --cache-to type=gha,mode=max,scope=zsh-${{ matrix.zsh-version }} --load
