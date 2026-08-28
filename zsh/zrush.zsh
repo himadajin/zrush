@@ -177,6 +177,8 @@ typeset -gA _zrush_worker_callback_generation=( data 0 ack 0 drain 0 )
 typeset -gA _zrush_worker_callback_handler=()
 typeset -gA _zrush_worker_pending=()
 typeset -g  _zrush_namespace_payload= _zrush_namespace_queued= _zrush_namespace_acked=
+# Raw signature of the last encoded namespace; empty means "not trusted".
+typeset -g  _zrush_namespace_signature=
 typeset -gA _zrush_namespace_pending=()
 typeset -gi _zrush_namespace_latest_id=0
 typeset -gi _zrush_sync_target=0 _zrush_sync_done=0 _zrush_sync_ok=0
@@ -1159,38 +1161,47 @@ _zrush_encode_message() {
 
 _zrush_namespace_name_stream() {  # names... -> REPLY
   emulate -L zsh
-  local LC_ALL=C name stream=
+  local LC_ALL=C name
+  local -a parts=()
   for name in "$@"; do
     _zrush_netstring "$name"
-    stream+=$REPLY
+    parts+=( "$REPLY" )
   done
-  typeset -g REPLY=$stream
+  typeset -g REPLY=${(j::)parts}
 }
 
 _zrush_namespace_collect() {  # -> REPLY
   emulate -L zsh
   setopt localoptions typesetsilent
-  local LC_ALL=C name payload= stream
+  local LC_ALL=C stream
   local -a alias_names=( ${(ok)aliases} )
-  local -a function_names=() builtin_names=( ${(ok)builtins} )
+  local -a function_names=( ${(ok)functions:#_zrush*} )
+  local -a builtin_names=( ${(ok)builtins} )
   local -a reserved_names=( ${(ok)reswords} )
-  for name in ${(ok)functions}; do
-    [[ $name == _zrush* ]] || function_names+=( "$name" )
-  done
+  local -a payload=()
   _zrush_namespace_name_stream "${(@)alias_names}"; stream=$REPLY
-  _zrush_netstring "$stream"; payload+=$REPLY
+  _zrush_netstring "$stream"; payload+=( "$REPLY" )
   _zrush_namespace_name_stream "${(@)function_names}"; stream=$REPLY
-  _zrush_netstring "$stream"; payload+=$REPLY
+  _zrush_netstring "$stream"; payload+=( "$REPLY" )
   _zrush_namespace_name_stream "${(@)builtin_names}"; stream=$REPLY
-  _zrush_netstring "$stream"; payload+=$REPLY
+  _zrush_netstring "$stream"; payload+=( "$REPLY" )
   _zrush_namespace_name_stream "${(@)reserved_names}"; stream=$REPLY
-  _zrush_netstring "$stream"; payload+=$REPLY
-  _zrush_netstring "${PATH-}"; payload+=$REPLY
-  typeset -g REPLY=$payload
+  _zrush_netstring "$stream"; payload+=( "$REPLY" )
+  _zrush_netstring "${PATH-}"; payload+=( "$REPLY" )
+  typeset -g REPLY=${(j::)payload}
+}
+
+# Cheap change probe over exactly the sets _zrush_namespace_collect encodes,
+# built with bulk join expansions only. Names and $PATH cannot contain NUL, so
+# joining each set with NUL and the sets with NUL NUL is unambiguous.
+_zrush_namespace_signature_probe() {  # -> REPLY
+  emulate -L zsh
+  local LC_ALL=C
+  typeset -g REPLY="${(pj:\0:)${(@ok)aliases}}"$'\0\0'"${(pj:\0:)${(@ok)functions:#_zrush*}}"$'\0\0'"${(pj:\0:)${(@ok)builtins}}"$'\0\0'"${(pj:\0:)${(@ok)reswords}}"$'\0\0'"${PATH-}"
 }
 
 _zrush_namespace_latch_drop() {
-  _zrush_namespace_queued= _zrush_namespace_acked=
+  _zrush_namespace_queued= _zrush_namespace_acked= _zrush_namespace_signature=
   _zrush_namespace_pending=()
   _zrush_namespace_latest_id=0
 }
@@ -1217,6 +1228,12 @@ _zrush_request_namespace() {  # canonical-payload
 
 _zrush_namespace_refresh() {
   emulate -L zsh
+  # An unchanged namespace keeps the cached payload, so skip the encode. The
+  # signature is dropped wherever the queued payload is, so a match also means
+  # the queued state still reflects that payload.
+  _zrush_namespace_signature_probe
+  [[ -n $_zrush_namespace_signature && $REPLY == "$_zrush_namespace_signature" ]] && return 0
+  _zrush_namespace_signature=$REPLY
   _zrush_namespace_collect
   _zrush_namespace_payload=$REPLY
   (( _zrush_worker_rfd >= 0 && !_zrush_worker_stopping &&
@@ -1233,7 +1250,7 @@ _zrush_namespace_settle() {  # request-id ok|error
   if [[ $result == ok ]]; then
     _zrush_namespace_acked=$identity
   else
-    _zrush_namespace_queued= _zrush_namespace_acked=
+    _zrush_namespace_queued= _zrush_namespace_acked= _zrush_namespace_signature=
     _zrush_namespace_latest_id=0
   fi
   return 0
