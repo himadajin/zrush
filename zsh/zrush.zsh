@@ -527,10 +527,14 @@ _zrush_precmd() {
   # Ahead of the config block, whose reload branches return early: the index
   # must not skip a prompt (behavior.md "History Menu" 更新経路).
   _zrush_hist_reconcile
-  _zrush_namespace_refresh
+  # One scan of the name sets per prompt, shared by the namespace snapshot and
+  # the empty-word cache fingerprint; each keeps its own retention rules.
+  _zrush_namespace_signature_probe
+  local signature=$REPLY
+  _zrush_namespace_refresh "$signature"
   # Also ahead of the config block's early returns: the fingerprint is the
   # prompt's, and no prompt may leave the previous one's in place.
-  _zrush_cc_prompt_refresh
+  _zrush_cc_prompt_refresh "$signature"
   _zrush_config_mtime
   if [[ $REPLY != $_zrush_cfg_mtime ]]; then
     _zlog "precmd: config mtime changed ($_zrush_cfg_mtime -> $REPLY); reloading"
@@ -883,18 +887,21 @@ _zrush_teardown() {
 
 # ---------------------------------------------------------------- Empty-word collection cache
 # See docs/internal/specs/behavior.md "Empty-Word Collection Cache".
-# Do not use $#commands: lazy command hashing changes its size independently of the
-# candidate set. Directory mtimes detect executable additions and removals.
-# The function names are counted through their keys: $#functions would expand
-# every function *body*, which is both the most expensive part of this
-# fingerprint and pointless -- only the names are candidates.
-_zrush_cc_fingerprint() {
+# The name sets come from _zrush_namespace_signature_probe, so one scan per
+# prompt serves both this fingerprint and the namespace snapshot; the caller
+# passes the signature it already has. Do not use $#commands: lazy command
+# hashing changes its size independently of the candidate set. Directory mtimes
+# detect executable additions and removals.
+_zrush_cc_fingerprint() {  # [namespace-signature] -> REPLY
   emulate -L zsh
-  setopt localoptions extendedglob
-  local fp=$PATH
+  local fp=$1
+  if [[ -z $fp ]]; then
+    _zrush_namespace_signature_probe
+    fp=$REPLY
+  fi
   local d
   local -i rel=0
-  local -a st others
+  local -a st
   for d in $path; do
     [[ $d == /* ]] || rel=1
     if zstat -A st +mtime $d 2>/dev/null; then
@@ -903,8 +910,6 @@ _zrush_cc_fingerprint() {
       fp+=":-"
     fi
   done
-  others=( "${(@k)functions[(I)^_zrush*]}" )
-  fp+=":$#others:$#aliases:$#builtins"
   if [[ -o autocd ]] || (( rel )); then
     fp+=":$PWD"
   fi
@@ -913,8 +918,8 @@ _zrush_cc_fingerprint() {
 }
 
 # Recompute this prompt's fingerprint. Called from _zrush_precmd.
-_zrush_cc_prompt_refresh() {
-  _zrush_cc_fingerprint
+_zrush_cc_prompt_refresh() {  # [namespace-signature]
+  _zrush_cc_fingerprint "$1"
   typeset -g _zrush_cc_prompt_fp=$REPLY
   return 0
 }
@@ -1255,14 +1260,18 @@ _zrush_request_namespace() {  # canonical-payload
   return 0
 }
 
-_zrush_namespace_refresh() {
+_zrush_namespace_refresh() {  # [namespace-signature]
   emulate -L zsh
   # An unchanged namespace keeps the cached payload, so skip the encode. The
   # signature is dropped wherever the queued payload is, so a match also means
   # the queued state still reflects that payload.
-  _zrush_namespace_signature_probe
-  [[ -n $_zrush_namespace_signature && $REPLY == "$_zrush_namespace_signature" ]] && return 0
-  _zrush_namespace_signature=$REPLY
+  local signature=$1
+  if [[ -z $signature ]]; then
+    _zrush_namespace_signature_probe
+    signature=$REPLY
+  fi
+  [[ -n $_zrush_namespace_signature && $signature == "$_zrush_namespace_signature" ]] && return 0
+  _zrush_namespace_signature=$signature
   _zrush_namespace_collect
   _zrush_namespace_payload=$REPLY
   (( _zrush_worker_rfd >= 0 && !_zrush_worker_stopping &&
