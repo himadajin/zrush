@@ -164,6 +164,10 @@ typeset -gi _zrush_kick_fd=${_zrush_kick_fd:--1}  # shell-session permanent; see
 
 # Persistent Rust worker transport.
 typeset -gi _zrush_worker_rfd=-1 _zrush_worker_wfd=-1
+# Second request write fd, opened nonblocking (behavior.md "Worker Lifecycle").
+typeset -gi _zrush_worker_nbwfd=-1
+# Atomicity ceiling of the request FIFO; POSIX floor until the runtime is made.
+typeset -gi _zrush_worker_pipe_buf=512
 typeset -gi _zrush_worker_control_wfd=-1
 typeset -gi _zrush_worker_drain_fd=-1
 typeset -gi _zrush_worker_ack_fd=-1 _zrush_worker_ready=0
@@ -1387,6 +1391,12 @@ _zrush_worker_runtime_prepare() {
     return 1
   fi
   umask $old_umask
+  local pipe_buf=$(command getconf PIPE_BUF "$req" 2>/dev/null)
+  if [[ $pipe_buf == <-> ]] && (( pipe_buf >= 512 )); then
+    _zrush_worker_pipe_buf=$pipe_buf
+  else
+    _zrush_worker_pipe_buf=512
+  fi
   _zrush_worker_runtime_dir=$dir
   _zrush_worker_request_path=$req
   _zrush_worker_response_path=$resp
@@ -1428,6 +1438,10 @@ _zrush_worker_release_writer() {
 }
 
 _zrush_worker_close_request() {
+  if (( _zrush_worker_nbwfd >= 0 )); then
+    _zrush_close_internal_fd $_zrush_worker_nbwfd
+    _zrush_worker_nbwfd=-1
+  fi
   (( _zrush_worker_wfd >= 0 )) || return 0
   _zrush_close_internal_fd $_zrush_worker_wfd
   _zrush_worker_wfd=-1
@@ -1638,13 +1652,14 @@ _zrush_worker_start() {
     return 1
   }
 
-  local req_anchor= child_in= parent_w=
+  local req_anchor= child_in= parent_w= parent_nb=
   local resp_anchor= parent_r= child_out=
   local ctl_anchor= child_ctl= parent_ctl= spawn_fd=
   local -i fd endpoint_failed=0 spawn_ok=0 watcher_ok=0 spawn_st
   if ! sysopen -rw -o cloexec -u req_anchor "$_zrush_worker_request_path" ||
        ! sysopen -r -o cloexec -u child_in "$_zrush_worker_request_path" ||
        ! sysopen -w -o cloexec -u parent_w "$_zrush_worker_request_path" ||
+       ! sysopen -w -o cloexec,nonblock -u parent_nb "$_zrush_worker_request_path" ||
        ! sysopen -rw -o cloexec -u resp_anchor "$_zrush_worker_response_path" ||
        ! sysopen -r -o cloexec -u parent_r "$_zrush_worker_response_path" ||
        ! sysopen -w -o cloexec -u child_out "$_zrush_worker_response_path" ||
@@ -1653,13 +1668,13 @@ _zrush_worker_start() {
        ! sysopen -w -o cloexec -u parent_ctl "$_zrush_worker_control_path"; then
     endpoint_failed=1
   fi
-  for fd in $req_anchor $child_in $parent_w $resp_anchor $parent_r \
+  for fd in $req_anchor $child_in $parent_w $parent_nb $resp_anchor $parent_r \
             $child_out $ctl_anchor $child_ctl $parent_ctl; do
     (( fd > 2 )) || endpoint_failed=1
   done
 
   if (( endpoint_failed )); then
-    for fd in $req_anchor $child_in $parent_w $resp_anchor $parent_r \
+    for fd in $req_anchor $child_in $parent_w $parent_nb $resp_anchor $parent_r \
               $child_out $ctl_anchor $child_ctl $parent_ctl; do
       [[ -n $fd ]] && (( fd > 2 )) && _zrush_close_internal_fd $fd
     done
@@ -1671,7 +1686,7 @@ _zrush_worker_start() {
     exec 0<&$child_in || exit 1
     exec 1>&$child_out || exit 1
     exec {child_in}>&- {child_out}>&-
-    exec {req_anchor}>&- {parent_w}>&-
+    exec {req_anchor}>&- {parent_w}>&- {parent_nb}>&-
     exec {resp_anchor}>&- {parent_r}>&-
     exec {ctl_anchor}>&- {parent_ctl}>&-
     exec "$ZRUSH_BIN" worker --control-fd "$child_ctl" 2>>| "${ZRUSH_LOG:-/dev/null}"
@@ -1689,6 +1704,7 @@ _zrush_worker_start() {
     _zrush_worker_begin_stop
     _zrush_worker_rfd=$parent_r
     _zrush_worker_wfd=$parent_w
+    _zrush_worker_nbwfd=$parent_nb
     _zrush_worker_control_wfd=$parent_ctl
     _zrush_worker_ready=0
     _zrush_worker_rx=
@@ -1706,6 +1722,7 @@ _zrush_worker_start() {
 
   _zrush_worker_rfd=$parent_r
   _zrush_worker_wfd=$parent_w
+  _zrush_worker_nbwfd=$parent_nb
   _zrush_worker_control_wfd=$parent_ctl
   _zrush_worker_ready=0
   _zrush_worker_rx=
@@ -1719,8 +1736,19 @@ _zrush_worker_start() {
   fi
   _zrush_request_namespace "$_zrush_namespace_payload" || return 1
   _zrush_kick
-  _zlog "worker: started rfd=$_zrush_worker_rfd wfd=$_zrush_worker_wfd controlfd=$_zrush_worker_control_wfd"
+  _zlog "worker: started rfd=$_zrush_worker_rfd wfd=$_zrush_worker_wfd nbwfd=$_zrush_worker_nbwfd controlfd=$_zrush_worker_control_wfd pipebuf=$_zrush_worker_pipe_buf"
   _zrush_worker_flush
+}
+
+# A frame no longer than the request FIFO's PIPE_BUF is delivered whole or not
+# at all, so a successful nonblocking write settles it here
+# (behavior.md "Worker Lifecycle"). SIGPIPE must not reach the interactive
+# shell; a dead reader surfaces as a failed write like any other.
+_zrush_worker_write_direct() {  # frame
+  emulate -L zsh
+  setopt localoptions localtraps
+  trap '' PIPE
+  syswrite -o $_zrush_worker_nbwfd -- "$1" 2>/dev/null
 }
 
 _zrush_worker_flush() {
@@ -1731,10 +1759,20 @@ _zrush_worker_flush() {
   (( $#_zrush_worker_txq )) || return 0
   (( _zrush_worker_ack_fd >= 0 )) && return 0
   (( _zrush_worker_wfd >= 0 )) || return 1
-  local frame=$_zrush_worker_txq[1] fd=
+  local frame= fd=
   local -i spawn_st
+  while (( $#_zrush_worker_txq && _zrush_worker_nbwfd >= 0 )); do
+    frame=$_zrush_worker_txq[1]
+    (( ${#frame} <= _zrush_worker_pipe_buf )) || break
+    _zrush_worker_write_direct "$frame" || break
+    shift _zrush_worker_txq
+    _zlog "worker: frame written directly bytes=${#frame} queued=$#_zrush_worker_txq"
+  done
+  (( $#_zrush_worker_txq )) || return 0
+  frame=$_zrush_worker_txq[1]
   exec {fd}< <(
     { exec {_zrush_worker_rfd}>&- } 2>/dev/null
+    { exec {_zrush_worker_nbwfd}>&- } 2>/dev/null
     { exec {_zrush_worker_control_wfd}>&- } 2>/dev/null
     (( _zrush_worker_drain_fd >= 0 )) && { exec {_zrush_worker_drain_fd}>&- } 2>/dev/null
     syswrite -o $_zrush_worker_wfd -- "$frame" &&
@@ -2050,6 +2088,7 @@ _zrush_worker_arm_drain() {
   exec {fd}< <(
     { exec {_zrush_worker_rfd}>&- } 2>/dev/null
     { exec {_zrush_worker_wfd}>&- } 2>/dev/null
+    { exec {_zrush_worker_nbwfd}>&- } 2>/dev/null
     { exec {_zrush_worker_control_wfd}>&- } 2>/dev/null
     zselect -t 1
     print
