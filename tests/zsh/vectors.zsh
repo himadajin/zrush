@@ -1637,8 +1637,9 @@ reserialize_plan() {  # -> REPLY=bytes, or return 1 with REPLY=reason
     (( $#_zrush_rh == 0 )) || syn_wire=0
     # The next body replaces this group whole and leaves the listing group
     # alone, in both directions.
-    _zrush_rh_add 9 12 bold
     want_listing="9 12 bold${memo:+ memo=zrush}"
+    _zrush_rh=( "$want_listing" )
+    region_highlight+=( "${(@)_zrush_rh}" )
     _zrush_parse_highlight $'1\0reserved 0 2\0' || syn_wire=0
     _zrush_apply_syntax
     want_syn="0 2 fg=magenta${memo:+ memo=zrush-syn}"

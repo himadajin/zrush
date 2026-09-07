@@ -850,19 +850,6 @@ _zrush_rh_clear_syn() {
   return 0
 }
 
-_zrush_rh_add() {  # $1=start $2=end $3=spec [$4=memo suffix (-sel|-syn)]
-                   # Offsets are character counts from the start of BUFFER.
-  local e="$1 $2 $3${_zrush_hl_memo:+ memo=zrush${4:-}}"
-  region_highlight+=( "$e" )
-  if [[ ${4:-} == -syn ]]; then
-    _zrush_rh_syn+=( "$e" )
-  else
-    _zrush_rh+=( "$e" )
-    [[ ${4:-} == -sel ]] && _zrush_rh_sel=$e
-  fi
-  return 0
-}
-
 # Drop the listing and everything that describes it: display, selection, plan
 # (kind included), and any pending Tab. Unconditional -- it never inspects
 # _zrush_listing -- so no caller has to reason about whether something is
@@ -2662,8 +2649,8 @@ _zrush_apply_highlights() {
   local hl_histnum=${ZRUSH_CFG_HL_HISTORY_NUMBER-faint}
   local -i off=$(( $#BUFFER + 1 ))   # account for the leading newline
   local -i sel=$_zrush_selected
-  local e role spec
-  local -a f
+  local e spec
+  local -a f batch=()
   for e in "${(@)_zrush_plan_hl}"; do
     f=( ${=e} )   # role pos start len
     case $f[1] in
@@ -2678,12 +2665,15 @@ _zrush_apply_highlights() {
       heading) spec=$hl_head ;;
     esac
     [[ -n $spec ]] || continue
-    _zrush_rh_add $(( off + f[3] )) $(( off + f[3] + f[4] )) "$spec"
+    batch+=( "$(( off + f[3] )) $(( off + f[3] + f[4] )) $spec${_zrush_hl_memo:+ memo=zrush}" )
   done
   if (( sel > 0 )) && [[ -n $hl_sel ]]; then
     f=( ${=_zrush_plan_cells[sel]} )   # start len
-    _zrush_rh_add $(( off + f[1] )) $(( off + f[1] + f[2] )) "$hl_sel" -sel
+    _zrush_rh_sel="$(( off + f[1] )) $(( off + f[1] + f[2] )) $hl_sel${_zrush_hl_memo:+ memo=zrush-sel}"
+    batch+=( "$_zrush_rh_sel" )
   fi
+  _zrush_rh=( "${(@)batch}" )
+  (( $#batch )) && region_highlight+=( "${(@)batch}" )
   return 0
 }
 
@@ -2696,13 +2686,15 @@ _zrush_apply_syntax() {
   emulate -L zsh
   _zrush_rh_clear_syn
   local e spec
-  local -a tok
+  local -a tok batch=()
   for e in "${(@)_zrush_syn_hl}"; do
     tok=( ${=e} )   # role start len
     spec=${(P)_ZRUSH_SYNTAX_ROLE_VAR[$tok[1]]}
     [[ -n $spec ]] || continue
-    _zrush_rh_add $tok[2] $(( tok[2] + tok[3] )) "$spec" -syn
+    batch+=( "$tok[2] $(( tok[2] + tok[3] )) $spec${_zrush_hl_memo:+ memo=zrush-syn}" )
   done
+  _zrush_rh_syn=( "${(@)batch}" )
+  (( $#batch )) && region_highlight+=( "${(@)batch}" )
   return 0
 }
 
