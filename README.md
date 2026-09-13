@@ -1,11 +1,18 @@
 # zrush
 
-zsh-autocomplete を置き換える zsh 補完ツール。入力に追従して候補一覧を
-プロンプト下にリアルタイム表示する。↑ では、いま打っている内容で絞り込んだ
-履歴メニューを同じ一覧として開ける。Rust(マッチング・ランキング・履歴検索・設定解釈)+
-zsh スクリプト(zle 統合・候補収集・描画)で実装。
+入力に合わせて補完候補をプロンプトに表示する zsh 補完プラグイン。
 
-作者の日常利用を第一に、ドッグフーディング駆動で開発している。
+- 曖昧補完に対応 (`gti` → `git`、`dcs` → `docs`)。
+- シンタックスハイライトに対応。
+- 入力中の内容でコマンド履歴を絞り込める。
 
-- インストール・設定・使い方: [docs/user/](docs/user/)
-- 設計・仕様(開発者向け): [docs/internal/](docs/internal/)
+## Getting started
+
+macOS / Linux、zsh 5.8 以上に対応しています。
+ビルドには cargoが必要です。
+
+- [インストール](docs/user/install.md)
+- [使い方・キー操作](docs/user/usage.md)
+- [設定](docs/user/configuration.md)
+
+開発者向けの情報は [設計・仕様](docs/internal/) を参照してください。
