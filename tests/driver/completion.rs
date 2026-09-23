@@ -67,6 +67,22 @@ fn wait_scroll(host: &mut Host, baseline: usize) {
 }
 
 #[test]
+fn unselected_indicator_is_blank_without_changing_candidate_layout() {
+    let mut host = open(4, 12);
+    let initial = host.postdisplay("unselected counter");
+    assert!(initial.ends_with('\n'));
+    host.press(keys::DOWN);
+    let selected = host.postdisplay("selected counter");
+    assert!(selected.ends_with("1/100"));
+    assert_eq!(
+        initial.rsplit_once('\n').unwrap().0,
+        selected.rsplit_once('\n').unwrap().0
+    );
+    host.press(keys::UP);
+    assert_eq!(host.postdisplay("deselected counter"), initial);
+}
+
+#[test]
 fn fitting_candidates_have_no_indicator_when_selected() {
     let mut host = Host::boot_completion(
         r#"
@@ -95,7 +111,7 @@ compdef _zrush_test_complete zrtest
 fn all_candidates_are_reachable_across_columns_and_groups() {
     for columns in [12, 80] {
         let mut host = open(4, columns);
-        assert!(host.postdisplay("initial position").ends_with("0/100"));
+        assert!(host.postdisplay("initial position").ends_with('\n'));
         let before = host.log_count("confirm: kind=compsys");
         host.press(&[keys::DOWN.repeat(101), keys::ENTER.to_string()].concat());
         assert!(host.wait_log("confirm: kind=compsys", before, Duration::from_secs(15)));
@@ -111,7 +127,7 @@ fn completion_moves_back_to_global_start_and_deselects() {
     host.press(&keys::UP.repeat(5));
     let start = std::time::Instant::now();
     loop {
-        if host.postdisplay("back at first window").ends_with("0/100") {
+        if host.postdisplay("back at first window").ends_with('\n') {
             break;
         }
         assert!(start.elapsed() < Duration::from_secs(8));
@@ -274,6 +290,6 @@ fn worker_session_change_drops_pending_navigation_and_confirmation() {
     host.assert_buffer(QUERY, "session change leaves input alone");
     // A fresh input starts a fresh worker and an unselected initial window.
     host.send_keys_wait_plan(PlanShape::Nonempty, "0");
-    assert!(host.postdisplay("fresh session").ends_with("0/99"));
+    assert!(host.postdisplay("fresh session").ends_with('\n'));
     assert_eq!(host.log_count("confirm: kind=compsys"), 0);
 }

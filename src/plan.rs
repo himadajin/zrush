@@ -1175,7 +1175,7 @@ mod tests {
         let first = completion(&payload, 3, 20, 0, 0);
         assert_eq!(first.inserts.len(), 2);
         assert_eq!(first.rows[0].len(), 20);
-        assert_eq!(first.rows.last().unwrap(), b"0/41");
+        assert!(first.rows.last().unwrap().is_empty());
         let next = completion(&payload, 3, 20, 0, 3);
         assert_eq!(next.rows[0].len(), 20);
         let narrow = completion(&payload, 2, 1, 0, 3);
@@ -1187,6 +1187,23 @@ mod tests {
         let all = completion(&[header(&[]), word("only")].concat(), 10, 80, 0, 0);
         assert!(all.indicators.is_empty());
         assert_eq!(all.inserts.len(), 1);
+    }
+
+    #[test]
+    fn completion_selection_only_changes_the_indicator_row() {
+        let mut payload = header(&[]);
+        for n in 1..=10 {
+            payload.extend(word(&format!("item{n:02}")));
+        }
+        let unselected = completion(&payload, 4, 6, 0, 0);
+        let selected = completion(&payload, 4, 6, 0, 1);
+        assert_eq!(unselected.rows.len(), 4);
+        assert!(unselected.rows.last().unwrap().is_empty());
+        assert!(unselected.indicators[0].is_empty());
+        assert_eq!(selected.rows.last().unwrap(), b"1/10");
+        assert_eq!(candidate_rows(&unselected), candidate_rows(&selected));
+        assert_eq!(unselected.cells, selected.cells);
+        assert_eq!(unselected.navigation, selected.navigation);
     }
 
     #[test]

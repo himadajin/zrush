@@ -378,7 +378,10 @@ pub(crate) fn build_completion(
     if show_indicator {
         plan.indicators = (0..=count)
             .map(|p| {
-                let n = if p == 0 { 0 } else { offset + p };
+                if p == 0 {
+                    return Vec::new();
+                }
+                let n = offset + p;
                 let text = format!("{n}/{total}");
                 truncate_to_width(text.as_bytes(), options.width).0.to_vec()
             })

@@ -2592,8 +2592,9 @@ _zrush_parse_plan() {  # $1=raw render-plan bytes
     [[ -n $window ]] && (( P > 0 && L >= 2 )) || return 1
     indicators=( "${(@ps:\n:)indicator_text}" )
     (( $#indicators == P + 1 )) || return 1
+    [[ -z $indicators[1] ]] || return 1
     local line
-    for line in "${(@)indicators}"; do
+    for line in "${(@)indicators[2,-1]}"; do
       [[ -n $line && -z ${line//[0-9\/]/} ]] || return 1
     done
     [[ $rows[-1] == $indicators[selection+1] ]] || return 1

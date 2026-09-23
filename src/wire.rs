@@ -368,7 +368,8 @@ pub fn parse(output: &[u8]) -> Result<Plan, Error> {
             || p == 0
             || l < 2
             || indicators.len() != p + 1
-            || indicators.iter().any(|line| {
+            || !indicators[0].is_empty()
+            || indicators.iter().skip(1).any(|line| {
                 line.is_empty() || line.iter().any(|b| !b.is_ascii_digit() && *b != b'/')
             }))
     {
