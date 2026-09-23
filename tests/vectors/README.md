@@ -3,6 +3,8 @@
 This corpus turns the prose rules in `docs/internal/contracts/cli-protocol.md` into executable byte-level fixtures.
 
 Each `plan/<name>/` directory contains `args`, `payload`, an optional `append`, and `expected`: the request's scalar fields, a candidate payload, a second payload appended to the history index, and the render-plan body. A `store` vector exercises the asynchronous completion path and expects a `plan-ready` event; a `history` or `history-append` vector exercises the explicit history `plan` request and expects an `ok` response.
+A `store` vector with `--selected` adds an asynchronous `completion` request with `--offset` and checks its reply. The completion-scroll vectors fix forward scrolling, a move back inside the window, and a move back outside it.
+
 Each `reject/<name>/` directory contains `args` and `payload`.
 Each `reject-plan/<name>/` directory contains only `plan`.
 Each `encode/<name>/` directory contains `argv`, `hits`, `dscr`, `expected`, and an optional `env`.
@@ -98,7 +100,7 @@ Each `frame` is one complete outer message, byte for byte as cli-protocol.md spe
 | `capture-required` | the `capture-required` event answering that input |
 | `store-capture` | the `store` carrying that capture, bound to the same `input_generation` |
 | `error-superseded` | the `superseded` that store receives when the input is already gone |
-| `plan-ready-zero-match` | a `plan-ready` carrying the four-field zero-match plan |
+| `plan-ready-zero-match` | a `plan-ready` carrying the six-field zero-match plan |
 | `flush` | the `flush` that settles an input immediately |
 | `namespace-snapshot` | a request carrying the four canonical name-set streams and raw `$PATH` |
 

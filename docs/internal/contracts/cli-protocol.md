@@ -194,7 +194,7 @@ worker が受ける `hello` の kind・フィールド数・stamp 表記自体�
 
 | 種別 | 向き | 相関の鍵 | 応答 |
 |---|---|---|---|
-| 要求(`namespace-snapshot` / `store` / `history-snapshot` / `history-append` / `plan`) | zsh → worker | `request_id` | `ok` / `error` をちょうど 1 個 |
+| 要求(`namespace-snapshot` / `store` / `history-snapshot` / `history-append` / `plan` / `completion`) | zsh → worker | `request_id` | `ok` / `error` をちょうど 1 個 |
 | 入力通知(`input` / `flush`) | zsh → worker | `input_generation` | 無し(帰結は worker event) |
 | worker event(`plan-ready` / `capture-required` / `syntax-highlight`) | worker → zsh | `input_generation` | 無し |
 
@@ -220,16 +220,26 @@ history-snapshot: ["history-snapshot", request_id, candidate_generation, candida
 history-append:   ["history-append", request_id, candidate_generation, candidate_payload]
 plan:             ["plan", request_id, candidate_generation, query, mode, smart_case,
                    rows, width, history_limit, offset]
+completion:       ["completion", request_id, input_generation, offset, selected, rows, width]
 ok:               ["ok", request_id, body]
 error:            ["error", request_id, code]
 ```
 
-要求は 5 種類ある。
+要求は 6 種類ある。
 `namespace-snapshot` は zsh の名前空間と raw `$PATH` の完全な snapshot を worker session へ渡し、
 `store` は候補レコードストリームを worker へ渡して解析済みの candidate store のスロットへ格納し、
 `history-snapshot` / `history-append` は同じ形式のストリームを worker の history index へ渡し、
 `plan` は history index を `candidate_generation` で参照して描画プランを得る。
 候補 payload は `plan` に載せない。
+`completion` は通常補完の表示窓を非同期で再描画する。`input_generation` は現在の解決済み入力、
+`offset` は全体候補順の窓先頭(0 始まり)、`selected` は操作対象の全体位置(1 始まり)である。
+両者は canonical な非負 ASCII 整数(`selected` は正)、`rows` / `width` は最新サイズを使う。
+worker は入力に対応して保持する候補だけを使い、対象を収める最小の窓移動を計算する。
+現在の入力に一致しなければ `superseded`、未解決または候補を失っていれば `unknown-generation`、
+形式不正は `invalid-request` を返す。成功は描画プランを持つ `ok`。
+zsh は高々 1 個の通常補完再描画を待ち、その間の移動・確定を押下順に保持する。
+応答は request_id と有効な input_generation、入力バッファ・カーソルが一致するときだけ適用する。
+失効した応答は body を解析せず破棄する。失敗時は一覧と保留操作を消し、入力を保ち replay しない。
 
 - `request_id`: zsh が所有する `1..=9223372036854775807`(`i64::MAX`)の canonical ASCII 10 進識別子。
   先頭ゼロを付けない。
@@ -265,14 +275,14 @@ error:            ["error", request_id, code]
   `store` では格納先の generation を、`history-snapshot` / `history-append` では
   index に刻む generation を、`plan` では history index の現 stamp と照合する generation を表す。
   `plan` の generation 検索は history index だけを対象とし、現 stamp と完全一致したときに
-  その index の窓から描画プランを計算する。candidate slot は入力通知の `plan-ready` だけが参照する。
+  その index の窓から描画プランを計算する。candidate slot は入力通知の `plan-ready` と通常補完の `completion` が参照する。
   index の revision は index を最後に書いた要求の `candidate_generation` そのものであり、
   別の revision 識別子は存在しない。
 - `input_generation`: zsh が所有する `1..=9223372036854775807`(`i64::MAX`)の canonical ASCII 10 進識別子。
   先頭ゼロを付けない。
   `request_id` とも `candidate_generation` とも独立の値である。
   シェルセッション内で単調増加し、再利用せず、worker の終了・再起動・re-source でもリセットしない。
-  `store` だけが持つフィールドであり、その捕獲がどの入力の `capture-required` に答えたものかを表す
+  `store` と `completion` が持つフィールドである。`store` では、その捕獲がどの入力の `capture-required` に答えたものかを表す
   (「Input Notifications and Worker Events」節)。`store` は必ずこの束縛を持ち、束縛のない `store` は存在しない。
 - `candidate_payload`: 後述の候補レコードストリーム全体をそのまま格納する opaque bytes。
 - `history_limit`: `plan` だけが持つ、先頭ゼロなしの正の canonical ASCII 10 進数
@@ -280,10 +290,11 @@ error:            ["error", request_id, code]
   history index を参照する `plan` が index の新しい側から走査する件数の上限であり、
   worker はこれを retention cap へクランプする(走査の意味論は「history profile」節)。
   欠落・非 canonical 表記は不正である。
-- `offset`: `plan` だけが持つ、先頭ゼロなしの非負 canonical ASCII 10 進数
-  (`0..=18446744073709551615`。`0` は有効)。
-  history profile のランキング後のマッチ列における窓の先頭(0 始まり)である。
+- `offset`: `plan` と `completion` が持つ、先頭ゼロなしの非負 canonical ASCII 10 進数。
+  `plan` では `0..=18446744073709551615` で、history profile のランキング後のマッチ列における窓の先頭。
   worker は走査範囲のマッチ件数と `rows` から有効な最大値へクランプする。
+  `completion` では `0..=9223372036854775807` で、グループ化後の全体候補順における窓の先頭。
+  どちらも 0 始まりであり、通常補完は selected が収まる最小量だけ窓を動かす。
   欠落・非 canonical 表記は不正である。
 - `query`: マッチングに用いるユーザーの as-typed バイト列(NUL 除去済み)。空も有効
   (空クエリは全候補が最高同点マッチになる)。
@@ -336,6 +347,9 @@ worker は同じ `request_id` の `error` を返してセッションを継続�
 | `history-append` | `invalid-request` | kind・固定フィールド・scalar の不正 |
 | `history-append` | `invalid-payload` | 候補レコードストリームの framing error |
 | `history-append` | `unknown-generation` | 未初期化の index への追記、または index の現 stamp 以下の `candidate_generation` |
+| `completion` | `invalid-request` | 固定フィールド数・scalar の不正 |
+| `completion` | `superseded` | 現在の入力と input_generation が一致しない |
+| `completion` | `unknown-generation` | 入力が未解決、または対応する候補を保持していない |
 | `plan` | `invalid-request` | kind・固定フィールド・scalar の不正 |
 | `plan` | `unknown-generation` | history index が保持していない `candidate_generation` の参照 |
 
@@ -438,7 +452,7 @@ syntax-highlight: ["syntax-highlight", input_generation, highlight_body]
   (`syntax.md`「Lexical boundaries」の `#` の扱いを決める)。
   名前空間 snapshot ではなく呼び出しごとの context として運ぶ値である(`syntax.md`「Context and purity」)。
 - `plan_body`: `plan` の成功応答と同一形式の描画プランストリーム(「`plan` `ok` body (Render Plan Stream)」節)。
-  空バイト列も 0 マッチのプランではなく不正である(最小のプランは「Zero Matches」節の 4 フィールド)。
+  空バイト列も 0 マッチのプランではなく不正である(最小のプランは「Zero Matches」節の 6 フィールド)。
 - `highlight_body`: バッファ装飾のトークン列(「`syntax-highlight` body (Buffer Highlight Stream)」節)。
   token 0 個でも空バイト列ではなく、ちょうど 1 フィールドである。
 
@@ -581,10 +595,10 @@ current input は最後に受理した `input` 通知そのもの(その全フ�
   27:5:error,2:12,10:superseded,,
   ```
 
-- 0 マッチのプラン(「Zero Matches」節の 4 フィールド)を運ぶ `plan-ready`:
+- 0 マッチのプラン(「Zero Matches」節の 6 フィールド)を運ぶ `plan-ready`:
 
   ```
-  28:10:plan-ready,1:7,7:\00\00\00\0,,
+  36:10:plan-ready,1:7,14:\00\00\00\00 0 0\0\0,,
   ```
 
 - generation 7 の即時確定を求める `flush`:
@@ -857,10 +871,24 @@ NUL(`\0`)終端フィールドの平坦列。数値は ASCII 10 進表記。順�
 続く P 個: "start len"(位置ごとのセル実テキスト範囲)
 続く P 個: "next prev left right"(位置ごとのナビゲーション先)
 続く P 個: 位置ごとの挿入テキスト(バイト列そのまま)
+次の 1 個: window(通常補完は "offset total selected"、履歴は空)
+次の 1 個: indicators(位置表示の各状態を改行で連結。省略時は空)
 ```
 
-総フィールド数は `4 + L + H + 3P`。
+総フィールド数は `6 + L + H + 3P`。
 選択可能位置は 1 始まりで `1..P` の番号を持つ(0 は「未選択」を表す予約値)。
+
+`window` は非負 canonical 整数 3 個。`offset` は全体候補順の窓先頭、`total` は全一致候補数、
+`selected` は窓内の選択位置(0 は未選択)であり、`offset + P <= total`、`selected <= P`。
+`P = 0` と `total = 0` は同値で、0 件では offset / selected / L も 0。
+`selected = 0` のプランは offset も 0。3 値の上限は `9223372036854775807`。
+履歴はこの metadata を使わない。
+`indicators` が非空なら通常補完の非空プランで L >= 2、ちょうど P+1 行を持つ。
+先頭は `0/N`、続く P 行は各位置の `(offset + p)/N` を width で切り詰めたテキスト。
+各文字列は非空で ASCII 数字と `/` だけからなる。
+L 行目は現在の selected に対応する文字列で、装飾・セル範囲はこの最終行を指さない。
+zsh は選択変更時に最終行を対応する文字列へ置き換えるだけで、幅やレイアウトを計算しない。
+履歴・0 件・行予算 1 行では indicators は空。旧フィールド数は受理しない。
 
 #### Offset Rules
 
@@ -929,6 +957,8 @@ NUL(`\0`)終端フィールドの平坦列。数値は ASCII 10 進表記。順�
   `X` があれば `X`、なければ `J`(グループキーが空の場合は見出しなし。上記と同じ判定)。
   見出しテキストにも候補テキストと同じ制御バイト→スペース正規化を適用する
   (表示行フィールドは改行を含まない)。
+- 通常補完は全一致候補をグループ化してから窓を取り、グループ途中からでも元の見出しを使う。
+  行予算 2 以上では位置表示の 1 行を先に予約する。
 - **セル幅**: `gmaxw = max(1, min(width, グループ全メンバーの表示幅の最大値))`。
 - **列数**: 補完一覧は `cols = clamp(floor((width + 2) / (gmaxw + 2)), 1, 8)`、
   履歴一覧は常に `cols = 1`。
@@ -961,7 +991,7 @@ NUL(`\0`)終端フィールドの平坦列。数値は ASCII 10 進表記。順�
 
 - `next` = 位置 + 1。最終位置では、その方向に窓の外の続きがあるなら 0、なければ自己参照。
 - `prev` = 位置 - 1。位置 1 の `prev` は常に 0(窓の prev 側へ出る)。
-- `left` = 窓の prev 側に続きがあるなら 0、なければ
+- `left` = 履歴一覧で窓の prev 側に続きがあるなら 0、なければ
   `max(グループ先頭位置, p - grows)`。
   `right` = `min(グループ末尾位置, p + grows)`
   (`grows` は所属グループの行数。「Display Row Contents」節参照)。
@@ -974,10 +1004,10 @@ NUL(`\0`)終端フィールドの平坦列。数値は ASCII 10 進表記。順�
 - 遷移先 0 は、このプランの窓からその方向へ出ることを表す。
   どのキーがどの遷移に対応するか、および 0 を受けたときの扱いは zsh 側の規範であり、
   behavior.md「Selection and Keybindings」「History Menu」節が定める
-  (補完一覧の `prev = 0` は選択解除。履歴一覧では端越えの `plan` 再要求、
+  (補完一覧は窓外移動で非同期 `completion` 再要求、全体先頭の `prev = 0` は選択解除。履歴一覧では端越えの `plan` 再要求、
   または位置 1 かつ窓先頭でのメニュー消去)。
 - ナビゲーション表は profile に依らず同じ意味を持つ。
-  補完一覧は窓を持たないため、最終位置の `next` は自己参照のまま、`left` が 0 になることもない。
+  補完一覧の `left` / `right` は常に表示中の同じグループ内に留まり、スクロールしない。
 
 #### Insertion Text
 
@@ -1023,8 +1053,8 @@ NUL(`\0`)終端フィールドの平坦列。数値は ASCII 10 進表記。順�
 
 #### Zero Matches
 
-common-prefix(空も可)+ `L = 0` + `P = 0` + `H = 0` の、ちょうど 4 フィールドを出力して exit 0
-(総フィールド数の式 `4 + L + H + 3P` と整合する)。
+common-prefix(空も可)+ `L = 0` + `P = 0` + `H = 0` と window / indicators の、ちょうど 6 フィールドを出力して exit 0
+(総フィールド数の式 `6 + L + H + 3P` と整合する)。
 表示行・ハイライトエントリ・セル範囲・ナビゲーション・挿入テキストのいずれのフィールドも存在しない。
 zsh は一覧を消す。
 
@@ -1042,7 +1072,7 @@ zsh は一覧を消す。
     ずれるケースを含む)は**先頭候補(位置 1)を確定挿入**する(`tab = "insert"` と同じ確定動作)。
     候補 0 件なら何もしない。
 
-- 総マッチ件数は返さない(「+truncated 表示」の導入は wire contract の拡張として意図的に保留する)。
+- 通常補完の総マッチ件数は window の total で返す。common-prefix は表示窓によらず全 prefix マッチから計算する。
 
 ### Matching and Ranking Semantics
 
@@ -1114,15 +1144,17 @@ zsh は一覧を消す。
   UI 結果を持つ要求が現在の最新要求なら既存一覧も消し、stale 要求なら UI 状態を変えない。
   どちらの場合も worker は継続利用する。
   「現在の最新要求」の判定は経路ごとに決まる。
-  UI 結果を持つ非同期経路の要求は `store` だけであり、その束縛の `input_generation` が
-  zsh のいま有効な `input_generation` と一致することが判定になる
-  (`superseded` はこの一致が成り立たないことを表すため、UI 状態を変えない)。
+  `store` は束縛の `input_generation` が zsh のいま有効な値と一致することが判定になる。
+  `store` の `superseded` はこの一致が成り立たないことを表し、UI 状態を変えない。
+  `completion` は待機中 request_id と input_generation、および要求時の BUFFER / CURSOR の一致を検証する。
+  有効な `completion` の失敗は一覧と保留操作を破棄し、入力を保つ。
   `plan` は履歴メニューの同期交換専用であり、同期待ちの対象要求と一致することが判定になる。
 - `namespace-snapshot` の `error` は UI 結果を持たず、一覧を変更しない。
   最新 identity の要求なら namespace latch を無効化し、次の `precmd` で再試行可能にする。
   より新しい namespace 更新を既に queue 済みなら、その古い `error` は最新 latch を変更しない
   (詳細は behavior.md「Namespace Snapshot Synchronization」節)。
-- `unknown-generation` は、`plan` が参照した generation を worker が保持していないこと、または
+- `unknown-generation` は、`completion` が参照した入力の候補が未解決・失われていること、
+  `plan` が参照した generation を worker が保持していないこと、または
   `history-snapshot` / `history-append` が名乗った generation が index の現 stamp と両立しないことを表す。
   他の `error` と同じく正常な終端応答であり、worker セッション失敗にも連続失敗回数にも数えない。
   zsh はその要求も先行する `store` / history 要求も replay しない。
@@ -1132,17 +1164,17 @@ zsh は一覧を消す。
   失われたことを表すため、zsh は history index latch を無効化する
   (latch の所在と無効化点は behavior.md「Worker Lifecycle」節が定める)。
   次の明示的な履歴メニュー操作が `history-snapshot` から作り直すだけで、payload の replay はしない。
-- `superseded` は `store` だけが受ける終端応答で、その捕獲が答えようとした入力が既に
-  置き換えられていることを表す。zsh は候補を保持していないため replay できず、replay もしない。
+- `superseded` は `store` または `completion` が対象とする入力が既に置き換えられていることを表す。
+  `store` では、zsh は候補を保持していないため replay できず、replay もしない。
   candidate store latch はこの `store` について進めない(latch を進めるのは `ok` だけである)。
   対象の `input_generation` は既に無効なので UI 状態も変えない。
   worker セッション失敗にも連続失敗回数にも数えない。
 - `namespace-snapshot`、`store`、`history-snapshot` / `history-append` の `ok` は body が空バイト列であることを検証する。
   空でなければ仕様を満たさない応答として扱い、プランを破棄する場合と同じく worker セッションを終了する。
-- `plan` の `ok` body、および現在の generation に一致する `plan-ready` の `plan_body` が
+- `plan` と有効な `completion` の `ok` body、および現在の generation に一致する `plan-ready` の `plan_body` が
   仕様を満たさない場合
   (最終フィールドの NUL 終端欠落、`L` / `P` / `H` が非負の数字列でない、
-  総フィールド数が `4 + L + H + 3P` と一致しない、ハイライト・セル範囲・ナビゲーションの
+  総フィールド数が `6 + L + H + 3P` と一致しない、ハイライト・セル範囲・ナビゲーションの
   各タプルの要素数が不正、`role` が `match` / `heading` / `history-number` 以外、
   位置・ナビゲーション値が `0..P` の範囲外、
   ハイライト範囲・セル実テキスト範囲の `start + len` が listing text の文字数を超える)は、

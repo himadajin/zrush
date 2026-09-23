@@ -374,7 +374,10 @@ fn plan_literal_matches_suppress_approximate_and_keep_common_prefix() {
     // match and is explicitly suppressed; xxx matches no tier.
     assert_eq!(p.common_prefix, b"doc");
     let pad = |w: &str| format!("{w:<6}").into_bytes();
-    assert_eq!(p.rows, vec![pad("doc"), pad("docs"), pad("mydocs")]);
+    assert_eq!(
+        p.rows,
+        vec![pad("doc"), pad("docs"), pad("mydocs"), b"0/3".to_vec()]
+    );
     assert_eq!(
         p.inserts,
         vec![b"doc".to_vec(), b"docs".to_vec(), b"mydocs".to_vec()]
@@ -445,7 +448,7 @@ fn plan_match_highlight_offset_is_non_trivial_for_a_mid_string_match() {
     let (code, out) = run_plan(&plan_args("ar", "substring", "10", "40", "false"), &stdin);
     assert_eq!(code, 0);
     let p = parse_wire(&out);
-    assert_eq!(p.rows, vec![b"cargo".to_vec()]);
+    assert_eq!(p.rows, vec![b"cargo".to_vec(), b"0/1".to_vec()]);
     assert!(has_highlight(&p, wire::Role::Match, 1, 1, 2));
 }
 

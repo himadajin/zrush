@@ -1,20 +1,5 @@
 //! Orchestration for worker plan requests (cli-protocol.md "`zrush worker`").
 //!
-//! Pipeline: hidden-file exclusion -> matching::QueryMatcher
-//! (score every remaining candidate + common-prefix over the *untruncated*
-//! prefix-tier matches)
-//! -> ranking::rank (suppress approximate tiers when a literal exists,
-//! then use the producer's ordering; compsys is then capped at rows*8,
-//! history keeps every match and takes a rows-tall window at `offset`)
-//! -> matching::QueryMatcher::spans (only for the ranked subset that
-//! reaches layout) ->
-//! layout::build (the producer's grid direction/column cap plus shared
-//! grouping/highlights/nav, further truncated to the real per-group row
-//! budget; history also marks window edges on the nav table) ->
-//! insert::build per displayed position
-//! (this is where `-f` directory-synthesis stat happens, and only for
-//! positions layout actually kept) -> wire::serialize.
-//!
 //! `compute` reads a candidate source (record::Candidates: a slot's parsed
 //! payload, or a window over the history index) and takes an injected
 //! `is_dir` predicate, so it stays free of I/O and is directly testable. It
@@ -28,6 +13,7 @@ use crate::{insert, layout, ranking, record, wire};
 
 /// Snapshot of a plan request's scalar fields; producer selects result
 /// ordering and layout geometry.
+#[derive(Clone)]
 pub(crate) struct Params {
     pub producer: Producer,
     pub query: Vec<u8>,
@@ -69,6 +55,15 @@ pub(crate) fn compute(
     source: &dyn Candidates,
     is_dir: &dyn Fn(&[u8]) -> bool,
 ) -> Vec<u8> {
+    compute_selected(params, source, is_dir, 0)
+}
+
+pub(crate) fn compute_selected(
+    params: &Params,
+    source: &dyn Candidates,
+    is_dir: &dyn Fn(&[u8]) -> bool,
+    selected: usize,
+) -> Vec<u8> {
     let batches = source.batches();
 
     let mut qm = QueryMatcher::new(&params.query, params.mode, params.smart_case);
@@ -95,15 +90,8 @@ pub(crate) fn compute(
     }
     let common_prefix = crate::matching::common_prefix(prefix_texts.into_iter());
 
-    // behavior.md "Display": compsys ranking is capped at the grid's absolute
-    // capacity; history keeps every match and takes a rows-tall window.
-    // layout::build applies the real, per-group row budget on top of this.
     let style = params.producer.layout_style();
-    let cap = match params.producer {
-        Producer::Compsys => params.rows.saturating_mul(style.max_cols()),
-        Producer::History => usize::MAX,
-    };
-    let ranked = ranking::rank(&matched, cap, params.producer.order());
+    let ranked = ranking::rank(&matched, params.producer.order());
     let (ranked, more_prev, more_next) = match params.producer {
         Producer::History => history_window(ranked, params.offset, params.rows),
         Producer::Compsys => (ranked, false, false),
@@ -127,19 +115,25 @@ pub(crate) fn compute(
     // membership, even when the row budget later drops some positions.
     let sources = compose_cell_sources(&candidates);
 
-    let built = layout::build(
-        &candidates,
-        &batches,
-        &sources,
-        &spans,
-        layout::Options {
-            row_budget: params.rows,
-            width: params.width,
-            style,
-            more_prev,
-            more_next,
-        },
-    );
+    let options = layout::Options {
+        row_budget: params.rows,
+        width: params.width,
+        style,
+        more_prev,
+        more_next,
+    };
+    let built = match params.producer {
+        Producer::Compsys => layout::build_completion(
+            &candidates,
+            &batches,
+            &sources,
+            &spans,
+            options,
+            params.offset,
+            selected,
+        ),
+        Producer::History => layout::build(&candidates, &batches, &sources, &spans, options),
+    };
 
     // Insertion text, and thus the `-f` stat, is built only for the
     // positions layout actually kept -- never the full ranked/matched set.
@@ -470,6 +464,10 @@ mod tests {
         r
     }
 
+    fn candidate_rows(plan: &wire::Plan) -> &[Vec<u8>] {
+        &plan.rows[..plan.rows.len() - usize::from(!plan.indicators.is_empty())]
+    }
+
     fn has_match(plan: &wire::Plan, pos: usize, start: usize, len: usize) -> bool {
         plan.highlights
             .iter()
@@ -477,9 +475,9 @@ mod tests {
     }
 
     #[test]
-    fn empty_stdin_is_the_four_field_zero_match_form() {
+    fn empty_stdin_is_the_six_field_zero_match_form() {
         let out = run(&params("abc", Mode::Typo, 10, 40, true), b"", &no_dir).unwrap();
-        assert_eq!(out, b"\x000\x000\x000\x00");
+        assert_eq!(out, b"\x000\x000\x000\x000 0 0\0\0");
     }
 
     #[test]
@@ -496,7 +494,7 @@ mod tests {
         assert_eq!(p.common_prefix, b"g");
         // heading + "git" padded to gmaxw=4 + "grep" (already width 4).
         assert_eq!(
-            p.rows,
+            candidate_rows(&p),
             vec![b"Commands".to_vec(), b"git ".to_vec(), b"grep".to_vec()]
         );
         assert_eq!(p.cells.len(), 2);
@@ -547,7 +545,7 @@ mod tests {
         )
         .unwrap();
         let p = parse_wire(&out);
-        assert_eq!(p.rows, vec![b"space name.txt".to_vec()]);
+        assert_eq!(candidate_rows(&p), vec![b"space name.txt".to_vec()]);
         assert_eq!(p.inserts, vec![b"space\\ name.txt".to_vec()]);
     }
 
@@ -566,7 +564,7 @@ mod tests {
 
         let out = run(&params("", Mode::Typo, 10, 40, false), &stdin, &no_dir).unwrap();
         let p = parse_wire(&out);
-        assert_eq!(p.rows, vec![b"Pretty Display".to_vec()]);
+        assert_eq!(candidate_rows(&p), vec![b"Pretty Display".to_vec()]);
         assert_eq!(p.inserts, vec![b"raw".to_vec()]);
     }
 
@@ -579,7 +577,7 @@ mod tests {
         let p = parse_wire(&out);
         // single column (gmaxw=6, width=8 -> cols=floor(10/8)=1)
         assert_eq!(
-            p.rows,
+            candidate_rows(&p),
             vec!["日本語".as_bytes().to_vec(), b"ab    ".to_vec()]
         );
         assert_eq!(p.cells[0], (0, 3));
@@ -622,7 +620,7 @@ mod tests {
     }
 
     #[test]
-    fn zero_matches_after_filtering_is_still_the_four_field_form() {
+    fn zero_matches_after_filtering_is_still_the_six_field_form() {
         let stdin = {
             let mut s = header(&[]);
             s.extend(word("alpha"));
@@ -630,7 +628,7 @@ mod tests {
             s
         };
         let out = run(&params("zzz", Mode::Typo, 10, 40, true), &stdin, &no_dir).unwrap();
-        assert_eq!(out, b"\x000\x000\x000\x00");
+        assert_eq!(out, b"\x000\x000\x000\x000 0 0\0\0");
     }
 
     /// cli-protocol.md "隠し候補の除外".
@@ -646,17 +644,17 @@ mod tests {
         // Empty query: the dot candidate reaches neither the listing nor
         // common-prefix, which is computed over the survivors alone.
         let p = parse_wire(&run(&params("", Mode::Typo, 10, 40, false), &stdin, &no_dir).unwrap());
-        assert_eq!(p.rows, vec![b"visible".to_vec()]);
+        assert_eq!(candidate_rows(&p), vec![b"visible".to_vec()]);
         assert_eq!(p.common_prefix, b"visible");
 
         // A query matching it as a substring is not an opt-in.
         let out = run(&params("h", Mode::Typo, 10, 40, false), &stdin, &no_dir).unwrap();
-        assert_eq!(out, b"\x000\x000\x000\x00");
+        assert_eq!(out, b"\x000\x000\x000\x000 0 0\0\0");
 
         // A leading dot opts in; "visible" then matches no tier.
         let p =
             parse_wire(&run(&params(".h", Mode::Typo, 10, 40, false), &stdin, &no_dir).unwrap());
-        assert_eq!(p.rows, vec![b".hidden".to_vec()]);
+        assert_eq!(candidate_rows(&p), vec![b".hidden".to_vec()]);
         assert_eq!(p.common_prefix, b".hidden");
     }
 
@@ -670,7 +668,7 @@ mod tests {
             s
         };
         let p = parse_wire(&run(&params("", Mode::Typo, 10, 40, false), &stdin, &no_dir).unwrap());
-        assert_eq!(p.rows, vec![b".PHONY".to_vec()]);
+        assert_eq!(candidate_rows(&p), vec![b".PHONY".to_vec()]);
     }
 
     #[test]
@@ -691,7 +689,10 @@ mod tests {
         // an Edit match and is explicitly suppressed rather than ranked
         // below them. xxx matches no tier.
         let pad = |w: &str| format!("{w:<6}").into_bytes();
-        assert_eq!(p.rows, vec![pad("doc"), pad("docs"), pad("mydocs")]);
+        assert_eq!(
+            candidate_rows(&p),
+            vec![pad("doc"), pad("docs"), pad("mydocs")]
+        );
         assert_eq!(
             p.inserts,
             vec![b"doc".to_vec(), b"docs".to_vec(), b"mydocs".to_vec()]
@@ -713,14 +714,13 @@ mod tests {
     }
 
     #[test]
-    fn late_literal_suppresses_approximates_before_the_coarse_capacity_cap() {
+    fn late_literal_suppresses_approximates_before_windowing() {
         let mut stdin = header(&[]);
-        // rows=1 gives compsys a coarse capacity of 8. These eight Edit
-        // matches would fill it if ranking truncated before suppression.
+        // Eight approximate matches precede the literal, outside the first window.
         for n in 0..8 {
             stdin.extend(word(&format!("dot{n}")));
         }
-        // The only literal match deliberately arrives beyond that capacity.
+        // Suppression must inspect every match.
         stdin.extend(word("doc"));
 
         let out = run(&params("doc", Mode::Typo, 1, 10, false), &stdin, &no_dir).unwrap();
@@ -764,7 +764,7 @@ mod tests {
         )
         .unwrap();
         let p = parse_wire(&out);
-        assert_eq!(p.rows, vec![b"cargo".to_vec()]);
+        assert_eq!(candidate_rows(&p), vec![b"cargo".to_vec()]);
         assert!(
             p.highlights
                 .iter()
@@ -773,13 +773,8 @@ mod tests {
     }
 
     #[test]
-    fn common_prefix_includes_matches_dropped_by_the_rows_times_8_cap() {
-        // rows=1 -> cap = rows*8 = 8. 8 "aaaN" candidates plus a 9th
-        // ("ab") all match query "a"'s prefix tier, but only the first 8
-        // (stdin order; all tied) survive ranking's cap -- "ab" never
-        // reaches layout. common-prefix must still reflect it
-        // (cli-protocol.md: computed over the *untruncated* prefix-tier
-        // matches), so the LCP collapses to "a", not "aaa".
+    fn common_prefix_includes_matches_outside_the_window() {
+        // The ninth prefix match remains outside the one-row display window.
         let stdin = {
             let mut s = header(&[]);
             for n in 1..=8 {
@@ -791,15 +786,15 @@ mod tests {
         let out = run(&params("a", Mode::Typo, 1, 40, false), &stdin, &no_dir).unwrap();
         let p = parse_wire(&out);
         assert_eq!(p.common_prefix, b"a");
-        // Sanity: "ab" really was dropped by the cap, not merely unranked.
-        assert!(p.rows.iter().all(|r| r != b"ab"));
+        // The common prefix includes the undisplayed candidate.
+        assert!(candidate_rows(&p).iter().all(|r| r != b"ab"));
     }
 
     #[test]
     fn stat_runs_only_for_displayed_f_eq_1_positions() {
         // 10 candidates, all f=1, but a narrow grid (rows=1, width=3)
         // only displays 1 of them. `is_dir` must be called exactly once
-        // -- not once per matched, ranked, or rows*8-capped candidate --
+        // -- not once per matched or ranked candidate --
         // since the `-f` stat is budgeted by what the grid actually shows.
         let stdin = {
             let mut s = header(&[("f", "1"), ("rd", "./")]);
@@ -852,7 +847,10 @@ mod tests {
         )
         .unwrap();
         let p = parse_wire(&out);
-        assert_eq!(p.rows, vec![b"ab cd ef gh  zz cd      ".to_vec()]);
+        assert_eq!(
+            candidate_rows(&p),
+            vec![b"ab cd ef gh  zz cd      ".to_vec()]
+        );
         assert_eq!(p.cells, vec![(0, 11), (13, 5)]);
         // Spans are computed on the raw match-text; the 1-byte-for-1-byte
         // normalization keeps them aligned with the displayed cell.
@@ -870,7 +868,10 @@ mod tests {
         )
         .unwrap();
         let p = parse_wire(&out);
-        assert_eq!(p.rows, vec![b"ab cd".to_vec(), b"zz cd".to_vec()]);
+        assert_eq!(
+            candidate_rows(&p),
+            vec![b"ab cd".to_vec(), b"zz cd".to_vec()]
+        );
         assert_eq!(p.cells, vec![(0, 5), (6, 5)]);
         assert!(has_match(&p, 1, 3, 2));
         assert!(has_match(&p, 2, 9, 2));
@@ -894,7 +895,10 @@ mod tests {
         let p = parse_wire(&out);
         // fop is Edit and far-out-object is Fuzzy; both are explicitly
         // suppressed. unrelated matches no tier.
-        assert_eq!(p.rows, vec![b"foo      ".to_vec(), b"echo xfoo".to_vec()]);
+        assert_eq!(
+            candidate_rows(&p),
+            vec![b"foo      ".to_vec(), b"echo xfoo".to_vec()]
+        );
         assert_eq!(p.inserts, vec![b"echo xfoo".to_vec(), b"foo".to_vec()]);
         assert!(!p.inserts.iter().any(|text| text == b"fop"));
         assert!(!p.inserts.iter().any(|text| text == b"far-out-object"));
@@ -929,7 +933,10 @@ mod tests {
 
         let out = run(&history_params("", Mode::Typo, 2, 80), &stdin, &no_dir).unwrap();
         let p = parse_wire(&out);
-        assert_eq!(p.rows, vec![b"newer ".to_vec(), b"newest".to_vec()]);
+        assert_eq!(
+            candidate_rows(&p),
+            vec![b"newer ".to_vec(), b"newest".to_vec()]
+        );
         assert_eq!(p.inserts, vec![b"newest".to_vec(), b"newer".to_vec()]);
         assert_eq!(p.navigation[0].prev, 0);
         assert_eq!(p.navigation[0].left, 1);
@@ -954,7 +961,10 @@ mod tests {
         )
         .unwrap();
         let p = parse_wire(&out);
-        assert_eq!(p.rows, vec![b"older".to_vec(), b"newer".to_vec()]);
+        assert_eq!(
+            candidate_rows(&p),
+            vec![b"older".to_vec(), b"newer".to_vec()]
+        );
         assert_eq!(p.inserts, vec![b"newer".to_vec(), b"older".to_vec()]);
         assert_eq!(p.navigation[0].prev, 0);
         assert_eq!(p.navigation[0].left, 0);
@@ -971,7 +981,10 @@ mod tests {
         )
         .unwrap();
         let p = parse_wire(&out);
-        assert_eq!(p.rows, vec![b"oldest".to_vec(), b"older ".to_vec()]);
+        assert_eq!(
+            candidate_rows(&p),
+            vec![b"oldest".to_vec(), b"older ".to_vec()]
+        );
         assert_eq!(p.inserts, vec![b"older".to_vec(), b"oldest".to_vec()]);
         assert_eq!(p.navigation[0].left, 0);
         assert_eq!(p.navigation[1].next, 2);
@@ -996,7 +1009,7 @@ mod tests {
         stdin.extend(history_word("echo foo", "42"));
         let out = run(&history_params("foo", Mode::Typo, 10, 40), &stdin, &no_dir).unwrap();
         let p = parse_wire(&out);
-        assert_eq!(p.rows, vec![b"   42  echo foo".to_vec()]);
+        assert_eq!(candidate_rows(&p), vec![b"   42  echo foo".to_vec()]);
         assert_eq!(p.cells, vec![(0, 15)]);
         assert_eq!(p.inserts, vec![b"echo foo".to_vec()]);
         assert!(
@@ -1055,5 +1068,123 @@ mod tests {
         let out = run(&params("", Mode::Typo, 10, 40, true), &stdin, &real_is_dir).unwrap();
         let p = parse_wire(&out);
         assert_eq!(p.inserts, vec![b"child ".to_vec()]); // no '/'; trailing space kept
+    }
+
+    fn completion(
+        payload: &[u8],
+        rows: usize,
+        width: usize,
+        offset: usize,
+        selected: usize,
+    ) -> wire::Plan {
+        let source = record::parse(payload.to_vec()).unwrap();
+        let mut options = params("", Mode::Prefix, rows, width, false);
+        options.offset = offset;
+        parse_wire(&compute_selected(&options, &source, &no_dir, selected))
+    }
+
+    #[test]
+    fn completion_scrolls_every_match_in_both_directions() {
+        let mut payload = header(&[]);
+        for n in 1..=100 {
+            payload.extend(word(&format!("item{n:03}")));
+        }
+        for (rows, width) in [(1, 7), (4, 7), (4, 18)] {
+            let mut offset = 0;
+            for target in (1..=100).chain((1..100).rev()) {
+                let plan = completion(&payload, rows, width, offset, target);
+                let window = plan.window.unwrap();
+                assert_eq!(window.total, 100);
+                assert_eq!(window.offset + window.selected, target);
+                assert_eq!(
+                    plan.inserts[window.selected - 1],
+                    format!("item{target:03}").as_bytes()
+                );
+                assert!(plan.rows.len() <= rows);
+                if rows == 1 {
+                    assert!(plan.indicators.is_empty());
+                } else {
+                    assert_eq!(
+                        plan.rows.last().unwrap(),
+                        format!("{target}/100").as_bytes()
+                    );
+                }
+                if target == 100 {
+                    assert_eq!(plan.navigation[window.selected - 1].next, window.selected);
+                }
+                offset = window.offset;
+            }
+            assert_eq!(offset, 0);
+        }
+    }
+
+    #[test]
+    fn completion_grid_moves_minimally_and_keeps_left_right_local() {
+        let mut payload = header(&[]);
+        for n in 1..=9 {
+            payload.extend(word(&n.to_string()));
+        }
+        let first = completion(&payload, 4, 4, 0, 6);
+        assert_eq!(candidate_rows(&first), [b"1  4", b"2  5", b"3  6"]);
+        let next = completion(&payload, 4, 4, 0, 7);
+        assert_eq!(candidate_rows(&next), [b"2  5", b"3  6", b"4  7"]);
+        assert_eq!(next.window.unwrap().offset, 1);
+        assert_eq!(next.navigation[0].left, 1);
+        assert_eq!(next.navigation[5].right, 6);
+        let back = completion(&payload, 4, 4, 1, 6);
+        assert_eq!(candidate_rows(&back), candidate_rows(&next));
+        assert_eq!(back.window.unwrap().selected, 5);
+        assert_eq!(completion(&payload, 4, 4, 1, 1).window.unwrap().offset, 0);
+    }
+
+    #[test]
+    fn completion_group_boundary_keeps_heading_and_uses_smallest_shift() {
+        let mut payload = header(&[("J", "A"), ("X", "Original")]);
+        payload.extend(word("a1"));
+        payload.extend(word("a2"));
+        payload.extend(header(&[("J", "B")]));
+        payload.extend(word("b1"));
+        payload.extend(header(&[("J", "A"), ("X", "Later")]));
+        payload.extend(word("a3"));
+        let first = completion(&payload, 5, 3, 0, 3);
+        assert_eq!(first.inserts, [b"a1", b"a2", b"a3"]);
+        let next = completion(&payload, 5, 3, 0, 4);
+        assert_eq!(next.window.unwrap().offset, 2);
+        assert_eq!(
+            candidate_rows(&next),
+            [
+                b"Ori".to_vec(),
+                b"a3".to_vec(),
+                b"B".to_vec(),
+                b"b1".to_vec()
+            ]
+        );
+        assert_eq!(next.inserts, [b"a3", b"b1"]);
+        let tiny = completion(&payload, 2, 10, 0, 4);
+        assert_eq!(tiny.inserts, [b"b1"]);
+        assert_eq!(tiny.rows, [b"b1".to_vec(), b"4/4".to_vec()]);
+    }
+
+    #[test]
+    fn completion_width_uses_undisplayed_members_and_indicator_handles_small_sizes() {
+        let mut payload = header(&[]);
+        for n in 1..=40 {
+            payload.extend(word(&format!("a{n:02}")));
+        }
+        payload.extend(word("last-is-twenty-chars!"));
+        let first = completion(&payload, 3, 20, 0, 0);
+        assert_eq!(first.inserts.len(), 2);
+        assert_eq!(first.rows[0].len(), 20);
+        assert_eq!(first.rows.last().unwrap(), b"0/41");
+        let next = completion(&payload, 3, 20, 0, 3);
+        assert_eq!(next.rows[0].len(), 20);
+        let narrow = completion(&payload, 2, 1, 0, 3);
+        assert!(narrow.rows.iter().all(|row| row.len() == 1));
+        let empty = completion(b"", 2, 10, 0, 0);
+        assert!(empty.rows.is_empty());
+        assert!(empty.indicators.is_empty());
+        assert_eq!(empty.window.unwrap().total, 0);
+        let all = completion(&[header(&[]), word("only")].concat(), 10, 80, 0, 0);
+        assert_eq!(all.rows.last().unwrap(), b"0/1");
     }
 }

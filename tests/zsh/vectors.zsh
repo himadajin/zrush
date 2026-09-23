@@ -224,7 +224,8 @@ reserialize_plan() {  # -> REPLY=bytes, or return 1 with REPLY=reason
     "$_zrush_plan_cp" "$_zrush_plan_nlines" "$_zrush_plan_npos" \
     "${(@)rows}" "$#_zrush_plan_hl" \
     "${(@)_zrush_plan_hl}" "${(@)_zrush_plan_cells}" \
-    "${(@)_zrush_plan_nav}" "${(@)_zrush_plan_insert}"
+    "${(@)_zrush_plan_nav}" "${(@)_zrush_plan_insert}" \
+    "$_zrush_plan_window" "${(pj:\n:)_zrush_plan_indicators}"
   do
     o+="$field"$'\0'
   done

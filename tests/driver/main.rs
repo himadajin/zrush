@@ -11,6 +11,7 @@ mod boot;
 mod cache;
 mod capture;
 mod coexist;
+mod completion;
 mod confirm;
 mod death;
 mod dismiss;

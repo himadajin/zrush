@@ -167,6 +167,15 @@ pub struct BootOptions<'a> {
 }
 
 impl Host {
+    pub fn boot_completion(post_rc: &str, rows: usize) -> Self {
+        Self::boot_with(BootOptions {
+            rc: HostRc::History,
+            post_rc,
+            config: Some(&format!("[display]\nmax-lines = {rows}\n")),
+            ..BootOptions::default()
+        })
+    }
+
     pub fn boot() -> Self {
         Self::boot_with(BootOptions::default())
     }

@@ -38,7 +38,7 @@ const DIE_STATUS: i32 = 19;
 const WRITE_FAILED_STATUS: i32 = 1;
 /// The zero-match render plan of cli-protocol.md "Zero Matches": the smallest
 /// body a `plan-ready` can carry, and all this fake ever computes.
-const EMPTY_PLAN: &[u8] = b"\x000\x000\x000\x00";
+const EMPTY_PLAN: &[u8] = b"\x000\x000\x000\x000 0 0\0\0";
 
 fn main() {
     let real = env::var_os("ZRUSH_REAL_BIN").expect("ZRUSH_REAL_BIN is set by the harness");

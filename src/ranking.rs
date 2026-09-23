@@ -19,15 +19,14 @@ pub enum Order {
     Stdin,
 }
 
-/// Order matched candidates per `order`, truncated to `max_lines`.
+/// Order all matched candidates per `order`.
 ///
 /// `matched` holds `(stdin position, hit)` pairs in stdin order; the
 /// surviving pairs are returned in result order. The sort is stable, so
 /// equal ranks keep stdin order per the contract.
-pub fn rank(matched: &[(usize, TierHit)], max_lines: usize, order: Order) -> Vec<(usize, TierHit)> {
+pub fn rank(matched: &[(usize, TierHit)], order: Order) -> Vec<(usize, TierHit)> {
     // Suppress approximate tiers at the matching/ranking boundary whenever a
-    // literal result exists.  Apply this before either producer ordering and
-    // before truncation so both orders share the same candidate set.
+    // literal result exists, before either producer ordering.
     let has_literal = matched
         .iter()
         .any(|(_, hit)| hit.tier().group() == TierGroup::Literal);
@@ -39,7 +38,6 @@ pub fn rank(matched: &[(usize, TierHit)], max_lines: usize, order: Order) -> Vec
     if order == Order::Quality {
         ranked.sort_by_key(|(_, hit)| hit.rank());
     }
-    ranked.truncate(max_lines);
     ranked
 }
 
@@ -50,8 +48,8 @@ mod tests {
 
     /// Rank and keep only the stdin positions, which is all these cases
     /// are about.
-    fn ranked(matched: &[(usize, TierHit)], max_lines: usize, order: Order) -> Vec<usize> {
-        rank(matched, max_lines, order)
+    fn ranked(matched: &[(usize, TierHit)], order: Order) -> Vec<usize> {
+        rank(matched, order)
             .into_iter()
             .map(|(pos, _)| pos)
             .collect()
@@ -79,13 +77,13 @@ mod tests {
 
     #[test]
     fn quality_sorts_by_tier_then_intra_tier_rank() {
-        assert_eq!(ranked(&mixed(), 10, Order::Quality), vec![3, 1, 4]);
+        assert_eq!(ranked(&mixed(), Order::Quality), vec![3, 1, 4]);
     }
 
     #[test]
     fn stdin_order_ignores_match_quality() {
         assert_eq!(
-            ranked(&mixed(), 10, Order::Stdin),
+            ranked(&mixed(), Order::Stdin),
             vec![1, 3, 4],
             "Order::Stdin must preserve stdin order after suppression"
         );
@@ -98,8 +96,8 @@ mod tests {
             (2, edit(20)),
             (5, TierHit::Fuzzy { score: 30 }),
         ];
-        assert_eq!(ranked(&matched, 10, Order::Quality), vec![2, 5, 8]);
-        assert_eq!(ranked(&matched, 10, Order::Stdin), vec![8, 2, 5]);
+        assert_eq!(ranked(&matched, Order::Quality), vec![2, 5, 8]);
+        assert_eq!(ranked(&matched, Order::Stdin), vec![8, 2, 5]);
     }
 
     #[test]
@@ -109,27 +107,24 @@ mod tests {
             (3, TierHit::Fuzzy { score: 10 }),
             (9, TierHit::Fuzzy { score: 10 }),
         ];
-        assert_eq!(ranked(&matched, 10, Order::Quality), vec![7, 3, 9]);
+        assert_eq!(ranked(&matched, Order::Quality), vec![7, 3, 9]);
     }
 
     #[test]
-    fn truncates_to_max_lines() {
-        let matched: Vec<(usize, TierHit)> = (0..10)
+    fn keeps_all_matches() {
+        let matched: Vec<_> = (0..100)
             .map(|i| (i, TierHit::Prefix { exact: false }))
             .collect();
-        assert_eq!(ranked(&matched, 3, Order::Quality), vec![0, 1, 2]);
-        assert_eq!(ranked(&matched, 0, Order::Quality), Vec::<usize>::new());
-        assert_eq!(ranked(&matched, 3, Order::Stdin), vec![0, 1, 2]);
-
-        // Suppression precedes truncation, so approximate entries cannot
-        // consume the output cap when literals are available.
-        assert_eq!(ranked(&mixed(), 2, Order::Quality), vec![3, 1]);
-        assert_eq!(ranked(&mixed(), 2, Order::Stdin), vec![1, 3]);
+        assert_eq!(
+            ranked(&matched, Order::Quality),
+            (0..100).collect::<Vec<_>>()
+        );
+        assert_eq!(ranked(&matched, Order::Stdin), (0..100).collect::<Vec<_>>());
     }
 
     #[test]
     fn empty_input_is_empty_output() {
-        assert_eq!(ranked(&[], 10, Order::Quality), Vec::<usize>::new());
-        assert_eq!(ranked(&[], 10, Order::Stdin), Vec::<usize>::new());
+        assert_eq!(ranked(&[], Order::Quality), Vec::<usize>::new());
+        assert_eq!(ranked(&[], Order::Stdin), Vec::<usize>::new());
     }
 }

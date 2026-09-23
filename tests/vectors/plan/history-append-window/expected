@@ -17,3 +17,5 @@ history-number 1 39 2\0
 git status\0
 ls -la\0
 cd /tmp\0
+\0
+\0

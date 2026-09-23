@@ -81,6 +81,8 @@ pub(crate) struct Highlight {
 pub(crate) struct Plan {
     /// L display rows (no trailing/embedded newline per row).
     pub rows: Vec<Vec<u8>>,
+    pub window: Option<crate::wire::Window>,
+    pub indicators: Vec<Vec<u8>>,
     /// H highlight entries.
     pub highlights: Vec<Highlight>,
     /// P entries: char range of the position's real (post-truncation,
@@ -112,6 +114,7 @@ struct Group<'a> {
     key: &'a [u8],
     heading: &'a [u8],
     members: Vec<usize>,
+    max_width: usize,
 }
 
 /// Group geometry associated with one logical position.
@@ -182,13 +185,14 @@ pub(crate) fn build(
         "cell sources must align with candidates"
     );
 
-    let groups = group_candidates(candidates, batches);
+    let groups = group_candidates(candidates, batches, sources);
     let grid = render_grid(
         &groups,
         sources,
         options.row_budget,
         options.width,
         options.style,
+        0,
     );
     let offsets = compute_offsets(sources, spans, &grid);
     let nav = build_navigation(
@@ -204,6 +208,8 @@ pub(crate) fn build(
         cell_ranges: offsets.cell_ranges,
         nav,
         positions: grid.positions,
+        window: None,
+        indicators: Vec::new(),
     }
 }
 
@@ -212,6 +218,7 @@ pub(crate) fn build(
 fn group_candidates<'candidate, 'batch>(
     candidates: &[Candidate<'candidate>],
     batches: &[Batch<'batch>],
+    sources: &[CellSource],
 ) -> Vec<Group<'batch>> {
     let mut groups: Vec<Group<'batch>> = Vec::new();
     let mut group_index: std::collections::HashMap<&[u8], usize> = std::collections::HashMap::new();
@@ -220,6 +227,9 @@ fn group_candidates<'candidate, 'batch>(
         let key = group_key(batch);
         if let Some(&group) = group_index.get(key) {
             groups[group].members.push(idx);
+            groups[group].max_width = groups[group]
+                .max_width
+                .max(display_width(&sources[idx].text));
         } else {
             let heading = if key.is_empty() {
                 &b""[..]
@@ -231,62 +241,158 @@ fn group_candidates<'candidate, 'batch>(
                 key,
                 heading,
                 members: vec![idx],
+                max_width: display_width(&sources[idx].text),
             });
         }
     }
     groups
 }
 
-/// Place groups into the producer-specific grid and retain the marks needed
-/// by the later offset phase.
+#[derive(Debug)]
+struct GroupGeometry {
+    group: usize,
+    first: usize,
+    show_heading: bool,
+    cols: usize,
+    rows: usize,
+    count: usize,
+    width: usize,
+}
+
+fn window_geometry(
+    groups: &[Group<'_>],
+    row_budget: usize,
+    width: usize,
+    style: Style,
+    mut offset: usize,
+) -> Vec<GroupGeometry> {
+    let mut placed = Vec::new();
+    let mut remaining = row_budget;
+    for (group_idx, group) in groups.iter().enumerate() {
+        if offset >= group.members.len() {
+            offset -= group.members.len();
+            continue;
+        }
+        if remaining == 0 {
+            break;
+        }
+        let wants_heading = !group.key.is_empty();
+        let show_heading = if !wants_heading {
+            false
+        } else if remaining >= 2 {
+            true
+        } else if placed.is_empty() {
+            false
+        } else {
+            break;
+        };
+        let gmaxw = group_gmaxw(width, group.max_width);
+        let (cols, rows, count) = grid_dims(
+            gmaxw,
+            width,
+            group.members.len() - offset,
+            remaining - usize::from(show_heading),
+            style.max_cols(),
+        );
+        placed.push(GroupGeometry {
+            group: group_idx,
+            first: offset,
+            show_heading,
+            cols,
+            rows,
+            count,
+            width: gmaxw,
+        });
+        remaining -= rows + usize::from(show_heading);
+        offset = 0;
+    }
+    placed
+}
+
+/// behavior.md "Display" and "Selection and Keybindings".
+pub(crate) fn build_completion(
+    candidates: &[Candidate<'_>],
+    batches: &[Batch<'_>],
+    sources: &[CellSource],
+    spans: &[Vec<CharSpan>],
+    options: Options,
+    offset: usize,
+    selected: usize,
+) -> Plan {
+    let groups = group_candidates(candidates, batches, sources);
+    let total = candidates.len();
+    let selected = selected.min(total);
+    let budget = options.row_budget.saturating_sub(1).max(1);
+    let mut offset = if selected == 0 {
+        0
+    } else {
+        offset.min(selected - 1)
+    };
+    let end = |start| {
+        start
+            + window_geometry(&groups, budget, options.width, Style::Grid, start)
+                .iter()
+                .map(|group| group.count)
+                .sum::<usize>()
+    };
+    if selected > end(offset) {
+        let mut lo = offset + 1;
+        let mut hi = selected - 1;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if end(mid) >= selected {
+                hi = mid;
+            } else {
+                lo = mid + 1;
+            }
+        }
+        offset = lo;
+    }
+    let grid = render_grid(&groups, sources, budget, options.width, Style::Grid, offset);
+    let offsets = compute_offsets(sources, spans, &grid);
+    let count = grid.positions.len();
+    let nav = build_navigation(&grid.group_bounds, count, false, offset + count < total);
+    let local_selected = selected.saturating_sub(offset);
+    let mut plan = Plan {
+        rows: grid.rows,
+        highlights: offsets.highlights,
+        cell_ranges: offsets.cell_ranges,
+        nav,
+        positions: grid.positions,
+        window: Some(crate::wire::Window {
+            offset,
+            total,
+            selected: local_selected,
+        }),
+        indicators: Vec::new(),
+    };
+    if total > 0 && options.row_budget > 1 {
+        plan.indicators = (0..=count)
+            .map(|p| {
+                let n = if p == 0 { 0 } else { offset + p };
+                let text = format!("{n}/{total}");
+                truncate_to_width(text.as_bytes(), options.width).0.to_vec()
+            })
+            .collect();
+        plan.rows.push(plan.indicators[local_selected].clone());
+    }
+    plan
+}
+
 fn render_grid(
     groups: &[Group<'_>],
     sources: &[CellSource],
     row_budget: usize,
     width: usize,
     style: Style,
+    offset: usize,
 ) -> GridState {
     let mut grid = GridState::default();
-    let mut remaining = row_budget;
-
-    for (group_idx, group) in groups.iter().enumerate() {
-        if remaining == 0 {
-            break; // budget exhausted: this and every later group is dropped
-        }
-        let wants_heading = !group.key.is_empty();
-        let required = if wants_heading { 2 } else { 1 };
-        let show_heading = if remaining >= required {
-            wants_heading
-        } else if group_idx == 0 && wants_heading && remaining >= 1 {
-            // Contract exception: only the first group may show its
-            // candidates without a heading when the budget cannot fit both.
-            false
-        } else {
-            break; // cannot fit this group: drop it and stop
-        };
-        let candidate_budget = if show_heading {
-            remaining - 1
-        } else {
-            remaining
-        };
-
-        // gmaxw is based on the group's full membership, not only the
-        // positions that survive the row budget.
-        let max_member_width = group
-            .members
-            .iter()
-            .map(|&i| display_width(&sources[i].text))
-            .max()
-            .unwrap_or(1);
-        let gmaxw = group_gmaxw(width, max_member_width);
-        let (cols, grows, gcount) = grid_dims(
-            gmaxw,
-            width,
-            group.members.len(),
-            candidate_budget,
-            style.max_cols(),
-        );
-
+    for geometry in window_geometry(groups, row_budget, width, style, offset) {
+        let group = &groups[geometry.group];
+        let show_heading = geometry.show_heading;
+        let (cols, grows, gcount, gmaxw) =
+            (geometry.cols, geometry.rows, geometry.count, geometry.width);
         if show_heading {
             let heading = normalize_control_bytes(group.heading);
             // Same truncation rule as cells: keep the maximal original-byte
@@ -299,7 +405,7 @@ fn render_grid(
         }
 
         let start_pos = grid.positions.len() + 1;
-        let members_shown = &group.members[..gcount];
+        let members_shown = &group.members[geometry.first..geometry.first + gcount];
         // Positions are assigned in rank order once, before visual row/col
         // scanning. The scan order is (a,c,e,b,d) for a 3-column, 2-row
         // ragged grid, so assigning positions inside the scan would corrupt
@@ -350,8 +456,6 @@ fn render_grid(
                 grows,
             });
         }
-
-        remaining -= grows + usize::from(show_heading);
     }
 
     grid
@@ -1428,5 +1532,27 @@ mod tests {
         let plan = build(&cands, &batches, &spans_none(1), 10, 40);
         assert_eq!(plan.rows, vec![b"a".to_vec()]); // no heading row
         assert!(plan.highlights.iter().all(|h| h.role != Role::Heading));
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn window_end_is_monotonic_across_group_boundaries(
+            specs in proptest::collection::vec((1usize..15, 1usize..30, proptest::bool::ANY), 1..8),
+            rows in 1usize..10,
+            width in 1usize..90,
+        ) {
+            let groups: Vec<_> = specs.iter().map(|&(count, max_width, heading)| Group {
+                key: if heading { b"g" } else { b"" }, heading: b"heading",
+                members: (0..count).collect(), max_width,
+            }).collect();
+            let total: usize = specs.iter().map(|s| s.0).sum();
+            let mut previous = 0;
+            for start in 0..total {
+                let end = start + window_geometry(&groups, rows, width, Style::Grid, start)
+                    .iter().map(|g| g.count).sum::<usize>();
+                proptest::prop_assert!(end >= previous, "start={start}, end={end}, previous={previous}");
+                previous = end;
+            }
+        }
     }
 }

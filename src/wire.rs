@@ -87,6 +87,15 @@ pub struct Plan {
     pub cells: Vec<(usize, usize)>,
     pub navigation: Vec<Navigation>,
     pub inserts: Vec<Vec<u8>>,
+    pub window: Option<Window>,
+    pub indicators: Vec<Vec<u8>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Window {
+    pub offset: usize,
+    pub total: usize,
+    pub selected: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -177,6 +186,12 @@ pub(crate) fn serialize(
     for text in insert_texts {
         push_bytes(&mut out, text);
     }
+    let window = plan
+        .window
+        .map(|w| format!("{} {} {}", w.offset, w.total, w.selected));
+    push_bytes(&mut out, window.as_deref().unwrap_or("").as_bytes());
+    push_bytes(&mut out, &plan.indicators.join(&b'\n'));
+
     out
 }
 
@@ -306,9 +321,9 @@ pub fn parse(output: &[u8]) -> Result<Plan, Error> {
     let fields: Vec<&[u8]> = output[..output.len() - 1]
         .split(|&byte| byte == 0)
         .collect();
-    if fields.len() < 4 {
+    if fields.len() < 6 {
         return Err(Error::FieldCount {
-            expected: 4,
+            expected: 6,
             actual: fields.len(),
         });
     }
@@ -324,7 +339,7 @@ pub fn parse(output: &[u8]) -> Result<Plan, Error> {
         actual: fields.len(),
     })?;
     let h = count(h, "H")?;
-    let expected = 4usize
+    let expected = 6usize
         .checked_add(l)
         .and_then(|n| n.checked_add(h))
         .and_then(|n| n.checked_add(p.checked_mul(3)?))
@@ -336,6 +351,30 @@ pub fn parse(output: &[u8]) -> Result<Plan, Error> {
         return Err(Error::FieldCount {
             expected,
             actual: fields.len(),
+        });
+    }
+
+    let window = parse_window(fields[expected - 2], p, l)?;
+    let indicators: Vec<Vec<u8>> = if fields[expected - 1].is_empty() {
+        Vec::new()
+    } else {
+        fields[expected - 1]
+            .split(|&b| b == b'\n')
+            .map(<[u8]>::to_vec)
+            .collect()
+    };
+    if !indicators.is_empty()
+        && (window.is_none()
+            || p == 0
+            || l < 2
+            || indicators.len() != p + 1
+            || indicators.iter().any(|line| {
+                line.is_empty() || line.iter().any(|b| !b.is_ascii_digit() && *b != b'/')
+            }))
+    {
+        return Err(Error::InvalidTuple {
+            field: "indicators",
+            value: fields[expected - 1].to_vec(),
         });
     }
 
@@ -351,7 +390,20 @@ pub fn parse(output: &[u8]) -> Result<Plan, Error> {
     // char counts over the listing text -- the L rows joined by `\n`, no
     // leading newline. `\n` is a char boundary in every row's lossy reading,
     // so joining first cannot merge an invalid tail into the next row.
-    let listing_chars = String::from_utf8_lossy(&rows.join(&b'\n')).chars().count();
+    let cell_rows = if indicators.is_empty() {
+        &rows[..]
+    } else {
+        if rows.last() != window.as_ref().and_then(|w| indicators.get(w.selected)) {
+            return Err(Error::InvalidTuple {
+                field: "indicator row",
+                value: rows.last().cloned().unwrap_or_default(),
+            });
+        }
+        &rows[..rows.len() - 1]
+    };
+    let listing_chars = String::from_utf8_lossy(&cell_rows.join(&b'\n'))
+        .chars()
+        .count();
 
     let mut highlights = Vec::with_capacity(h);
     for field in &fields[index..index + h] {
@@ -383,7 +435,44 @@ pub fn parse(output: &[u8]) -> Result<Plan, Error> {
         cells,
         navigation,
         inserts,
+        window,
+        indicators,
     })
+}
+
+fn parse_window(value: &[u8], positions: usize, lines: usize) -> Result<Option<Window>, Error> {
+    if value.is_empty() {
+        return Ok(None);
+    }
+    let invalid = || Error::InvalidTuple {
+        field: "window",
+        value: value.to_vec(),
+    };
+    let parts: Vec<_> = value.split(|&b| b == b' ').collect();
+    if parts.len() != 3 {
+        return Err(invalid());
+    }
+    let mut numbers = [0; 3];
+    for (out, part) in numbers.iter_mut().zip(parts) {
+        *out = parse_canonical_u64(part)
+            .filter(|&v| v <= i64::MAX as u64)
+            .and_then(|v| usize::try_from(v).ok())
+            .ok_or_else(invalid)?;
+    }
+    let [offset, total, selected] = numbers;
+    if offset.checked_add(positions).is_none_or(|end| end > total)
+        || selected > positions
+        || (positions == 0) != (total == 0)
+        || (total == 0 && lines != 0)
+        || (selected == 0 && offset != 0)
+    {
+        return Err(invalid());
+    }
+    Ok(Some(Window {
+        offset,
+        total,
+        selected,
+    }))
 }
 
 fn count(value: &[u8], field: &'static str) -> Result<usize, Error> {
@@ -531,6 +620,7 @@ mod tests {
             output.extend_from_slice(value);
             output.push(0);
         }
+        output.extend_from_slice(b"\0\0");
         output
     }
 
@@ -616,7 +706,7 @@ mod tests {
     #[test]
     fn too_few_fields_are_rejected() {
         assert!(matches!(
-            parse(&fields(&[b"", b"1", b"0", b"row"])),
+            parse(&fields(&[b"", b"3", b"0", b"row"])),
             Err(Error::FieldCount { .. })
         ));
     }
@@ -626,8 +716,8 @@ mod tests {
         assert_eq!(
             parse(&fields(&[b"", b"0", b"0", b"0", b"extra"])),
             Err(Error::FieldCount {
-                expected: 4,
-                actual: 5
+                expected: 6,
+                actual: 7
             })
         );
     }
@@ -877,7 +967,7 @@ mod tests {
     #[test]
     fn zero_match_form_is_accepted() {
         assert_eq!(
-            parse(b"\0\x30\0\x30\0\x30\0"),
+            parse(b"\0\x30\0\x30\0\x30\0\0\0"),
             Ok(Plan {
                 common_prefix: Vec::new(),
                 rows: Vec::new(),
@@ -885,6 +975,8 @@ mod tests {
                 cells: Vec::new(),
                 navigation: Vec::new(),
                 inserts: Vec::new(),
+                window: None,
+                indicators: Vec::new(),
             })
         );
     }
