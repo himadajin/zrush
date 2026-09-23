@@ -146,6 +146,44 @@ fn edits_cursor_changes_and_dismiss_cancel_pending_confirmation() {
 }
 
 #[test]
+fn edits_and_cursor_changes_during_drain_cancel_remaining_operations() {
+    let edit_buffer = r#"
+_zrush_test_edit_buffer() { RBUFFER=x$RBUFFER }
+zle -N backward-char _zrush_test_edit_buffer
+"#;
+    for (predecessor, expected_buffer, expected_cursor) in [
+        ("", QUERY, QUERY.len() - 1),
+        (edit_buffer, "zrtest itemx", QUERY.len()),
+    ] {
+        for confirm in [keys::ENTER, keys::TAB] {
+            let mut host = Host::boot_completion(&format!("{RC}\n{predecessor}"), 4);
+            host.resize(12, 24);
+            host.send_keys_wait_plan(PlanShape::Nonempty, QUERY);
+            let before = host.log_count("completion: scrolled");
+            host.press(&keys::DOWN.repeat(3));
+            wait_scroll(&mut host, before);
+            host.press(keys::UP);
+            assert!(
+                host.postdisplay("global second candidate")
+                    .ends_with("2/100")
+            );
+            host.press(HOLD);
+            let held = host.log_count("test: completion held");
+            host.press(&[keys::UP, keys::UP, keys::LEFT, keys::DOWN, confirm].concat());
+            assert!(host.wait_log("test: completion held", held, Duration::from_secs(8)));
+            host.assert_buffer(QUERY, "queued operations wait for the response");
+            host.press(RELEASE);
+            host.assert_buffer(
+                expected_buffer,
+                "only the delegated operation changes the buffer",
+            );
+            assert_eq!(host.cursor("delegated operation cursor"), expected_cursor);
+            assert_eq!(host.log_count("confirm: kind=compsys"), 0);
+        }
+    }
+}
+
+#[test]
 fn reverse_delivery_does_not_restore_a_cancelled_selection() {
     let mut host = open(4, 12);
     host.press(HOLD);

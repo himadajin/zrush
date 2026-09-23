@@ -3241,12 +3241,17 @@ _zrush_completion_replan() {  # global selection
 
 _zrush_completion_drain() {
   emulate -L zsh
-  local action
+  local action before_buffer=$BUFFER
+  local -i before_cursor=$CURSOR
   while (( !_zrush_completion_pending && $#_zrush_completion_actions >= 2 )); do
     action=$_zrush_completion_actions[1]
     _zrush_dispatch_prev=$_zrush_completion_actions[2]
     _zrush_completion_actions[1,2]=()
     _zrush_dispatch_action "$action"
+    if [[ $BUFFER != "$before_buffer" ]] || (( CURSOR != before_cursor )); then
+      _zrush_input_invalidate
+      break
+    fi
   done
   return 0
 }
