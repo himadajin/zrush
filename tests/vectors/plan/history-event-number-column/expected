@@ -14,3 +14,5 @@ match 1 25 4\0
 2 1 1 2\0
 echo foo\0
 echo bar\0
+\0
+\0

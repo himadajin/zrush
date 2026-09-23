@@ -916,7 +916,7 @@ unset ZDOTDIR
   _zrush_sync_target=3 _zrush_sync_done=0 _zrush_sync_ok=0
   _zrush_encode_message ok 1 ''; typeset -g NAMESPACE_OK=$REPLY
   _zrush_encode_message ok 2 ''; typeset -g SNAPSHOT_OK=$REPLY
-  _zrush_encode_message ok 3 $'\0'"0"$'\0'"0"$'\0'"0"$'\0'; typeset -g TARGET=$REPLY
+  _zrush_encode_message ok 3 $'\0'"0"$'\0'"0"$'\0'"0"$'\0\0\0'; typeset -g TARGET=$REPLY
   _zrush_encode_message error 4 invalid-request; typeset -g TRAILING=$REPLY
   _zrush_worker_rx=$NAMESPACE_OK$SNAPSHOT_OK$TARGET$TRAILING
   _zrush_worker_read sync $(( EPOCHREALTIME + 1.0 )); typeset -gi sync_st=$?

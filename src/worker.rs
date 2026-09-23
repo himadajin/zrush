@@ -300,6 +300,13 @@ enum Request {
         history_limit: usize,
         params: plan::Params,
     },
+    Completion {
+        input_generation: i64,
+        offset: usize,
+        selected: usize,
+        rows: usize,
+        width: usize,
+    },
     Invalid,
 }
 
@@ -357,6 +364,7 @@ struct CurrentInput {
     buffer: Vec<u8>,
     interactive_comments: bool,
     params: plan::Params,
+    resolved_generation: Option<i64>,
     expiry: Option<Instant>,
 }
 
@@ -411,11 +419,11 @@ impl Session {
             return Ok(());
         };
         input.expiry = None;
-        let input = &*input;
         let resolved = match generation {
             0 => None,
             generation => self.store.find(generation),
         };
+        input.resolved_generation = resolved.map(|_| generation);
         let target = input.generation.to_string();
         match resolved {
             Some(stored) => {
@@ -688,6 +696,40 @@ fn process_request<W: Write>(
                 write_message(output, &[b"error", &request_id, b"invalid-payload"])
             }
         },
+        Request::Completion {
+            input_generation,
+            offset,
+            selected,
+            rows,
+            width,
+        } => {
+            let Some(input) = session
+                .input
+                .as_ref()
+                .filter(|input| input.generation == input_generation)
+            else {
+                return write_message(output, &[b"error", &request_id, b"superseded"]);
+            };
+            let Some(stored) = input
+                .resolved_generation
+                .and_then(|generation| session.store.find(generation))
+            else {
+                return write_message(output, &[b"error", &request_id, b"unknown-generation"]);
+            };
+            let params = plan::Params {
+                offset,
+                rows,
+                width,
+                ..input.params.clone()
+            };
+            let body = plan::compute_selected(
+                &params,
+                stored,
+                &|path| is_dir_from(&input.cwd, path),
+                selected,
+            );
+            write_message(output, &[b"ok", &request_id, &body])
+        }
         Request::Plan {
             generation,
             history_limit,
@@ -717,7 +759,32 @@ fn parse_request(fields: Vec<Vec<u8>>) -> Request {
         Some(b"history-snapshot") => parse_history(fields, HistoryWrite::Snapshot),
         Some(b"history-append") => parse_history(fields, HistoryWrite::Append),
         Some(b"plan") => parse_plan(fields),
+        Some(b"completion") => parse_completion(fields),
         _ => Request::Invalid,
+    }
+}
+
+fn parse_completion(fields: Vec<Vec<u8>>) -> Request {
+    let Ok([_kind, _id, input_generation, offset, selected, rows, width]) =
+        <[Vec<u8>; 7]>::try_from(fields)
+    else {
+        return Request::Invalid;
+    };
+    let (Some(input_generation), Some(offset), Some(selected), Some(rows), Some(width)) = (
+        parse_identifier(&input_generation),
+        parse_reference(&offset).and_then(|v| usize::try_from(v).ok()),
+        parse_positive_usize(&selected),
+        parse_positive_usize(&rows),
+        parse_positive_usize(&width),
+    ) else {
+        return Request::Invalid;
+    };
+    Request::Completion {
+        input_generation,
+        offset,
+        selected,
+        rows,
+        width,
     }
 }
 
@@ -823,6 +890,7 @@ fn parse_input(fields: Vec<Vec<u8>>, now: Instant) -> Option<CurrentInput> {
             trailing_space,
             offset: 0,
         },
+        resolved_generation: None,
         expiry: (!delay.is_zero()).then(|| now + delay),
     })
 }
@@ -2379,7 +2447,7 @@ mod tests {
         let capture_required = b"24:16:capture-required,1:7,,";
         let store = b"40:5:store,2:12,4:live,2:41,1:7,8:b\x01\0w\x01ls\0,,";
         let superseded = b"27:5:error,2:12,10:superseded,,";
-        let plan_ready = b"28:10:plan-ready,1:7,7:\x000\x000\x000\x00,,";
+        let plan_ready = b"36:10:plan-ready,1:7,14:\x000\x000\x000\x000 0 0\0\0,,";
         let flush = b"12:5:flush,1:7,,";
         // The same notification with an empty `buffer`, which is how zsh
         // spells decoration being off.
@@ -2503,5 +2571,50 @@ mod tests {
                 capture_required(b"2"),
             ]
         );
+    }
+
+    #[test]
+    fn completion_replans_the_settled_store_without_capture() {
+        let mut candidates = b"b\x01\0".to_vec();
+        for i in 1..=30 {
+            candidates.extend_from_slice(format!("w\x01item{i:02}\0").as_bytes());
+        }
+        let decoded = session(&[
+            pending_input(b"7"),
+            message(&store_request(b"1", b"live", b"1", b"7", &candidates)),
+            message(&[b"completion", b"2", b"7", b"0", b"20", b"3", b"6"]),
+            message(&[b"completion", b"3", b"7", b"18", b"19", b"3", b"6"]),
+        ]);
+        let p = wire::parse(body(&reply(&decoded, b"2"))).unwrap();
+        assert_eq!(
+            p.window,
+            Some(wire::Window {
+                offset: 18,
+                total: 30,
+                selected: 2
+            })
+        );
+        assert_eq!(p.inserts[1], b"item20 ");
+        let p = wire::parse(body(&reply(&decoded, b"3"))).unwrap();
+        assert_eq!(p.window.unwrap().selected, 1);
+        assert_eq!(events(&decoded).len(), 1);
+    }
+
+    #[test]
+    fn completion_rejects_superseded_unresolved_and_malformed_requests() {
+        let decoded = session(&[
+            pending_input(b"7"),
+            message(&[b"completion", b"1", b"7", b"0", b"1", b"3", b"6"]),
+            message(&[b"completion", b"2", b"6", b"0", b"1", b"3", b"6"]),
+            message(&[b"completion", b"3", b"7", b"00", b"1", b"3", b"6"]),
+            message(&[b"completion", b"4", b"7", b"0", b"0", b"3", b"6"]),
+            message(&[b"completion", b"5", b"7", b"0", b"1", b"0", b"6"]),
+            message(&[b"completion", b"6", b"7", b"0", b"1", b"3"]),
+        ]);
+        assert_eq!(reply(&decoded, b"1"), error(b"1", b"unknown-generation"));
+        assert_eq!(reply(&decoded, b"2"), error(b"2", b"superseded"));
+        for id in [b"3", b"4", b"5", b"6"] {
+            assert_eq!(reply(&decoded, id), error(id, b"invalid-request"));
+        }
     }
 }

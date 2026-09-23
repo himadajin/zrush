@@ -221,6 +221,17 @@ fn run_vector_raw(path: &Path) -> std::process::Output {
         value if value.is_empty() => OsString::from("0"),
         value => value,
     };
+    if source.as_bytes() == b"store" && !value("--selected").is_empty() {
+        requests.extend(msg(&[
+            b"completion",
+            b"2",
+            BINDING,
+            offset.as_bytes(),
+            value("--selected").as_bytes(),
+            value("--rows").as_bytes(),
+            value("--width").as_bytes(),
+        ]));
+    }
     if source.as_bytes() != b"store" {
         let mut plan_fields = vec![
             b"plan".to_vec(),
@@ -321,7 +332,7 @@ fn run_vector(path: &Path) -> std::process::Output {
         let fs = decode_fields_strict(frame);
         match fs.first().map(Vec::as_slice) {
             Some(b"plan-ready") if source.as_bytes() == b"store" => fs.get(2).cloned(),
-            Some(b"ok") if source.as_bytes() != b"store" => fs.get(2).cloned(),
+            Some(b"ok") if fs.get(2).is_some_and(|body| !body.is_empty()) => fs.get(2).cloned(),
             _ => None,
         }
     });

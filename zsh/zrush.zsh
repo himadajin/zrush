@@ -204,6 +204,12 @@ typeset -ga _zrush_plan_hl=()          # H entries, each "role pos start len"
 typeset -ga _zrush_plan_cells=()       # P entries, each "start len" (1-based by position)
 typeset -ga _zrush_plan_nav=()         # P entries, each "next prev left right"
 typeset -ga _zrush_plan_insert=()      # P entries, completed insertion text
+typeset -g  _zrush_plan_window=
+typeset -ga _zrush_plan_indicators=()
+typeset -gi _zrush_plan_total=0 _zrush_plan_selection=0
+typeset -gi _zrush_completion_pending=0 _zrush_completion_cursor=0
+typeset -g _zrush_completion_buffer=
+typeset -ga _zrush_completion_actions=()
 typeset -g  _zrush_plan_cp=            # common-prefix
 typeset -gi _zrush_listing=0
 # Which listing profile the current plan came from: none (no plan) | compsys | history.
@@ -211,7 +217,7 @@ typeset -gi _zrush_listing=0
 # rule and key mapping branch on this and on nothing else.
 typeset -g  _zrush_plan_kind=none
 # Window start of the current history plan (cli-protocol.md `offset`).
-# Completions do not use a window; teardown resets this with the plan.
+# Completion plans carry their window start; history records the requested offset.
 typeset -gi _zrush_plan_offset=0
 
 # Rendering (POSTDISPLAY + region_highlight)
@@ -785,6 +791,7 @@ _zrush_cancel_collection() {
 # is cancelled with it (behavior.md "Candidate Collection").
 _zrush_input_invalidate() {
   emulate -L zsh
+  _zrush_completion_reset
   _zrush_input_gen=0 _zrush_input_pending=0 _zrush_input_latched=0 _zrush_input_decor=0
   _zrush_txq_drop_notifications
   _zrush_cancel_collection
@@ -859,6 +866,9 @@ _zrush_rh_clear_syn() {
 # awaiting a worker event, the collection it started) is not part of the
 # listing; callers that must also stop it call _zrush_input_invalidate first.
 _zrush_teardown() {
+  _zrush_completion_reset
+  _zrush_plan_window= _zrush_plan_total=0 _zrush_plan_selection=0
+  _zrush_plan_indicators=()
   POSTDISPLAY=
   _zrush_rh_clear
   _zrush_listing=0
@@ -1925,6 +1935,7 @@ _zrush_worker_handle_message() {  # message [absolute-deadline]
   case $reqkind in
     store)                           slot=${req[2]:-} stored_gen=${req[3]:-0} bound_gen=${req[4]:-0} ;;
     history-snapshot|history-append) stored_gen=${req[2]:-0} ;;
+    completion) bound_gen=${req[2]:-0} ;;
   esac
   # A terminal response, whatever it says, retires the frame from the bound on
   # unacknowledged appends (behavior.md "History Menu" 更新経路).
@@ -1968,6 +1979,11 @@ _zrush_worker_handle_message() {  # message [absolute-deadline]
        [[ $reqkind == history-* || $reqkind == plan ]]; then
       _zrush_hist_invalidate unknown-generation
     fi
+    if [[ $reqkind == completion ]] && _zrush_completion_current $id $bound_gen; then
+      _zrush_input_invalidate
+      _zrush_teardown
+      zle -R 2>/dev/null
+    fi
     if (( id == _zrush_sync_target )); then
       _zrush_sync_done=1 _zrush_sync_ok=0
     elif [[ $reqkind == store ]] && (( bound_gen == _zrush_input_gen )) &&
@@ -2005,10 +2021,35 @@ _zrush_worker_handle_message() {  # message [absolute-deadline]
     return 0
   fi
 
+  if [[ $reqkind == completion ]]; then
+    unset "_zrush_worker_pending[$id]"
+    _zrush_worker_failures=0
+    _zrush_status_set ""
+    if ! _zrush_completion_current $id $bound_gen; then
+      (( id == _zrush_completion_pending )) && _zrush_completion_reset
+      return 0
+    fi
+    _zrush_parse_plan "$f[3]" && [[ -n $_zrush_plan_window ]] || {
+      _zrush_worker_session_fail "malformed completion plan request_id=$id"
+      return 1
+    }
+    _zrush_completion_pending=0
+    _zrush_selected=$_zrush_plan_selection
+    _zrush_plan_kind=compsys
+    _zrush_apply_plan
+    _zlog "completion: scrolled offset=$_zrush_plan_offset total=$_zrush_plan_total selected=$_zrush_selected"
+    _zrush_completion_drain
+    zle -R 2>/dev/null
+    return 0
+  fi
+
   # Only the synchronous history exchange sends a `plan`, so a plan response is
   # either the one it is waiting for or a stale one it must leave the UI alone
   # for (behavior.md "History Menu").
   local old_text=$_zrush_plan_text old_cp=$_zrush_plan_cp old_kind=$_zrush_plan_kind
+  local old_window=$_zrush_plan_window
+  local -i old_offset=$_zrush_plan_offset old_total=$_zrush_plan_total old_selection=$_zrush_plan_selection
+  local -a old_indicators=( "${(@)_zrush_plan_indicators}" )
   local -i old_l=$_zrush_plan_nlines old_p=$_zrush_plan_npos
   local -a old_hl=( "${(@)_zrush_plan_hl}" ) old_cells=( "${(@)_zrush_plan_cells}" )
   local -a old_nav=( "${(@)_zrush_plan_nav}" ) old_insert=( "${(@)_zrush_plan_insert}" )
@@ -2024,6 +2065,9 @@ _zrush_worker_handle_message() {  # message [absolute-deadline]
     _zrush_plan_kind=history
     _zrush_sync_done=1 _zrush_sync_ok=1
   else
+    _zrush_plan_window=$old_window _zrush_plan_offset=$old_offset
+    _zrush_plan_total=$old_total _zrush_plan_selection=$old_selection
+    _zrush_plan_indicators=( "${(@)old_indicators}" )
     _zrush_plan_text=$old_text _zrush_plan_nlines=$old_l _zrush_plan_npos=$old_p
     _zrush_plan_cp=$old_cp _zrush_plan_kind=$old_kind
     _zrush_plan_hl=( "${(@)old_hl}" ) _zrush_plan_cells=( "${(@)old_cells}" )
@@ -2103,6 +2147,7 @@ _zrush_worker_handle_event() {  # kind input_generation [plan_body|highlight_bod
     _zrush_worker_session_fail "malformed render plan input_generation=$gen"
     return 1
   }
+  _zrush_selected=$_zrush_plan_selection
   _zrush_plan_kind=compsys
   _zrush_settle_plan
   zle -R 2>/dev/null
@@ -2489,18 +2534,16 @@ _zrush_dec_le_all() {  # $1=bound, $2.. = values, all matched by <->
 }
 
 # Validate and split one render-plan buffer into _zrush_plan_*.
-# Field layout is fixed (cli-protocol.md "`plan` `ok` body (Render Plan Stream)"):
-#   common-prefix, L, P, L rows, H, H "role pos start len", P "start len",
-#   P "next prev left right", P insert texts -- total 4 + L + H + 3P fields.
+# See cli-protocol.md "`plan` `ok` body (Render Plan Stream)".
 _zrush_parse_plan() {  # $1=raw render-plan bytes
   emulate -L zsh
   local out=$1
   [[ $out == *$'\0' ]] || return 1   # final NUL required (cli-protocol.md)
   local -a f=( "${(@0)${out%$'\0'}}" )
   local -i n=$#f
-  (( n >= 4 )) || return 1
+  (( n >= 6 )) || return 1
   [[ $f[2] == <-> && $f[3] == <-> ]] || return 1
-  # n = 4 + L + H + 3P bounds each count by n; checking that before any
+  # n = 6 + L + H + 3P bounds each count by n; checking that before any
   # arithmetic keeps the counts inside the integer range from here on.
   _zrush_dec_le_all $n $f[2] $f[3] || return 1
   local -i L=$f[2] P=$f[3]
@@ -2526,12 +2569,43 @@ _zrush_parse_plan() {  # $1=raw render-plan bytes
   (( idx + P - 1 <= n )) || return 1
   local -a inserts=( "${(@)f[idx,idx+P-1]}" )
   (( idx += P ))
-  (( idx - 1 == n )) || return 1   # exact field count: 4 + L + H + 3P
+  (( idx + 1 == n )) || return 1
+  local window=$f[idx] indicator_text=$f[idx+1]
+  local -i offset=0 total=0 selection=0
+  local -a win=() indicators=()
+  if [[ -n $window ]]; then
+    win=( ${=window} )
+    (( $#win == 3 )) || return 1
+    local number
+    for number in "${(@)win}"; do
+      [[ $number == 0 || ( $number == <-> && $number != 0* ) ]] || return 1
+    done
+    [[ $window == "$win[1] $win[2] $win[3]" ]] || return 1
+    _zrush_dec_le_all 9223372036854775807 "${(@)win}" || return 1
+    offset=$win[1] total=$win[2] selection=$win[3]
+    (( offset <= total && P <= total - offset && selection <= P )) || return 1
+    (( (P == 0) == (total == 0) )) || return 1
+    (( total != 0 || L == 0 )) || return 1
+    (( selection != 0 || offset == 0 )) || return 1
+  fi
+  if [[ -n $indicator_text ]]; then
+    [[ -n $window ]] && (( P > 0 && L >= 2 )) || return 1
+    indicators=( "${(@ps:\n:)indicator_text}" )
+    (( $#indicators == P + 1 )) || return 1
+    [[ -z $indicators[1] ]] || return 1
+    local line
+    for line in "${(@)indicators[2,-1]}"; do
+      [[ -n $line && -z ${line//[0-9\/]/} ]] || return 1
+    done
+    [[ $rows[-1] == $indicators[selection+1] ]] || return 1
+  fi
 
   # Tuple shapes, then every 0..P value in one pass; `ranged` collects those,
   # `offs` collects the (start, len) pairs bounded by the listing text.
   local text=${(pj:\n:)rows}
-  local -i N=$#text   # $# is this receiver's own character reading (contract)
+  local body_text=$text
+  (( $#indicators )) && body_text=${text%$'\n'*}
+  local -i N=$#body_text
   local e role pos start len
   local -a tok ranged=() offs=()
   for e in "${(@)hls}"; do
@@ -2565,6 +2639,9 @@ _zrush_parse_plan() {  # $1=raw render-plan bytes
     (( offs[i] + offs[i+1] <= N )) || return 1
   done
 
+  _zrush_plan_window=$window _zrush_plan_offset=$offset
+  _zrush_plan_total=$total _zrush_plan_selection=$selection
+  _zrush_plan_indicators=( "${(@)indicators}" )
   _zrush_plan_cp=$f[1]
   _zrush_plan_nlines=$L
   _zrush_plan_npos=$P
@@ -2639,8 +2716,19 @@ _zrush_apply_plan() {
 # re-fetching or recomputing the plan (cli-protocol.md "Highlights": match
 # decoration is skipped for the selected cell and replaced by the selected
 # spec built from that position's cell range).
+_zrush_apply_indicator() {
+  [[ -n $_zrush_plan_window ]] || return 0
+  _zrush_plan_selection=$_zrush_selected
+  if (( $#_zrush_plan_indicators )); then
+    _zrush_plan_text=${_zrush_plan_text%$'\n'*}$'\n'$_zrush_plan_indicators[_zrush_selected+1]
+    POSTDISPLAY=$'\n'$_zrush_plan_text
+  fi
+  return 0
+}
+
 _zrush_apply_highlights() {
   emulate -L zsh
+  _zrush_apply_indicator
   _zrush_rh_clear
   (( _zrush_plan_nlines > 0 )) || return 0
   local hl_sel=${ZRUSH_CFG_HL_SELECTED-standout}
@@ -2967,6 +3055,7 @@ _zrush_line_pre_redraw() {
   _zrush_selected=0
   _zrush_tab_pending=0
   _zrush_rh_clear_sel
+  _zrush_apply_indicator
 
   # See docs/internal/specs/behavior.md "Candidate Collection": blank buffers neither collect nor display.
   # A blank buffer holds no decoration either, and zsh settles that on its own
@@ -3118,6 +3207,56 @@ _zrush_confirm_pos() {  # $1=one-based position into _zrush_plan_insert
   return 0
 }
 
+# See behavior.md "Selection and Keybindings".
+_zrush_completion_reset() {
+  _zrush_completion_pending=0
+  _zrush_completion_actions=()
+  _zrush_completion_buffer=
+  return 0
+}
+
+_zrush_completion_current() {  # request-id input-generation
+  (( $1 == _zrush_completion_pending && $2 == _zrush_input_gen && _zrush_input_gen > 0 )) &&
+    [[ $BUFFER == "$_zrush_completion_buffer" ]] && (( CURSOR == _zrush_completion_cursor ))
+}
+
+_zrush_completion_replan() {  # global selection
+  emulate -L zsh
+  (( _zrush_input_gen > 0 && !_zrush_worker_stopping && _zrush_worker_ready )) || {
+    _zrush_teardown
+    return 0
+  }
+  _zrush_geometry
+  local -i rows=$REPLY_ROWS width=$REPLY_WIDTH
+  _zrush_next_request_id || return 1
+  local -i id=$REPLY
+  _zrush_completion_pending=$id
+  _zrush_completion_buffer=$BUFFER _zrush_completion_cursor=$CURSOR
+  _zrush_worker_pending[$id]="completion $_zrush_input_gen"
+  _zrush_encode_message completion "$id" "$_zrush_input_gen" "$_zrush_plan_offset" "$1" "$rows" "$width"
+  _zrush_worker_txq+=( "$REPLY" )
+  _zlog "completion: queued request_id=$id target=$1"
+  _zrush_worker_flush || { _zrush_teardown; return 1 }
+  return 0
+}
+
+_zrush_completion_drain() {
+  emulate -L zsh
+  local action before_buffer=$BUFFER
+  local -i before_cursor=$CURSOR
+  while (( !_zrush_completion_pending && $#_zrush_completion_actions >= 2 )); do
+    action=$_zrush_completion_actions[1]
+    _zrush_dispatch_prev=$_zrush_completion_actions[2]
+    _zrush_completion_actions[1,2]=()
+    _zrush_dispatch_action "$action"
+    if [[ $BUFFER != "$before_buffer" ]] || (( CURSOR != before_cursor )); then
+      _zrush_input_invalidate
+      break
+    fi
+  done
+  return 0
+}
+
 # ---------------------------------------------------------------- Selection
 _zrush_select_start() {
   emulate -L zsh
@@ -3160,6 +3299,13 @@ _zrush_select_dir() {  # $1=next|prev|left|right (navigation-table transition)
       left) _zrush_history_replan 0 1 ;;
       *) return 0 ;;
     esac
+    return 0
+  fi
+  if (( new == 0 )) && [[ $_zrush_plan_kind == compsys ]] &&
+     [[ $1 == next || ( $1 == prev && $_zrush_plan_offset -gt 0 ) ]]; then
+    local -i target=$(( _zrush_plan_offset + p ))
+    [[ $1 == next ]] && (( ++target )) || (( --target ))
+    _zrush_completion_replan $target
     return 0
   fi
   _zrush_selected=$new
@@ -3371,6 +3517,18 @@ _zrush_dispatch() {  # $1=action $2=predecessor $3=dispatcher name
     _zrush_call_prev
     return 0
   fi
+  if (( _zrush_completion_pending )); then
+    case ${1:-} in
+      select-next|select-prev|select-left|select-right|confirm|tab)
+        _zrush_completion_actions+=( "$1" "$_zrush_dispatch_prev" )
+        return 0
+        ;;
+    esac
+  fi
+  _zrush_dispatch_action "${1:-}"
+}
+
+_zrush_dispatch_action() {
   case ${1:-} in
     select-next)  _zrush_action_next ;;
     select-prev)  _zrush_action_prev ;;
