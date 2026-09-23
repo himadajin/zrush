@@ -322,8 +322,17 @@ pub(crate) fn build_completion(
     let groups = group_candidates(candidates, batches, sources);
     let total = candidates.len();
     let selected = selected.min(total);
-    let budget = options.row_budget.saturating_sub(1).max(1);
-    let mut offset = if selected == 0 {
+    let overflow = window_geometry(&groups, options.row_budget, options.width, Style::Grid, 0)
+        .iter()
+        .map(|group| group.count)
+        .sum::<usize>()
+        < total;
+    let show_indicator = overflow && options.row_budget > 1;
+    let budget = options
+        .row_budget
+        .saturating_sub(usize::from(show_indicator))
+        .max(1);
+    let mut offset = if selected == 0 || !overflow {
         0
     } else {
         offset.min(selected - 1)
@@ -366,7 +375,7 @@ pub(crate) fn build_completion(
         }),
         indicators: Vec::new(),
     };
-    if total > 0 && options.row_budget > 1 {
+    if show_indicator {
         plan.indicators = (0..=count)
             .map(|p| {
                 let n = if p == 0 { 0 } else { offset + p };

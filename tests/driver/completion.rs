@@ -67,6 +67,31 @@ fn wait_scroll(host: &mut Host, baseline: usize) {
 }
 
 #[test]
+fn fitting_candidates_have_no_indicator_when_selected() {
+    let mut host = Host::boot_completion(
+        r#"
+_zrush_test_complete() { compadd -J items -X Items -- item{001..003} }
+compdef _zrush_test_complete zrtest
+"#,
+        4,
+    );
+    host.resize(12, 24);
+    host.send_keys_wait_plan(PlanShape::Nonempty, QUERY);
+    for label in ["unselected", "selected"] {
+        let shown = host.postdisplay(label);
+        assert!(shown.contains("Items"));
+        assert!(shown.contains("item001") && shown.contains("item003"));
+        assert!(!shown.contains("/3"));
+        assert_eq!(shown.trim_start_matches('\n').lines().count(), 4);
+        host.press(keys::DOWN);
+    }
+    let before = host.log_count("confirm: kind=compsys");
+    host.press(keys::ENTER);
+    assert!(host.wait_log("confirm: kind=compsys", before, Duration::from_secs(8)));
+    host.assert_buffer("zrtest item002 ", "selection without an indicator");
+}
+
+#[test]
 fn all_candidates_are_reachable_across_columns_and_groups() {
     for columns in [12, 80] {
         let mut host = open(4, columns);

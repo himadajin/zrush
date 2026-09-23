@@ -1185,6 +1185,33 @@ mod tests {
         assert!(empty.indicators.is_empty());
         assert_eq!(empty.window.unwrap().total, 0);
         let all = completion(&[header(&[]), word("only")].concat(), 10, 80, 0, 0);
-        assert_eq!(all.rows.last().unwrap(), b"0/1");
+        assert!(all.indicators.is_empty());
+        assert_eq!(all.inserts.len(), 1);
+    }
+
+    #[test]
+    fn completion_uses_all_rows_before_reserving_an_indicator() {
+        let mut payload = header(&[]);
+        for n in 1..=4 {
+            payload.extend(word(&format!("item{n}")));
+        }
+        for selected in [0, 1, 4] {
+            let plan = completion(&payload, 4, 5, 0, selected);
+            assert!(plan.indicators.is_empty());
+            assert_eq!(plan.rows.len(), 4);
+            assert_eq!(plan.inserts.len(), 4);
+            assert_eq!(plan.window.unwrap().selected, selected);
+        }
+        let overflow = completion(&payload, 3, 5, 0, 4);
+        assert_eq!(overflow.rows.last().unwrap(), b"4/4");
+        let offset = overflow.window.unwrap().offset;
+        assert!(offset > 0);
+        for (rows, width) in [(4, 5), (2, 12)] {
+            let resized = completion(&payload, rows, width, offset, 4);
+            assert!(resized.indicators.is_empty());
+            assert_eq!(resized.inserts.len(), 4);
+            assert_eq!(resized.window.unwrap().offset, 0);
+            assert_eq!(resized.window.unwrap().selected, 4);
+        }
     }
 }
