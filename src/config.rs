@@ -52,6 +52,8 @@ pub enum TabBehavior {
 }
 
 impl TabBehavior {
+    pub const ALL: [Self; 3] = [Self::CommonPrefix, Self::Menu, Self::Insert];
+
     fn parse(s: &str) -> Option<Self> {
         match s {
             "common-prefix" => Some(TabBehavior::CommonPrefix),
@@ -235,27 +237,13 @@ fn apply_key(
         ("display", "delay-ms") => cfg.delay_ms = int_val(val, table, key, 0, 10000, 30, warnings),
         ("display", "min-input") => cfg.min_input = int_val(val, table, key, 0, 100, 0, warnings),
         ("matching", "mode") => {
-            if let Some(m) = val.as_str().and_then(Mode::parse) {
-                cfg.mode = m;
-            } else {
-                warnings.push(format!(
-                    "config: [matching] mode: expected one of \"prefix\", \"substring\", \"typo\", got {}; using default \"typo\"",
-                    fmt_got(val)
-                ));
-            }
+            cfg.mode = enum_val(val, table, key, cfg.mode, warnings);
         }
         ("matching", "smart-case") => {
             cfg.smart_case = bool_val(val, table, key, true, warnings);
         }
         ("insert", "tab") => {
-            if let Some(t) = val.as_str().and_then(TabBehavior::parse) {
-                cfg.tab = t;
-            } else {
-                warnings.push(format!(
-                    "config: [insert] tab: expected one of \"common-prefix\", \"menu\", \"insert\", got {}; using default \"menu\"",
-                    fmt_got(val)
-                ));
-            }
+            cfg.tab = enum_val(val, table, key, cfg.tab, warnings);
         }
         ("insert", "trailing-space") => {
             cfg.trailing_space = bool_val(val, table, key, true, warnings);
@@ -387,6 +375,61 @@ fn bool_val(
     warnings.push(format!(
         "config: [{table}] {key}: expected boolean, got {}; using default {default}",
         fmt_got(val)
+    ));
+    default
+}
+
+trait ConfigEnum: Copy + 'static {
+    const ALL: &'static [Self];
+
+    fn parse(s: &str) -> Option<Self>;
+    fn as_str(self) -> &'static str;
+}
+
+impl ConfigEnum for Mode {
+    const ALL: &'static [Self] = &Mode::ALL;
+
+    fn parse(s: &str) -> Option<Self> {
+        Mode::parse(s)
+    }
+
+    fn as_str(self) -> &'static str {
+        Mode::as_str(self)
+    }
+}
+
+impl ConfigEnum for TabBehavior {
+    const ALL: &'static [Self] = &TabBehavior::ALL;
+
+    fn parse(s: &str) -> Option<Self> {
+        TabBehavior::parse(s)
+    }
+
+    fn as_str(self) -> &'static str {
+        TabBehavior::as_str(self)
+    }
+}
+
+fn enum_val<T: ConfigEnum>(
+    val: &toml::Value,
+    table: &str,
+    key: &str,
+    default: T,
+    warnings: &mut Vec<String>,
+) -> T {
+    if let Some(value) = val.as_str().and_then(T::parse) {
+        return value;
+    }
+
+    let expected = T::ALL
+        .iter()
+        .map(|value| format!("{:?}", value.as_str()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    warnings.push(format!(
+        "config: [{table}] {key}: expected one of {expected}, got {}; using default {:?}",
+        fmt_got(val),
+        default.as_str()
     ));
     default
 }
@@ -797,15 +840,39 @@ mod tests {
     #[test]
     fn unknown_enum_value_falls_back() {
         let r = parse("[matching]\nmode = \"fuzzy\"\n");
-        assert_eq!(r.config.mode, Mode::Typo);
-        assert_eq!(r.warnings.len(), 1);
-        assert!(
-            r.warnings[0].contains("expected one of \"prefix\", \"substring\", \"typo\""),
-            "{}",
-            r.warnings[0]
+        let default = Config::default().mode;
+        let expected_values = Mode::ALL
+            .iter()
+            .map(|mode| format!("{:?}", mode.as_str()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        assert_eq!(r.config.mode, default);
+        assert_eq!(
+            r.warnings,
+            [format!(
+                "config: [matching] mode: expected one of {expected_values}, got \"fuzzy\"; using default {:?}",
+                default.as_str()
+            )]
         );
-        assert!(r.warnings[0].contains("got \"fuzzy\""));
-        assert!(r.warnings[0].contains("using default \"typo\""));
+    }
+
+    #[test]
+    fn unknown_tab_behavior_falls_back() {
+        let r = parse("[insert]\ntab = \"cycle\"\n");
+        let default = Config::default().tab;
+        let expected_values = TabBehavior::ALL
+            .iter()
+            .map(|tab| format!("{:?}", tab.as_str()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        assert_eq!(r.config.tab, default);
+        assert_eq!(
+            r.warnings,
+            [format!(
+                "config: [insert] tab: expected one of {expected_values}, got \"cycle\"; using default {:?}",
+                default.as_str()
+            )]
+        );
     }
 
     #[test]
