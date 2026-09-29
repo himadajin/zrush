@@ -13,13 +13,24 @@ use crate::fake::Mode;
 use crate::hist::{NO_COLLECTION, assert_no_history_kind, open_menu};
 use crate::host::{Host, keys};
 
-/// Down at position 1 erases the whole menu, unlike a completion listing, where
-/// the analogous transition only deselects and keeps the text (see
-/// `up_at_a_completion_listing_deselects_before_opening_the_history_menu`).
+/// Down at the newest history entry closes the menu and resumes normal
+/// completion for the unchanged input (behavior.md "History Menu").
 #[test]
-fn down_at_position_1_erases_the_whole_history_menu() {
+fn down_at_position_1_resumes_completion() {
     let mut host = Host::boot_history();
-    open_menu(&mut host, "echo");
+    host.send_keys("ls fx/basic/al");
+    assert!(
+        host.expect("alpha.txt", Duration::from_secs(10)),
+        "(h15-setup) completion listing did not render"
+    );
+    let kind = host.listing_kind("(h15-before)");
+    assert!(
+        kind.starts_with("kind=compsys sel=0 listing=1"),
+        "(h15-before) completion listing was not visible and unselected: {kind}"
+    );
+    let cursor = host.cursor("(h15-before) cursor dump failed");
+
+    host.press(keys::UP);
     let kind = host.listing_kind("(h15-setup)");
     assert!(
         kind.starts_with("kind=history sel=1"),
@@ -27,12 +38,90 @@ fn down_at_position_1_erases_the_whole_history_menu() {
     );
 
     host.press(keys::DOWN);
-    assert_eq!(
-        host.listing_kind("(h15a)"),
-        "kind=none sel=0 listing=0 npos=0",
-        "(h15a) Down at position 1 did not erase the whole menu:"
+    assert!(
+        host.expect("alpha.txt", Duration::from_secs(10)),
+        "(h15a) Down did not resume the completion listing"
     );
-    host.assert_buffer("echo", "(h15b) buffer is unchanged");
+    let kind = host.listing_kind("(h15b)");
+    assert!(
+        kind.starts_with("kind=compsys sel=0 listing=1"),
+        "(h15b) resumed completion was not unselected: {kind}"
+    );
+    host.assert_buffer(
+        "ls fx/basic/al",
+        "(h15c) buffer changed while leaving history",
+    );
+    assert_eq!(
+        host.cursor("(h15d) cursor dump failed"),
+        cursor,
+        "(h15d) cursor moved while leaving history"
+    );
+
+    host.press(keys::DOWN);
+    let kind = host.listing_kind("(h15e)");
+    assert!(
+        kind.starts_with("kind=compsys sel=1 listing=1"),
+        "(h15e) Down after resumption did not start completion selection: {kind}"
+    );
+}
+
+#[test]
+fn dismissing_history_does_not_resume_completion() {
+    let mut host = Host::boot_history();
+    host.send_keys("ls fx/basic/al");
+    assert!(
+        host.expect("alpha.txt", Duration::from_secs(10)),
+        "(h27-setup) completion listing did not render"
+    );
+    host.press(keys::UP);
+    let kind = host.listing_kind("(h27a)");
+    assert!(
+        kind.starts_with("kind=history sel=1"),
+        "(h27a) history menu did not open: {kind}"
+    );
+
+    let input_before = host.log_count("worker: queued input input_generation=");
+    host.press(keys::DISMISS);
+    assert_eq!(
+        host.listing_kind("(h27b)"),
+        "kind=none sel=0 listing=0 npos=0",
+        "(h27b) Ctrl-G did not leave the listing closed:"
+    );
+    assert_eq!(
+        host.log_count("worker: queued input input_generation="),
+        input_before,
+        "(h27c) Ctrl-G queued a completion input"
+    );
+    assert!(
+        host.postdisplay("(h27d)").is_empty(),
+        "(h27d) Ctrl-G left completion text visible"
+    );
+    host.assert_buffer("ls fx/basic/al", "(h27e) buffer changed across Ctrl-G");
+}
+
+#[test]
+fn down_at_an_empty_history_menu_does_not_resume_completion() {
+    let mut host = Host::boot_history();
+    host.press(keys::UP);
+    let kind = host.listing_kind("(h30-setup)");
+    assert!(
+        kind.starts_with("kind=history sel=1"),
+        "(h30-setup) empty-buffer history menu did not open: {kind}"
+    );
+
+    let inputs = host.log_count("worker: queued input input_generation=");
+    host.press(keys::DOWN);
+    assert_eq!(
+        host.listing_kind("(h30a)"),
+        "kind=none sel=0 listing=0 npos=0",
+        "(h30a) empty input left a listing after closing history:"
+    );
+    assert_eq!(
+        host.log_count("worker: queued input input_generation="),
+        inputs,
+        "(h30b) empty input queued a completion request"
+    );
+    host.assert_buffer("", "(h30c) buffer changed while leaving history");
 }
 
 /// select-prev at a completion listing's position 1 only deselects, leaving the

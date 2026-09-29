@@ -3028,6 +3028,34 @@ _zrush_open_history_menu() {  # ZLE widget context
 }
 
 # ---------------------------------------------------------------- ZLE hooks
+_zrush_notify_input() {
+  emulate -L zsh
+  # See docs/internal/specs/behavior.md "Candidate Collection".
+  _zrush_selected=0
+  _zrush_tab_pending=0
+  _zrush_rh_clear_sel
+  _zrush_apply_indicator
+
+  if [[ -z ${BUFFER//[[:space:]]/} ]]; then
+    _zrush_teardown
+    _zrush_rh_clear_syn
+    return 0
+  fi
+
+  local -i decor=0
+  _zrush_widen "$LBUFFER"
+  if (( ${#REPLY_WORD} < ZRUSH_CFG_MIN_INPUT )); then
+    _zrush_teardown
+    [[ $ZRUSH_CFG_SYNTAX_ENABLED == true ]] || return 0
+    decor=1
+  fi
+
+  (( KEYS_QUEUED_COUNT || PENDING )) && return 0
+
+  _zrush_send_input $decor
+  return 0
+}
+
 _zrush_line_pre_redraw() {
   emulate -L zsh
   _zrush_status_refresh
@@ -3049,41 +3077,7 @@ _zrush_line_pre_redraw() {
     _zlog "history: menu erased by an external buffer/cursor change"
     _zrush_teardown
   fi
-  # A buffer change clears selection and pending Tab state. Remove only the selection
-  # highlight immediately; retain list text and other decoration until the next result
-  # to avoid flashing. ZLE adjusts their offsets with buffer edits.
-  _zrush_selected=0
-  _zrush_tab_pending=0
-  _zrush_rh_clear_sel
-  _zrush_apply_indicator
-
-  # See docs/internal/specs/behavior.md "Candidate Collection": blank buffers neither collect nor display.
-  # A blank buffer holds no decoration either, and zsh settles that on its own
-  # rather than waiting for a round trip (behavior.md "Buffer Syntax Highlighting").
-  if [[ -z ${BUFFER//[[:space:]]/} ]]; then
-    _zrush_teardown
-    _zrush_rh_clear_syn
-    return 0
-  fi
-
-  # Apply min-input to the current word; blank buffers were handled above.
-  # While decoration is on, this suppression does not stop the notification but
-  # makes it decoration-only, so colouring starts at the first character
-  # (behavior.md "Candidate Collection").
-  local -i decor=0
-  _zrush_widen "$LBUFFER"
-  if (( ${#REPLY_WORD} < ZRUSH_CFG_MIN_INPUT )); then
-    _zrush_teardown
-    [[ $ZRUSH_CFG_SYNTAX_ENABLED == true ]] || return 0
-    decor=1
-  fi
-
-  # Input pressure is visible to zsh alone, so it is judged here: while keys are
-  # still queued no notification is made, and the change that key causes makes
-  # the next one (behavior.md "Candidate Collection"). The listing is left as it is.
-  (( KEYS_QUEUED_COUNT || PENDING )) && return 0
-
-  _zrush_send_input $decor
+  _zrush_notify_input
   return 0
 }
 
@@ -3294,6 +3288,7 @@ _zrush_select_dir() {  # $1=next|prev|left|right (navigation-table transition)
         else
           _zlog "history: menu closed at position 1"
           _zrush_teardown
+          _zrush_notify_input
         fi
         ;;
       left) _zrush_history_replan 0 1 ;;
