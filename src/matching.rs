@@ -32,6 +32,8 @@ pub enum Mode {
 }
 
 impl Mode {
+    pub const ALL: [Self; 3] = [Self::Prefix, Self::Substring, Self::Typo];
+
     /// Parse the config/CLI notation ("prefix" | "substring" | "typo").
     pub fn parse(s: &str) -> Option<Mode> {
         match s {
