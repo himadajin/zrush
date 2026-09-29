@@ -798,17 +798,22 @@ _zrush_input_invalidate() {
   return 0
 }
 
-# Remove only this plugin's listing region_highlight entries, leaving the buffer
-# decoration group untouched (behavior.md "Display").
-# ZLE rewrites offsets after buffer edits, so exact original values cannot identify them.
-# zsh 5.9+ uses memo=zrush; 5.8 removes entries in the POSTDISPLAY region
-# (start >= $#BUFFER), accepting possible collateral removal there.
+# (behavior.md "Display").
+_zrush_rh_remove() {
+  local memo_pattern=$1 ledger_name=$2
+  if [[ -n $_zrush_hl_memo ]]; then
+    region_highlight=( "${(@)region_highlight:#${~memo_pattern}}" )
+  else
+    local -a ledger=( "${(@P)ledger_name}" )
+    region_highlight=( "${(@)region_highlight:|ledger}" )
+  fi
+  return 0
+}
+
 _zrush_rh_clear() {
   (( $#_zrush_rh )) || return 0
-  if [[ -n $_zrush_hl_memo ]]; then
-    region_highlight=( "${(@)region_highlight:#*memo=zrush(|-sel)}" )
-  else
-    region_highlight=( "${(@)region_highlight:|_zrush_rh}" )
+  _zrush_rh_remove '*memo=zrush(|-sel)' _zrush_rh
+  if [[ -z $_zrush_hl_memo ]]; then
     local e
     local -a keep=()
     for e in "${(@)region_highlight}"; do
@@ -824,35 +829,18 @@ _zrush_rh_clear() {
   return 0
 }
 
-# Remove only the selection highlight after input or cursor movement; retain list text
-# and match/heading/history-number decoration until the next result.
 _zrush_rh_clear_sel() {
   [[ -n $_zrush_rh_sel ]] || return 0
-  if [[ -n $_zrush_hl_memo ]]; then
-    region_highlight=( "${(@)region_highlight:#*memo=zrush-sel}" )
-  else
-    # On 5.8, remove only an exact match. If ZLE changed its offsets after editing,
-    # accept that it remains until the next render.
-    local -a _sel=( "$_zrush_rh_sel" )
-    region_highlight=( "${(@)region_highlight:|_sel}" )
-  fi
-  local -a _sel2=( "$_zrush_rh_sel" )
-  _zrush_rh=( "${(@)_zrush_rh:|_sel2}" )
+  local -a _sel=( "$_zrush_rh_sel" )
+  _zrush_rh_remove '*memo=zrush-sel' _sel
+  _zrush_rh=( "${(@)_zrush_rh:|_sel}" )
   _zrush_rh_sel=
   return 0
 }
 
-# Remove only the buffer decoration group, leaving the listing groups alone
-# (cli-protocol.md "Buffer Highlight Application (zsh-Side Normative)").
-# On 5.8 this is the ledger's exact values: an entry ZLE has since shifted
-# stays until the next event replaces it (behavior.md "Display").
 _zrush_rh_clear_syn() {
   (( $#_zrush_rh_syn )) || return 0
-  if [[ -n $_zrush_hl_memo ]]; then
-    region_highlight=( "${(@)region_highlight:#*memo=zrush-syn}" )
-  else
-    region_highlight=( "${(@)region_highlight:|_zrush_rh_syn}" )
-  fi
+  _zrush_rh_remove '*memo=zrush-syn' _zrush_rh_syn
   _zrush_rh_syn=()
   return 0
 }
