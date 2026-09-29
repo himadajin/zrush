@@ -147,3 +147,31 @@ fn min_input_does_not_gate_the_history_menu() {
         "(h19a) empty-buffer Up did not open the history menu with min-input=50: {kind}"
     );
 }
+
+#[test]
+fn min_input_suppression_still_applies_after_leaving_the_history_menu() {
+    let mut host = Host::boot_history_with_config("[display]\nmin-input = 50\n");
+    host.send_keys("echo");
+    host.drain(Duration::from_millis(500));
+    host.press(keys::UP);
+    let kind = host.listing_kind("(h29-setup)");
+    assert!(
+        kind.starts_with("kind=history sel=1"),
+        "(h29-setup) history menu did not open: {kind}"
+    );
+
+    let collections = host.log_count("collect: collecting");
+    host.press(keys::DOWN);
+    host.drain(Duration::from_millis(500));
+    assert_eq!(
+        host.listing_kind("(h29a)"),
+        "kind=none sel=0 listing=0 npos=0",
+        "(h29a) min-input suppression left a completion listing:"
+    );
+    assert_eq!(
+        host.log_count("collect: collecting"),
+        collections,
+        "(h29b) min-input suppression started compsys collection"
+    );
+    host.assert_buffer("echo", "(h29c) buffer changed while leaving history");
+}
