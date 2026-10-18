@@ -175,6 +175,50 @@ unset ZDOTDIR
     (( !_zrush_worker_stopping ))
   }
 
+  # Observe the send boundary itself: pending must exist before flush, the
+  # encoded fields must survive unchanged, and flush may overwrite REPLY.
+  () {
+    local saved_flush=$functions[_zrush_worker_flush]
+    local -i _zrush_request_seq=40 FLUSH_STATUS=0 FLUSH_CALLS=0
+    local -a _zrush_worker_txq=()
+    local -A _zrush_worker_pending=()
+    local PAYLOAD=$'space : comma, newline\n日本語'
+    _zrush_worker_flush() {
+      (( ++FLUSH_CALLS ))
+      eq "pending at flush" "${_zrush_worker_pending[$_zrush_request_seq]}" 'store live 7 9'
+      eq "queue at flush" $#_zrush_worker_txq 1
+      _zrush_netstring_take "$_zrush_worker_txq[1]"
+      eq "complete frame" "$REPLY_REST" ''
+      _zrush_decode_fields "$REPLY" || note "cannot decode request"
+      eq "field count" $#reply 6
+      eq "kind" "$reply[1]" store
+      eq "wire id" "$reply[2]" "$_zrush_request_seq"
+      eq "slot" "$reply[3]" live
+      eq "candidate generation" "$reply[4]" 7
+      eq "input generation" "$reply[5]" 9
+      eq "payload" "$reply[6]" "$PAYLOAD"
+      _zrush_worker_txq=()
+      REPLY=overwritten-by-flush
+      return $FLUSH_STATUS
+    }
+    {
+      _zrush_worker_request 'store live 7 9' store 'slot=live generation=7 input_generation=9' \
+        live 7 9 "$PAYLOAD" || note "request failed"
+      eq "returned request id" "$REPLY" 41
+      eq "flush count" $FLUSH_CALLS 1
+      verdict "request: pending precedes flush and fields and returned id survive encoding and flush"
+
+      FLUSH_STATUS=1 PAYLOAD=
+      _zrush_worker_request 'store live 7 9' store '' live 7 9 "$PAYLOAD"
+      eq "flush failure propagated" $? 1
+      eq "next id" $_zrush_request_seq 42
+      eq "failure flush count" $FLUSH_CALLS 2
+      verdict "request: flush failure is returned to the caller"
+    } always {
+      functions[_zrush_worker_flush]=$saved_flush
+    }
+  }
+
   # ------------------------------------------------ secure runtime topology
   reset_transport
   typeset -gi saved0 saved1 saved2

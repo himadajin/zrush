@@ -345,7 +345,7 @@ fn a_failed_request_is_not_replayed_and_only_new_input_makes_a_generation() {
         .last_log_line("worker: queued history-snapshot request_id=")
         .expect("(err-6a) no history snapshot was queued for the menu");
     let plan_line = host
-        .last_log_line("worker: queued request_id=")
+        .last_log_line("worker: queued plan request_id=")
         .expect("(err-6a) no plan was queued for the menu");
     let snapshot_id = dump_field(&snapshot_line, "request_id").to_string();
     let plan_id = dump_field(&plan_line, "request_id").to_string();
