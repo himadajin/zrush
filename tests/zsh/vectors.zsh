@@ -1584,6 +1584,25 @@ reserialize_plan() {  # -> REPLY=bytes, or return 1 with REPLY=reason
   fi
   unset REPLY
 
+  # ---------------- 5.8 listing-highlight removal ----------------
+  # ZLE may rewrite an entry's offset after a buffer edit, so its new value no
+  # longer matches the listing ledger. The 5.8 fallback also removes entries
+  # starting in POSTDISPLAY; an entry still inside BUFFER must survive.
+  local -i rh_remove_ok=1
+  BUFFER=abc
+  _zrush_hl_memo=
+  _zrush_rh=( '4 5 bold' )
+  _zrush_rh_sel='7 8 standout'
+  region_highlight=( '0 2 fg=red' '3 4 bold' )
+  _zrush_rh_clear
+  [[ "${(j:|:)region_highlight}" == '0 2 fg=red' ]] || rh_remove_ok=0
+  (( $#_zrush_rh == 0 )) && [[ -z $_zrush_rh_sel ]] || rh_remove_ok=0
+  if (( rh_remove_ok )); then
+    ok "region_highlight: 5.8 listing cleanup removes shifted POSTDISPLAY entries"
+  else
+    ng "region_highlight: 5.8 listing cleanup left rh=${(qqqq)region_highlight} ledger=${(qqqq)_zrush_rh} selected=${(qqqq)_zrush_rh_sel}"
+  fi
+
   # ---------------- Buffer highlight body ----------------
   # cli-protocol.md "`syntax-highlight` body (Buffer Highlight Stream)": one
   # well-formed body is decoded in the order it arrives, and every acceptance
