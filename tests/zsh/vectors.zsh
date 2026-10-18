@@ -580,7 +580,7 @@ reserialize_plan() {  # -> REPLY=bytes, or return 1 with REPLY=reason
   # ---------------- Empty-word collection cache latch ----------------
   # The latch is the worker session's, not the shell's: a lost session drops it
   # and the entry misses even while fingerprint and TTL are still good
-  # (behavior.md "Empty-Word Collection Cache" / "Worker Lifecycle").
+  # (behavior.md "Candidate Reuse" / "Worker Lifecycle").
   zmodload -F zsh/stat b:zstat 2>/dev/null
   ZRUSH_LOG=$WORK/cache.log
   local -i cache_ok=1
@@ -636,6 +636,8 @@ reserialize_plan() {  # -> REPLY=bytes, or return 1 with REPLY=reason
     _zrush_worker_ready=1 _zrush_worker_stopping=0 _zrush_worker_runtime_tainted=0
     _zrush_worker_failures=0 _zrush_disabled=0 _zrush_disable_reason= _zrush_enabled=1
     _zrush_worker_txq=() _zrush_worker_pending=() _zrush_cc_staged=()
+    _zrush_cc_staged_cwd=() _zrush_reuse_staged=()
+    _zrush_reuse_drop
     _zrush_namespace_payload= _zrush_namespace_queued= _zrush_namespace_acked=
     _zrush_namespace_pending=()
     _zrush_namespace_latest_id=0
@@ -766,6 +768,51 @@ reserialize_plan() {  # -> REPLY=bytes, or return 1 with REPLY=reason
     ok "request wiring: the slot follows the cache's subject and only a store ok takes the latch"
   else
     ng "request wiring: finalize store/plan pair or latch commit mismatch"
+  fi
+
+  # See docs/internal/specs/behavior.md "Candidate Reuse".
+  local outcome= reuse_id= reuse_generation=
+  local -i reuse_wire=1
+  for outcome in ok changed invalid-payload superseded; do
+    wire_reset
+    LBUFFER='git che'
+    _zrush_send_input
+    _zrush_worker_txq=()
+    _zrush_collect_gen=$_zrush_input_gen _zrush_buf=
+    _zrush_finalize
+    wire_fields "$_zrush_worker_txq[1]" && sf=( "${(@)reply}" ) || reuse_wire=0
+    reuse_id=$sf[2] reuse_generation=$sf[4]
+    [[ $sf[3] == live && -z $sf[6] ]] || reuse_wire=0
+    (( _zrush_reuse_gen == 0 && ${+_zrush_reuse_staged[$reuse_id]} )) || reuse_wire=0
+    if [[ $outcome == changed ]]; then
+      LBUFFER='git checkout '
+      _zrush_send_input
+      LBUFFER='git che'
+      _zrush_send_input
+    fi
+    if [[ $outcome == ok || $outcome == changed ]]; then
+      _zrush_encode_message ok $reuse_id ''
+    else
+      _zrush_encode_message error $reuse_id $outcome
+    fi
+    _zrush_netstring_take "$REPLY"
+    _zrush_worker_handle_message "$REPLY"
+    _zrush_worker_txq=()
+    LBUFFER='git chec'
+    _zrush_send_input
+    wire_fields "$_zrush_worker_txq[1]" && hf=( "${(@)reply}" ) || reuse_wire=0
+    if [[ $outcome == ok ]]; then
+      [[ $hf[3] == $reuse_generation ]] || reuse_wire=0
+    else
+      [[ $hf[3] == 0 ]] || reuse_wire=0
+    fi
+    (( $#_zrush_reuse_staged == 0 )) || reuse_wire=0
+  done
+  LBUFFER=
+  if (( reuse_wire )); then
+    ok "candidate reuse: empty live payload requires ok; a late ok cannot restore a departed key"
+  else
+    ng "candidate reuse: staged live generation or invalidation mismatch"
   fi
 
   # ---- History index requests, observed on the same outbound queue ----

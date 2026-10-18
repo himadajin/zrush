@@ -1,6 +1,6 @@
-//! Empty-word collection cache: what a hit skips, what forces a miss, and how
+//! Keyed candidate reuse: what a hit skips, what forces a miss, and how
 //! the candidate store latch dies with the worker session it belongs to
-//! (docs/internal/specs/behavior.md "Empty-Word Collection Cache", "Worker Lifecycle",
+//! (docs/internal/specs/behavior.md "Candidate Reuse", "Worker Lifecycle",
 //! docs/internal/contracts/cli-protocol.md "Requests and Responses"
 //! and "Response Validation and zsh-Side Application (Normative)").
 
@@ -10,7 +10,7 @@ use crate::fake::Mode;
 use crate::host::{Host, PlanShape, SHUTDOWN_SEAM, dump_field, keys, state_has};
 
 /// A command-position word: the widening rule empties it, so the collection it
-/// provokes is the cache's subject (behavior.md "Candidate Collection", "Empty-Word Collection Cache").
+/// provokes is the cache's subject (behavior.md "Candidate Collection", "Candidate Reuse").
 const QUERY: &str = "whic";
 
 /// The frame that carries a candidate record stream; a hit sends none.
@@ -21,7 +21,7 @@ const COLLECTING: &str = "collect: collecting";
 const HIT: &str = "cache: hit (generation=";
 const LATCHED: &str = "cache: latched";
 /// The worker answering a latched notification with `capture-required`: the
-/// latch names a generation it does not hold (behavior.md "Empty-Word Collection Cache").
+/// latch names a generation it does not hold (behavior.md "Candidate Reuse").
 const LATCH_DROPPED: &str = "cache: latch dropped by capture-required";
 
 /// Type [`QUERY`] and wait until the cache has decided that request: either it
@@ -230,7 +230,7 @@ fn a_changed_environment_expires_the_fingerprint() {
 /// A new executable in a `$PATH` directory is a new command-position candidate
 /// that no shell name set notices -- only that directory's mtime does. The
 /// change lands between two prompts, which is where the fingerprint the
-/// notification compares against is computed (behavior.md "Empty-Word Collection Cache").
+/// notification compares against is computed (behavior.md "Candidate Reuse").
 #[test]
 fn a_new_executable_on_path_expires_the_fingerprint() {
     let mut host = Host::boot();
@@ -286,7 +286,7 @@ fn a_new_executable_on_path_expires_the_fingerprint() {
 /// builtins are all as numerous as they were. The fingerprint carries the name
 /// lists themselves, so the replacement is what expires it -- and the
 /// recollection is what puts the new name in the listing
-/// (behavior.md "Empty-Word Collection Cache").
+/// (behavior.md "Candidate Reuse").
 #[test]
 fn a_same_count_replacement_expires_the_fingerprint() {
     let mut host = Host::boot();
@@ -455,7 +455,7 @@ fn the_latch_dies_with_the_worker_session_and_with_a_re_source() {
 /// zrush generates one handler function per armed `zle -F` watcher, so its own
 /// function table moves whenever a worker session starts or stops. None of that
 /// is a candidate-set change, and the fingerprint covers only the names outside
-/// zrush's namespace so that it says so (behavior.md "Empty-Word Collection Cache").
+/// zrush's namespace so that it says so (behavior.md "Candidate Reuse").
 /// A restart still costs one recollection -- through the latch, which is the
 /// worker's own state -- but the fingerprint must survive it untouched.
 #[test]
@@ -567,7 +567,7 @@ fn live_slot_stores_leave_the_cached_generation_intact() {
 /// costs no session failure and replays nothing. Only the notification that
 /// named the latch drops it and recollects; one that named the reserved `0`
 /// collects without touching any latch
-/// (behavior.md "Empty-Word Collection Cache", cli-protocol.md "Input Notifications and Worker Events").
+/// (behavior.md "Candidate Reuse", cli-protocol.md "Input Notifications and Worker Events").
 #[test]
 fn capture_required_drops_only_the_latch_its_notification_named() {
     let mut host = Host::boot_fake();
@@ -632,7 +632,7 @@ fn capture_required_drops_only_the_latch_its_notification_named() {
 /// The quiet period is there to suppress captures, so a notification the
 /// candidate store already answers settles at acceptance however long
 /// `delay-ms` is, while one that may still need a capture waits it out
-/// (cli-protocol.md "Worker-Side Norms", behavior.md "Empty-Word Collection Cache").
+/// (cli-protocol.md "Worker-Side Norms", behavior.md "Candidate Reuse").
 /// A `delay-ms` far longer than any of this test's waits is what separates the
 /// two: an immediate listing cannot be the quiet period expiring early.
 #[test]
@@ -663,4 +663,106 @@ fn a_latched_input_renders_without_waiting_out_the_quiet_period() {
         host.wait_log(COLLECTING, collecting, Duration::from_secs(10)),
         "(cc-7c) the unresolvable input never settled"
     );
+}
+
+#[test]
+fn a_live_candidate_is_reused_for_typing_deletion_and_cursor_movement() {
+    let mut host =
+        Host::boot_with_config("[display]\ndelay-ms = 2000\n[matching]\nmode = \"prefix\"\n");
+    host.send_keys_wait_plan(PlanShape::Nonempty, "ls fx/basic/al");
+    let stores = host.log_count(STORE);
+    let captures = host.log_count(COLLECTING);
+    for key in ["p", "\x7f", keys::LEFT, keys::RIGHT] {
+        let ready = host.log_count(READY);
+        host.send_keys(key);
+        assert!(host.wait_log(READY, ready, Duration::from_millis(1000)));
+        assert_eq!(host.log_count(STORE), stores);
+        assert_eq!(host.log_count(COLLECTING), captures);
+        let listing = host.postdisplay("live reuse");
+        assert!(listing.contains("alpha.txt"));
+        assert_eq!(listing.contains("alsoalpha.txt"), key != "p");
+    }
+    assert_eq!(last_store(&host, "live reuse").0, "live");
+}
+
+#[test]
+fn leaving_a_collection_key_discards_live_reuse_even_when_returning() {
+    let mut host = Host::boot();
+    host.send_keys_wait_plan(PlanShape::Nonempty, "ls fx/basic/subdir");
+    let stores = host.log_count(STORE);
+    host.send_keys_wait_plan(PlanShape::Nonempty, "/in");
+    assert_eq!(host.log_count(STORE), stores + 1);
+    host.send_keys_wait_plan(PlanShape::Nonempty, "\x7f\x7f\x7f");
+    assert_eq!(host.log_count(STORE), stores + 2);
+
+    host.clear_line();
+    host.send_keys_wait_plan(PlanShape::Nonempty, "ls fx/basic/al");
+    assert_eq!(host.log_count(STORE), stores + 3);
+}
+
+#[test]
+fn line_initialization_and_worker_replacement_discard_live_reuse() {
+    let mut host = Host::boot();
+    host.send_line(SHUTDOWN_SEAM);
+    host.sync_prompt(Duration::from_secs(5));
+    host.send_keys_wait_plan(PlanShape::Nonempty, "ls fx/basic/al");
+    assert!(host.send_break_and_sync(Duration::from_secs(5)));
+    let stores = host.log_count(STORE);
+    host.send_keys_wait_plan(PlanShape::Nonempty, "ls fx/basic/al");
+    assert_eq!(host.log_count(STORE), stores + 1);
+
+    host.press(keys::WORKER_TEARDOWN);
+    host.wait_worker_state(Duration::from_secs(10), &["stopping=0", "ready=0"])
+        .expect("worker shutdown completed");
+    let stores = host.log_count(STORE);
+    host.send_keys_wait_plan(PlanShape::Nonempty, "p");
+    assert_eq!(host.log_count(STORE), stores + 1);
+}
+
+#[test]
+fn an_unknown_live_generation_recollects_without_failing_the_session() {
+    let mut host = Host::boot_fake();
+    host.fake().set_mode(Mode::UnknownGeneration);
+    host.send_keys_wait_plan(PlanShape::Zero, "ls fx/basic/al");
+    let stores = host.log_count(STORE);
+    let dropped = host.log_count("reuse: latch dropped by capture-required");
+    host.send_keys_wait_plan(PlanShape::Zero, "p");
+    assert_eq!(host.log_count(STORE), stores + 1);
+    assert_eq!(
+        host.log_count("reuse: latch dropped by capture-required"),
+        dropped + 1
+    );
+    assert!(state_has(
+        &host.worker_state(),
+        &["failures=0", "disabled=0"]
+    ));
+}
+
+#[test]
+fn an_empty_word_cache_entry_requires_the_same_cwd() {
+    let mut host = Host::boot();
+    warm_to_a_hit(&mut host, "cwd setup");
+    host.send_line("cd fx/basic");
+    host.sync_prompt(Duration::from_secs(5));
+    let misses = host.log_count("cache: miss (cwd)");
+    assert!(!query(&mut host, "changed cwd"));
+    assert!(host.log_count("cache: miss (cwd)") > misses);
+}
+
+#[test]
+fn changing_cwd_during_line_editing_discards_live_reuse() {
+    let mut host = Host::boot_completion(
+        r#"
+_zrushtest_chdir() { builtin cd fx/basic }
+zle -N _zrushtest-chdir _zrushtest_chdir
+bindkey '^Xo' _zrushtest-chdir
+"#,
+        10,
+    );
+    host.send_keys_wait_plan(PlanShape::Nonempty, "ls fx/basic/al");
+    let stores = host.log_count(STORE);
+    host.press("\x18o");
+    host.send_keys_wait_plan(PlanShape::Zero, "p");
+    assert_eq!(host.log_count(STORE), stores + 1);
+    assert!(host.postdisplay("changed cwd").is_empty());
 }

@@ -236,25 +236,19 @@ typeset -ga _zrush_syn_hl=()
 typeset -gi _zrush_selected=0      # 0=unselected; >0=one-based, column-major display position
 typeset -gi _zrush_tab_pending=0   # Tab was pressed before candidates arrived
 
-# See docs/internal/specs/behavior.md "Empty-Word Collection Cache".
-# Cache storage is separate from working state and survives across prompts.
-# The parsed candidates live in the worker's `cache` slot; this side keeps only
-# the fingerprint, the save time and the candidate store latch. An empty
-# fingerprint means no cache entry.
-typeset -g  _zrush_cc_fp=          # fingerprint at save time
-typeset -gi _zrush_cc_time=0       # save time (EPOCHSECONDS)
-# This prompt's fingerprint, computed once per prompt and used by every
-# comparison and snapshot on the line. Empty until the first precmd of a
-# source computes it.
+# See docs/internal/specs/behavior.md "Candidate Reuse".
+typeset -g  _zrush_cc_fp=
+typeset -gi _zrush_cc_time=0
 typeset -g  _zrush_cc_prompt_fp=
-# Candidate store latch: the generation this worker session holds in its
-# `cache` slot, 0 when there is none. Belongs to the worker session, so a
-# source starts without one (behavior.md "Worker Lifecycle").
+typeset -g  _zrush_cc_cwd=
 typeset -gi _zrush_cc_cand_gen=0
-# Cache entries whose `store` is still outstanding, by request_id ->
-# "<save time> <fingerprint>"; they become the latch on that store's `ok`.
-typeset -gA _zrush_cc_staged=()
-typeset -gi _ZRUSH_CC_TTL=300      # seconds; catches same-count replacement and is not configurable
+typeset -gA _zrush_cc_staged=()      # request_id -> "<save time> <fingerprint>"
+typeset -gA _zrush_cc_staged_cwd=()
+typeset -gi _ZRUSH_CC_TTL=300
+
+typeset -g  _zrush_reuse_query= _zrush_reuse_cwd=
+typeset -gi _zrush_reuse_gen=0 _zrush_reuse_epoch=0
+typeset -gA _zrush_reuse_staged=()   # request_id -> key epoch at enqueue
 
 # See docs/internal/specs/behavior.md "History Menu".
 # The worker owns the history index; this side keeps only the history index
@@ -870,8 +864,8 @@ _zrush_teardown() {
   return 0
 }
 
-# ---------------------------------------------------------------- Empty-word collection cache
-# See docs/internal/specs/behavior.md "Empty-Word Collection Cache".
+# ---------------------------------------------------------------- Candidate reuse
+# See docs/internal/specs/behavior.md "Candidate Reuse".
 # The name sets come from _zrush_namespace_signature_probe, so one scan per
 # prompt serves both this fingerprint and the namespace snapshot; the caller
 # passes the signature it already has. Do not use $#commands: lazy command
@@ -910,7 +904,7 @@ _zrush_cc_prompt_refresh() {  # [namespace-signature]
 }
 
 # REPLY = this prompt's fingerprint, computing it on the spot when no precmd
-# has produced one yet (behavior.md "Empty-Word Collection Cache").
+# has produced one yet (behavior.md "Candidate Reuse").
 _zrush_cc_fp_current() {
   if [[ -z $_zrush_cc_prompt_fp ]]; then
     _zrush_cc_prompt_refresh
@@ -920,8 +914,31 @@ _zrush_cc_fp_current() {
   return 0
 }
 
-# The worker no longer holds the cache slot's generation. Called from every
-# invalidation point named in behavior.md "Worker Lifecycle".
+# See docs/internal/specs/behavior.md "Candidate Reuse".
+_zrush_reuse_drop() {
+  _zrush_reuse_gen=0
+  (( ++_zrush_reuse_epoch ))
+  return 0
+}
+
+_zrush_reuse_track() {  # widened collection string
+  if [[ $1 != "$_zrush_reuse_query" || $PWD != "$_zrush_reuse_cwd" ]]; then
+    _zrush_reuse_drop
+    _zrush_reuse_query=$1 _zrush_reuse_cwd=$PWD
+  fi
+  return 0
+}
+
+_zrush_reuse_commit() {  # request_id generation
+  local epoch=${_zrush_reuse_staged[$1]:-}
+  unset "_zrush_reuse_staged[$1]"
+  if [[ -n $epoch ]] && (( epoch == _zrush_reuse_epoch )); then
+    _zrush_reuse_gen=$2
+    _zlog "reuse: latched (generation=$2)"
+  fi
+  return 0
+}
+
 _zrush_cc_latch_drop() {
   _zrush_cc_cand_gen=0
   return 0
@@ -942,7 +959,7 @@ _zrush_cc_subject() {
   [[ -z $_zrush_query ]]
 }
 
-# Checked when the notification is made (behavior.md "Empty-Word Collection Cache").
+# Checked when the notification is made (behavior.md "Candidate Reuse").
 _zrush_cc_check() {  # 0=usable hit; on a miss, log the reason and return nonzero
   emulate -L zsh
   if [[ -z $_zrush_cc_fp ]]; then
@@ -959,6 +976,11 @@ _zrush_cc_check() {  # 0=usable hit; on a miss, log the reason and return nonzer
     _zrush_cc_invalidate
     return 1
   fi
+  if [[ $PWD != "$_zrush_cc_cwd" ]]; then
+    _zlog "cache: miss (cwd)"
+    _zrush_cc_invalidate
+    return 1
+  fi
   _zrush_cc_fp_current
   if [[ $REPLY != "$_zrush_cc_fp" ]]; then
     _zlog "cache: miss (fingerprint)"
@@ -970,7 +992,7 @@ _zrush_cc_check() {  # 0=usable hit; on a miss, log the reason and return nonzer
 }
 
 # The latch may only name a generation the worker actually holds
-# (behavior.md "Empty-Word Collection Cache"), so an entry is staged when the `cache`
+# (behavior.md "Candidate Reuse"), so an entry is staged when the `cache`
 # store goes out and committed when that store's `ok` comes back. The save time
 # and this prompt's fingerprint are snapshotted here, at collection time: values
 # taken on arrival would describe an environment the capture never saw.
@@ -978,13 +1000,15 @@ _zrush_cc_stage() {  # $1=store request_id
   emulate -L zsh
   _zrush_cc_fp_current
   _zrush_cc_staged[$1]="$EPOCHSECONDS $REPLY"
+  _zrush_cc_staged_cwd[$1]=$PWD
   return 0
 }
 
 _zrush_cc_commit() {  # $1=store request_id $2=generation the worker accepted
   emulate -L zsh
   local staged=${_zrush_cc_staged[$1]:-}
-  unset "_zrush_cc_staged[$1]"
+  _zrush_cc_cwd=${_zrush_cc_staged_cwd[$1]:-}
+  unset "_zrush_cc_staged[$1]" "_zrush_cc_staged_cwd[$1]"
   [[ -n $staged ]] || return 0
   _zrush_cc_time=${staged%% *}
   _zrush_cc_fp=${staged#* }
@@ -1081,7 +1105,7 @@ _zrush_on_data() {  # zle -F -w handler ($1=fd)
 # an accepted store with the `plan-ready` for that same input. A successful
 # empty-word command-position collection is the cache's subject, so it stores
 # into the `cache` slot; the latch itself is staged here and taken only once
-# that store answers `ok` (behavior.md "Empty-Word Collection Cache").
+# that store answers `ok` (behavior.md "Candidate Reuse").
 _zrush_finalize() {
   emulate -L zsh
   setopt localoptions no_monitor no_notify
@@ -1488,6 +1512,7 @@ _zrush_worker_begin_stop() {
   # this is a normal shutdown, an abort, or a session failure
   # (behavior.md "Worker Lifecycle": one invalidation set for both latches).
   _zrush_cc_latch_drop
+  _zrush_reuse_drop
   _zrush_hist_invalidate session-stop
   _zrush_namespace_latch_drop
   # The worker's current input dies with the session too, so the generation it
@@ -1497,6 +1522,8 @@ _zrush_worker_begin_stop() {
   _zrush_worker_txq=()
   _zrush_worker_pending=()
   _zrush_cc_staged=()
+  _zrush_cc_staged_cwd=()
+  _zrush_reuse_staged=()
   _zrush_sync_target=0 _zrush_sync_done=0 _zrush_sync_ok=0
 }
 
@@ -1512,6 +1539,8 @@ _zrush_worker_finalize() {
   _zrush_worker_txq=()
   _zrush_worker_pending=()
   _zrush_cc_staged=()
+  _zrush_cc_staged_cwd=()
+  _zrush_reuse_staged=()
   _zrush_namespace_latch_drop
   _zrush_sync_target=0 _zrush_sync_done=0 _zrush_sync_ok=0
   _zrush_worker_stopping=0
@@ -1664,6 +1693,7 @@ _zrush_worker_start() {
   (( _zrush_worker_rfd >= 0 )) && return 0
   # A new session starts with empty slots and an uninitialized index.
   _zrush_cc_latch_drop
+  _zrush_reuse_drop
   _zrush_hist_invalidate session-start
   _zrush_namespace_latch_drop
   _zrush_worker_runtime_valid || {
@@ -1951,7 +1981,7 @@ _zrush_worker_handle_message() {  # message [absolute-deadline]
     # A store that ends in error changed no slot, so its staged entry never
     # becomes a latch -- `superseded` included (cli-protocol.md
     # "Response Validation and zsh-Side Application (Normative)": only an `ok` moves the latch).
-    unset "_zrush_cc_staged[$id]"
+    unset "_zrush_cc_staged[$id]" "_zrush_cc_staged_cwd[$id]" "_zrush_reuse_staged[$id]"
     if [[ $reqkind == namespace-snapshot ]]; then
       _zrush_namespace_settle $id error
     else
@@ -2002,9 +2032,12 @@ _zrush_worker_handle_message() {  # message [absolute-deadline]
       _zrush_status_set ""
     fi
     # The worker now holds this generation, so the entry staged for it becomes
-    # the latch (behavior.md "Empty-Word Collection Cache"). The history index latch is
+    # the latch (behavior.md "Candidate Reuse"). The history index latch is
     # not staged: it already moved optimistically when the frame was enqueued.
-    [[ $slot == cache ]] && _zrush_cc_commit $id $stored_gen
+    if [[ $reqkind == store ]]; then
+      [[ $slot == cache ]] && _zrush_cc_commit $id $stored_gen
+      _zrush_reuse_commit $id $stored_gen
+    fi
     _zlog "worker: ok $reqkind request_id=$id slot=$slot generation=$stored_gen binding=$bound_gen"
     return 0
   fi
@@ -2117,13 +2150,16 @@ _zrush_worker_handle_event() {  # kind input_generation [plan_body|highlight_bod
   fi
   _zrush_input_pending=0
   if [[ $kind == capture-required ]]; then
-    # The notification named the cache latch's generation and the worker turns
-    # out not to hold it: the latch is wrong, and this is a notification of that
-    # rather than an error (behavior.md "Empty-Word Collection Cache").
+    # See docs/internal/specs/behavior.md "Candidate Reuse".
     if (( _zrush_input_latched )); then
       _zrush_input_latched=0
-      _zrush_cc_latch_drop
-      _zlog "cache: latch dropped by capture-required"
+      if [[ -z $_zrush_query ]]; then
+        _zrush_cc_latch_drop
+        _zlog "cache: latch dropped by capture-required"
+      else
+        _zrush_reuse_drop
+        _zlog "reuse: latch dropped by capture-required"
+      fi
     fi
     _zrush_start_collection
     return 0
@@ -2353,7 +2389,11 @@ _zrush_request_store() {  # slot payload input-generation -> REPLY = candidate g
   _zrush_next_cand_gen || return 1
   local -i gen=$REPLY
   _zrush_worker_pending[$id]="store $slot $gen $input_gen"
-  [[ $slot == cache ]] && _zrush_cc_stage $id
+  if [[ $slot == cache ]]; then
+    _zrush_cc_stage $id
+  elif [[ -n $_zrush_query ]]; then
+    _zrush_reuse_staged[$id]=$_zrush_reuse_epoch
+  fi
   _zrush_encode_message store "$id" "$slot" "$gen" "$input_gen" "$payload"
   _zrush_worker_txq+=( "$REPLY" )
   _zlog "worker: queued store request_id=$id slot=$slot generation=$gen input_generation=$input_gen bytes=${#REPLY} queued=$#_zrush_worker_txq"
@@ -2431,9 +2471,7 @@ _zrush_request_plan() {  # candidate-generation query [offset]
 # with one event. The caller has already applied the suppression rules and the
 # input-pressure check, so reaching here means a notification is owed.
 #
-# The quiet period itself is `delay-ms`, measured by the worker; this side has
-# no timer. The candidate generation is the empty-word cache's latch when it
-# hits and the reserved 0 otherwise (behavior.md "Empty-Word Collection Cache").
+# See docs/internal/specs/behavior.md "Candidate Reuse".
 #
 # A decoration-only notification follows one rule set instead (behavior.md
 # "Candidate Collection"): candidate_generation is always 0 with no cache check,
@@ -2450,11 +2488,19 @@ _zrush_send_input() {  # [1 = decoration-only]
 
   _zrush_widen "$LBUFFER"
   _zrush_query=$REPLY_WIDENED
+  _zrush_reuse_track "$_zrush_query"
   _zrush_fuzzy=${REPLY_QUERY//$'\0'/}   # the sender must strip NUL from the query
 
   local -i cand_gen=0 latched=0
-  if (( !decor )) && _zrush_cc_subject && _zrush_cc_check; then
-    cand_gen=$_zrush_cc_cand_gen latched=1
+  if (( !decor )); then
+    if _zrush_cc_subject; then
+      if _zrush_cc_check; then
+        cand_gen=$_zrush_cc_cand_gen latched=1
+      fi
+    elif (( _zrush_reuse_gen > 0 )); then
+      cand_gen=$_zrush_reuse_gen latched=1
+      _zlog "reuse: hit (generation=$cand_gen)"
+    fi
   fi
 
   # Per-call context for the buffer lexer. `enabled = false` is expressed by an
@@ -3024,6 +3070,8 @@ _zrush_notify_input() {
   _zrush_rh_clear_sel
   _zrush_apply_indicator
 
+  _zrush_widen "$LBUFFER"
+  _zrush_reuse_track "$REPLY_WIDENED"
   if [[ -z ${BUFFER//[[:space:]]/} ]]; then
     _zrush_teardown
     _zrush_rh_clear_syn
@@ -3031,7 +3079,6 @@ _zrush_notify_input() {
   fi
 
   local -i decor=0
-  _zrush_widen "$LBUFFER"
   if (( ${#REPLY_WORD} < ZRUSH_CFG_MIN_INPUT )); then
     _zrush_teardown
     [[ $ZRUSH_CFG_SYNTAX_ENABLED == true ]] || return 0
@@ -3071,6 +3118,7 @@ _zrush_line_pre_redraw() {
 
 _zrush_line_init() {
   emulate -L zsh
+  _zrush_reuse_drop
   _zrush_last_buffer=
   _zrush_last_cursor=-1
   # A new ZLE session can follow an exit that bypassed _zrush_line_finish
@@ -3175,13 +3223,7 @@ _zrush_confirm_pos() {  # $1=one-based position into _zrush_plan_insert
   fi
   _zlog "confirm: kind=$_zrush_plan_kind pos=$pos insert=${(qqqq)text}"
 
-  # After confirmation, clear selection/list and invalidate the pre-redraw
-  # baseline, so the next pre-redraw always treats the insertion as a buffer
-  # change and triggers recollection (behavior.md "Confirmation (Insertion)"), matching the
-  # common-prefix insertion path. Leaving the baseline alone would not do: an
-  # insertion identical to what the baseline already records -- confirming the
-  # history candidate that equals the current line, say -- would read as "no
-  # change" and stall the recollection.
+  # See docs/internal/specs/behavior.md "Confirmation (Insertion)".
   _zrush_last_buffer=
   _zrush_last_cursor=-1
   _zrush_input_invalidate
@@ -3453,7 +3495,7 @@ _zrush_tab_with_results() {  # Tab behavior when results are available
         local pre=${LBUFFER[1,$#LBUFFER-$#word]}
         LBUFFER=$pre$keep${(q)cp}
         _zlog "tab: common-prefix inserted ${(qqqq)cp}"
-        # Partial insertion is not confirmation; leave last_buffer stale to trigger recollection.
+        # See docs/internal/specs/behavior.md "Tab".
       else
         _zlog "tab: common-prefix fallback -> insert top (cp=${(qqqq)cp} q=${(qqqq)q})"
         (( _zrush_plan_npos > 0 )) && _zrush_confirm_pos 1

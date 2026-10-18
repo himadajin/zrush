@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use crate::fake::Mode;
 use crate::hist::{NO_COLLECTION, assert_no_history_kind, open_menu};
-use crate::host::{Host, keys};
+use crate::host::{Host, PlanShape, keys};
 
 /// Down at the newest history entry closes the menu and resumes normal
 /// completion for the unchanged input (behavior.md "History Menu").
@@ -247,42 +247,40 @@ fn opening_the_menu_cancels_an_in_flight_collection_and_confirm_resumes_it() {
     );
 }
 
-/// Regression (f6fcf2e): confirming a history candidate byte-identical to the
-/// current BUFFER must still trigger recollection. Opening the menu snapshots
-/// BUFFER/CURSOR as the pre-redraw baseline (behavior.md "History Menu"); if
-/// confirm left that baseline untouched, an insertion identical to the pre-open
-/// buffer would read as "no change" on the next pre-redraw and silently stall
-/// recollection (behavior.md "Confirmation (Insertion)").
+/// See behavior.md "Confirmation (Insertion)" and "Candidate Reuse".
 #[test]
-fn confirming_an_entry_identical_to_the_buffer_recollects_via_enter() {
-    assert_exact_match_confirm_recollects(keys::ENTER, "(h22-setup-enter)", "(h22a)");
+fn confirming_an_entry_identical_to_the_buffer_resumes_completion_via_enter() {
+    assert_exact_match_confirm_resumes_completion(keys::ENTER, "(h22-setup-enter)", "(h22a)");
 }
 
-/// [`confirming_an_entry_identical_to_the_buffer_recollects_via_enter`] through
+/// [`confirming_an_entry_identical_to_the_buffer_resumes_completion_via_enter`] through
 /// the other confirm key.
 #[test]
-fn confirming_an_entry_identical_to_the_buffer_recollects_via_tab() {
-    assert_exact_match_confirm_recollects(keys::TAB, "(h22-setup-tab)", "(h22b)");
+fn confirming_an_entry_identical_to_the_buffer_resumes_completion_via_tab() {
+    assert_exact_match_confirm_resumes_completion(keys::TAB, "(h22-setup-tab)", "(h22b)");
 }
 
-fn assert_exact_match_confirm_recollects(confirm: &str, setup_label: &str, label: &str) {
+fn assert_exact_match_confirm_resumes_completion(confirm: &str, setup_label: &str, label: &str) {
     let mut host = Host::boot_history();
-    open_menu(&mut host, "echo newest");
+    host.send_keys_wait_plan(PlanShape::Zero, "echo newest");
+    host.press(keys::UP);
     let kind = host.listing_kind(setup_label);
     assert_eq!(
         kind, "kind=history sel=1 listing=1 npos=1",
         "{setup_label} exact-match menu did not open as expected:"
     );
 
-    // The recollection the confirm has to provoke is a compsys one, so what
-    // proves it ran is its own `store` reaching the worker.
-    let answered = "worker: ok store request_id=";
+    let stores = host.log_count("worker: queued store request_id=");
+    let answered = "worker: plan-ready applied";
     let before = host.log_count(answered);
     host.press(confirm);
     assert!(
         host.wait_log(answered, before, Duration::from_secs(3)),
-        "{label} no fresh compsys recollection after confirming an exact-BUFFER-match entry"
+        "{label} no completion update after confirming an exact-BUFFER-match entry"
     );
+    assert_eq!(host.log_count("worker: queued store request_id="), stores);
+    host.assert_buffer("echo newest", label);
+    assert_no_history_kind(&host.listing_kind(label), label);
 }
 
 /// The fixture-injection mechanism itself (`print -s`, run from the host's rc

@@ -266,6 +266,8 @@ zsh は高々 1 個の通常補完再描画を待ち、その間の移動・確�
   worker はスロットごとに最大 1 generation の解析済み candidate store を保持し、
   新しい `store` の受理は**同一スロットの**前 generation だけを破棄する(他スロットの generation は残る)。
   candidate store は worker セッションに属し、worker の終了とともに失われる。
+  zsh は空語のプロンプトを跨ぐ保持に `cache`、それ以外に `live` を使い、
+  両方の受理済み generation を鍵付き再利用の対象にする(behavior.md「Candidate Reuse」節)。
   history index はスロットではない。
   `store` は index を変更せず、`history-snapshot` / `history-append` はどのスロットも変更しない。
 - `candidate_generation`: zsh が所有する `1..=9223372036854775807`(`i64::MAX`)の canonical ASCII 10 進識別子。
@@ -767,12 +769,12 @@ zpty 内で compsys を駆動して得る payload(behavior.md「Candidate Collec
   zsh が受信中に取り除いてから `store` 要求の `candidate_payload` へ入れる。
   Rust 側でのスキップは保険であり、通常の入力では発生しない。
 - `store` 要求のフィールド値: `slot` は空語収集キャッシュの対象となる収集なら `cache`、それ以外の収集なら `live`。
-  どの収集がキャッシュの対象かは behavior.md「Empty-Word Collection Cache」節が定める。
+  どの収集がキャッシュの対象かは behavior.md「Candidate Reuse」節が定める。
   `input_generation` は、この収集を始めさせた `capture-required` の対象 generation。
 - `input` 通知のフィールド値: `query` は広げ規則が定めるクエリ(behavior.md「Candidate Collection」節)、
   `trailing_space` は `[insert].trailing-space`、`delay_ms` は `[display].delay-ms` の設定値、
-  `candidate_generation` は空語収集キャッシュの latch が有効ならその generation、
-  それ以外は `0`(behavior.md「Empty-Word Collection Cache」節)。
+  `candidate_generation` は広げ結果と `cwd` に一致する再利用可能な latch があればその generation、
+  それ以外は `0`(behavior.md「Candidate Reuse」節)。
   ただし装飾専用の通知(behavior.md「Candidate Collection」節)は
   latch を名乗らず、キャッシュのヒット判定も行わずに常に `0` を送る。
   `buffer` は `BUFFER` 全体(`[syntax].enabled = false` なら空)、
@@ -1364,10 +1366,9 @@ typeset -g _ZRUSH_EXPECTED_BUILD_STAMP='<build-stamp>'
 4. 入力変化: zsh は新しい `input_generation` を採番して `input` 通知を直ちに送る。
    worker は受理と同時にバッファを字句解析して `syntax-highlight` を返し、
    zsh はそれを `BUFFER` 領域の `region_highlight` へ適用する。
-   続けて worker は `delay-ms` の静穏期間を張り、打鍵が続く間は新しい通知で置き換え続ける。
-   期間が満了すると、通知が名乗った `candidate_generation` を保持していれば
-   `plan-ready` を返し(空語収集キャッシュのヒットはこの経路になる)、
-   保持していなければ `capture-required` を返す。
+   通知が名乗った `candidate_generation` を保持していれば、静穏期間を待たず `plan-ready` を返す。
+   それ以外は `delay-ms` の静穏期間を張り、打鍵が続く間は新しい通知で置き換え続ける。
+   期間が満了しても候補がなければ `capture-required` を返す。
 5. `capture-required` 受信後: zsh が zpty 収集を 1 回だけ開始し、完走したら pid レコードを取り除いた
    捕獲 payload を、新しい `candidate_generation` と対象の `input_generation` を載せた `store` 要求
    (空語収集キャッシュの対象なら `cache`、それ以外は `live`)で送る。
