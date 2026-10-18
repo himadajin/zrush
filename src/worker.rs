@@ -760,39 +760,26 @@ fn parse_request(fields: Vec<Vec<u8>>) -> Request {
         Some(b"history-append") => parse_history(fields, HistoryWrite::Append),
         Some(b"plan") => parse_plan(fields),
         Some(b"completion") => parse_completion(fields),
-        _ => Request::Invalid,
+        _ => None,
     }
+    .unwrap_or(Request::Invalid)
 }
 
-fn parse_completion(fields: Vec<Vec<u8>>) -> Request {
-    let Ok([_kind, _id, input_generation, offset, selected, rows, width]) =
-        <[Vec<u8>; 7]>::try_from(fields)
-    else {
-        return Request::Invalid;
-    };
-    let (Some(input_generation), Some(offset), Some(selected), Some(rows), Some(width)) = (
-        parse_identifier(&input_generation),
-        parse_reference(&offset).and_then(|v| usize::try_from(v).ok()),
-        parse_positive_usize(&selected),
-        parse_positive_usize(&rows),
-        parse_positive_usize(&width),
-    ) else {
-        return Request::Invalid;
-    };
-    Request::Completion {
-        input_generation,
-        offset,
-        selected,
-        rows,
-        width,
-    }
+fn parse_completion(fields: Vec<Vec<u8>>) -> Option<Request> {
+    let [_kind, _id, input_generation, offset, selected, rows, width] =
+        <[Vec<u8>; 7]>::try_from(fields).ok()?;
+    Some(Request::Completion {
+        input_generation: parse_identifier(&input_generation)?,
+        offset: usize::try_from(parse_reference(&offset)?).ok()?,
+        selected: parse_positive_usize(&selected)?,
+        rows: parse_positive_usize(&rows)?,
+        width: parse_positive_usize(&width)?,
+    })
 }
 
-fn parse_namespace(fields: Vec<Vec<u8>>) -> Request {
-    let Ok([_kind, _id, payload]) = <[Vec<u8>; 3]>::try_from(fields) else {
-        return Request::Invalid;
-    };
-    Request::Namespace { payload }
+fn parse_namespace(fields: Vec<Vec<u8>>) -> Option<Request> {
+    let [_kind, _id, payload] = <[Vec<u8>; 3]>::try_from(fields).ok()?;
+    Some(Request::Namespace { payload })
 }
 
 #[derive(Debug)]
@@ -822,27 +809,15 @@ fn parse_name_set(payload: &[u8]) -> Result<BTreeSet<Vec<u8>>, InvalidNamespaceP
         .map_err(|_| InvalidNamespacePayload)
 }
 
-fn parse_store(fields: Vec<Vec<u8>>) -> Request {
-    let Ok([_kind, _id, slot, generation, input_generation, payload]) =
-        <[Vec<u8>; 6]>::try_from(fields)
-    else {
-        return Request::Invalid;
-    };
-    let Some(slot) = parse_slot(&slot) else {
-        return Request::Invalid;
-    };
-    let Some(generation) = parse_identifier(&generation) else {
-        return Request::Invalid;
-    };
-    let Some(input_generation) = parse_identifier(&input_generation) else {
-        return Request::Invalid;
-    };
-    Request::Store {
-        slot,
-        generation,
-        input_generation,
+fn parse_store(fields: Vec<Vec<u8>>) -> Option<Request> {
+    let [_kind, _id, slot, generation, input_generation, payload] =
+        <[Vec<u8>; 6]>::try_from(fields).ok()?;
+    Some(Request::Store {
+        slot: parse_slot(&slot)?,
+        generation: parse_identifier(&generation)?,
+        input_generation: parse_identifier(&input_generation)?,
         payload,
-    }
+    })
 }
 
 /// cli-protocol.md "Input Notifications and Worker Events": an `input` notification, whose
@@ -867,11 +842,6 @@ fn parse_input(fields: Vec<Vec<u8>>, now: Instant) -> Option<CurrentInput> {
     let generation = parse_identifier(&generation)?;
     let candidate_generation = parse_reference(&candidate_generation)?;
     let delay = parse_delay(&delay_ms)?;
-    let mode = Mode::parse(std::str::from_utf8(&mode).ok()?)?;
-    let smart_case = parse_bool(&smart_case)?;
-    let rows = parse_positive_usize(&rows)?;
-    let width = parse_positive_usize(&width)?;
-    let trailing_space = parse_bool(&trailing_space)?;
     let interactive_comments = parse_bool(&interactive_comments)?;
 
     Some(CurrentInput {
@@ -881,91 +851,65 @@ fn parse_input(fields: Vec<Vec<u8>>, now: Instant) -> Option<CurrentInput> {
         buffer,
         interactive_comments,
         params: plan::Params {
-            producer: Producer::Compsys,
-            query,
-            mode,
-            smart_case,
-            rows,
-            width,
-            trailing_space,
-            offset: 0,
+            trailing_space: parse_bool(&trailing_space)?,
+            ..parse_layout_params(Producer::Compsys, query, &mode, &smart_case, &rows, &width)?
         },
         resolved_generation: None,
         expiry: (!delay.is_zero()).then(|| now + delay),
     })
 }
 
-fn parse_history(fields: Vec<Vec<u8>>, write: HistoryWrite) -> Request {
-    let Ok([_kind, _id, generation, payload]) = <[Vec<u8>; 4]>::try_from(fields) else {
-        return Request::Invalid;
-    };
-    let Some(generation) = parse_identifier(&generation) else {
-        return Request::Invalid;
-    };
-    Request::History {
+fn parse_history(fields: Vec<Vec<u8>>, write: HistoryWrite) -> Option<Request> {
+    let [_kind, _id, generation, payload] = <[Vec<u8>; 4]>::try_from(fields).ok()?;
+    Some(Request::History {
         write,
-        generation,
+        generation: parse_identifier(&generation)?,
         payload,
-    }
+    })
 }
 
-fn parse_plan(fields: Vec<Vec<u8>>) -> Request {
-    let Ok(
-        [
-            _kind,
-            _id,
-            generation,
-            query,
-            mode,
-            smart_case,
-            rows,
-            width,
-            history_limit,
-            offset,
-        ],
-    ) = <[Vec<u8>; 10]>::try_from(fields)
-    else {
-        return Request::Invalid;
-    };
-
-    let Some(generation) = parse_identifier(&generation) else {
-        return Request::Invalid;
-    };
-    let Some(mode) = Mode::parse(std::str::from_utf8(&mode).unwrap_or("")) else {
-        return Request::Invalid;
-    };
-    let Some(smart_case) = parse_bool(&smart_case) else {
-        return Request::Invalid;
-    };
-    let Some(rows) = parse_positive_usize(&rows) else {
-        return Request::Invalid;
-    };
-    let Some(width) = parse_positive_usize(&width) else {
-        return Request::Invalid;
-    };
-    // Both fields are meaningful for the history-only plan and mandatory in
-    // its request shape (cli-protocol.md "Requests and Responses").
-    let Some(history_limit) = parse_identifier(&history_limit) else {
-        return Request::Invalid;
-    };
-    let Some(offset) = parse_nonneg_usize(&offset) else {
-        return Request::Invalid;
-    };
-
-    Request::Plan {
+fn parse_plan(fields: Vec<Vec<u8>>) -> Option<Request> {
+    let [
+        _kind,
+        _id,
         generation,
-        history_limit: usize::try_from(history_limit).unwrap_or(usize::MAX),
+        query,
+        mode,
+        smart_case,
+        rows,
+        width,
+        history_limit,
+        offset,
+    ] = <[Vec<u8>; 10]>::try_from(fields).ok()?;
+
+    Some(Request::Plan {
+        generation: parse_identifier(&generation)?,
+        history_limit: usize::try_from(parse_identifier(&history_limit)?).unwrap_or(usize::MAX),
         params: plan::Params {
-            producer: Producer::History,
-            query,
-            mode,
-            smart_case,
-            rows,
-            width,
-            trailing_space: false,
-            offset,
+            offset: parse_nonneg_usize(&offset)?,
+            ..parse_layout_params(Producer::History, query, &mode, &smart_case, &rows, &width)?
         },
-    }
+    })
+}
+
+fn parse_layout_params(
+    producer: Producer,
+    query: Vec<u8>,
+    mode: &[u8],
+    smart_case: &[u8],
+    rows: &[u8],
+    width: &[u8],
+) -> Option<plan::Params> {
+    Some(plan::Params {
+        producer,
+        query,
+        mode: Mode::parse(std::str::from_utf8(mode).ok()?)?,
+        smart_case: parse_bool(smart_case)?,
+        rows: parse_positive_usize(rows)?,
+        width: parse_positive_usize(width)?,
+        trailing_space: false,
+        offset: 0,
+    })
 }
 
 fn parse_slot(value: &[u8]) -> Option<Slot> {
@@ -2250,6 +2194,62 @@ mod tests {
 
         for id in [b"1".as_slice(), b"2", b"3", b"4"] {
             assert_eq!(reply(&decoded, id), error(id, b"invalid-request"));
+        }
+    }
+
+    #[test]
+    fn input_and_plan_reject_invalid_layout_scalars() {
+        for (input_index, plan_index, value) in [
+            (6, 4, b"".as_slice()),
+            (6, 4, b"unknown"),
+            (6, 4, b"\xff"),
+            (7, 5, b"1"),
+            (8, 6, b"0"),
+            (8, 6, b"01"),
+            (9, 7, b"0"),
+            (9, 7, b"18446744073709551616"),
+        ] {
+            let mut input = input_notification(b"1", b"0", b"0");
+            input[input_index] = value;
+            assert!(
+                parse_input(input.into_iter().map(Vec::from).collect(), Instant::now()).is_none(),
+                "input field {input_index}: {value:?}"
+            );
+
+            let mut plan = plan_request(b"1", b"9");
+            plan[plan_index] = value;
+            let decoded = session(&[message(&plan)]);
+            assert_eq!(
+                reply(&decoded, b"1"),
+                error(b"1", b"invalid-request"),
+                "plan field {plan_index}: {value:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn completion_and_history_plan_keep_distinct_offset_ranges() {
+        for (offset, completion_valid, plan_valid) in [
+            (b"0".as_slice(), true, true),
+            (b"9223372036854775807", true, true),
+            (b"9223372036854775808", false, true),
+            (b"18446744073709551615", false, true),
+            (b"18446744073709551616", false, false),
+        ] {
+            let decoded = session(&[
+                pending_input(b"7"),
+                message(&[b"completion", b"1", b"7", offset, b"1", b"3", b"6"]),
+                message(&history_plan_request_at(b"2", b"9", b"5000", offset)),
+            ]);
+            for (id, valid) in [(b"1".as_slice(), completion_valid), (b"2", plan_valid)] {
+                let code = if valid {
+                    b"unknown-generation".as_slice()
+                } else {
+                    b"invalid-request"
+                };
+                assert_eq!(reply(&decoded, id), error(id, code), "{offset:?}");
+            }
         }
     }
 
