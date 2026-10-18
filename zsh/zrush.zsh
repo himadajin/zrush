@@ -1202,6 +1202,24 @@ _zrush_encode_message() {
   _zrush_netstring "$payload"
 }
 
+# Flush never reads responses or dispatches callbacks, so callers can attach
+# request-specific state to the returned id before any response is consumed.
+_zrush_worker_request() {  # pending kind log-context fields... -> REPLY = request_id
+  emulate -L zsh
+  setopt localoptions typesetsilent no_monitor no_notify
+  local LC_ALL=C pending=$1 kind=$2 context=$3
+  shift 3
+  _zrush_next_request_id || return 1
+  local -i id=$REPLY
+  _zrush_worker_pending[$id]=$pending
+  _zrush_encode_message "$kind" "$id" "$@"
+  _zrush_worker_txq+=( "$REPLY" )
+  _zlog "worker: queued $kind request_id=$id${context:+ $context} bytes=${#REPLY} queued=$#_zrush_worker_txq"
+  _zrush_worker_flush || return 1
+  typeset -g REPLY=$id
+  return 0
+}
+
 _zrush_namespace_name_stream() {  # names... -> REPLY
   emulate -L zsh
   local LC_ALL=C name
@@ -1256,16 +1274,11 @@ _zrush_request_namespace() {  # canonical-payload
   (( _zrush_worker_rfd >= 0 && !_zrush_worker_stopping &&
      !_zrush_worker_runtime_tainted )) || return 1
   [[ $payload != "$_zrush_namespace_queued" ]] || return 0
-  _zrush_next_request_id || return 1
+  _zrush_worker_request namespace-snapshot namespace-snapshot '' "$payload" || return 1
   local -i id=$REPLY
-  _zrush_worker_pending[$id]=namespace-snapshot
   _zrush_namespace_pending[$id]=$payload
   _zrush_namespace_queued=$payload
   _zrush_namespace_latest_id=$id
-  _zrush_encode_message namespace-snapshot "$id" "$payload"
-  _zrush_worker_txq+=( "$REPLY" )
-  _zlog "worker: queued namespace-snapshot request_id=$id bytes=${#REPLY} queued=$#_zrush_worker_txq"
-  _zrush_worker_flush || return 1
   return 0
 }
 
@@ -2384,20 +2397,17 @@ _zrush_request_store() {  # slot payload input-generation -> REPLY = candidate g
   local -i input_gen=$3
   (( !_zrush_worker_stopping && !_zrush_worker_runtime_tainted )) || return 1
   _zrush_worker_ensure_session || return 1
-  _zrush_next_request_id || return 1
-  local -i id=$REPLY
   _zrush_next_cand_gen || return 1
   local -i gen=$REPLY
-  _zrush_worker_pending[$id]="store $slot $gen $input_gen"
+  _zrush_worker_request "store $slot $gen $input_gen" store \
+    "slot=$slot generation=$gen input_generation=$input_gen" \
+    "$slot" "$gen" "$input_gen" "$payload" || return 1
+  local -i id=$REPLY
   if [[ $slot == cache ]]; then
     _zrush_cc_stage $id
   elif [[ -n $_zrush_query ]]; then
     _zrush_reuse_staged[$id]=$_zrush_reuse_epoch
   fi
-  _zrush_encode_message store "$id" "$slot" "$gen" "$input_gen" "$payload"
-  _zrush_worker_txq+=( "$REPLY" )
-  _zlog "worker: queued store request_id=$id slot=$slot generation=$gen input_generation=$input_gen bytes=${#REPLY} queued=$#_zrush_worker_txq"
-  _zrush_worker_flush || return 1
   typeset -g REPLY=$gen
   return 0
 }
@@ -2417,20 +2427,15 @@ _zrush_request_history() {  # kind payload [event] -> REPLY = candidate generati
   local LC_ALL=C kind=$1 payload=$2 event=${3:-}
   (( !_zrush_worker_stopping && !_zrush_worker_runtime_tainted )) || return 1
   (( _zrush_worker_rfd >= 0 )) || return 1
-  _zrush_next_request_id || return 1
-  local -i id=$REPLY
   _zrush_next_cand_gen || return 1
   local -i gen=$REPLY
-  _zrush_worker_pending[$id]="$kind $gen"
-  _zrush_encode_message "$kind" "$id" "$gen" "$payload"
-  _zrush_worker_txq+=( "$REPLY" )
-  _zlog "worker: queued $kind request_id=$id generation=$gen bytes=${#REPLY} queued=$#_zrush_worker_txq"
+  _zrush_worker_request "$kind $gen" "$kind" "generation=$gen" "$gen" "$payload" || return 1
+  local -i id=$REPLY
   if [[ $kind == history-append ]]; then
     _zlog "history: append request_id=$id generation=$gen event=$event"
   else
     _zlog "history: snapshot request_id=$id generation=$gen bytes=${#payload}"
   fi
-  _zrush_worker_flush || return 1
   typeset -g REPLY=$gen
   return 0
 }
@@ -2450,18 +2455,11 @@ _zrush_request_plan() {  # candidate-generation query [offset]
   _zrush_geometry
   local -i rows=$REPLY_ROWS width=$REPLY_WIDTH
 
-  _zrush_next_request_id || return 1
-  local -i id=$REPLY
-  _zrush_worker_pending[$id]=plan
   # `plan` is the history-menu request; its profile, cwd, and trailing-space
   # policy are fixed by that path and do not appear on the wire.
-  _zrush_encode_message plan "$id" "$gen" "$query" \
-    "$ZRUSH_CFG_MODE" "$ZRUSH_CFG_SMART_CASE" "$rows" "$width" \
-    "$ZRUSH_CFG_HISTORY_LIMIT" "$offset"
-  _zrush_worker_txq+=( "$REPLY" )
-  _zlog "worker: queued request_id=$id plan=history generation=$gen offset=$offset bytes=${#REPLY} queued=$#_zrush_worker_txq"
-  _zrush_worker_flush || return 1
-  typeset -g REPLY=$id
+  _zrush_worker_request plan plan "plan=history generation=$gen offset=$offset" \
+    "$gen" "$query" "$ZRUSH_CFG_MODE" "$ZRUSH_CFG_SMART_CASE" "$rows" "$width" \
+    "$ZRUSH_CFG_HISTORY_LIMIT" "$offset" || return 1
   return 0
 }
 
@@ -3252,15 +3250,13 @@ _zrush_completion_replan() {  # global selection
   }
   _zrush_geometry
   local -i rows=$REPLY_ROWS width=$REPLY_WIDTH
-  _zrush_next_request_id || return 1
-  local -i id=$REPLY
-  _zrush_completion_pending=$id
+  _zrush_worker_request "completion $_zrush_input_gen" completion "target=$1" \
+    "$_zrush_input_gen" "$_zrush_plan_offset" "$1" "$rows" "$width" || {
+    _zrush_teardown
+    return 1
+  }
+  _zrush_completion_pending=$REPLY
   _zrush_completion_buffer=$BUFFER _zrush_completion_cursor=$CURSOR
-  _zrush_worker_pending[$id]="completion $_zrush_input_gen"
-  _zrush_encode_message completion "$id" "$_zrush_input_gen" "$_zrush_plan_offset" "$1" "$rows" "$width"
-  _zrush_worker_txq+=( "$REPLY" )
-  _zlog "completion: queued request_id=$id target=$1"
-  _zrush_worker_flush || { _zrush_teardown; return 1 }
   return 0
 }
 
