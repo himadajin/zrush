@@ -36,6 +36,8 @@
 #                timer-subprocess bucket, because neither exists:
 #                notify -> quiet-period -> capture-start -> compsys
 #                    -> capture-transport -> worker-roundtrip+apply
+#   reuse      : settled prefix + one key -> plan-ready, using log timestamps;
+#                every trial must hit live reuse without another capture
 #   colour     : keystroke to buffer decoration, taken from ZRUSH_LOG rather
 #                than from the pty: the applied checkpoint is subtracted from
 #                the moment the key was written, so the number is the whole
@@ -258,7 +260,7 @@ paint_break_hit_case() {  # needs one preceding command-position collection (see
   return 0
 }
 
-# ------------------------------------------------- keystroke -> colour
+# ------------------------------------------------- single keystroke -> worker event
 # behavior.md "Buffer Syntax Highlighting": the decoration event is answered
 # when the worker accepts the notification, without waiting for the quiet
 # period, so it is measured apart from first-paint rather than as a phase of it.
@@ -277,7 +279,7 @@ paint_break_hit_case() {  # needs one preceding command-position collection (see
 # change (behavior.md "Candidate Collection"), not to the key being measured.
 # The event is matched by the generation the measured keystroke notified under,
 # so a decoration the prefix was still owed cannot be timed in its place.
-syn_once() {  # $1=prefix keys $2=final keystroke -> REPLY=ms, REPLY_NOTIFY=ms
+key_event_once() {  # prefix final-key [syntax-highlight|plan-ready] -> REPLY=ms, REPLY_NOTIFY=ms
   typeset -g REPLY=NA REPLY_NOTIFY=NA
   send_keys $1
   drain 0.8
@@ -287,7 +289,8 @@ syn_once() {  # $1=prefix keys $2=final keystroke -> REPLY=ms, REPLY_NOTIFY=ms
   send_keys $2
   local -F dl=$(( SECONDS + 10 ))
   local -a L=()
-  local line gen=
+  local line gen= event=${3:-syntax-highlight}
+  local -i captured=0 hit=0
   while (( SECONDS < dl )); do
     drain 0.05
     L=( ${(f)"$(<$HOSTLOG)"} )
@@ -300,35 +303,41 @@ syn_once() {  # $1=prefix keys $2=final keystroke -> REPLY=ms, REPLY_NOTIFY=ms
         *" worker: queued input input_generation="*)
           [[ -z $gen ]] && gen=${${line#*input_generation=}%% *} ;;
       esac
-      [[ -n $gen && $line == *" worker: syntax-highlight applied input_generation=$gen "* ]] &&
+      [[ $line == *"collect: collecting"* ]] && captured=1
+      [[ $line == *"reuse: hit"* ]] && hit=1
+      [[ -n $gen && ( $line == *" worker: $event applied input_generation=$gen" ||
+          $line == *" worker: $event applied input_generation=$gen "* ) ]] &&
         (( t_apply == 0 )) && { ts_of $line; t_apply=$REPLY }
     done
     (( t_apply )) && break
   done
   clear_line
   (( t_apply )) || return 1
+  [[ $event != plan-ready ]] || (( hit && !captured )) || return 1
   typeset -g REPLY=$(( (t_apply - t0) * 1000 ))
   (( t_notify )) && typeset -g REPLY_NOTIFY=$(( (t_notify - t0) * 1000 ))
   return 0
 }
 
-syn_case() {  # $1=host-label $2=case-label $3=prefix keys $4=final keystroke [$5=trials]
+key_event_case() {  # host-label case-label prefix final-key [trials] [event]
   local -i trials=${5:-${ZRUSH_LATENCY_TRIALS:-4}}
   local -a ms=() notify=()
   local -i i
+  local event=${6:-syntax-highlight} tag=COLOUR
+  [[ $event == plan-ready ]] && tag=REUSE
   for (( i = 1; i <= trials; ++i )); do
-    if syn_once $3 $4; then
+    if key_event_once $3 $4 $event; then
       ms+=( $REPLY )
       [[ $REPLY_NOTIFY == NA ]] || notify+=( $REPLY_NOTIFY )
     else
-      out "WARN: [$1/$2] attempt $i produced no decoration"
+      out "WARN: [$1/$2] attempt $i produced no $event"
     fi
     drain 0.4
   done
   median $ms; local m_total=$REPLY
   median $notify; local m_notify=$REPLY
-  (( $#ms == trials )) || bad "WARN: [$1/$2] $(( trials - $#ms )) of $trials attempts produced no decoration"
-  out "COLOUR| ${(r:12:)1} | ${(r:32:)2} | med=$(fmt $m_total)ms | key→notify med=$(fmt $m_notify)ms | trials=[${(j:, :)${(@)ms/(#m)*/$(fmt $MATCH)}}]"
+  (( $#ms == trials )) || bad "WARN: [$1/$2] $(( trials - $#ms )) of $trials attempts produced no $event"
+  out "$tag | ${(r:12:)1} | ${(r:32:)2} | med=$(fmt $m_total)ms | key→notify med=$(fmt $m_notify)ms | trials=[${(j:, :)${(@)ms/(#m)*/$(fmt $MATCH)}}]"
   return 0
 }
 
@@ -601,10 +610,7 @@ history_tax_suite() {  # $1=host-label
   out "==== min-zrush (isolated + default delay-ms=30) ===="
   if start_min_zrush min-zrush $WORK/xdg-default; then
     host_rss; out "INFO: RSS=${REPLY}KB"
-    # Command position is the only cached one (behavior.md "Empty-Word Collection Cache"),
-    # so the miss case is this host's first collection and the hit case is
-    # whatever it latched. Every cache-hit case has to come before the file and
-    # git cases, which measure uncached collection.
+    # See docs/internal/specs/behavior.md "Candidate Reuse".
     paint_break_case min-zrush "cmd 1st (whic)"   'whic'         'which'
     paint_break_hit_case min-zrush "cmd hit (whic)" 'whic'       'which'
     paint_case min-zrush "cmd hit (whic)"   'whic'         'which'
@@ -612,11 +618,13 @@ history_tax_suite() {  # $1=host-label
     paint_break_case min-zrush "git (git chec)"   'git chec'     'checkout'
     paint_case min-zrush "file (docs/inte)" 'ls docs/inte' 'internal'
     paint_case min-zrush "git (git chec)"   'git chec'     'checkout'
+    key_event_case min-zrush "reuse git (che+c)" 'git che' 'c' ${ZRUSH_LATENCY_TRIALS:-4} plan-ready
+    key_event_case min-zrush "reuse file (int+e)" 'ls docs/int' 'e' ${ZRUSH_LATENCY_TRIALS:-4} plan-ready
     # Buffer decoration, measured on the last keystroke of each buffer: one
     # command word resolved against $PATH, and one argument resolved as a
     # literal path (specs/syntax.md "Literal paths and resolution").
-    syn_case min-zrush "colour cmd (whic+h)"       'whic'            'h'
-    syn_case min-zrush "colour path (interna+l)"   'ls docs/interna' 'l'
+    key_event_case min-zrush "colour cmd (whic+h)"       'whic'            'h'
+    key_event_case min-zrush "colour path (interna+l)"   'ls docs/interna' 'l'
   else
     bad "FATAL: min-zrush failed to start"
   fi
@@ -632,7 +640,7 @@ history_tax_suite() {  # $1=host-label
     paint_case min-d0 "git (git chec)"   'git chec'     'checkout'
     # The same colour case without a quiet period in the way: the decoration
     # does not wait for one, so this pair is what shows it.
-    syn_case min-d0 "colour cmd (whic+h)"          'whic'            'h'
+    key_event_case min-d0 "colour cmd (whic+h)"          'whic'            'h'
   else
     bad "FATAL: min-d0 failed to start"
   fi

@@ -25,7 +25,7 @@
   静穏期間中に届いた新しい通知は期間を張り直すため、打鍵が続く間は通知が採用されない。
   `delay-ms = 0` は通知を受理と同時に採用することを意味し、打鍵ごとに settle する。
   静穏期間が掛かるのは捕獲を要し得る通知だけであり、
-  candidate store だけで解決する通知(空語収集キャッシュのヒット)は
+  candidate store だけで解決する通知(広げ結果と cwd による候補再利用のヒット)は
   `delay-ms` の値によらず受理と同時に `plan-ready` が返る。
 - `delay-ms` はバッファ装飾には効かない。
   worker は通知の受理時に字句解析して直ちに結果を返す(`[syntax]`、behavior.md「Buffer Syntax Highlighting」)。

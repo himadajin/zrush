@@ -41,7 +41,7 @@ bindkey '^Xw' _zrt-dump-worker
 # stored -- whether the saved fingerprint still describes this environment, and
 # how old the entry is. ^Xw carries the third (the latch) as raw state. A test
 # that expects a recollection needs to show which condition forced it
-# (behavior.md "Empty-Word Collection Cache").
+# (behavior.md "Candidate Reuse").
 _zrt_dump_cache() {
   emulate -L zsh
   local -i match=0 age=-1

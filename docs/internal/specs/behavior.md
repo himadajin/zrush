@@ -153,17 +153,15 @@ zsh は zle 統合・compsys 呼び出しによる捕獲・zsh 名前空間 snap
   次のバッファ変化が新しい `input_generation` を作るまで、その入力の一覧は更新されない。
 - 解析済みの候補は worker がスロット(`live` / `cache`)ごとに candidate generation 単位で保持する
   (`../contracts/cli-protocol.md`「Requests and Responses」節)。
-  zsh が要求を跨いで参照するのは `cache` スロットだけであり、
-  「現 worker session が `cache` スロットにどの generation を保持しているか」を
-  **candidate store latch** として持つ。
-  `live` スロットの store は、その store 自身が worker に作らせる `plan-ready` からしか参照されないため、
-  latch を持たない。
+  zsh は再利用可能な鍵と generation を **candidate store latch** として持つ。
+  `cache` は空語のプロンプトを跨ぐ保持、`live` はそれ以外の行編集中の保持に使う。
+  有効範囲と検証は「Candidate Reuse」節が定める。
   candidate store は worker session に属するため、latch は worker の起動・正常 shutdown・異常 abort・
   session failure・worker の交換・re-source のたび、および latch の generation を名乗った入力通知が
   `capture-required` を受けたときに無効化する
   (worker がその generation を保持していないことの通知であり、error ではない)。
   装飾専用の通知は latch の generation を名乗らないため、その `capture-required` は無効化点ではない
-  (「Candidate Collection」「Empty-Word Collection Cache」節)。
+  (「Candidate Collection」「Candidate Reuse」節)。
   latch を無効化した generation を payload の再送で復元することはせず、
   `error` / `superseded` で終端した `store` も replay しない。
   新しい generation を作るのは新しい収集だけである。
@@ -307,10 +305,10 @@ wire の byte-exact な形と receiver の置換規則は
   装飾専用の通知とはバッファ装飾のためだけに送る入力通知であり、一覧に一切関与しない。
   `min-input` 抑止のほか、line-finish settle が送る通知もこれである
   (「Buffer Syntax Highlighting」節)。次の 1 つの規則にまとめて従う。
-  - `candidate_generation` は**常に `0`** とする。空語収集キャッシュのヒット判定は行わない。
+  - `candidate_generation` は**常に `0`** とする。候補再利用のヒット判定は行わない。
     `min-input >= 1` で現在語が空になる入力(`ls ` のカーソル直後など)は
     空語収集キャッシュの対象と `min-input` 抑止が同時に成り立つが、この規則が唯一の答えである
-    (「Empty-Word Collection Cache」節)。
+    (「Candidate Reuse」節)。
   - 返る `plan-ready` / `capture-required` は捨てる。捕獲を開始せず、一覧を作らない
     (表示中の一覧があってもこの通知は触らない。消去が要るかどうかはその通知を作った操作が決める)。
   - latch の generation を名乗らないため、捨てた event は空語収集キャッシュの latch を変えない。
@@ -328,10 +326,10 @@ wire の byte-exact な形と receiver の置換規則は
   worker は静穏期間中に届いた通知で前の通知を置き換え、満了時に残っていた最新の 1 個だけを採用して
   `plan-ready` か `capture-required` を返す。
   静穏期間が掛かるのは捕獲を要し得る通知だけである。
-  通知の `candidate_generation` を worker が保持している(空語収集キャッシュのヒットが実際に解決した)ときは、
+  通知の `candidate_generation` を worker が保持している(鍵付き再利用が実際に解決した)ときは、
   受理と同時に `plan-ready` が返る。この場合の一覧更新は打鍵ごとに 1 回で、`delay-ms` は待たない。
 - 入力通知は、その時点の広げ規則が定めるクエリ・行数/桁数予算・マッチング設定・`cwd`・`delay-ms` と、
-  空語収集キャッシュが提供する candidate generation(提供が無ければ `0`)を運ぶ。
+  鍵付き再利用が提供する candidate generation(提供が無ければ `0`)を運ぶ。
   加えてバッファ装飾のための per-call context として `BUFFER` 全体と `interactive_comments` を運ぶ
   (`[syntax].enabled = false` のときバッファは空で送る。「Buffer Syntax Highlighting」節)。
 - 現在の `input_generation` に一致する `capture-required` を受けたときにだけ、compsys 捕獲を 1 回開始する。
@@ -365,7 +363,7 @@ wire の byte-exact な形と receiver の置換規則は
   要求にはその収集を始めさせた `capture-required` の `input_generation` を載せる
   (`../contracts/cli-protocol.md`「Requests and Responses」節)。
   スロットは空語収集キャッシュの対象となる収集が `cache`、それ以外の収集が `live`。
-  どの収集がキャッシュの対象かは「Empty-Word Collection Cache」節が定める。
+  どの収集がキャッシュの対象かは「Candidate Reuse」節が定める。
   payload を zsh 側に保持することはせず、`plan` 要求も連送しない。
   worker はその `store` を受理すると同じ入力に対する `plan-ready` を返し、zsh はそれを適用する。
   入力が既に置き換えられていた場合の `store` は `superseded` で終端し、一覧は変わらない。
@@ -397,24 +395,40 @@ wire の byte-exact な形と receiver の置換規則は
 - compsys 初期化済みの検知は `$+functions[_main_complete]` による
   (zsh-autocomplete が compinit を代行する構成も検出できる)。
 
-## Empty-Word Collection Cache
+## Candidate Reuse
 
-行頭のコマンド位置(広げ結果が空文字列)の収集は最重量ケース(全コマンド名)のため、
-結果をプロンプトを跨いでキャッシュする。
+候補の再利用の鍵は、広げ結果(収集に使う文字列)と `$PWD` の組とする。
+絞り込み用クエリを別途鍵に加えない。鍵が同じ間は、追加・削除やカーソル移動でクエリが変わっても
+受理済みの候補を絞り込み直し、収集しない。
 
-- 対象は広げ結果が空文字列の収集のみ。
-  `sudo ` 後などのコマンド位置は広げ結果が非空になるため対象外である。
-  広げ結果が空文字列でも、捕獲した payload が空の収集は対象外とする。
-  ここで対象とした収集だけが `cache` スロットを使い、それ以外の収集は `live` スロットを使う
-  (cli-protocol.md「Requests and Responses」節)。
-- 解析済みの候補を保持するのは worker の `cache` スロットである(cli-protocol.md「Requests and Responses」節)。
-  zsh が保持するのは**フィンガープリント・保存時刻・`cache` スロットの candidate store latch**
-  (現 worker session が保持している generation)の 3 つだけで、生の捕獲 payload は保持しない。
-- 検証は入力通知を作る時点で行う。
-  ただし比較相手となる現在のフィンガープリントは**プロンプトごとに 1 回だけ**算出し、
-  その行の編集中はすべての通知が同じ値を参照する
-  (行編集中に起きた環境変化は、次のプロンプトの算出でフィンガープリント不一致として捕まる)。
-  ヒットの条件は次の 3 つがすべて成り立つこと:
+- zsh は `ok` で終端した `store` の鍵と generation を保持し、通知を作るときに照合する。
+  `error` / `superseded` の結果を再利用せず、捕獲 payload も保持しない。
+- 非空語(広げ結果が非空)の候補は `live` スロットに保持する。空 payload も再利用できる。
+  有効範囲は同じ鍵が続く行の編集中だけとし、鍵の変化、`zle-line-init`、worker session の喪失で
+  latch を捨てる。空バッファや `min-input` によって通知を抑止する変化でも鍵を追跡する。
+  一度離れた鍵へ戻っても以前の非空語の候補は復活しない。
+  無効化より前に送った `store` の `ok` が後着しても、非空語の latch を復活させない。
+- 鍵が同じ間に外部要因で候補集合が変化しても(ファイルの追加など)、再収集まで反映しない。
+  同じ語でも `/`・`=`・先頭ダッシュ列などで広げ結果が変われば別の鍵である。
+- ヒット時は latch の generation を通知の `candidate_generation` に載せる。
+  worker が保持していれば、収集・`store`・payload の転送や再解析なしで、
+  静穏期間を待たず受理と同時に `plan-ready` が返る。
+  worker が保持していなければ `capture-required` が返るため、名乗った latch を無効化して通常の収集へ落ちる。
+  ミス時は `candidate_generation = 0` で通知し、通常どおり収集する。
+  最初の収集が受理される前の入力は、同じ鍵でも再利用ヒットにはならない。
+- 装飾専用の通知ではヒット判定をせず、常に `candidate_generation = 0` とする。
+  その通知の event を捨てても latch は変えず、ヒットにもミスにも数えない。
+  鍵の変化による非空語の無効化は、装飾専用かどうかによらない。
+
+行頭のコマンド位置(広げ結果が空文字列)は、全コマンド名の収集を避けるため、
+次の追加規則でプロンプトを跨いで保持する。
+
+- 空語のうち payload が非空の収集だけを `cache` スロットに保存する。
+  `sudo ` 後など広げ結果が非空の収集、および空 payload は `live` に保存する。
+  空語の空 payload は再利用しない。
+  `cache` は `live` の収集で上書きされず、別の鍵への移動や行の初期化でも残る。
+- zsh は鍵・generation に加え、フィンガープリントと保存時刻を保持する。
+  ヒットには `$PWD` の一致に加え、次の条件をすべて要求する。
   **フィンガープリント**(「Namespace Snapshot Synchronization」節の名前集合と
   `$PATH` 文字列からなる signature + PATH 各ディレクトリの mtime。
   `autocd` 有効または PATH に相対要素がある場合のみ `$PWD` を含める)の一致、
@@ -426,25 +440,9 @@ wire の byte-exact な形と receiver の置換規則は
   signature の算出は namespace snapshot と共有し、プロンプトごとの走査を 1 回にする。
   共有するのは算出だけで、保持と無効化はそれぞれの機構が独立に持つ
   (worker への供給状態はキャッシュの検証に影響せず、逆も同じ)。
-- ヒット時は latch が指す generation を通知の `candidate_generation` に載せる。
-  worker がそれを保持していれば、収集も `store` も起こらないまま `plan-ready` が返る
-  (payload の転送も再解析も起こらない)。
-  この `plan-ready` は静穏期間を待たず通知の受理と同時に返るため、
-  一覧は打鍵ごとに `plan-ready` 1 個・再描画 1 回で即座に更新される
-  (「Candidate Collection」節)。
-  worker が保持していなければ `capture-required` が返るため、zsh は latch を無効化して通常の収集へ落ちる。
-- 装飾専用の通知(「Candidate Collection」節)では検証そのものを行わず、
-  `candidate_generation` を `0` として送る。
-  latch の generation を名乗らないため、その generation の `capture-required` / `plan-ready` を捨てても
-  latch は変わらず、ヒットにもミスにも数えない
-  (latch を無効化するのは latch の generation を名乗った通知が `capture-required` を受けたときだけである。
-  「Worker Lifecycle」節)。
-- ミス時は通知の `candidate_generation` を `0` として送り、返る `capture-required` で通常どおり収集する。
-  収集の `store` が `ok` で終端した時点で、フィンガープリント・保存時刻・latch を更新する
-  (`superseded` や他の `error` で終端した `store` では更新しない)。
-  保存するフィンガープリントは、その `store` を送出した時点で有効なプロンプトごとの値である。
-  worker session を失った後は latch が無効なため、フィンガープリントと TTL が有効でもミスとして再収集する
-  (latch の無効化点は「Worker Lifecycle」節)。
+- 現在のフィンガープリントはプロンプトごとに 1 回だけ算出し、行編集中は同じ値を使う。
+  保存時刻・フィンガープリント・`$PWD` は `store` 送出時の値を保存し、`ok` で確定する。
+  worker session を失った後は、フィンガープリントと TTL が有効でも再収集する。
 
 ## Matching
 
@@ -755,7 +753,8 @@ Enter で確定した行はスクロールバックへそのまま焼き付く�
   - select-right は表示中の最も古い履歴へ移る(窓内。再要求しない)。
 - ブラウズ中は `BUFFER` に触らない(移動のたびに挿入することはしない)。
 - confirm(既定 Enter)は行全体の置き換えで挿入する(実行はしない。「Confirmation (Insertion)」節)。
-  選択中の Tab も同じく確定。確定後は通常のバッファ変化として再収集へ戻り、履歴一覧は残らない。
+  選択中の Tab も同じく確定。確定後は通常のバッファ変化として補完へ戻り、履歴一覧は残らない。
+  鍵が変わらず候補を再利用できる場合は、再収集せず一覧を更新する(「Candidate Reuse」節)。
 - dismiss(既定 ctrl-g)は履歴メニューを閉じる(バッファは変えず、通常補完も再開しない)。
 - 履歴メニューを消して通常状態へ戻る条件:
   - **マッチ 0 件**(履歴が 0 件の場合を含む)→ メニューは開かず(既存の一覧があれば消し)、
@@ -778,7 +777,7 @@ Enter で確定した行はスクロールバックへそのまま焼き付く�
 - `menu`: 選択開始。
 - `insert`: 先頭候補を確定挿入。
 - `common-prefix`: クエリが common-prefix の真の接頭辞なら共通部分を挿入する
-  (確定ではない。挿入後は通常フローの再収集に任せる)。
+  (確定ではない。挿入後は通常フローで、候補の再利用または再収集により一覧を更新する)。
   伸びない場合は先頭候補を確定挿入する(insert と同じ確定動作)。
 - pending Tab の結果が候補 0 件なら何もしない。選択中の Tab は確定。
 - 候補未着時の Tab は押下を記録し、結果到着時に上記の挙動を適用する。
@@ -811,7 +810,8 @@ Enter で確定した行はスクロールバックへそのまま焼き付く�
 - 履歴候補の確定は行全体の置き換え: `BUFFER` を挿入テキストで置き換え、`CURSOR` を末尾に置く
   (適用規則は cli-protocol.md「Plan Application (zsh-Side Normative)」節)。
 - 確定後は一覧をいったん消去し、確定による挿入も通常のバッファ変化として扱って
-  新しい入力通知を送る(静穏期間は worker が測る)。trailing-space 付き確定なら次の引数位置、
+  新しい入力通知を送る。候補再利用と静穏期間の規則は通常の入力と同じとする。
+  挿入前後で `BUFFER` / `CURSOR` が同一でも通知する。trailing-space 付き確定なら次の引数位置、
   `/` 合成なら当該ディレクトリ内容の候補が非同期で表示される。
 
 ## Configuration Application and Warnings
