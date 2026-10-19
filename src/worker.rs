@@ -386,7 +386,94 @@ struct Session {
     input: Option<CurrentInput>,
 }
 
+type RequestResult = Result<Vec<u8>, &'static [u8]>;
+
 impl Session {
+    fn replace_namespace(&mut self, payload: &[u8]) -> RequestResult {
+        let snapshot = parse_namespace_payload(payload)
+            .map_err(|InvalidNamespacePayload| b"invalid-payload".as_slice())?;
+        self.namespace = Some(snapshot);
+        Ok(Vec::new())
+    }
+
+    fn store_candidates(
+        &mut self,
+        slot: Slot,
+        generation: i64,
+        input_generation: i64,
+        payload: Vec<u8>,
+    ) -> RequestResult {
+        // cli-protocol.md "Requests and Responses": validation order.
+        if !self.binds_current_input(input_generation) {
+            return Err(b"superseded");
+        }
+        let stored =
+            record::parse(payload).map_err(|record::FramingError| b"invalid-payload".as_slice())?;
+        self.store.insert(slot, generation, stored);
+        Ok(Vec::new())
+    }
+
+    fn write_history(
+        &mut self,
+        write: HistoryWrite,
+        generation: i64,
+        payload: Vec<u8>,
+    ) -> RequestResult {
+        let stored =
+            record::parse(payload).map_err(|record::FramingError| b"invalid-payload".as_slice())?;
+        match write {
+            HistoryWrite::Snapshot => self.history.install(generation, &stored),
+            HistoryWrite::Append => self.history.append(generation, &stored),
+        }
+        .map_err(|_| b"unknown-generation".as_slice())?;
+        Ok(Vec::new())
+    }
+
+    fn completion_plan(
+        &self,
+        input_generation: i64,
+        offset: usize,
+        selected: usize,
+        rows: usize,
+        width: usize,
+    ) -> RequestResult {
+        let input = self
+            .input
+            .as_ref()
+            .filter(|input| input.generation == input_generation)
+            .ok_or(b"superseded".as_slice())?;
+        let stored = input
+            .resolved_generation
+            .and_then(|generation| self.store.find(generation))
+            .ok_or(b"unknown-generation".as_slice())?;
+        let params = plan::Params {
+            offset,
+            rows,
+            width,
+            ..input.params.clone()
+        };
+        Ok(plan::compute_selected(
+            &params,
+            stored,
+            &|path| is_dir_from(&input.cwd, path),
+            selected,
+        ))
+    }
+
+    fn history_plan(
+        &self,
+        generation: i64,
+        history_limit: usize,
+        params: &plan::Params,
+    ) -> RequestResult {
+        // cli-protocol.md "Requests and Responses": history-only generation lookup.
+        if !self.history.holds(generation) {
+            return Err(b"unknown-generation");
+        }
+        let window = self.history.window(history_limit);
+        Ok(plan::compute(params, &window, &|_| false))
+    }
+
     /// The instant stdin must stop waiting at, if an input is pending.
     fn deadline(&self) -> Option<Instant> {
         self.input.as_ref().and_then(|input| input.expiry)
@@ -639,117 +726,47 @@ fn process_request<W: Write>(
         .ok_or(Error::Protocol)?
         .clone();
 
-    match parse_request(fields) {
-        Request::Invalid => write_message(output, &[b"error", &request_id, b"invalid-request"]),
-        Request::Namespace { payload } => match parse_namespace_payload(&payload) {
-            Ok(snapshot) => {
-                session.namespace = Some(snapshot);
-                write_message(output, &[b"ok", &request_id, b""])
-            }
-            Err(InvalidNamespacePayload) => {
-                write_message(output, &[b"error", &request_id, b"invalid-payload"])
-            }
-        },
+    let mut settle_generation = None;
+    let result = match parse_request(fields) {
+        Request::Invalid => Err(b"invalid-request".as_slice()),
+        Request::Namespace { payload } => session.replace_namespace(&payload),
         Request::Store {
             slot,
             generation,
             input_generation,
             payload,
-        } => {
-            // cli-protocol.md "Requests and Responses": the binding is checked before the
-            // payload's framing, so a superseded input's candidate stream is
-            // never parsed.
-            if !session.binds_current_input(input_generation) {
-                return write_message(output, &[b"error", &request_id, b"superseded"]);
-            }
-            match record::parse(payload) {
-                Ok(stored) => {
-                    session.store.insert(slot, generation, stored);
-                    write_message(output, &[b"ok", &request_id, b""])?;
-                    // An accepted `store` settles the input it answers, and the
-                    // terminal `ok` precedes that event.
-                    session.settle_against(generation, output)
-                }
-                Err(record::FramingError) => {
-                    write_message(output, &[b"error", &request_id, b"invalid-payload"])
-                }
-            }
-        }
+        } => session
+            .store_candidates(slot, generation, input_generation, payload)
+            .inspect(|_| settle_generation = Some(generation)),
         Request::History {
             write,
             generation,
             payload,
-        } => match record::parse(payload) {
-            Ok(stored) => {
-                let accepted = match write {
-                    HistoryWrite::Snapshot => session.history.install(generation, &stored),
-                    HistoryWrite::Append => session.history.append(generation, &stored),
-                };
-                match accepted {
-                    Ok(()) => write_message(output, &[b"ok", &request_id, b""]),
-                    Err(_) => {
-                        write_message(output, &[b"error", &request_id, b"unknown-generation"])
-                    }
-                }
-            }
-            Err(record::FramingError) => {
-                write_message(output, &[b"error", &request_id, b"invalid-payload"])
-            }
-        },
+        } => session.write_history(write, generation, payload),
         Request::Completion {
             input_generation,
             offset,
             selected,
             rows,
             width,
-        } => {
-            let Some(input) = session
-                .input
-                .as_ref()
-                .filter(|input| input.generation == input_generation)
-            else {
-                return write_message(output, &[b"error", &request_id, b"superseded"]);
-            };
-            let Some(stored) = input
-                .resolved_generation
-                .and_then(|generation| session.store.find(generation))
-            else {
-                return write_message(output, &[b"error", &request_id, b"unknown-generation"]);
-            };
-            let params = plan::Params {
-                offset,
-                rows,
-                width,
-                ..input.params.clone()
-            };
-            let body = plan::compute_selected(
-                &params,
-                stored,
-                &|path| is_dir_from(&input.cwd, path),
-                selected,
-            );
-            write_message(output, &[b"ok", &request_id, &body])
-        }
+        } => session.completion_plan(input_generation, offset, selected, rows, width),
         Request::Plan {
             generation,
             history_limit,
             params,
-        } => {
-            // cli-protocol.md "Requests and Responses": an explicit plan
-            // addresses the history index only. History candidates never carry
-            // directory-synthesis metadata, so no filesystem stat is needed.
-            let body = if session.history.holds(generation) {
-                let window = session.history.window(history_limit);
-                Some(plan::compute(&params, &window, &|_| false))
-            } else {
-                None
-            };
-            match body {
-                Some(body) => write_message(output, &[b"ok", &request_id, &body]),
-                None => write_message(output, &[b"error", &request_id, b"unknown-generation"]),
-            }
-        }
+        } => session.history_plan(generation, history_limit, &params),
+    };
+    let (kind, body): (&[u8], &[u8]) = match &result {
+        Ok(body) => (b"ok", body),
+        Err(code) => (b"error", code),
+    };
+    write_message(output, &[kind, &request_id, body])?;
+
+    // cli-protocol.md "Requests and Responses": store response/event ordering.
+    if let Some(generation) = settle_generation {
+        session.settle_against(generation, output)?;
     }
+    Ok(())
 }
 
 fn parse_request(fields: Vec<Vec<u8>>) -> Request {
@@ -1750,6 +1767,65 @@ mod tests {
         assert_eq!(decoded[1][..2], [b"plan-ready".to_vec(), b"7".to_vec()]);
         assert!(decoded[1][2].windows(3).any(|bytes| bytes == b"git"));
         assert_eq!(decoded.len(), 2);
+    }
+
+    #[test]
+    fn a_store_does_not_settle_when_its_response_write_or_flush_fails() {
+        struct ResponseFailure {
+            fail_on_flush: bool,
+            bytes: Vec<u8>,
+        }
+
+        impl Write for ResponseFailure {
+            fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+                if !self.fail_on_flush {
+                    return Err(std::io::ErrorKind::BrokenPipe.into());
+                }
+                self.bytes.extend_from_slice(buffer);
+                Ok(buffer.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            }
+        }
+
+        for fail_on_flush in [false, true] {
+            let mut session = Session {
+                input: parse_input(
+                    input_notification(b"7", b"0", b"1000")
+                        .into_iter()
+                        .map(<[u8]>::to_vec)
+                        .collect(),
+                    Instant::now(),
+                ),
+                ..Session::default()
+            };
+            let deadline = session.deadline();
+            let stored = payload(b"git");
+            let fields = store_request(b"1", b"live", b"41", b"7", &stored)
+                .into_iter()
+                .map(<[u8]>::to_vec)
+                .collect();
+            let mut output = ResponseFailure {
+                fail_on_flush,
+                bytes: Vec::new(),
+            };
+
+            let Err(Error::Io(error)) = process_request(fields, &mut session, &mut output) else {
+                panic!("expected an I/O error");
+            };
+            assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+            assert!(session.store.find(41).is_some());
+            assert!(deadline.is_some());
+            assert_eq!(session.deadline(), deadline);
+            assert_eq!(session.input.as_ref().unwrap().resolved_generation, None);
+            if fail_on_flush {
+                assert_eq!(messages(&output.bytes), [ok(b"1")]);
+            } else {
+                assert!(output.bytes.is_empty());
+            }
+        }
     }
 
     /// A second `store` bound to the same generation is answered like the
