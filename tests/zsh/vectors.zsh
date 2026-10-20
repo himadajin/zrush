@@ -244,6 +244,63 @@ reserialize_plan() {  # -> REPLY=bytes, or return 1 with REPLY=reason
   (( $+functions[_zrush_history_append_payload] )) || { out "FATAL: _zrush_history_append_payload undefined after source"; exit 1 }
   (( _zrush_enabled )) && { out "FATAL: ZRUSH_NO_INIT did not suppress initialization"; exit 1 }
 
+  # ---------------- Sequence allocation ----------------
+  () {
+    local -i _zrush_request_seq=0 _zrush_cand_gen_seq=10 _zrush_input_gen_seq=20
+    local -i seq_ok=1 expected
+    local counter label
+    local -a calls=()
+    local -A saved=(
+      _zrush_worker_disable_policy "$functions[_zrush_worker_disable_policy]"
+      _zrush_worker_shutdown "$functions[_zrush_worker_shutdown]"
+      _zrush_teardown "$functions[_zrush_teardown]"
+    )
+    functions[_zrush_worker_disable_policy]='calls+=( "disable:$1" )'
+    functions[_zrush_worker_shutdown]='calls+=( shutdown )'
+    functions[_zrush_teardown]='calls+=( teardown )'
+    {
+      for counter label in \
+        _zrush_request_seq request_id \
+        _zrush_cand_gen_seq candidate_generation \
+        _zrush_input_gen_seq input_generation; do
+        expected=$(( ${(P)counter} + 1 ))
+        _zrush_next_seq $counter $label || seq_ok=0
+        [[ $REPLY == $expected && ${(P)counter} == $expected ]] || seq_ok=0
+      done
+      (( _zrush_request_seq == 1 && _zrush_cand_gen_seq == 11 && _zrush_input_gen_seq == 21 \
+         && $#calls == 0 )) || seq_ok=0
+      if (( seq_ok )); then
+        ok "sequence allocation: independent counters increment and return their own value"
+      else
+        ng "sequence allocation: counter or returned value mismatch"
+      fi
+
+      for counter label in \
+        _zrush_request_seq request_id \
+        _zrush_cand_gen_seq candidate_generation \
+        _zrush_input_gen_seq input_generation; do
+        seq_ok=1 calls=()
+        typeset -g "$counter=9223372036854775806"
+        _zrush_next_seq $counter $label || seq_ok=0
+        [[ $REPLY == 9223372036854775807 && ${(P)counter} == 9223372036854775807 \
+           && $#calls == 0 ]] || seq_ok=0
+        REPLY=unchanged
+        _zrush_next_seq $counter $label
+        (( $? == 1 )) || seq_ok=0
+        [[ $REPLY == unchanged && ${(P)counter} == 9223372036854775807 \
+           && "${(j: :)calls}" == "disable:$label exhausted shutdown teardown" ]] || seq_ok=0
+        if (( seq_ok )); then
+          ok "sequence allocation: $label reaches the maximum then disables without wrapping"
+        else
+          ng "sequence allocation: $label boundary or exhaustion mismatch"
+        fi
+      done
+    } always {
+      local fn
+      for fn in ${(k)saved}; do functions[$fn]=$saved[$fn]; done
+    }
+  }
+
   # ---------------- Internal fd close ----------------
   # Preserve duplicates of the runner's stdio so the helper contract can be
   # checked without assuming those descriptors point at a terminal.
@@ -1081,7 +1138,7 @@ reserialize_plan() {  # -> REPLY=bytes, or return 1 with REPLY=reason
   local saved_fail_for_exhaustion=$functions[_zrush_worker_session_fail]
   local -i saved_request_seq=$_zrush_request_seq
   typeset -gi _zrt_startup_session_failures=0
-  functions[_zrush_worker_start]='_zrush_next_request_id'
+  functions[_zrush_worker_start]='_zrush_next_seq _zrush_request_seq request_id'
   functions[_zrush_worker_session_fail]='(( ++_zrt_startup_session_failures )); return 1'
   wire_reset
   _zrush_worker_rfd=-1 _zrush_request_seq=9223372036854775807

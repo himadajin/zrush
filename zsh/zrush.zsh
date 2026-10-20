@@ -1209,7 +1209,7 @@ _zrush_worker_request() {  # pending kind log-context fields... -> REPLY = reque
   setopt localoptions typesetsilent no_monitor no_notify
   local LC_ALL=C pending=$1 kind=$2 context=$3
   shift 3
-  _zrush_next_request_id || return 1
+  _zrush_next_seq _zrush_request_seq request_id || return 1
   local -i id=$REPLY
   _zrush_worker_pending[$id]=$pending
   _zrush_encode_message "$kind" "$id" "$@"
@@ -2304,39 +2304,16 @@ _zrush_worker_on_drain() {
   return 0
 }
 
-_zrush_next_request_id() {  # -> REPLY
+_zrush_next_seq() {  # counter-name label -> REPLY
   emulate -L zsh
-  (( _zrush_request_seq < 9223372036854775807 )) || {
-    _zrush_worker_disable_policy "request_id exhausted"
+  (( ${(P)1} < 9223372036854775807 )) || {
+    _zrush_worker_disable_policy "$2 exhausted"
     _zrush_worker_shutdown
     _zrush_teardown
     return 1
   }
-  typeset -g REPLY=$(( ++_zrush_request_seq ))
-  return 0
-}
-
-_zrush_next_cand_gen() {  # -> REPLY
-  emulate -L zsh
-  (( _zrush_cand_gen_seq < 9223372036854775807 )) || {
-    _zrush_worker_disable_policy "candidate_generation exhausted"
-    _zrush_worker_shutdown
-    _zrush_teardown
-    return 1
-  }
-  typeset -g REPLY=$(( ++_zrush_cand_gen_seq ))
-  return 0
-}
-
-_zrush_next_input_gen() {  # -> REPLY
-  emulate -L zsh
-  (( _zrush_input_gen_seq < 9223372036854775807 )) || {
-    _zrush_worker_disable_policy "input_generation exhausted"
-    _zrush_worker_shutdown
-    _zrush_teardown
-    return 1
-  }
-  typeset -g REPLY=$(( ++_zrush_input_gen_seq ))
+  typeset -g "$1=$(( ${(P)1} + 1 ))"
+  typeset -g REPLY=${(P)1}
   return 0
 }
 
@@ -2397,7 +2374,7 @@ _zrush_request_store() {  # slot payload input-generation -> REPLY = candidate g
   local -i input_gen=$3
   (( !_zrush_worker_stopping && !_zrush_worker_runtime_tainted )) || return 1
   _zrush_worker_ensure_session || return 1
-  _zrush_next_cand_gen || return 1
+  _zrush_next_seq _zrush_cand_gen_seq candidate_generation || return 1
   local -i gen=$REPLY
   _zrush_worker_request "store $slot $gen $input_gen" store \
     "slot=$slot generation=$gen input_generation=$input_gen" \
@@ -2427,7 +2404,7 @@ _zrush_request_history() {  # kind payload [event] -> REPLY = candidate generati
   local LC_ALL=C kind=$1 payload=$2 event=${3:-}
   (( !_zrush_worker_stopping && !_zrush_worker_runtime_tainted )) || return 1
   (( _zrush_worker_rfd >= 0 )) || return 1
-  _zrush_next_cand_gen || return 1
+  _zrush_next_seq _zrush_cand_gen_seq candidate_generation || return 1
   local -i gen=$REPLY
   _zrush_worker_request "$kind $gen" "$kind" "generation=$gen" "$gen" "$payload" || return 1
   local -i id=$REPLY
@@ -2509,7 +2486,7 @@ _zrush_send_input() {  # [1 = decoration-only]
   local comments=false
   [[ -o interactive_comments ]] && comments=true
 
-  _zrush_next_input_gen || return 1
+  _zrush_next_seq _zrush_input_gen_seq input_generation || return 1
   local -i gen=$REPLY
   _zrush_geometry
   local -i rows=$REPLY_ROWS width=$REPLY_WIDTH delay=$ZRUSH_CFG_DELAY_MS
