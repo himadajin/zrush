@@ -2929,7 +2929,7 @@ _zrush_request_plan_sync() {  # cold snapshot-payload snapshot-head snapshot-cou
   local -i head=$3 count=$4
   local query=$5
   local -i offset=${6:-0}
-  local -F deadline=$(( EPOCHREALTIME + ${ZRUSH_HISTORY_DEADLINE_MS:-100} / 1000.0 )) remaining
+  local -F deadline=$(( EPOCHREALTIME + ${ZRUSH_HISTORY_DEADLINE_MS:-100} / 1000.0 ))
   local -i gen=$_zrush_hist_gen
   if (( cold )); then
     # The one path allowed to start a worker synchronously; the update path is
@@ -2943,23 +2943,12 @@ _zrush_request_plan_sync() {  # cold snapshot-payload snapshot-head snapshot-cou
   # cli-protocol.md "history profile": trailing-space is always false, so the
   # inserted text is the history line verbatim.
   _zrush_request_plan $gen "$query" $offset || return 1
-  local -i target=$REPLY cs
+  local -i target=$REPLY
   _zlog "history: query request_id=$target generation=$gen offset=$offset limit=$ZRUSH_CFG_HISTORY_LIMIT"
   _zrush_sync_target=$target _zrush_sync_done=0 _zrush_sync_ok=0
   while (( !_zrush_sync_done )); do
-    remaining=$(( deadline - EPOCHREALTIME ))
-    if (( remaining <= 0 )); then
-      _zrush_worker_session_fail "history deadline exceeded request_id=$target"
-      return 1
-    fi
-    cs=$(( remaining * 100 ))
-    (( cs < 1 )) && cs=1
-    if (( _zrush_worker_ack_fd >= 0 )); then
-      zselect -t $cs -r $_zrush_worker_rfd -r $_zrush_worker_ack_fd >/dev/null 2>&1
-    else
-      zselect -t $cs -r $_zrush_worker_rfd >/dev/null 2>&1
-    fi
-    if (( EPOCHREALTIME >= deadline )); then
+    if ! _zrush_worker_wait $deadline $_zrush_worker_rfd $_zrush_worker_ack_fd ||
+       (( EPOCHREALTIME >= deadline )); then
       _zrush_worker_session_fail "history deadline exceeded request_id=$target"
       return 1
     fi
@@ -3135,24 +3124,16 @@ _zrush_syn_settle() {
     (( gen > 0 )) || return 0
   fi
 
-  local -F deadline=$(( EPOCHREALTIME + _ZRUSH_SYN_SETTLE_MS / 1000.0 )) remaining
-  local -i cs
+  local -F deadline=$(( EPOCHREALTIME + _ZRUSH_SYN_SETTLE_MS / 1000.0 ))
   while (( _zrush_syn_gen != gen )); do
     (( !_zrush_worker_stopping && _zrush_worker_rfd >= 0 )) || return 0
-    remaining=$(( deadline - EPOCHREALTIME ))
-    if (( remaining <= 0 )); then
+    if ! _zrush_worker_wait $deadline $_zrush_worker_rfd $_zrush_worker_ack_fd ||
+       (( EPOCHREALTIME >= deadline )); then
       # Best effort: the line is finished undecorated-as-of-now and the
       # notification is not replayed. Bytes read so far stay in the receive
       # buffer for the ordinary asynchronous path.
       _zlog "syntax: settle deadline exceeded input_generation=$gen"
       return 0
-    fi
-    cs=$(( remaining * 100 ))
-    (( cs < 1 )) && cs=1
-    if (( _zrush_worker_ack_fd >= 0 )); then
-      zselect -t $cs -r $_zrush_worker_rfd -r $_zrush_worker_ack_fd >/dev/null 2>&1
-    else
-      zselect -t $cs -r $_zrush_worker_rfd >/dev/null 2>&1
     fi
     _zrush_worker_consume_ack || return 0
     _zrush_worker_read async || return 0

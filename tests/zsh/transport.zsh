@@ -219,6 +219,97 @@ unset ZDOTDIR
     }
   }
 
+  # A sub-centisecond budget must not become a zero-timeout busy loop or a
+  # rounded-up wait. Observe zselect without relying on wall-clock sleeps.
+  () {
+    local -a SELECT_ARGS=()
+    local -i SELECT_CALLS=0 SELECT_STATUS=0
+    zselect() { (( ++SELECT_CALLS )); SELECT_ARGS=( "$@" ); return $SELECT_STATUS }
+    {
+      _zrush_worker_wait 0 9
+      eq "expired wait status" $? 1
+      _zrush_worker_wait $(( EPOCHREALTIME + 0.005 )) 9
+      eq "sub-centisecond wait status" $? 1
+      _zrush_worker_wait $(( EPOCHREALTIME + 10 )) -1 -2
+      eq "no descriptors status" $? 1
+      eq "no select without a full centisecond and a descriptor" $SELECT_CALLS 0
+
+      _zrush_worker_wait $(( EPOCHREALTIME + 10 )) 9 -1
+      eq "readiness status" $? 0
+      eq "response-only descriptors" "${(j: :)SELECT_ARGS[3,-1]}" '-r 9'
+      (( SELECT_ARGS[2] > 0 && SELECT_ARGS[2] <= 1000 )) || note "wait exceeded its budget"
+      SELECT_STATUS=1
+      _zrush_worker_wait $(( EPOCHREALTIME + 10 )) 9 11
+      eq "timeout status" $? 1
+      eq "response and ack descriptors" "${(j: :)SELECT_ARGS[3,-1]}" '-r 9 -r 11'
+      eq "select calls" $SELECT_CALLS 2
+      verdict "wait: bounded centiseconds, absent descriptors, readiness and timeout"
+    } always {
+      unfunction zselect
+    }
+  }
+
+  # Expire the caller's dynamically scoped deadline at the readiness boundary
+  # to model a shell resuming late, without timing-dependent sleeps.
+  () {
+    local -a names=( _zrush_worker_wait _zrush_request_plan _zrush_worker_consume_ack
+      _zrush_worker_read _zrush_worker_session_fail )
+    local -A saved=()
+    local name mode
+    for name in $names; do saved[$name]=$functions[$name]; done
+    local -i _zrush_worker_rfd=9 _zrush_worker_ack_fd=-1 _zrush_worker_stopping=0
+    local -i _zrush_worker_runtime_tainted=0 _zrush_input_gen=7 _zrush_syn_gen=0
+    local -i _zrush_hist_gen=1 _zrush_sync_target=0 _zrush_sync_done=0 _zrush_sync_ok=0
+    local -i WAITS=0 ACKS=0 READS=0 FAILURES=0 history_status
+    local BUFFER=command ZRUSH_CFG_SYNTAX_ENABLED=true _zrush_worker_rx=
+    _zrush_request_plan() { REPLY=42 }
+    _zrush_worker_wait() {
+      (( ++WAITS ))
+      eq "wait descriptors" "$2:$3" "9:$_zrush_worker_ack_fd"
+      [[ $mode == timeout ]] && return 1
+      [[ $mode == late ]] && deadline=0
+      return 0
+    }
+    _zrush_worker_consume_ack() { (( ++ACKS )); return 0 }
+    _zrush_worker_read() {
+      (( ++READS ))
+      _zrush_sync_done=1 _zrush_sync_ok=1 _zrush_syn_gen=$_zrush_input_gen
+      return 0
+    }
+    _zrush_worker_session_fail() { (( ++FAILURES )); return 1 }
+    {
+      for _zrush_worker_ack_fd in -1 11; do
+        for mode in timeout late ready; do
+          WAITS=0 ACKS=0 READS=0 FAILURES=0
+          _zrush_request_plan_sync 0 '' 0 0 query
+          history_status=$?
+          if [[ $mode == ready ]]; then
+            eq "history success" $history_status 0
+            eq "history response consumed" "$WAITS:$ACKS:$READS:$FAILURES" 1:1:1:0
+          else
+            eq "history failure" $history_status 1
+            eq "history stops before consuming responses" "$WAITS:$ACKS:$READS:$FAILURES" 1:0:0:1
+          fi
+
+          WAITS=0 ACKS=0 READS=0 FAILURES=0 _zrush_syn_gen=0
+          _zrush_worker_rx=partial-response
+          _zrush_syn_settle
+          eq "settle is best effort" $? 0
+          if [[ $mode == ready ]]; then
+            eq "settle response consumed" "$WAITS:$ACKS:$READS:$FAILURES" 1:1:1:0
+          else
+            eq "settle stops without session failure" "$WAITS:$ACKS:$READS:$FAILURES" 1:0:0:0
+            eq "settle retains partial response" "$_zrush_worker_rx" partial-response
+          fi
+          _zrush_worker_rx=
+          verdict "wait callers: $mode with ack fd $_zrush_worker_ack_fd"
+        done
+      done
+    } always {
+      for name in $names; do functions[$name]=$saved[$name]; done
+    }
+  }
+
   # ------------------------------------------------ secure runtime topology
   reset_transport
   typeset -gi saved0 saved1 saved2
