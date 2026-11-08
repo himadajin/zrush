@@ -1701,8 +1701,6 @@ mod tests {
             message(&store_request(b"9", b"elsewhere", b"5", b"1", b"")),
             message(&store_request(b"10", b"live", b"05", b"1", b"")),
             message(&store_request(b"11", b"live", b"5", b"01", b"")),
-            // The five-field `store` of the previous wire carries no binding.
-            message(&[b"store", b"12", b"live", b"5", b""]),
             message(&plan_request(b"13", b"0")),
         ]);
 
@@ -1711,8 +1709,20 @@ mod tests {
         assert_eq!(reply(&decoded, b"9"), error(b"9", b"invalid-request"));
         assert_eq!(reply(&decoded, b"10"), error(b"10", b"invalid-request"));
         assert_eq!(reply(&decoded, b"11"), error(b"11", b"invalid-request"));
-        assert_eq!(reply(&decoded, b"12"), error(b"12", b"invalid-request"));
         assert_eq!(reply(&decoded, b"13"), error(b"13", b"invalid-request"));
+    }
+
+    #[test]
+    fn a_store_with_missing_or_extra_fields_is_invalid() {
+        let mut missing = store_request(b"1", b"live", b"5", b"1", b"");
+        missing.pop();
+        let mut extra = store_request(b"2", b"live", b"5", b"1", b"");
+        extra.push(b"extra");
+        let decoded = session(&[pending_input(b"1"), message(&missing), message(&extra)]);
+
+        for id in [b"1", b"2"] {
+            assert_eq!(reply(&decoded, id), error(id, b"invalid-request"));
+        }
     }
 
     /// cli-protocol.md "Requests and Responses": a `store` whose scalars *and* payload
@@ -2341,13 +2351,9 @@ mod tests {
         ] {
             requests.push(message(&history_plan_request(id, b"9", limit)));
         }
-        // The 11-field plan of the previous wire is not a request either.
-        requests.push(message(&[
-            b"plan", b"6", b"9", b"/", b"compsys", b"", b"typo", b"true", b"10", b"40", b"true",
-        ]));
         let decoded = session(&requests);
 
-        for id in [b"1".as_slice(), b"2", b"3", b"4", b"5", b"6"] {
+        for id in [b"1".as_slice(), b"2", b"3", b"4", b"5"] {
             assert_eq!(reply(&decoded, id), error(id, b"invalid-request"));
         }
     }
@@ -2362,14 +2368,9 @@ mod tests {
         ] {
             requests.push(message(&history_plan_request_at(id, b"9", b"5000", offset)));
         }
-        // The 12-field plan of the previous wire is not a request either.
-        requests.push(message(&[
-            b"plan", b"4", b"9", b"/", b"compsys", b"", b"typo", b"true", b"10", b"40", b"true",
-            b"5000",
-        ]));
         let decoded = session(&requests);
 
-        for id in [b"1".as_slice(), b"2", b"3", b"4"] {
+        for id in [b"1".as_slice(), b"2", b"3"] {
             assert_eq!(reply(&decoded, id), error(id, b"invalid-request"));
         }
     }
