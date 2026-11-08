@@ -1019,7 +1019,7 @@ zsh は選択変更時に最終行を対応する文字列へ置き換えるだ�
 > 抑止条件(`es = 1` / `s` が非空)に該当するバッチを stat しないこと・nospace 条件 —
 > `src/insert.rs` の単体テスト(`is_dir` を注入する)。
 > stat するのは表示位置として採用された `f = 1` の候補だけであること、および stat 失敗・非ディレクトリ時の扱い — `src/plan.rs`。
-> 実ファイルシステムに対する `/` 合成 — `tests/cli.rs`。
+> 実ファイルシステムに対する `/` 合成 — `src/plan.rs`。
 
 - 位置ごとに、確定時にそのまま使える完成済みの挿入テキストを 1 個ずつ返す。
 - 構築規則: `ip + i + P + p + w + s + S + I` の連結
@@ -1083,7 +1083,7 @@ zsh は一覧を消す。
 > `src/matching.rs` の単体テスト(小さなアルファベット上での DP 参照実装との網羅照合を含む)。
 > literal の存在による approximate の抑止・approximate だけが存在する場合の保持・両 profile の結果順・ティア順のソートと同点時の candidate payload 順保存 — `src/ranking.rs`。
 > history profile がマッチ品質で並べ替えないこと・隠し候補の除外(空クエリと非ドットのクエリで落ちること、`.` 始まりのクエリで残ること、`f = 1` でないバッチには掛からないこと、common-prefix に入らないこと)— `src/plan.rs`。
-> worker セッション越しの completion/history profile ごとの結果順と common-prefix — `tests/cli.rs`。history profile のプラン全体 — `tests/vectors/plan/`。
+> completion/history profile ごとの結果順と common-prefix — `src/plan.rs`。history profile のプラン全体 — `tests/vectors/plan/`。
 > 大文字小文字の畳み込みを ASCII に限る規範は、どのテストも固定していない。
 
 - **隠し候補の除外**: クエリの先頭バイトが `.` でないとき、`f = 1` のバッチに属し match-text が `.` で始まる候補を、ティア判定より前に除外する(空クエリも「`.` で始まらない」に含む)。
@@ -1205,9 +1205,9 @@ zsh は一覧を消す。
 ## `zrush config`
 
 > 検証: 既定出力 — `src/config.rs` の `default_output_matches_contract_example` が**下の出力例そのものを読んで** `zrush config` の出力と突き合わせる(この文書が唯一のコピー)。
-> 同じ出力を実プロセスで — `tests/cli.rs`(独立したコピーを持つ)。
-> クォート規律・設定値の反映・不正値の既定値フォールバックと警告・キーバインド配列(正規化後の重複解決を含む)— `src/config.rs` と `tests/cli.rs` の設定テスト。
-> config パス解決は `$XDG_CONFIG_HOME` が設定されている経路(ファイル不在を含む)のみ検査される。未設定・空文字列で `~/.config` に落ちる規範を固定するテストは無い。
+> クォート規律・設定値の反映・不正値の既定値フォールバックと警告・キーバインド配列(正規化後の重複解決を含む)— `src/config.rs`。
+> `$XDG_CONFIG_HOME` からの設定ファイル読み込み、および不正値・構文エラーがあっても exit 0 すること — `tests/cli.rs`。
+> config パス解決は `$XDG_CONFIG_HOME` が設定されていてファイルが存在する経路のみ検査される。未設定・空文字列で `~/.config` に落ちる規範を固定するテストは無い。
 > zsh 側の規範(`emulate -L zsh` での source、`key:` の `$terminfo` 解決、`main` キーマップへの bindkey)は、既定キーバインドの範囲で `cargo test --test driver`(実 pty 上の host zsh に既定キーを送る)がスモークテストする。
 
 config.toml を解決・検証し、zsh が `source` できる形で設定値とキーバインド定義を出力する。
