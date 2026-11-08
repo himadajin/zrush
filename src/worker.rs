@@ -1579,6 +1579,11 @@ mod tests {
             message(&plan_request(b"3", b"5")),
         ]);
 
+        assert_eq!(
+            decoded.len(),
+            3,
+            "one response per request, no extra messages"
+        );
         assert_eq!(reply(&decoded, b"1"), ok(b"1"));
         assert_eq!(&reply(&decoded, b"2")[..2], [b"ok".as_slice(), b"2"]);
         assert_eq!(&reply(&decoded, b"3")[..2], [b"ok".as_slice(), b"3"]);
@@ -2283,6 +2288,7 @@ mod tests {
             (8, 6, b"0"),
             (8, 6, b"01"),
             (9, 7, b"0"),
+            (9, 7, b"-1"),
             (9, 7, b"18446744073709551616"),
         ] {
             let mut input = input_notification(b"1", b"0", b"0");
