@@ -255,23 +255,6 @@ fn run_vector_raw(path: &Path) -> std::process::Output {
             b"extra-field" => {
                 plan_fields.push(b"extra".to_vec());
             }
-            b"obsolete-producer" => {
-                plan_fields = vec![
-                    b"plan".to_vec(),
-                    plan_id.to_vec(),
-                    generation.to_vec(),
-                    cwd.as_os_str().as_bytes().to_vec(),
-                    b"compsys".to_vec(),
-                    value("--query").into_vec(),
-                    value("--mode").into_vec(),
-                    value("--smart-case").into_vec(),
-                    value("--rows").into_vec(),
-                    value("--width").into_vec(),
-                    b"false".to_vec(),
-                    b"5000".to_vec(),
-                    b"0".to_vec(),
-                ];
-            }
             b"" => {}
             shape => panic!(
                 "{}: unknown --plan-shape {:?}",
